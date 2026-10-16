@@ -5,17 +5,83 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.168 (2026-10-16; §4.168 the bounded host dispatch answer: every
-  admitted host request now answers within the §4.166 stall budget — the lane-permit
-  wait and the dispatch itself are both bounded by `HOST_DISPATCH_STALL_WARN_AFTER`,
-  expiry emits the §4.166 warn (byte-identical on the dispatch arm) and answers the
-  retryable `INTERNAL_ERROR` deadline face, the same shape as the capacity face — so
-  the admitted-but-forever-pending shape the intermittent-send audit hit can no longer
-  strand a request without an answer, a lane permit, or a truthful
-  `host_pending_requests` gauge (the connection exit now resets the gauge). `link.*`
-  waits stay exempt: their approval window is legitimately long. The answerability
-  contract changes; the wire vocabulary does not — zero new methods, events, error
-  codes, capability bits, or schema moves. Tests +4 (lib).)
+- Contract revision: 1.170 (2026-10-16; §4.170 the canonical memo key: the
+  Note-to-Self conversation now lives on the account's own ACI
+  (`accounts.aci`, contract 1.142) instead of its phone number. Three
+  writers keyed the self chat by number — the contacts-sync materialization,
+  own-number envelope ingest, history import — while the ACI-keyed face
+  answered from the receive path, so a linked account could hold two
+  competing self rows. The number-keyed row is now a shell that folds into
+  the canonical ACI row: `ensure_conversation` redirects a direct chat keyed
+  by the account's own number to the ACI key whenever the account carries an
+  ACI distinct from it (recursion-safe: the degenerate `aci == number`
+  answer redirects nothing), the §4.42/§4.43 `isSelf` predicates match the
+  stored ACI beside the number (superseding the §4.24 recorded boundary —
+  the own ACI became queryable in 1.142), and a backfill migration
+  (`Store::normalize_memo_identity`) folds an existing shell into the
+  canonical row — messages move deduplicated by signal identity (the table
+  carries no unique constraint; the `NOT EXISTS` guard is the dedupe),
+  reactions move under the same guard on their unique tuple, pins and
+  drafts move when the canonical row lacks them, conversation state merges
+  (title upgrade, unread MAX, muted/pinned OR, timers/preview COALESCE
+  toward the canonical's own stamp), the shell row is deleted, and a
+  `memo_migrations` ledger row records the fold with a rollback snapshot
+  (schema 25 → 26). The migration runs at the two ACI-write seams — the
+  account sync and `link.finish` — and announces the canonical row via
+  `conversation.changed`; it is idempotent and a no-op without a shell, an
+  ACI, or after folding. Receive and send paths are untouched: the receive
+  self-mirror already keys by the own ACI and the engine resolves a UUID
+  recipient directly. The old-ACI-era rows (the `c9bf3cad…`-keyed legs,
+  18 rows in the reference store) are deliberately NOT migrated — no safe
+  predicate distinguishes a stale own-ACI row from a stranger's
+  ACI-keyed conversation, and a wrong merge is a data incident; they stay
+  and the boundary is recorded. Tests +4 (store) +1 (supervisor).)
+- Contract revision: 1.169 (2026-10-16; §4.169 the bounded host answer
+  write-back: every post-authentication host write — dispatch responses,
+  registry/host events, reject answers — now enqueues a pre-serialized
+  frame into a bounded per-session queue (`HOST_WRITE_QUEUE_CAPACITY`, 256
+  frames) drained by a single writer task that owns the sink ("one writer,
+  one order", the engine stdin discipline), so a host that stops reading
+  its socket parks only the writer task and never the session loop. The
+  forensics that forced this: the 2026-10-16 03:48–04:22Z session (the
+  restarted connector, engine pid 21695) served its boot burst
+  (125 read + 28 send completions through 04:05:58.304Z) and then froze
+  completely — `host_pending_requests` stuck at 4 from 04:06:50Z to
+  04:21:50Z (15+ minutes, 3× the §4.168 deadline) with the metrics task
+  still ticking every 60s and **zero** §4.166/§4.168 stall warns: the
+  deadlines were armed but never observed. The last logged completion is a
+  dispatch that logged its answer and then went to write it — and the
+  write-back await sat outside every deadline wrapper. Two unbounded faces
+  existed past §4.168: the dispatch future's own answer write (a
+  non-reading peer parks it forever — response, pending-budget slot and
+  completion all stay parked, no deadline covers them) and the session
+  loop's own event/reject writes (one parked write freezes the whole
+  `select!` loop, and every in-flight dispatch future — deadline futures
+  included — stops being polled, so even the §4.168 deadline face becomes
+  unobservable; a `tokio` timer fires into a task that never returns
+  while its poll is parked or never re-scheduled). The repair makes the
+  answerability claim structural: admit → acquire ≤300s → dispatch ≤300s
+  → enqueue (non-blocking; saturated = drop + warn + the pending budget
+  still releases) → delivery best-effort by the writer task, whose I/O
+  failure reaches the loop through a bounded failure channel and ends the
+  session exactly as a direct write error did. Zero wire change: same
+  frames, same order, same faces; the new internal
+  `HostError::WriteBackSaturated` never reaches the host or the exit
+  status, and the new stall warns are log-only. Tests +3 (lib).)
+- Contract revision: 1.168 (2026-10-16; §4.168 the bounded host dispatch
+  answer: every admitted host request now answers within the §4.166 stall
+  budget — the lane-permit wait and the dispatch itself were both bounded
+  by `HOST_DISPATCH_STALL_WARN_AFTER`, expiry emitted the §4.166 warn
+  (byte-identical on the dispatch arm) and answered the retryable
+  `INTERNAL_ERROR` deadline face, the same shape as the capacity face — so
+  the admitted-but-forever-pending shape the intermittent-send audit hit
+  could no longer strand a request without an answer, a lane permit, or a
+  truthful `host_pending_requests` gauge (the connection exit resets the
+  gauge). `link.*` waits stayed exempt: their approval window is
+  legitimately long. The answerability contract changed; the wire
+  vocabulary did not — zero new methods, events, error codes, capability
+  bits, or schema moves. Tests +4 (lib); superseded in reach by the 1.169
+  write-back bound, which its deadline wrapper now sits inside.)
 - No-revision record: 2026-10-16; the group-history resync batch (§4.167)
   lands as connector-internal behavior only — a `groups.get` cache miss
   or an empty roster now triggers one throttled (5-minute TTL, official
@@ -14277,6 +14343,227 @@ the `link.*` exemption stays unbounded
 (`link_waits_stay_exempt_from_the_stall_budget`); and a full session ends
 with the pending gauge at zero
 (`connection_exit_resets_the_host_pending_gauge`).
+
+### 4.169 The bounded host answer write-back: a wedged peer parks a writer task, never the session loop (contract revision 1.169, 2026-10-16)
+
+The wound (the 2026-10-16 03:48–04:22Z read-lane wedge, the session after
+the user's 12:04 restart): the connector (pid 21694, engine 21695, the
+e74a8f5 build — sources last touched 03:28:35Z, the release binary built
+03:37:50Z, both before the 03:48Z session start, and the dev resolver
+prefers `KT_SIGNAL_CONNECTOR_BIN` pointing at that release binary) served
+its boot burst normally — 125 read and 28 send completions, the last one
+logged at 04:05:58.304Z — and then froze completely: every metrics
+snapshot from 04:06:50Z to the log's end at 04:21:50Z repeats
+`host_pending_requests=4` with zero further request completions. That is
+15+ minutes stuck, three times the §4.168 answer deadline, with the
+process demonstrably alive (the metrics task kept ticking every 60s) and
+**zero** §4.166/§4.168 stall warns: the deadlines were armed but never
+observed. The engine log shows the same silence from its side — after the
+03:53:35Z `listGroups` answers (pre-restart) and the 04:05:58Z one
+(post-restart), no engine call arrives at all while the Signal websocket
+keepalive diagnostics keep streaming — so the wedge is connector-side,
+downstream of every engine budget.
+
+The gap §4.168 left open, in code: the deadline wrapper
+(`dispatch_within_stall_budget`) bounds only the dispatch execution. The
+answer write that follows it — `send_shared(&task_writer, &response).await`
+— is an unbounded await on the host socket's writability, and the session
+loop's own writes (reject answers, registry events, host events) are
+unbounded awaits too. A host that stops reading its Unix socket fills the
+kernel buffer and every subsequent write parks forever. Two wedge shapes
+follow, both past every deadline:
+
+1. **The parked response write-back.** A dispatch whose execution
+   completed logs its answer line and then parks inside its own
+   `send_shared`: the `DispatchCompletion` never returns, the
+   pending-budget slot never releases, and no deadline covers the await —
+   the §4.168 wrapper already passed. The last logged completion
+   (04:05:58.304Z, `send ok duration_ms=0`) is exactly this shape: an
+   answer computed, logged, and never provably delivered.
+2. **The frozen session loop.** One parked write inside any `select!` arm
+   (an event forward, a reject) stops the loop from ever re-entering the
+   poll — and `FuturesUnordered`'s futures only advance when the loop
+   polls them. Every in-flight dispatch freezes mid-await; its deadline
+   timer fires, wakes the future, and the wake queues behind a poll that
+   never comes. This is the shape that explains zero stall warns on a
+   live process: an armed `tokio` timer cannot fire through a task that
+   is parked inside a single unbounded await.
+
+Which of the two parked first in the 04:05:58Z wedge is not
+distinguishable from the surviving logs (the pre-restart connector log
+was truncated by the restart; the post-restart log holds both shapes'
+joint signature — frozen completions, stuck gauge, silent deadlines).
+Both share one root cause and both are repaired together.
+
+**The repair mirrors the engine's A7 stdin-writer discipline.** All
+post-authentication host writes — dispatch responses, reject answers,
+registry events, host events — enqueue a pre-serialized frame into a
+bounded per-session queue (`HOST_WRITE_QUEUE_CAPACITY`, 256 frames,
+count-bounded) drained by a single writer task that owns the sink: one
+writer, one order. Enqueue never awaits writability:
+
+- a saturated queue drops the frame with a log-only warn; on the
+  response arm the pending budget still releases (the dispatch future
+  always completes, `host_pending_requests` stays truthful), on the
+  event arm the event is dropped (the same lossy shape as the existing
+  broadcast-backpressure `eventBackpressure` face, which predates this
+  batch). A peer that stopped reading wedges only the writer task;
+- the writer task's own I/O failure (peer gone mid-frame) forwards
+  through a bounded failure channel into the `select!` loop as a new arm
+  and ends the session exactly as a direct write error did — the
+  `PeerGone` normalization and the teardown path are unchanged;
+- the loop itself never parks on a host write, so every §4.168 deadline
+  stays observable and the answerability claim becomes structural:
+  admit → acquire ≤300s → dispatch ≤300s → enqueue (non-blocking) →
+  delivery best-effort by the writer task. The pre-authentication
+  challenge/handshake writes keep their direct framed form (bounded by
+  `HANDSHAKE_TIMEOUT` on the read side, single small frames before any
+  wedge surface exists).
+
+Zero wire change: the frames, their order (one queue, one consumer), and
+every face are byte-identical; a healthy peer observes no difference in
+latency (enqueue is a bounded-channel push the writer drains
+immediately). The new `HostError::WriteBackSaturated` is internal-only
+(never reaches the host or the exit status), matching the `PeerGone`
+discipline. The §4.166/§4.168 stall warns keep their bytes; the new
+saturation warns are separate log-only faces carrying
+`method`/`method_class`/`account_id`/`request_bytes` (response arm) or
+the event kind (event arm).
+
+Tests (+3 lib): a non-reading peer wedges only the writer — a follow-up
+request still completes and releases its budget slot
+(`wedged_peer_parks_the_writer_task_and_the_session_loop_stays_alive`);
+a saturated queue drops the response with the warn face and the truthful
+gauge (`saturated_write_queue_drops_the_answer_warns_and_releases_the_budget`);
+a writer I/O failure still ends the session like a direct write error
+(`writer_io_failure_still_ends_the_session`).
+
+### 4.170 The canonical memo key: the self conversation lives on the account's ACI (contract revision 1.170, 2026-10-16)
+
+The Note-to-Self conversation is the one conversation whose peer is the
+linked account itself, and its store key has been ambiguous since the ACI
+became queryable. Contract 1.43 (§4.42) keyed the self chat by the account's
+own number and recorded the boundary honestly: "the own ACI is not
+queryable on either engine's jsonRpc surface, so a UUID-shaped peer key
+cannot be marked." Contract 1.142 (§4.138) then made the ACI queryable and
+persisted it on the account row. Three writers kept keying the self chat by
+number — the contacts-sync materialization, the ingest of an own-number
+envelope, the history import of the self chat — while the receive path's
+self-mirror carries `sourceUuid` = the own ACI, so the two key families
+describe the same conversation and a store can hold both: a number-keyed
+shell (sent history, contacts material) beside an ACI-keyed row (received
+mirror). The desktop shows two self chats; the unread counts split.
+
+**The canonical key is the ACI** (`accounts.aci`): it is the Signal-native
+identity the receive path already speaks, it survives number churn, and the
+send path resolves it directly (the engine's `resolve_recipient` parses a
+UUID service id on its first ladder arm — verified read-only). The
+number-keyed row is a shell to fold, never a second conversation.
+
+**The redirect (write-time unification).** `Store::ensure_conversation`
+checks one predicate before its existing body: `kind == "direct"` and
+`peer_key` equals the account's own `signal_account` and the account
+carries an `aci` distinct from that number → the call re-keys to
+`(direct, aci)` (title rides). The redirected call cannot loop: its peer
+key is the ACI, which fails the equals-the-number test; the degenerate
+`aci == signal_account` answer redirects nothing. Every path that
+materializes or touches the self chat through `ensure_conversation` —
+contacts sync, ingest, history import — lands canonical from then on.
+Read paths that query a conversation by an explicit id or by a non-self
+peer key are untouched.
+
+**The predicates (read-time truth).** `peer_key_is_self` now matches the
+stored ACI beside the number, and the §4.42/§4.43 summary and contacts
+derivations pass the account row's `aci` through — one column in the same
+single-row account lookup they already hold. A canonical `(direct, aci)`
+row is `isSelf: true`; a stranger's UUID-keyed row still never is. The
+§4.24 recorded boundary ("the own ACI cannot be marked") is superseded by
+1.142's answer, and this paragraph records the supersession.
+
+**The backfill (store-level fold).** `Store::normalize_memo_identity(
+account_id) -> Option<ConversationSummary>` runs inside one transaction:
+
+1. Read the account row; no ACI, or an ACI equal to the number → `None`
+   (nothing to fold, and the redirect would be a no-op anyway).
+2. The canonical row is ensured at `(direct, aci)` (title: the shell's
+   current title when a shell exists, else the account's display name or
+   number). No shell row → `None`: a store with only canonical state is
+   already done; the canonical row is not pre-created for accounts that
+   never materialized a self chat (the redirect creates it on first real
+   touch, so the conversation list never grows empty placeholders).
+3. Messages move with an `UPDATE … SET conversation_id = canonical WHERE
+   conversation_id = shell AND NOT EXISTS (SELECT 1 FROM messages other
+   WHERE other.conversation_id = canonical AND other.account_id =
+   messages.account_id AND other.direction = messages.direction AND
+   other.sent_at = messages.sent_at AND other.sender_id =
+   messages.sender_id)` — the signal-identity tuple the
+   `messages_signal_identity_v2` index already sorts. The table carries NO
+   unique constraint on that tuple, so the dedupe is this guard, not a
+   constraint; rows that would duplicate stay shell-side and are deleted
+   (the canonical copy wins — it is the row the desktop reads). A deleted
+   duplicate takes its `message_edits` history with it (the edits FK
+   cascades); edits on the kept copy are untouched. Message ids do not
+   change on the moved rows, so every id-keyed side reference stays valid.
+4. `message_events` (reactions, keyed by conversation + target timestamp)
+   move under the same `NOT EXISTS` guard on their own unique tuple
+   `(account_id, conversation_id, kind, target_timestamp, actor_id)`;
+   duplicates drop. The table's conversation FK has no cascade, so this
+   step is what keeps the shell row deletable.
+5. `conversation_pins` / `conversation_drafts` rows move when the
+   canonical row lacks one (PK `(account_id, conversation_id)`); the
+   shell's rows cascade away with the shell.
+6. Conversation state merges shell → canonical: `title` through
+   `title_should_upgrade` (a real name upgrades, a mask never); `unread_
+   count` and `unread_mentions` take the MAX; `muted` and `pinned` OR;
+   `expire_timer_seconds`, `mrr_factors_json`, `last_message_at` and
+   `last_message_preview` keep the canonical's own stamp when present and
+   take the shell's otherwise (recency resolves the preview pair).
+7. The shell row is deleted. A `memo_migrations` ledger row is written:
+   `account_id` (PK), `canonical_aci`, `source_peer_key`, `rollback_json`
+   (the shell row verbatim plus the ids of dropped duplicates),
+   `migrated_at`. The answer is the refreshed canonical summary (its
+   `isSelf` now true).
+
+The fold is idempotent: a second call finds no shell and answers `None`.
+The schema moves 25 → 26 for the `memo_migrations` table alone (created by
+the schema string, so old databases gain it on open; no backfill at open
+time — the fold runs at the seams, where the ACI is fresh and the
+announcement channel exists).
+
+**The seams.** The migration runs exactly where the ACI is (re)written
+with a host-facing lane to announce on: after the account sync persists
+each engine-reported ACI, and after `link.finish` persists the finish
+answer. Both seams fold the account's shell and, when a fold happened,
+send `HostSideEvent::ConversationChanged` with the canonical summary —
+the desktop's open list re-reads one row instead of two.
+
+**The recorded boundary: the old-ACI era is not migrated.** The reference
+store holds 18 rows keyed by a stale own-ACI from a previous link era
+(peer keys like `c9bf3cad-…`). No safe predicate distinguishes a stale
+own-ACI row from a stranger's ACI-keyed conversation — an ACI the account
+once answered with is indistinguishable, at fold time, from an ACI another
+human owns. A wrong merge silently moves one person's history into
+another's conversation: a data incident, not a migration. Those rows stay
+exactly as they are; only the row keyed by the CURRENT `accounts.aci` is
+canonical, and the current ACI is what both the redirect and the fold key
+on. Rollback, if ever needed, is an operator SQL pass driven by
+`memo_migrations.rollback_json`: re-insert the shell row from the
+snapshot, `UPDATE messages SET conversation_id = shell_id WHERE id IN`
+the snapshot's moved set, restore pins/drafts/reactions, delete the
+ledger row — the ledger exists so that pass is mechanical, not because
+the connector runs it.
+
+Tests (+4 store, +1 supervisor): the fold moves deduplicated messages,
+reactions, pins and merged state into the canonical row, deletes the shell
+and writes the ledger
+(`memo_migration_folds_the_number_shell_into_the_canonical_aci_row`);
+the fold is idempotent and skips accounts without a shell or an ACI
+(`memo_migration_is_idempotent_and_skips_accounts_without_shell_or_aci`);
+the redirect re-keys the own-number key to the ACI and the canonical row
+reads `isSelf` on both list and single-row faces
+(`canonical_aci_key_redirects_the_own_number_and_marks_is_self`, beside an
+extended arm in the §4.42 self-boundary test); the sync seam folds and
+announces (`account_sync_backfills_the_memo_identity_and_announces_the_canonical_row`).
 
 ## 5. signal-cli Boundary
 

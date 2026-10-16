@@ -15,7 +15,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, broadcast, watch};
+use tokio::sync::{
+    Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch,
+};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
@@ -107,8 +109,89 @@ const SEND_CONCURRENCY: usize = 2;
 /// waits are exempt (their approval window is legitimately long).
 const HOST_DISPATCH_STALL_WARN_AFTER: Duration = Duration::from_secs(300);
 
-type HostWriter<S> = Arc<Mutex<SplitSink<Framed<S, LinesCodec>, String>>>;
+/// The bounded per-session host write queue (§4.169): every
+/// post-authentication frame — dispatch responses, rejects, registry and
+/// host events — enters the writer task through this channel, and enqueue
+/// never awaits socket writability. Count-bounded like the engine's A7
+/// stdin queue; a saturated queue drops the frame with a warn (a response
+/// drop still releases its pending-budget slot) instead of parking the
+/// session loop behind a peer that stopped reading its socket.
+const HOST_WRITE_QUEUE_CAPACITY: usize = 256;
+
 type DispatchFuture = BoxFuture<'static, DispatchCompletion>;
+
+/// The write half of one authenticated session (§4.169): pre-serialized
+/// frames flow through `frames` to the single writer task that owns the
+/// sink; the writer's own I/O failures surface on `failures` so the
+/// session loop can end exactly as a direct write error did. Cloneable and
+/// type-erased — dispatch futures hold a clone without carrying the socket
+/// type.
+#[derive(Clone)]
+struct HostWriteChannel {
+    frames: mpsc::Sender<String>,
+    failures: mpsc::Sender<HostError>,
+}
+
+/// Enqueue one frame (§4.169): never awaits socket writability. A saturated
+/// queue answers `WriteBackSaturated` and the caller owns the drop face; a
+/// serialization failure answers `InvalidFrame` exactly as the pre-queue
+/// `send_shared` did.
+fn enqueue_frame<T: Serialize>(channel: &HostWriteChannel, value: &T) -> Result<(), HostError> {
+    let encoded = serde_json::to_string(value).map_err(|_| HostError::InvalidFrame)?;
+    channel
+        .frames
+        .try_send(encoded)
+        .map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => HostError::WriteBackSaturated,
+            mpsc::error::TrySendError::Closed(_) => HostError::PeerGone,
+        })
+}
+
+/// Enqueue one already-built wire event (§4.169): a saturated queue drops
+/// the frame with a warn and keeps the session alive — the event faces own
+/// the same lossy discipline as the lagged-broadcast `eventBackpressure`
+/// notice — while only a closed channel (a peer that left) ends it.
+fn enqueue_event_or_break(
+    channel: &HostWriteChannel,
+    wire: &HostEvent<Value>,
+) -> Result<(), HostError> {
+    match enqueue_frame(channel, wire) {
+        Ok(()) => Ok(()),
+        Err(HostError::WriteBackSaturated) => {
+            tracing::warn!(
+                event = wire.event,
+                "host event dropped: the write queue stayed saturated before delivery"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The session's single writer task (§4.169): it alone owns the sink, so a
+/// host that stops reading parks only this task — the session loop and
+/// every in-flight dispatch deadline keep being polled. One frame at a
+/// time, in enqueue order. The first I/O failure is reported on the
+/// failure channel and the task returns, dropping the sink (the same EOF
+/// semantics the inline write path had).
+async fn run_host_writer<S>(
+    mut frames: mpsc::Receiver<String>,
+    mut sink: SplitSink<Framed<S, LinesCodec>, String>,
+    failures: mpsc::Sender<HostError>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    while let Some(frame) = frames.recv().await {
+        if let Err(error) = sink.feed(frame).await {
+            let _ = failures.send(codec_failure(&error)).await;
+            return;
+        }
+        if let Err(error) = sink.flush().await {
+            let _ = failures.send(codec_failure(&error)).await;
+            return;
+        }
+    }
+}
 
 struct DispatchCompletion {
     account_id: Option<String>,
@@ -361,6 +444,11 @@ pub enum HostError {
     /// way a clean EOF does and never reaches the exit status or the host.
     #[error("host connection is gone")]
     PeerGone,
+    /// The bounded host write queue stayed full (§4.169): the frame was
+    /// dropped with a warn and the session continues. Internal only — the
+    /// host never sees this face and it never ends the session.
+    #[error("host write queue is saturated")]
+    WriteBackSaturated,
     #[error("host authentication failed")]
     Authentication,
     #[error("engine runtime could not be stopped")]
@@ -551,7 +639,17 @@ where
     .await?;
 
     let (sink, mut stream) = framed.split();
-    let writer = Arc::new(Mutex::new(sink));
+    // §4.169: every post-authentication write goes through the bounded
+    // queue and the single writer task below. The loop never awaits socket
+    // writability, so a host that stops reading wedges only the writer —
+    // every in-flight dispatch deadline stays observable.
+    let (frames_tx, frames_rx) = mpsc::channel(HOST_WRITE_QUEUE_CAPACITY);
+    let (failures_tx, mut failures_rx) = mpsc::channel::<HostError>(1);
+    let writer = HostWriteChannel {
+        frames: frames_tx,
+        failures: failures_tx,
+    };
+    tokio::spawn(run_host_writer(frames_rx, sink, writer.failures.clone()));
     let limits = Arc::new(HostDispatchLimits::new());
     let mut dispatches = FuturesUnordered::<DispatchFuture>::new();
     let mut pending = HostPendingBudget::default();
@@ -576,8 +674,15 @@ where
                 };
                 if let Err(error) = request.validate_envelope() {
                     let response = HostResponse::failure(request.request_id, error);
-                    if let Err(error) = send_shared(&writer, &response).await {
-                        break Err(error);
+                    match enqueue_frame(&writer, &response) {
+                        Ok(()) => {}
+                        Err(HostError::WriteBackSaturated) => {
+                            tracing::warn!(
+                                method_class = metrics::method_class(&request.method),
+                                "host answer dropped: the write queue stayed saturated"
+                            );
+                        }
+                        Err(error) => break Err(error),
                     }
                     continue;
                 }
@@ -586,8 +691,15 @@ where
                         request.request_id,
                         ApiError::new("INVALID_REQUEST", "requestId was already used in this session", false),
                     );
-                    if let Err(error) = send_shared(&writer, &response).await {
-                        break Err(error);
+                    match enqueue_frame(&writer, &response) {
+                        Ok(()) => {}
+                        Err(HostError::WriteBackSaturated) => {
+                            tracing::warn!(
+                                method_class = metrics::method_class(&request.method),
+                                "host answer dropped: the write queue stayed saturated"
+                            );
+                        }
+                        Err(error) => break Err(error),
                     }
                     continue;
                 }
@@ -609,8 +721,15 @@ where
                             true,
                         ),
                     );
-                    if let Err(error) = send_shared(&writer, &response).await {
-                        break Err(error);
+                    match enqueue_frame(&writer, &response) {
+                        Ok(()) => {}
+                        Err(HostError::WriteBackSaturated) => {
+                            tracing::warn!(
+                                method_class = metrics::method_class(&method),
+                                "host answer dropped: the write queue stayed saturated"
+                            );
+                        }
+                        Err(error) => break Err(error),
                     }
                     continue;
                 }
@@ -718,7 +837,27 @@ where
                         request_bytes,
                         elapsed,
                     );
-                    let write_result = send_shared(&task_writer, &response).await;
+                    // §4.169: the answer enters the bounded write queue and
+                    // the future returns immediately — a peer that stopped
+                    // reading parks only the writer task, so the pending
+                    // budget always releases and every §4.168 deadline stays
+                    // observable. A saturated queue drops this answer with a
+                    // warn (honest: it was never delivered) and keeps the
+                    // session alive.
+                    let write_result = match enqueue_frame(&task_writer, &response) {
+                        Ok(()) => Ok(()),
+                        Err(HostError::WriteBackSaturated) => {
+                            tracing::warn!(
+                                method = %method,
+                                method_class = method_class,
+                                account_id = task_account.as_deref().unwrap_or("-"),
+                                request_bytes,
+                                "host answer dropped: the write queue stayed saturated before delivery"
+                            );
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    };
                     DispatchCompletion {
                         account_id: task_account,
                         request_bytes,
@@ -736,6 +875,13 @@ where
                         break Err(error);
                     }
                 }
+            }
+            failure = failures_rx.recv() => {
+                // §4.169: the writer task owns the sink, so its first I/O
+                // failure is the session's write failure — end exactly as a
+                // direct write error did (PeerGone normalization happens at
+                // the same boundary below).
+                break Err(failure.unwrap_or(HostError::PeerGone));
             }
             _ = shutdown.changed() => {
                 break Ok(());
@@ -785,20 +931,16 @@ where
                                 json!({ "state": state }),
                             ),
                         };
-                        if let Err(error) = send_shared(&writer, &wire).await {
-                            break Err(error);
-                        }
+                        enqueue_event_or_break(&writer, &wire)?;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if let Err(error) = send_shared(
+                        enqueue_event_or_break(
                             &writer,
                             &HostEvent::new(
                                 "runtime.protocolWarning",
                                 json!({ "kind": "eventBackpressure" }),
                             ),
-                        ).await {
-                            break Err(error);
-                        }
+                        )?;
                     }
                     Err(broadcast::error::RecvError::Closed) => break Ok(()),
                 }
@@ -806,20 +948,17 @@ where
             event = host_events.recv() => {
                 match event {
                     Ok(event) => {
-                        if let Err(error) = send_host_event(&writer, event).await {
-                            break Err(error);
-                        }
+                        let wire = host_event_frame(event)?;
+                        enqueue_event_or_break(&writer, &wire)?;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if let Err(error) = send_shared(
+                        enqueue_event_or_break(
                             &writer,
                             &HostEvent::new(
                                 "runtime.protocolWarning",
                                 json!({ "kind": "eventBackpressure" }),
                             ),
-                        ).await {
-                            break Err(error);
-                        }
+                        )?;
                     }
                     Err(broadcast::error::RecvError::Closed) => break Ok(()),
                 }
@@ -3649,31 +3788,24 @@ fn map_stop_failure(failure: StopFailure) -> ApiError {
     }
 }
 
-async fn send_host_event<S>(writer: &HostWriter<S>, event: HostSideEvent) -> Result<(), HostError>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError> {
     match event {
-        HostSideEvent::StorageChanged { state } => {
-            send_shared(
-                writer,
-                &HostEvent::new("runtime.storageChanged", json!({ "state": state })),
-            )
-            .await
-        }
-        HostSideEvent::AccountChanged(account) => {
-            send_shared(writer, &HostEvent::new("account.changed", account)).await
-        }
-        HostSideEvent::ConversationChanged(conversation) => {
-            send_shared(
-                writer,
-                &HostEvent::new("conversation.changed", conversation),
-            )
-            .await
-        }
-        HostSideEvent::MessageUpserted(message) => {
-            send_shared(writer, &HostEvent::new("message.upserted", message)).await
-        }
+        HostSideEvent::StorageChanged { state } => Ok(HostEvent::new(
+            "runtime.storageChanged",
+            json!({ "state": state }),
+        )),
+        HostSideEvent::AccountChanged(account) => Ok(HostEvent::new(
+            "account.changed",
+            serde_json::to_value(account).unwrap_or(Value::Null),
+        )),
+        HostSideEvent::ConversationChanged(conversation) => Ok(HostEvent::new(
+            "conversation.changed",
+            serde_json::to_value(conversation).unwrap_or(Value::Null),
+        )),
+        HostSideEvent::MessageUpserted(message) => Ok(HostEvent::new(
+            "message.upserted",
+            serde_json::to_value(message).unwrap_or(Value::Null),
+        )),
         HostSideEvent::MessageStatusChanged {
             account_id,
             message_id,
@@ -3699,7 +3831,7 @@ where
             if let Some(at) = viewed_at {
                 payload["viewedAt"] = json!(at);
             }
-            send_shared(writer, &HostEvent::new("message.statusChanged", payload)).await
+            Ok(HostEvent::new("message.statusChanged", payload))
         }
         HostSideEvent::ConversationTyping {
             account_id,
@@ -3721,68 +3853,50 @@ where
             if let Some(sender_name) = sender_name {
                 payload["senderName"] = json!(sender_name);
             }
-            send_shared(writer, &HostEvent::new("conversation.typing", payload)).await
+            Ok(HostEvent::new("conversation.typing", payload))
         }
         HostSideEvent::MessageViewOnceOpened {
             account_id,
             conversation_id,
             message_id,
             opened_at,
-        } => {
-            send_shared(
-                writer,
-                &HostEvent::new(
-                    "message.viewOnceOpened",
-                    json!({
-                        "accountId": account_id,
-                        "conversationId": conversation_id,
-                        "messageId": message_id,
-                        "openedAt": opened_at,
-                    }),
-                ),
-            )
-            .await
-        }
+        } => Ok(HostEvent::new(
+            "message.viewOnceOpened",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "messageId": message_id,
+                "openedAt": opened_at,
+            }),
+        )),
         HostSideEvent::MessageExpired {
             account_id,
             conversation_id,
             message_ids,
-        } => {
-            send_shared(
-                writer,
-                &HostEvent::new(
-                    "message.expired",
-                    json!({
-                        "accountId": account_id,
-                        "conversationId": conversation_id,
-                        "messageIds": message_ids,
-                    }),
-                ),
-            )
-            .await
-        }
+        } => Ok(HostEvent::new(
+            "message.expired",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "messageIds": message_ids,
+            }),
+        )),
         HostSideEvent::CallIncoming {
             account_id,
             conversation_id,
             call_id,
             signal_type,
             payload,
-        } => {
-            send_shared(
-                writer,
-                &HostEvent::new(
-                    "call.incoming",
-                    json!({
-                        "accountId": account_id,
-                        "conversationId": conversation_id,
-                        "callId": call_id,
-                        "type": signal_type,
-                        "payload": payload,
-                    }),
-                ),
-            )
-            .await
-        }
+        } => Ok(HostEvent::new(
+            "call.incoming",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "callId": call_id,
+                "type": signal_type,
+                "payload": payload,
+            }),
+        )),
         HostSideEvent::CallGroupIncoming {
             account_id,
             sender,
@@ -3804,7 +3918,7 @@ where
             if let Some(device_id) = destination_device_id {
                 data["destinationDeviceId"] = json!(device_id);
             }
-            send_shared(writer, &HostEvent::new("call.groupIncoming", data)).await
+            Ok(HostEvent::new("call.groupIncoming", data))
         }
         HostSideEvent::StoryReceived {
             account_id,
@@ -3833,7 +3947,7 @@ where
             if let Some(at) = timestamp {
                 payload["timestamp"] = json!(at);
             }
-            send_shared(writer, &HostEvent::new("story.received", payload)).await
+            Ok(HostEvent::new("story.received", payload))
         }
         HostSideEvent::StoryViewed {
             account_id,
@@ -3862,7 +3976,7 @@ where
             if let Some(name) = viewer_name {
                 payload["viewerName"] = json!(name);
             }
-            send_shared(writer, &HostEvent::new("story.viewed", payload)).await
+            Ok(HostEvent::new("story.viewed", payload))
         }
         HostSideEvent::StoryReaction {
             account_id,
@@ -3905,7 +4019,7 @@ where
             if let Some(at) = timestamp {
                 payload["timestamp"] = json!(at);
             }
-            send_shared(writer, &HostEvent::new("story.reaction", payload)).await
+            Ok(HostEvent::new("story.reaction", payload))
         }
         HostSideEvent::StoryDeleted {
             account_id,
@@ -3939,7 +4053,7 @@ where
             if let Some(at) = timestamp {
                 payload["timestamp"] = json!(at);
             }
-            send_shared(writer, &HostEvent::new("story.deleted", payload)).await
+            Ok(HostEvent::new("story.deleted", payload))
         }
         HostSideEvent::StoryDeleteCandidate {
             account_id,
@@ -3974,7 +4088,7 @@ where
             if let Some(at) = timestamp {
                 payload["timestamp"] = json!(at);
             }
-            send_shared(writer, &HostEvent::new("story.deleteCandidate", payload)).await
+            Ok(HostEvent::new("story.deleteCandidate", payload))
         }
         HostSideEvent::SyncStoryRecipientUpdate {
             account_id,
@@ -3990,7 +4104,7 @@ where
                 "timestamp": timestamp,
                 "storyMessageRecipients": recipients,
             });
-            send_shared(writer, &HostEvent::new("story.recipientUpdate", payload)).await
+            Ok(HostEvent::new("story.recipientUpdate", payload))
         }
         HostSideEvent::GroupChanged {
             account_id,
@@ -4015,7 +4129,7 @@ where
             if let Some(seconds) = expire_timer_seconds {
                 payload["expireTimerSeconds"] = json!(seconds);
             }
-            send_shared(writer, &HostEvent::new("group.changed", payload)).await
+            Ok(HostEvent::new("group.changed", payload))
         }
         HostSideEvent::SyncDeleteForMe {
             account_id,
@@ -4025,17 +4139,13 @@ where
             // absent-optional discipline — a group nothing resolved stays
             // conversation-less, an unmatched entry stays messageId-less (the
             // serde skip keeps the keys absent).
-            send_shared(
-                writer,
-                &HostEvent::new(
-                    "message.deleteForMe",
-                    json!({
-                        "accountId": account_id,
-                        "deletes": deletes,
-                    }),
-                ),
-            )
-            .await
+            Ok(HostEvent::new(
+                "message.deleteForMe",
+                json!({
+                    "accountId": account_id,
+                    "deletes": deletes,
+                }),
+            ))
         }
         HostSideEvent::IdentityVerifiedChanged {
             account_id,
@@ -4064,7 +4174,7 @@ where
             if let Some(conversation_id) = conversation_id {
                 payload["conversationId"] = json!(conversation_id);
             }
-            send_shared(writer, &HostEvent::new("identity.verifiedChanged", payload)).await
+            Ok(HostEvent::new("identity.verifiedChanged", payload))
         }
         HostSideEvent::CallHistoryEvent {
             account_id,
@@ -4105,7 +4215,7 @@ where
             if let Some(conversation_id) = conversation_id {
                 payload["conversationId"] = json!(conversation_id);
             }
-            send_shared(writer, &HostEvent::new("call.historyEvent", payload)).await
+            Ok(HostEvent::new("call.historyEvent", payload))
         }
         HostSideEvent::SettingsConfigurationSync {
             account_id,
@@ -4131,11 +4241,7 @@ where
             if let Some(flag) = link_previews {
                 payload["linkPreviews"] = json!(flag);
             }
-            send_shared(
-                writer,
-                &HostEvent::new("settings.configurationSync", payload),
-            )
-            .await
+            Ok(HostEvent::new("settings.configurationSync", payload))
         }
         HostSideEvent::FetchLatestSync { account_id, kind } => {
             // Contract 1.106, §4.87: the trigger forwards flat — the
@@ -4145,7 +4251,7 @@ where
             if let Some(kind) = kind {
                 payload["type"] = json!(kind);
             }
-            send_shared(writer, &HostEvent::new("sync.fetchLatest", payload)).await
+            Ok(HostEvent::new("sync.fetchLatest", payload))
         }
         HostSideEvent::CallLinkUpdate {
             account_id,
@@ -4166,7 +4272,7 @@ where
             if let Some(key) = admin_key {
                 payload["adminKey"] = json!(key);
             }
-            send_shared(writer, &HostEvent::new("call.linkUpdate", payload)).await
+            Ok(HostEvent::new("call.linkUpdate", payload))
         }
         HostSideEvent::CallLogEvent {
             account_id,
@@ -4201,7 +4307,7 @@ where
             if let Some(conversation_id) = resolved_conversation_id {
                 payload["conversationId"] = json!(conversation_id);
             }
-            send_shared(writer, &HostEvent::new("call.logEvent", payload)).await
+            Ok(HostEvent::new("call.logEvent", payload))
         }
         HostSideEvent::DeviceNameChanged {
             account_id,
@@ -4209,30 +4315,22 @@ where
         } => {
             // Contract 1.106, §4.87: the id forwards flat; the local-device
             // comparison stays the desktop's.
-            send_shared(
-                writer,
-                &HostEvent::new(
-                    "account.deviceNameChanged",
-                    json!({
-                        "accountId": account_id,
-                        "deviceId": device_id,
-                    }),
-                ),
-            )
-            .await
+            Ok(HostEvent::new(
+                "account.deviceNameChanged",
+                json!({
+                    "accountId": account_id,
+                    "deviceId": device_id,
+                }),
+            ))
         }
         HostSideEvent::UsernameChanged { account_id } => {
             // Contract 1.106, §4.87: the empty pure-signal sync forwards as
             // the fact alone; the new value converges through the host's own
             // profile read.
-            send_shared(
-                writer,
-                &HostEvent::new(
-                    "account.usernameChanged",
-                    json!({ "accountId": account_id }),
-                ),
-            )
-            .await
+            Ok(HostEvent::new(
+                "account.usernameChanged",
+                json!({ "accountId": account_id }),
+            ))
         }
         HostSideEvent::PniChanged {
             account_id,
@@ -4250,7 +4348,7 @@ where
             if let Some(number) = new_e164 {
                 payload["newE164"] = json!(number);
             }
-            send_shared(writer, &HostEvent::new("identity.pniChanged", payload)).await
+            Ok(HostEvent::new("identity.pniChanged", payload))
         }
         HostSideEvent::GroupTerminated {
             account_id,
@@ -4269,7 +4367,7 @@ where
             if let Some(at) = timestamp {
                 payload["timestamp"] = json!(at);
             }
-            send_shared(writer, &HostEvent::new("group.terminated", payload)).await
+            Ok(HostEvent::new("group.terminated", payload))
         }
         HostSideEvent::ContactProfileUpdated {
             account_id,
@@ -4283,16 +4381,15 @@ where
             if let Some(at) = timestamp {
                 payload["timestamp"] = json!(at);
             }
-            send_shared(writer, &HostEvent::new("contact.profileUpdated", payload)).await
+            Ok(HostEvent::new("contact.profileUpdated", payload))
         }
         HostSideEvent::ReceiveEmptied { account_id } => {
             // Contract 1.134, §4.117: the account-domain transient lane —
             // the queue-drained advisory forwards as the fact alone.
-            send_shared(
-                writer,
-                &HostEvent::new("receive.emptied", json!({ "accountId": account_id })),
-            )
-            .await
+            Ok(HostEvent::new(
+                "receive.emptied",
+                json!({ "accountId": account_id }),
+            ))
         }
         HostSideEvent::ClockSkewObserved {
             account_id,
@@ -4306,7 +4403,7 @@ where
             if let Some(at) = server_timestamp {
                 payload["serverTimestamp"] = json!(at);
             }
-            send_shared(writer, &HostEvent::new("receive.clockSkew", payload)).await
+            Ok(HostEvent::new("receive.clockSkew", payload))
         }
         HostSideEvent::ConversationStateChanged {
             account_id,
@@ -4318,18 +4415,14 @@ where
             // owner red line: a passthrough structure error corrupts every
             // downstream consumer), never re-shaped or trimmed here; the
             // overflow tail marker rides beside it.
-            send_shared(
-                writer,
-                &HostEvent::new(
-                    "conversation.stateChanged",
-                    json!({
-                        "accountId": account_id,
-                        "conversations": conversations,
-                        "overflow": overflow,
-                    }),
-                ),
-            )
-            .await
+            Ok(HostEvent::new(
+                "conversation.stateChanged",
+                json!({
+                    "accountId": account_id,
+                    "conversations": conversations,
+                    "overflow": overflow,
+                }),
+            ))
         }
         HostSideEvent::StoragePull {
             account_id,
@@ -4341,49 +4434,27 @@ where
             // the trigger word rides verbatim (the value domain stays the
             // engine's; the connector never rewrites an unseen word into a
             // known one) beside the two per-family result legs.
-            send_shared(
-                writer,
-                &HostEvent::new(
-                    "engine.storagePull",
-                    json!({
-                        "accountId": account_id,
-                        "trigger": trigger,
-                        "contactsOk": contacts_ok,
-                        "groupsOk": groups_ok,
-                    }),
-                ),
-            )
-            .await
+            Ok(HostEvent::new(
+                "engine.storagePull",
+                json!({
+                    "accountId": account_id,
+                    "trigger": trigger,
+                    "contactsOk": contacts_ok,
+                    "groupsOk": groups_ok,
+                }),
+            ))
         }
         HostSideEvent::ReceiveDecryptionError { account_id } => {
             // Contract 1.165, §4.163: the decryption-error envelope — the
             // fact alone (the receive.emptied posture). Observability only:
             // no reset action exists on this face, the metrics snapshot
             // counts independently.
-            send_shared(
-                writer,
-                &HostEvent::new(
-                    "receive.decryptionError",
-                    json!({ "accountId": account_id }),
-                ),
-            )
-            .await
+            Ok(HostEvent::new(
+                "receive.decryptionError",
+                json!({ "accountId": account_id }),
+            ))
         }
     }
-}
-
-async fn send_shared<S, T>(writer: &HostWriter<S>, value: &T) -> Result<(), HostError>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    T: Serialize,
-{
-    let encoded = serde_json::to_string(value).map_err(|_| HostError::InvalidFrame)?;
-    writer
-        .lock()
-        .await
-        .send(encoded)
-        .await
-        .map_err(|error| codec_failure(&error))
 }
 
 async fn send_json<S, T>(framed: &mut Framed<S, LinesCodec>, value: &T) -> Result<(), HostError>
@@ -4694,6 +4765,191 @@ mod tests {
             0,
             "a finished session must leave the pending gauge at zero"
         );
+    }
+
+    /// An authenticated session over a small duplex for the §4.169 wedge
+    /// tests: the server end runs `handle_connection`, the client end has
+    /// completed the handshake and is returned to the caller, which stops
+    /// reading from it — the wedge premise.
+    async fn authenticated_session(
+        buffer: usize,
+    ) -> (
+        tokio::task::JoinHandle<Result<(), HostError>>,
+        Framed<tokio::io::DuplexStream, LinesCodec>,
+    ) {
+        let secret_bytes = [7_u8; 32];
+        let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
+        let runtime = test_runtime();
+        let (server_stream, client_stream) = duplex(buffer);
+        let server = tokio::spawn(handle_connection(server_stream, secret, runtime));
+        let mut client = Framed::new(client_stream, LinesCodec::new());
+        let challenge: Value =
+            serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
+        client
+            .send(
+                json!({
+                    "apiVersion": API_VERSION,
+                    "requestId": "handshake-1",
+                    "method": "handshake",
+                    "params": {
+                        "clientNonce": hex::encode([9_u8; 32]),
+                        "proof": client_proof(&secret_bytes, server_nonce, &hex::encode([9_u8; 32])),
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let _handshake_reply = client.next().await.unwrap().unwrap();
+        (server, client)
+    }
+
+    fn status_request(id: &str) -> String {
+        json!({
+            "apiVersion": API_VERSION,
+            "requestId": id,
+            "method": "runtime.status",
+            "params": {}
+        })
+        .to_string()
+    }
+
+    async fn wait_for_gauge_to_drain(what: &str) {
+        timeout(Duration::from_secs(5), async {
+            while metrics::host_pending_requests() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    }
+
+    /// §4.169: a host that stops reading parks only the single writer task.
+    /// The session loop never awaits socket writability, so follow-up work
+    /// still completes and releases its budget slot — the pre-queue code
+    /// parked inside the first answer's `send_shared` and the gauge froze
+    /// with it (the 04:05:58Z wedge shape).
+    #[tokio::test]
+    async fn wedged_peer_parks_the_writer_task_and_the_session_loop_stays_alive() {
+        metrics::set_host_pending(0);
+        let (server, mut client) = authenticated_session(1024).await;
+        // Fill the 1 KiB duplex buffer with unanswered answers: the writer
+        // parks inside its flush, the queue (256 slots) holds the rest.
+        for index in 0..16 {
+            client
+                .send(status_request(&format!("fill-{index}")))
+                .await
+                .unwrap();
+        }
+        wait_for_gauge_to_drain("every admitted dispatch must complete while the writer is parked")
+            .await;
+
+        // The loop is alive: a follow-up request is admitted, dispatched and
+        // its budget slot released, with no byte consumed by the peer.
+        client.send(status_request("follow-up")).await.unwrap();
+        wait_for_gauge_to_drain(
+            "the session loop must keep completing work behind a parked writer",
+        )
+        .await;
+        assert!(
+            !server.is_finished(),
+            "a parked writer must not tear the session down"
+        );
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), server).await;
+    }
+
+    /// §4.169: once the queue saturates behind the parked writer, further
+    /// answers drop with the saturation warn — and the pending budget still
+    /// releases, so `host_pending_requests` stays truthful and the loop
+    /// keeps admitting (the lossy face, never a parked dispatch future).
+    #[tokio::test]
+    async fn saturated_write_queue_drops_the_answer_warns_and_releases_the_budget() {
+        metrics::set_host_pending(0);
+        let (server, mut client) = authenticated_session(1024).await;
+        // Flood past the queue capacity without reading: admissions beyond
+        // the pending budget reject (reject frames enqueue too), dispatch
+        // answers enqueue, the parked writer drains nothing — the queue
+        // saturates and stays saturated.
+        for index in 0..HOST_WRITE_QUEUE_CAPACITY + 32 {
+            client
+                .send(status_request(&format!("flood-{index}")))
+                .await
+                .unwrap();
+        }
+        wait_for_gauge_to_drain("dropped answers must still release every budget slot").await;
+
+        // A request answered after saturation completes the same way: the
+        // drop face, not a frozen lane.
+        client
+            .send(status_request("after-saturation"))
+            .await
+            .unwrap();
+        wait_for_gauge_to_drain(
+            "the saturated queue must drop answers instead of parking the loop",
+        )
+        .await;
+        assert!(
+            !server.is_finished(),
+            "a saturated queue must not tear the session down"
+        );
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), server).await;
+    }
+
+    /// §4.169: the writer task owns the sink, so its I/O failure surfaces on
+    /// the failure channel and the session ends exactly as a direct write
+    /// error did — never a dead sink the loop keeps feeding forever.
+    #[tokio::test]
+    async fn writer_io_failure_still_ends_the_session() {
+        // Unit face: the wedged writer reports the sink failure and exits.
+        let (peer, server_side) = duplex(64);
+        let (failures_tx, mut failures_rx) = mpsc::channel(1);
+        let (frames_tx, frames_rx) = mpsc::channel(8);
+        let writer = tokio::spawn(run_host_writer(
+            frames_rx,
+            Framed::new(server_side, LinesCodec::new()).split().0,
+            failures_tx,
+        ));
+        for _ in 0..8 {
+            frames_tx.send("x".repeat(200)).await.unwrap();
+        }
+        // Let the writer park inside its flush on the full 64-byte buffer,
+        // then break the pipe under it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(peer);
+        let failure = timeout(Duration::from_secs(5), failures_rx.recv())
+            .await
+            .expect("the writer must report its failure on the channel")
+            .expect("the failure sender stays alive while the writer runs");
+        assert!(
+            matches!(failure, HostError::PeerGone),
+            "a vanished peer normalizes to PeerGone, got {failure:?}"
+        );
+        timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("the writer task must exit after reporting the failure")
+            .unwrap();
+
+        // Session face: with the writer wedged and the sink then broken, the
+        // session ends instead of running with a dead writer.
+        metrics::set_host_pending(0);
+        let (server, mut client) = authenticated_session(1024).await;
+        for index in 0..16 {
+            client
+                .send(status_request(&format!("fill-{index}")))
+                .await
+                .unwrap();
+        }
+        wait_for_gauge_to_drain("the wedge must be in place before the drop").await;
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the session must end once the writer's sink fails")
+            .expect("the vanished host stays PeerGone-normalized at teardown");
     }
 
     #[tokio::test]
@@ -5302,42 +5558,28 @@ mod tests {
     /// absent-optional identity discipline keeps masked sources absent.
     #[tokio::test]
     async fn story_received_event_rides_the_story_projection_verbatim() {
-        let (client, mut server) = duplex(64 * 1024);
-        let framed = Framed::new(client, LinesCodec::new());
-        let (sink, _stream) = framed.split();
-        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
-        send_host_event(
-            &writer,
-            HostSideEvent::StoryReceived {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::StoryReceived {
                 account_id: "acct-1".into(),
                 sender: Some("+15555550101".into()),
                 sender_aci: Some("22222222-2222-2222-2222-222222222222".into()),
                 sender_name: None,
                 timestamp: Some(1727000002000u64),
                 story: json!({
-                    "textAttachment": {
-                        "text": "story body",
-                        "preview": {
-                            "url": "https://example.com/a",
-                            "title": "Example",
-                            "someLaterKey": {"rides": true},
-                        },
-                    },
-                    "allowsReplies": true,
+                "textAttachment": {
+                "text": "story body",
+                "preview": {
+                "url": "https://example.com/a",
+                "title": "Example",
+                "someLaterKey": {"rides": true},
+                },
+                },
+                "allowsReplies": true,
                 }),
-            },
+            })
+            .unwrap(),
         )
-        .await
         .unwrap();
-
-        let line = timeout(Duration::from_millis(500), async {
-            Framed::new(&mut server, LinesCodec::new()).next().await
-        })
-        .await
-        .expect("the event frame must flush")
-        .unwrap()
-        .unwrap();
-        let frame: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(frame["event"], "story.received");
         assert_eq!(frame["data"]["accountId"], "acct-1");
         let story = &frame["data"]["story"];
@@ -5366,30 +5608,15 @@ mod tests {
     /// reshape, no trim, the overflow marker beside it).
     #[tokio::test]
     async fn engine_notification_events_ride_their_contract_frames() {
-        let read_frame = |event: HostSideEvent| async {
-            let (client, mut server) = duplex(64 * 1024);
-            let framed = Framed::new(client, LinesCodec::new());
-            let (sink, _stream) = framed.split();
-            let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
-            send_host_event(&writer, event).await.unwrap();
-            let line = timeout(Duration::from_millis(500), async {
-                Framed::new(&mut server, LinesCodec::new()).next().await
-            })
-            .await
-            .expect("the event frame must flush")
-            .unwrap()
-            .unwrap();
-            let frame: Value = serde_json::from_str(&line).unwrap();
-            frame
-        };
+        let read_frame =
+            |event: HostSideEvent| serde_json::to_value(host_event_frame(event).unwrap()).unwrap();
 
         let frame = read_frame(HostSideEvent::GroupTerminated {
             account_id: "acct-1".into(),
             group_id: "ZmFrZS1ncm91cC0x".into(),
             terminator: Some("33333333-3333-3333-3333-333333333333".into()),
             timestamp: Some(1726999999000),
-        })
-        .await;
+        });
         assert_eq!(frame["event"], "group.terminated");
         assert_eq!(frame["data"]["accountId"], "acct-1");
         assert_eq!(frame["data"]["groupId"], "ZmFrZS1ncm91cC0x");
@@ -5404,8 +5631,7 @@ mod tests {
             group_id: "ZmFrZS1ncm91cC0x".into(),
             terminator: None,
             timestamp: None,
-        })
-        .await;
+        });
         assert!(
             frame["data"].get("terminator").is_none() && frame["data"].get("timestamp").is_none(),
             "absent optional identities stay absent: {frame}"
@@ -5415,16 +5641,14 @@ mod tests {
             account_id: "acct-1".into(),
             aci: "22222222-2222-2222-2222-222222222222".into(),
             timestamp: None,
-        })
-        .await;
+        });
         assert_eq!(frame["event"], "contact.profileUpdated");
         assert_eq!(frame["data"]["aci"], "22222222-2222-2222-2222-222222222222");
         assert!(frame["data"].get("timestamp").is_none());
 
         let frame = read_frame(HostSideEvent::ReceiveEmptied {
             account_id: "acct-1".into(),
-        })
-        .await;
+        });
         assert_eq!(frame["event"], "receive.emptied");
         assert_eq!(frame["data"]["accountId"], "acct-1");
 
@@ -5432,8 +5656,7 @@ mod tests {
             account_id: "acct-1".into(),
             skew_ms: -86_400_001,
             server_timestamp: Some(1727000000000),
-        })
-        .await;
+        });
         assert_eq!(frame["event"], "receive.clockSkew");
         assert_eq!(frame["data"]["skewMs"], -86_400_001);
         assert_eq!(frame["data"]["serverTimestamp"], 1727000000000u64);
@@ -5452,8 +5675,7 @@ mod tests {
             account_id: "acct-1".into(),
             conversations: conversations.clone(),
             overflow: true,
-        })
-        .await;
+        });
         assert_eq!(frame["event"], "conversation.stateChanged");
         assert_eq!(frame["data"]["accountId"], "acct-1");
         assert_eq!(frame["data"]["conversations"], conversations, "verbatim");
@@ -5467,8 +5689,7 @@ mod tests {
             trigger: "fetchLatest".into(),
             contacts_ok: true,
             groups_ok: false,
-        })
-        .await;
+        });
         assert_eq!(frame["event"], "engine.storagePull");
         assert_eq!(frame["data"]["accountId"], "acct-1");
         assert_eq!(frame["data"]["trigger"], "fetchLatest");
@@ -5480,8 +5701,7 @@ mod tests {
             trigger: "someFutureEngineTrigger".into(),
             contacts_ok: false,
             groups_ok: true,
-        })
-        .await;
+        });
         assert_eq!(
             frame["data"]["trigger"], "someFutureEngineTrigger",
             "an unseen trigger forwards verbatim: {frame}"
@@ -5491,8 +5711,7 @@ mod tests {
         // alone (the receive.emptied posture), observability only.
         let frame = read_frame(HostSideEvent::ReceiveDecryptionError {
             account_id: "acct-1".into(),
-        })
-        .await;
+        });
         assert_eq!(frame["event"], "receive.decryptionError");
         assert_eq!(frame["data"]["accountId"], "acct-1");
     }
@@ -5502,35 +5721,21 @@ mod tests {
     /// absent.
     #[tokio::test]
     async fn group_changed_event_rides_the_batch_verbatim() {
-        let (client, mut server) = duplex(64 * 1024);
-        let framed = Framed::new(client, LinesCodec::new());
-        let (sink, _stream) = framed.split();
-        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
-        send_host_event(
-            &writer,
-            HostSideEvent::GroupChanged {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::GroupChanged {
                 account_id: "acct-1".into(),
                 conversation_id: "conv-1".into(),
                 revision: 10,
                 changes: json!([
-                    { "type": "title", "newTitle": "renamed" },
-                    { "type": "group-link-reset" },
+                { "type": "title", "newTitle": "renamed" },
+                { "type": "group-link-reset" },
                 ]),
                 editor: None,
                 expire_timer_seconds: None,
-            },
+            })
+            .unwrap(),
         )
-        .await
         .unwrap();
-
-        let line = timeout(Duration::from_millis(500), async {
-            Framed::new(&mut server, LinesCodec::new()).next().await
-        })
-        .await
-        .expect("the event frame must flush")
-        .unwrap()
-        .unwrap();
-        let frame: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(frame["event"], "group.changed");
         assert_eq!(frame["data"]["accountId"], "acct-1");
         assert_eq!(frame["data"]["conversationId"], "conv-1");
@@ -5553,13 +5758,8 @@ mod tests {
     /// `messageId`-less, an unresolved group stays conversation-less.
     #[tokio::test]
     async fn delete_for_me_event_rides_the_resolved_groups() {
-        let (client, mut server) = duplex(64 * 1024);
-        let framed = Framed::new(client, LinesCodec::new());
-        let (sink, _stream) = framed.split();
-        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
-        send_host_event(
-            &writer,
-            HostSideEvent::SyncDeleteForMe {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::SyncDeleteForMe {
                 account_id: "acct-1".into(),
                 deletes: vec![
                     crate::service::SyncDeleteForMeGroup {
@@ -5586,19 +5786,10 @@ mod tests {
                         }],
                     },
                 ],
-            },
+            })
+            .unwrap(),
         )
-        .await
         .unwrap();
-
-        let line = timeout(Duration::from_millis(500), async {
-            Framed::new(&mut server, LinesCodec::new()).next().await
-        })
-        .await
-        .expect("the event frame must flush")
-        .unwrap()
-        .unwrap();
-        let frame: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(frame["event"], "message.deleteForMe");
         assert_eq!(frame["data"]["accountId"], "acct-1");
         assert_eq!(frame["data"]["deletes"].as_array().unwrap().len(), 2);
@@ -5622,13 +5813,8 @@ mod tests {
     /// them or the destination resolved.
     #[tokio::test]
     async fn verified_changed_event_rides_the_flat_record() {
-        let (client, mut server) = duplex(64 * 1024);
-        let framed = Framed::new(client, LinesCodec::new());
-        let (sink, _stream) = framed.split();
-        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
-        send_host_event(
-            &writer,
-            HostSideEvent::IdentityVerifiedChanged {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::IdentityVerifiedChanged {
                 account_id: "acct-1".into(),
                 destination_uuid: "11111111-1111-1111-1111-111111111111".into(),
                 state: "verified",
@@ -5637,31 +5823,10 @@ mod tests {
                     "05ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12".into(),
                 ),
                 conversation_id: Some("conv-1".into()),
-            },
+            })
+            .unwrap(),
         )
-        .await
         .unwrap();
-        send_host_event(
-            &writer,
-            HostSideEvent::IdentityVerifiedChanged {
-                account_id: "acct-1".into(),
-                destination_uuid: "22222222-2222-2222-2222-222222222222".into(),
-                state: "default",
-                destination_number: None,
-                identity_key: None,
-                conversation_id: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        let mut lines = Framed::new(&mut server, LinesCodec::new());
-        let line = timeout(Duration::from_millis(500), lines.next())
-            .await
-            .expect("the event frame must flush")
-            .unwrap()
-            .unwrap();
-        let frame: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(frame["event"], "identity.verifiedChanged");
         assert_eq!(frame["data"]["accountId"], "acct-1");
         assert_eq!(
@@ -5673,12 +5838,18 @@ mod tests {
         assert!(frame["data"]["identityKey"].is_string());
         assert_eq!(frame["data"]["conversationId"], "conv-1");
 
-        let line = timeout(Duration::from_millis(500), lines.next())
-            .await
-            .expect("the second frame must flush")
-            .unwrap()
-            .unwrap();
-        let frame: Value = serde_json::from_str(&line).unwrap();
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::IdentityVerifiedChanged {
+                account_id: "acct-1".into(),
+                destination_uuid: "22222222-2222-2222-2222-222222222222".into(),
+                state: "default",
+                destination_number: None,
+                identity_key: None,
+                conversation_id: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(frame["data"]["state"], "default");
         // The absent-optional discipline: an unresolved destination carries
         // none of the three optional keys.
@@ -5696,13 +5867,8 @@ mod tests {
     /// record carries neither — the pre-1.155 shape byte-identically.
     #[tokio::test]
     async fn call_history_event_rides_the_flat_record() {
-        let (client, mut server) = duplex(64 * 1024);
-        let framed = Framed::new(client, LinesCodec::new());
-        let (sink, _stream) = framed.split();
-        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
-        send_host_event(
-            &writer,
-            HostSideEvent::CallHistoryEvent {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::CallHistoryEvent {
                 account_id: "acct-1".into(),
                 call_id: "18446744073709551615".into(),
                 timestamp: 1726999999000,
@@ -5711,33 +5877,10 @@ mod tests {
                 outcome: Some("accepted"),
                 peer_id: Some("deadbeef".into()),
                 conversation_id: Some("conv-1".into()),
-            },
+            })
+            .unwrap(),
         )
-        .await
         .unwrap();
-        send_host_event(
-            &writer,
-            HostSideEvent::CallHistoryEvent {
-                account_id: "acct-1".into(),
-                call_id: "42".into(),
-                timestamp: 1726999998000,
-                kind: None,
-                direction: None,
-                outcome: None,
-                peer_id: None,
-                conversation_id: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        let mut lines = Framed::new(&mut server, LinesCodec::new());
-        let line = timeout(Duration::from_millis(500), lines.next())
-            .await
-            .expect("the event frame must flush")
-            .unwrap()
-            .unwrap();
-        let frame: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(frame["event"], "call.historyEvent");
         assert_eq!(frame["data"]["accountId"], "acct-1");
         assert_eq!(frame["data"]["callId"], "18446744073709551615");
@@ -5749,12 +5892,20 @@ mod tests {
         assert_eq!(frame["data"]["peerId"], "deadbeef");
         assert_eq!(frame["data"]["conversationId"], "conv-1");
 
-        let line = timeout(Duration::from_millis(500), lines.next())
-            .await
-            .expect("the second frame must flush")
-            .unwrap()
-            .unwrap();
-        let frame: Value = serde_json::from_str(&line).unwrap();
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::CallHistoryEvent {
+                account_id: "acct-1".into(),
+                call_id: "42".into(),
+                timestamp: 1726999998000,
+                kind: None,
+                direction: None,
+                outcome: None,
+                peer_id: None,
+                conversation_id: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(frame["data"]["callId"], "42");
         // The absent-optional discipline: an unprojected record carries none
         // of the five optional keys — the pre-1.155 shape byte-identically
@@ -5772,92 +5923,17 @@ mod tests {
     /// the device-name/username/PNI frames carry their facts alone.
     #[tokio::test]
     async fn account_level_sync_events_ride_flat() {
-        let (client, mut server) = duplex(64 * 1024);
-        let framed = Framed::new(client, LinesCodec::new());
-        let (sink, _stream) = framed.split();
-        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
-        send_host_event(
-            &writer,
-            HostSideEvent::SettingsConfigurationSync {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::SettingsConfigurationSync {
                 account_id: "acct-1".into(),
                 read_receipts: None,
                 unidentified_delivery_indicators: Some(true),
                 typing_indicators: None,
                 link_previews: Some(false),
-            },
+            })
+            .unwrap(),
         )
-        .await
         .unwrap();
-        send_host_event(
-            &writer,
-            HostSideEvent::FetchLatestSync {
-                account_id: "acct-1".into(),
-                kind: Some("STORAGE_MANIFEST"),
-            },
-        )
-        .await
-        .unwrap();
-        send_host_event(
-            &writer,
-            HostSideEvent::FetchLatestSync {
-                account_id: "acct-1".into(),
-                kind: None,
-            },
-        )
-        .await
-        .unwrap();
-        send_host_event(
-            &writer,
-            HostSideEvent::DeviceNameChanged {
-                account_id: "acct-1".into(),
-                device_id: 3,
-            },
-        )
-        .await
-        .unwrap();
-        send_host_event(
-            &writer,
-            HostSideEvent::UsernameChanged {
-                account_id: "acct-1".into(),
-            },
-        )
-        .await
-        .unwrap();
-        send_host_event(
-            &writer,
-            HostSideEvent::PniChanged {
-                account_id: "acct-1".into(),
-                registration_id: Some(2718),
-                new_e164: Some("+15555550199".into()),
-            },
-        )
-        .await
-        .unwrap();
-        send_host_event(
-            &writer,
-            HostSideEvent::PniChanged {
-                account_id: "acct-1".into(),
-                registration_id: None,
-                new_e164: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        let mut lines = Framed::new(&mut server, LinesCodec::new());
-        macro_rules! next_frame {
-            () => {{
-                let line = timeout(Duration::from_millis(500), lines.next())
-                    .await
-                    .expect("the event frame must flush")
-                    .unwrap()
-                    .unwrap();
-                let frame: Value = serde_json::from_str(&line).unwrap();
-                frame
-            }};
-        }
-
-        let frame = next_frame!();
         assert_eq!(frame["event"], "settings.configurationSync");
         assert_eq!(frame["data"]["accountId"], "acct-1");
         assert_eq!(frame["data"]["unidentifiedDeliveryIndicators"], true);
@@ -5865,23 +5941,58 @@ mod tests {
         assert!(frame["data"].get("readReceipts").is_none());
         assert!(frame["data"].get("typingIndicators").is_none());
 
-        let frame = next_frame!();
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::FetchLatestSync {
+                account_id: "acct-1".into(),
+                kind: Some("STORAGE_MANIFEST"),
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(frame["event"], "sync.fetchLatest");
         assert_eq!(frame["data"]["type"], "STORAGE_MANIFEST");
 
-        let frame = next_frame!();
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::FetchLatestSync {
+                account_id: "acct-1".into(),
+                kind: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(frame["event"], "sync.fetchLatest");
         assert!(frame["data"].get("type").is_none());
 
-        let frame = next_frame!();
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::DeviceNameChanged {
+                account_id: "acct-1".into(),
+                device_id: 3,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(frame["event"], "account.deviceNameChanged");
         assert_eq!(frame["data"]["deviceId"], 3);
 
-        let frame = next_frame!();
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::UsernameChanged {
+                account_id: "acct-1".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(frame["event"], "account.usernameChanged");
         assert_eq!(frame["data"]["accountId"], "acct-1");
 
-        let frame = next_frame!();
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::PniChanged {
+                account_id: "acct-1".into(),
+                registration_id: Some(2718),
+                new_e164: Some("+15555550199".into()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(frame["event"], "identity.pniChanged");
         assert_eq!(frame["data"]["registrationId"], 2718);
         assert_eq!(frame["data"]["newE164"], "+15555550199");
@@ -5890,7 +6001,15 @@ mod tests {
         // is conditional-insert either way: an absent-both face would carry
         // the bare accountId (the schema pins the parse guarantee, not the
         // serializer).
-        let frame = next_frame!();
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::PniChanged {
+                account_id: "acct-1".into(),
+                registration_id: None,
+                new_e164: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(frame["event"], "identity.pniChanged");
         assert!(frame["data"].get("registrationId").is_none());
         assert!(frame["data"].get("newE164").is_none());
@@ -5902,55 +6021,16 @@ mod tests {
     /// `conversationId` beside it.
     #[tokio::test]
     async fn data_plane_sync_events_ride_flat() {
-        let (client, mut server) = duplex(64 * 1024);
-        let framed = Framed::new(client, LinesCodec::new());
-        let (sink, _stream) = framed.split();
-        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
-        send_host_event(
-            &writer,
-            HostSideEvent::CallLinkUpdate {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::CallLinkUpdate {
                 account_id: "acct-1".into(),
                 kind: "UPDATE",
                 root_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
                 admin_key: Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=".into()),
-            },
+            })
+            .unwrap(),
         )
-        .await
         .unwrap();
-        send_host_event(
-            &writer,
-            HostSideEvent::CallLogEvent {
-                account_id: "acct-1".into(),
-                kind: "MARKED_AS_READ",
-                timestamp: Some(1726999999000),
-                conversation_id: Some("11111111-1111-1111-1111-111111111111".into()),
-                call_id: Some(18446744073709551615),
-                resolved_conversation_id: Some("conv-1".into()),
-            },
-        )
-        .await
-        .unwrap();
-        send_host_event(
-            &writer,
-            HostSideEvent::CallLogEvent {
-                account_id: "acct-1".into(),
-                kind: "CLEAR",
-                timestamp: None,
-                conversation_id: None,
-                call_id: None,
-                resolved_conversation_id: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        let mut lines = Framed::new(&mut server, LinesCodec::new());
-        let line = timeout(Duration::from_millis(500), lines.next())
-            .await
-            .expect("the event frame must flush")
-            .unwrap()
-            .unwrap();
-        let frame: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(frame["event"], "call.linkUpdate");
         assert_eq!(frame["data"]["accountId"], "acct-1");
         assert_eq!(frame["data"]["type"], "UPDATE");
@@ -5963,12 +6043,18 @@ mod tests {
             "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
         );
 
-        let line = timeout(Duration::from_millis(500), lines.next())
-            .await
-            .expect("the second frame must flush")
-            .unwrap()
-            .unwrap();
-        let frame: Value = serde_json::from_str(&line).unwrap();
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::CallLogEvent {
+                account_id: "acct-1".into(),
+                kind: "MARKED_AS_READ",
+                timestamp: Some(1726999999000),
+                conversation_id: Some("11111111-1111-1111-1111-111111111111".into()),
+                call_id: Some(18446744073709551615),
+                resolved_conversation_id: Some("conv-1".into()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(frame["event"], "call.logEvent");
         assert_eq!(frame["data"]["type"], "MARKED_AS_READ");
         assert_eq!(frame["data"]["timestamp"], 1726999999000u64);
@@ -5979,12 +6065,18 @@ mod tests {
         assert_eq!(frame["data"]["callId"], u64::MAX);
         assert_eq!(frame["data"]["conversationId"], "conv-1");
 
-        let line = timeout(Duration::from_millis(500), lines.next())
-            .await
-            .expect("the third frame must flush")
-            .unwrap()
-            .unwrap();
-        let frame: Value = serde_json::from_str(&line).unwrap();
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::CallLogEvent {
+                account_id: "acct-1".into(),
+                kind: "CLEAR",
+                timestamp: None,
+                conversation_id: None,
+                call_id: None,
+                resolved_conversation_id: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(frame["data"]["type"], "CLEAR");
         // The absent-optional discipline: an unprojected mutation carries
         // only its verb.
