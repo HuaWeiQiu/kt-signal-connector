@@ -50,8 +50,8 @@ use crate::service::{
     GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
     HistoryAttachmentDownloadParams, HistoryImportCancelParams, HistoryImportRetryParams,
     HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
-    LinkSessionParams, LinkStartParams, MessageGetTextParams, MessageRequestParams,
-    MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
+    LinkSessionParams, LinkStartParams, MessageGetByClientRequestIdParams, MessageGetTextParams,
+    MessageRequestParams, MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesDeleteForMeParams,
     MessagesEditParams, MessagesListParams, MessagesMarkReadParams,
     MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams, MessagesRemoteDeleteParams,
@@ -2146,6 +2146,40 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             ),
         },
+        // messages.getByClientRequestId (contract 1.172, §4.172): the
+        // orphan-sweep read-only probe — the SAME ledger row the retry face
+        // addresses, answered with its settled state (full read projection,
+        // messages.list item shape). Read lane, zero mutation: a delivered
+        // row the desktop lost the answer to answers sent/delivered/read
+        // here, so the sweep flips the bubble instead of false-marking it
+        // failed; a row the store never saw answers MESSAGE_NOT_FOUND and
+        // the sweep keeps its honest error arm.
+        "messages.getByClientRequestId" => {
+            match serde_json::from_value::<MessageGetByClientRequestIdParams>(request.params) {
+                Ok(params) => match runtime
+                    .get_message_by_client_request(
+                        params.account_id,
+                        params.conversation_id,
+                        params.client_request_id,
+                    )
+                    .await
+                {
+                    Ok(message) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(message).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "messages.getByClientRequestId",
+                        "params",
+                        "invalid messages.getByClientRequestId params",
+                    ),
+                ),
+            }
+        }
         "messages.sendText" => {
             match serde_json::from_value::<MessagesSendTextParams>(request.params) {
                 Ok(params) => {

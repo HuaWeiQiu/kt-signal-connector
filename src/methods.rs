@@ -59,6 +59,11 @@ pub const METHODS: &[MethodRow] = &[
     // `message-adjacent-media`.
     ("messages.adjacentMedia", Lane::Read, false, "read"),
     ("messages.getText", Lane::Read, false, "read"),
+    // Orphan-sweep probe (contract 1.172, §4.172): the single-row read-only
+    // face behind the desktop's unsettled-row sweep — the same ledger row
+    // the retry face addresses, answered with its settled state; no
+    // mutation, no upstream traffic.
+    ("messages.getByClientRequestId", Lane::Read, false, "read"),
     // Account-wide store search (contract 1.30): a bounded read over the
     // local database only — no upstream traffic, no mutation.
     ("messages.search", Lane::Read, false, "read"),
@@ -972,6 +977,7 @@ mod tests {
             "messages.list",
             "messages.adjacentMedia",
             "messages.getText",
+            "messages.getByClientRequestId",
             "messages.search",
             "messages.attachments.open",
             "messages.attachments.readChunk",

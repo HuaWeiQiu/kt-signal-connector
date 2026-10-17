@@ -75,6 +75,7 @@
             "messages.adjacentMedia",
             "messages.search",
             "messages.getText",
+            "messages.getByClientRequestId",
             "messages.sendText",
             "messages.retryText",
             "messages.attachments.send",
@@ -797,6 +798,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messageGetTextParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.getByClientRequestId" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messageGetByClientRequestIdParams" }
             }
           }
         },
@@ -2053,11 +2065,22 @@
         }
       }
     },
+    "messageGetByClientRequestIdParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "clientRequestId"],
+      "description": "Contract 1.172 (§4.172): the read-only orphan-sweep probe — one ledger row addressed by the original send's idempotency key, answered with its settled state in the messages.list row shape (reactions, edits and the outbound quote projection attached). Zero mutation, no upstream traffic. A row the store never saw answers MESSAGE_NOT_FOUND (the original request never arrived); a row from another conversation answers INVALID_REQUEST.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "clientRequestId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
     "messagesRetryTextParams": {
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "conversationId", "clientRequestId"],
-      "description": "Contract 1.31: retry one definitively-failed outgoing text by its clientRequestId (the same idempotency key the original send used). The connector rearms the SAME pending row (status 'failed' -> 'pending') and re-dispatches the upstream send rebuilt from the persisted record — a retry never mints a new clientRequestId, so the local history keeps exactly one row per logical message (official resend behavior; the superseded-row duplication of a naive new-id retry cannot occur). Guards: the row must be an outgoing text with a stored clientRequestId in the terminal state 'failed' — 'pending' answers RETRY_IN_FLIGHT, 'unknown' answers RETRY_NOT_ALLOWED (its wire outcome was never settled, so a blind resend could double-deliver; the host must never auto-resend an unknown outcome), incoming/system rows and rows without a clientRequestId answer INVALID_REQUEST, a missing row or conversation answers MESSAGE_NOT_FOUND / CONVERSATION_NOT_FOUND. Settlement follows messages.sendText: the response is the SAME MessageRecord (same row id) now 'sent', an indeterminate outcome answers SEND_OUTCOME_UNKNOWN leaving the row 'unknown', a definite upstream error answers UPSTREAM_ERROR with the row back in 'failed'.",
+      "description": "Contract 1.31 (+ 1.172 replay semantics): retry one definitively-failed outgoing text by its clientRequestId (the same idempotency key the original send used). The connector rearms the SAME pending row (status 'failed' -> 'pending') and re-dispatches the upstream send rebuilt from the persisted record — a retry never mints a new clientRequestId, so the local history keeps exactly one row per logical message (official resend behavior; the superseded-row duplication of a naive new-id retry cannot occur). Guards: the row must be an outgoing row with a stored clientRequestId in the terminal state 'failed' — 'pending' answers RETRY_IN_FLIGHT, 'unknown' answers RETRY_OUTCOME_UNKNOWN (its wire outcome was never settled, so a blind resend could double-deliver; the host must never auto-resend an unknown outcome), incoming/system rows and rows without a clientRequestId answer INVALID_REQUEST, a missing row or conversation answers MESSAGE_NOT_FOUND / CONVERSATION_NOT_FOUND. Contract 1.172 (§4.172) idempotent replay: a retry addressed at a row whose original send already completed (status 'sent'/'delivered'/'read') is NOT refused — it answers the persisted terminal row (same MessageRecord shape the first success answered, including the outgoing quote projection), store untouched, never re-dispatched. Replay precedes the rebuild guards, so a completed attachment send replays too; only a FAILED row's rebuild keeps the guards — an attachment row answers RETRY_NOT_ALLOWED (§4.134) and an empty-text row answers INVALID_REQUEST. Settlement follows messages.sendText: the response is the SAME MessageRecord (same row id) now 'sent', an indeterminate outcome answers SEND_OUTCOME_UNKNOWN leaving the row 'unknown', a definite upstream error answers UPSTREAM_ERROR with the row back in 'failed'. The read-only probe messages.getByClientRequestId (contract 1.172) answers the same ledger row's settled state without any mutation.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -5880,6 +5903,7 @@
             "SEND_OUTCOME_UNKNOWN",
             "RETRY_NOT_ALLOWED",
             "RETRY_IN_FLIGHT",
+            "RETRY_OUTCOME_UNKNOWN",
             "NOT_RETRYABLE",
             "NO_ARCHIVE",
             "JOIN_REQUEST_NO_LONGER_PENDING",

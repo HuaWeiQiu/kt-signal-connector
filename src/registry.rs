@@ -760,6 +760,21 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// messages.getByClientRequestId (contract 1.172, §4.172): the read-only
+    /// single-row probe for the desktop orphan sweep — same slot routing as
+    /// the retry face (the row lives in this account's proxy group).
+    pub async fn get_message_by_client_request(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        client_request_id: String,
+    ) -> Result<MessageRecord, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .get_message_by_client_request(account_id, conversation_id, client_request_id)
+            .await
+    }
+
     /// Same-row retry of a definitively failed send (contract 1.31): routed
     /// through the account's own proxy-group slot exactly like the original
     /// send — the retry must reach the same engine the first attempt used.

@@ -1671,6 +1671,25 @@ impl MediaIngest {
     }
 }
 
+/// KT (send latency probe): service 层校验拒绝归因单点——host.rs
+/// `probe_reject_detail` 的 service 层同锚同形半（target=send_latency_probe,
+/// stage=connector.reject-detail，单锚 grep/移除纪律不变）：dispatch 前的
+/// serde 形状闸全在 host.rs，而 service 守卫臂（attachments.download 族的
+/// attachmentIndex/locator 校验）在 host 探针覆盖之外——现网
+/// INVALID_REQUEST 拒绝簇因此零 reject-detail 读数。本单点只落行不改应答
+/// （wire 逐字节不变）。红线同 host 面：只接受方法名/字段名/固定校验词
+/// （应答 message 原文，全部静态字面量），正文/号码/群名永不入日志。
+fn probe_service_reject_detail(method: &str, field: &str, reason: &str) {
+    tracing::warn!(
+        target: "send_latency_probe",
+        stage = "connector.reject-detail",
+        method = %method,
+        field = %field,
+        reason = %reason,
+        "send-latency-probe",
+    );
+}
+
 /// The capability gate every media method shares (same shape as the
 /// `messages.getText` gate): without the launcher opt-in the answer is
 /// deterministic and precedes every other check.
@@ -6735,13 +6754,72 @@ impl ConnectorService {
         params
     }
 
+    /// messages.getByClientRequestId (contract 1.172, §4.172): the read-only
+    /// single-row probe behind the desktop's orphan-row sweep — the desktop
+    /// reloads with a pending/unknown bubble whose in-flight attempt died
+    /// with the renderer process; before sweeping it to the official error
+    /// face it asks this face what the SAME ledger row actually settled to.
+    /// Read lane, zero mutation: the row answers with the full read
+    /// projection (reactions, edits, the §4.171 outgoing-quote face), the
+    /// same shape `messages.list` items carry. A row the store never saw
+    /// answers MESSAGE_NOT_FOUND (the original request never arrived — the
+    /// sweep's honest error arm), a row from another conversation answers
+    /// INVALID_REQUEST.
+    pub fn get_message_by_client_request(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        client_request_id: &str,
+    ) -> Result<MessageRecord, ServiceError> {
+        validate_opaque_id(client_request_id, "clientRequestId")?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        let mut row = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+            .ok_or(ServiceError::Store(StoreError::MessageNotFound))?;
+        if row.conversation_id != conversation.id {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "clientRequestId does not belong to this conversation",
+                false,
+            )));
+        }
+        self.store
+            .attach_reactions(account_id, std::slice::from_mut(&mut row))?;
+        self.store
+            .attach_edits(account_id, std::slice::from_mut(&mut row))?;
+        self.store
+            .attach_outgoing_quotes(account_id, std::slice::from_mut(&mut row))?;
+        Ok(row)
+    }
+
     /// Retry one definitively-failed outgoing text in place (contract 1.31,
-    /// §4.26): the row addressed by its original clientRequestId is rearmed
+    /// §4.26), with the §4.172 idempotent-replay semantics on top: the row
+    /// addressed by its original clientRequestId is rearmed
     /// `failed -> pending` under a store-level guard and re-dispatched with
     /// upstream params rebuilt from the persisted record — a retry never
     /// mints a new clientRequestId, so the history keeps exactly one row per
     /// logical message and settlement (any terminal outcome) completes the
     /// SAME row the desktop bubble already renders.
+    ///
+    /// §4.172 (contract 1.172): a retry addressed at a row whose original
+    /// send already reached a terminal success state (sent/delivered/read)
+    /// is an idempotent replay, not a refusal — the same semantics the first
+    /// dispatch's `PreparedSend::Existing` face already serves (official
+    /// anchor: a persisted send job re-run after its completion answers the
+    /// completed outcome; Signal iOS/Android send layers replay likewise).
+    /// The live case: the engine's send-done succeeded but the connector
+    /// process died before the answer reached the desktop, so the row reads
+    /// success here while the bubble still shows failure — refusing the
+    /// retry stranded a delivered message with no recovery. The replay
+    /// answers the persisted row's terminal projection (reactions and the
+    /// §4.171 outgoing-quote face attached, byte-shaped like the
+    /// `complete_send_success` answer row), never touches the store, and
+    /// never re-dispatches. The genuinely-not-allowed faces stay refused
+    /// with a split code: `unknown` answers RETRY_OUTCOME_UNKNOWN (its wire
+    /// outcome was never settled, so a blind resend could double-deliver)
+    /// and only the failed-row rebuild guards keep RETRY_NOT_ALLOWED (the
+    /// §4.134 attachment face).
     pub fn prepare_retry_text(
         &self,
         account_id: &str,
@@ -6766,6 +6844,29 @@ impl ConnectorService {
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
                 "only outgoing messages can be retried",
+                false,
+            )));
+        }
+        // §4.172 replay-first: a completed original request answers its
+        // terminal row projection regardless of payload kind (an attachment
+        // send replays too — the replay never rebuilds, so no bytes are
+        // lost), and regardless of the rebuild guards below.
+        if matches!(row.status, "sent" | "delivered" | "read") {
+            let mut replay = row.clone();
+            self.store
+                .attach_reactions(account_id, std::slice::from_mut(&mut replay))?;
+            self.store
+                .attach_outgoing_quotes(account_id, std::slice::from_mut(&mut replay))?;
+            return Ok(PreparedSend::Existing(Box::new(replay)));
+        }
+        if row.status == "unknown" {
+            // §4.172: 'unknown' is never retryable — its wire outcome was
+            // never settled, so a blind resend could double-deliver. The
+            // dedicated code keeps the refusal attributable apart from the
+            // rebuild guards' RETRY_NOT_ALLOWED.
+            return Err(ServiceError::Api(ApiError::new(
+                "RETRY_OUTCOME_UNKNOWN",
+                "the original send outcome is still unknown; resend is refused to avoid double delivery",
                 false,
             )));
         }
@@ -6796,8 +6897,6 @@ impl ConnectorService {
             )));
         }
         if row.status != "failed" {
-            // 'unknown' is never retryable: its wire outcome was never
-            // settled, so a blind resend could double-deliver.
             return Err(ServiceError::Api(ApiError::new(
                 "RETRY_NOT_ALLOWED",
                 "only a definitively failed send can be retried",
@@ -7909,7 +8008,11 @@ impl ConnectorService {
     /// `attachmentIndex` instead of `attachmentId`. Same capability gate,
     /// id ladder, and idempotent-dedup staging; the pointer face resolves
     /// through the live/import locator ladder (see
-    /// [`Self::attachment_locator_for_index`]).
+    /// [`Self::attachment_locator_for_index]). The INVALID_REQUEST guard
+    /// arms carry the §4.172 reject-detail probe (the service-layer half —
+    /// host.rs's dispatch-time probes cannot see these): the live cluster
+    /// this face refused read as bare rejected counts with zero
+    /// reject-detail rows, so each guard now names itself.
     pub fn prepare_attachment_download(
         &self,
         account_id: &str,
@@ -7924,6 +8027,11 @@ impl ConnectorService {
         validate_opaque_id(conversation_id, "conversationId")?;
         validate_opaque_id(message_id, "messageId")?;
         if attachment_index >= crate::engine::MAX_INBOUND_ATTACHMENTS {
+            probe_service_reject_detail(
+                "attachments.download",
+                "attachmentIndex",
+                "attachmentIndex must name an attachment of this message",
+            );
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
                 "attachmentIndex must name an attachment of this message",
@@ -7933,6 +8041,11 @@ impl ConnectorService {
         let (_account, _conversation, message) =
             self.resolve_target(account_id, conversation_id, message_id)?;
         let descriptor = message.attachments.get(attachment_index).ok_or_else(|| {
+            probe_service_reject_detail(
+                "attachments.download",
+                "attachmentIndex",
+                "attachmentIndex does not name an attachment of this message",
+            );
             ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
                 "attachmentIndex does not name an attachment of this message",
@@ -8001,6 +8114,11 @@ impl ConnectorService {
             && face.digest.is_none()
             && face.plaintext_hash.is_none()
         {
+            probe_service_reject_detail(
+                "attachments.download",
+                "locator",
+                "attachment has no downloadable pointer face",
+            );
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
                 "attachment has no downloadable pointer face",
@@ -12946,6 +13064,17 @@ pub struct MessageGetTextParams {
     pub account_id: String,
     pub conversation_id: String,
     pub message_id: String,
+}
+
+/// messages.getByClientRequestId params (contract 1.172, §4.172): the
+/// orphan-sweep probe's addressing triple — the same ledger row the retry
+/// face addresses, read-only.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageGetByClientRequestIdParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub client_request_id: String,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -19071,16 +19200,29 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, pending_id);
 
-        // A settled row answers RETRY_NOT_ALLOWED.
-        let sent_retry = service
+        // §4.172: a settled row answers the idempotent REPLAY — the persisted
+        // terminal row, no rearm, no second dispatch.
+        let replay = service
             .prepare_retry_text(&account.id, &conversation.id, "retry-req-1")
-            .unwrap_err();
-        assert!(
-            matches!(sent_retry, ServiceError::Api(ref error) if error.code == "RETRY_NOT_ALLOWED")
+            .unwrap();
+        let PreparedSend::Existing(replay_row) = replay else {
+            panic!("a settled row must replay its terminal answer");
+        };
+        assert_eq!(replay_row.id, pending_id);
+        assert_eq!(replay_row.status, "sent");
+        assert_eq!(replay_row.client_request_id.as_deref(), Some("retry-req-1"));
+        let row_after_replay = service
+            .store_ref()
+            .message_by_client_request(&account.id, "retry-req-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row_after_replay.status, "sent",
+            "the replay never touches the store"
         );
 
         // An unknown-outcome row is never retryable (no automatic or blind
-        // resend of an unsettled wire outcome).
+        // resend of an unsettled wire outcome) — the §4.172 dedicated code.
         let unknown_pending = match service
             .prepare_send_text(
                 &account.id,
@@ -19104,7 +19246,7 @@ mod tests {
             .prepare_retry_text(&account.id, &conversation.id, "retry-req-2")
             .unwrap_err();
         assert!(
-            matches!(unknown_retry, ServiceError::Api(ref error) if error.code == "RETRY_NOT_ALLOWED")
+            matches!(unknown_retry, ServiceError::Api(ref error) if error.code == "RETRY_OUTCOME_UNKNOWN")
         );
 
         // A row already in flight answers RETRY_IN_FLIGHT (double click).
@@ -19134,6 +19276,93 @@ mod tests {
             .unwrap();
         let cross = service
             .prepare_retry_text(&account.id, &other.id, "retry-req-1")
+            .unwrap_err();
+        assert!(matches!(cross, ServiceError::Api(ref error) if error.code == "INVALID_REQUEST"));
+    }
+
+    /// §4.172: the idempotent replay answers the SAME terminal projection the
+    /// first success answered — the settled row with the §4.171 outgoing-quote
+    /// face attached, byte-shaped like the `complete_send_success` answer row —
+    /// and the new read-only probe face answers the same settled state for
+    /// the desktop's orphan sweep.
+    #[test]
+    fn retry_replay_answers_the_terminal_projection_and_the_probe_face_agrees() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut target = expire_record_fixture(&account.id, &conversation.id, "m-replay-target");
+        target.sent_at = 500;
+        target.text = Some("quoted body".into());
+        service
+            .store_ref()
+            .insert_message(&target, None, None, false)
+            .unwrap();
+        let pending_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "a reply",
+                "req-replay-quote",
+                Some("m-replay-target"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        let (settled, _) = service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 999)
+            .unwrap();
+
+        // The replay is byte-shaped like the first success answer: same row
+        // id, same status, same quote projection.
+        let replay = service
+            .prepare_retry_text(&account.id, &conversation.id, "req-replay-quote")
+            .unwrap();
+        let PreparedSend::Existing(replay_row) = replay else {
+            panic!("a settled row must replay its terminal answer");
+        };
+        assert_eq!(replay_row.id, settled.id);
+        assert_eq!(replay_row.status, "sent");
+        let replay_quote = replay_row.quote.expect("replay carries the quote pill");
+        assert_eq!(replay_quote.id, 500);
+        assert_eq!(replay_quote.text, "quoted body");
+
+        // The read-only probe answers the same settled state (full read
+        // projection), and refuses cross-conversation addressing.
+        let probed = service
+            .get_message_by_client_request(&account.id, &conversation.id, "req-replay-quote")
+            .unwrap();
+        assert_eq!(probed.id, settled.id);
+        assert_eq!(probed.status, "sent");
+        assert_eq!(probed.quote.expect("probe projects the quote").id, 500);
+        let absent = service
+            .get_message_by_client_request(&account.id, &conversation.id, "req-absent")
+            .unwrap_err();
+        assert!(matches!(
+            absent,
+            ServiceError::Store(StoreError::MessageNotFound)
+        ));
+        let other = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550103", "Peer2")
+            .unwrap();
+        let cross = service
+            .get_message_by_client_request(&account.id, &other.id, "req-replay-quote")
             .unwrap_err();
         assert!(matches!(cross, ServiceError::Api(ref error) if error.code == "INVALID_REQUEST"));
     }

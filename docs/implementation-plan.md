@@ -5,6 +5,37 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.172 (2026-10-17; §4.172 retryText idempotent replay +
+  the orphan-sweep read probe + download-guard reject attribution: the
+  method probe closed the loop on the resend-refusal deadlock — a retry
+  addressed at a row whose original send already completed (engine send-done
+  succeeded, the connector process died before the answer reached the
+  desktop) was refused RETRY_NOT_ALLOWED, stranding a delivered message
+  with a failed bubble and no recovery. A retry at a
+  sent/delivered/read row is now an idempotent replay — the persisted
+  terminal row answers (reactions and the §4.171 quote projection
+  attached, byte-shaped like the first success answer), store untouched,
+  never re-dispatched; the official anchor is the persisted-job rerun
+  semantics (a completed job re-run answers its completed outcome), and
+  the first dispatch's `PreparedSend::Existing` face already serves the
+  same semantics for duplicate sends. The genuinely-not-allowed faces
+  split codes: 'unknown' answers the new RETRY_OUTCOME_UNKNOWN (never
+  RETRY_NOT_ALLOWED again — that code now means only the §4.134
+  failed-attachment rebuild guard), 'pending' keeps RETRY_IN_FLIGHT, a
+  missing row keeps MESSAGE_NOT_FOUND. The desktop's unsettled-row sweep
+  gains its read-only probe face `messages.getByClientRequestId` (read
+  lane, zero mutation, the messages.list row shape) so a reloaded
+  pending/unknown bubble the connector actually settled flips to sent
+  instead of being false-marked failed; the sweep probe deliberately does
+  NOT reuse retryText as a probe because a failed ledger row would be
+  re-dispatched by it (an automatic resend the user never asked for).
+  The attachments.download service-layer guard arms (attachmentIndex
+  ceiling/descriptor miss/no-pointer locator) join the reject-detail
+  probe coverage — the live INVALID_REQUEST refusal cluster read zero
+  reject-detail rows because host.rs's dispatch-time probes cannot see
+  service-layer guards. Tests +2 service (replay/probe parity, guard
+  state chain updated), +1 methods registry entry, schema method/params/
+  error-code entries.)
 - Contract revision: 1.171 (2026-10-17; §4.171 the outbound quote
   projection: contract §5.4 v1.7 promised the desktop an outbound `quote`
   face — an outgoing row that quotes answers with the quoted message's
@@ -3554,6 +3585,14 @@ upstream error flips it straight back to `failed` (the desktop's retry affordanc
 There is no automatic retry anywhere in the path — the connector retries nothing by itself; only
 an explicit `messages.retryText` may re-dispatch a failed send, and only a definite failure may
 be so re-dispatched.
+
+> **Superseded in part by §4.172 (contract 1.172):** the guard voice "a row
+> not `failed` answers `RETRY_NOT_ALLOWED`" changed — a row whose original
+> send completed (`sent`/`delivered`/`read`) now answers the idempotent
+> replay (the persisted terminal row), `unknown` answers the dedicated
+> `RETRY_OUTCOME_UNKNOWN`, and `RETRY_NOT_ALLOWED` is reserved for the
+> failed-attachment rebuild guard. This section's rearm/settlement
+> machinery is unchanged.
 
 ### 4.27 Peer-receipt timestamps + prior-body edit history (contract revision 1.32, 2026-10-03)
 
@@ -14680,6 +14719,89 @@ the send-success and edit answer rows carrying the projection
 (`complete_send_and_edit_answer_rows_carry_the_quote_projection`); the
 inbound `quote_snapshot` face staying untouched
 (`incoming_rows_keep_their_stored_quote_snapshot_face`).
+
+### 4.172 retryText idempotent replay: a completed original send answers its terminal row, and the orphan sweep gets a read-only probe (contract revision 1.172, 2026-10-17)
+
+The method probe closed the loop on a resend-refusal deadlock. The
+live sequence (restart29 era, 2026-10-17): the engine's `send-done`
+succeeded — the message reached the peer — but the connector service
+process died before the success answer crossed the socket, so the
+desktop's bubble never settled. The persisted ledger row, though, had
+already recorded the truth: `sent`. When the user later tapped 重新发送,
+`prepare_retry_text` saw a row that was not `failed` and refused
+`RETRY_NOT_ALLOWED` — the guard that exists to prevent double-delivery
+was stranding a *delivered* message with a failed bubble and no
+recovery path. Message delivered, row shows failed, resend refused:
+both ends clamped shut.
+
+**The fix is replay, not a wider refusal.** Idempotent replay is the
+standard semantics: the official client's persisted send job re-run
+after completion answers the completed outcome (conversationJobQueue
+re-queues the same job and the job layer is naturally idempotent), and
+Signal iOS/Android send layers replay the recorded result on a repeated
+request. The connector's first dispatch already implements exactly this
+face — `prepare_send_text` answers `PreparedSend::Existing` (the
+persisted row) when the clientRequestId was seen — and
+`dispatch_prepared` answers that variant without touching the engine.
+`prepare_retry_text` now joins the same semantics: a retry addressed at
+a row whose original send already reached a terminal success state
+(`sent`/`delivered`/`read`) answers the persisted terminal row
+(reactions and the §4.171 outgoing-quote projection attached —
+byte-shaped like the `complete_send_success` answer row), store
+untouched, never re-dispatched. Replay precedes the rebuild guards: a
+completed *attachment* send replays too (the replay never rebuilds, so
+no bytes are lost), which is exactly what the first-send `Existing`
+face does for it.
+
+**The genuinely-not-allowed faces stay refused, with a split code.**
+`unknown` answers the new `RETRY_OUTCOME_UNKNOWN` — its wire outcome was
+never settled, so a blind resend could double-deliver, and the host
+must never auto-resend it; the dedicated code keeps that refusal
+attributable apart from the rebuild guards. `RETRY_NOT_ALLOWED` now
+means one thing only: a *failed* row whose rebuild the connector
+refuses (the §4.134 attachment guard — the rebuild face carries
+text/quote/preview, so a captioned attachment send would leave as plain
+text without its bytes). `pending` keeps `RETRY_IN_FLIGHT`, a missing
+row keeps `MESSAGE_NOT_FOUND`, a cross-conversation address keeps
+`INVALID_REQUEST`. Only the replay arm is new behavior; every refusal
+that existed still exists, one of them under a more precise name.
+
+**The orphan sweep's probe is a new read-only face, not retryText.**
+The desktop's unsettled-row sweep (desktop contract 1.167) reloads a
+pending/unknown bubble whose in-flight attempt died with the renderer
+and must decide whether to mark it failed. Asking `messages.retryText`
+to answer that question is tempting (same addressing, same ledger) and
+wrong: a *failed* ledger row would be re-dispatched by it — an
+automatic resend the user never asked for, the exact thing the §5 send
+discipline forbids. So the connector grows `messages.getByClientRequestId`
+(read lane, zero mutation, no upstream traffic): the same ledger row
+addressed by the original send's idempotency key, answered with its
+settled state in the messages.list row shape (reactions, edits and the
+outbound quote projection attached). The sweep's decision table: the
+probe answers sent/delivered/read → flip the bubble in place; pending →
+leave it (the connector's outbox owns the row); failed/unknown → the
+honest error arm; `MESSAGE_NOT_FOUND` (the original request never
+arrived) or any probe transport failure → the same honest error arm.
+Wire change is additive — one method, one params shape, one error code.
+
+**Download-guard reject attribution.** The same probe era surfaced a
+live `attachments.download` INVALID_REQUEST refusal cluster that read
+zero reject-detail rows: host.rs's dispatch-time probes cover the serde
+shape gates, but the download face's real guards run one layer down, in
+`prepare_attachment_download` / `attachment_locator_for_index`
+(attachmentIndex over the inbound ceiling, attachmentIndex naming no
+descriptor, the no-pointer locator hole). Those three arms now carry
+the service-layer half of the reject-detail probe — identical anchor
+and shape (`target=send_latency_probe`, `stage=connector.reject-detail`)
+— so the next refusal burst names its field and reason directly. Pure
+log addition; the wire answers are byte-identical.
+
+Tests: the settled-row replay answers the terminal projection and the
+probe face agrees
+(`retry_replay_answers_the_terminal_projection_and_the_probe_face_agrees`);
+the guard-state chain moves the settled-row expectation from refusal
+to replay and the unknown-row expectation to `RETRY_OUTCOME_UNKNOWN`
+(`retry_text_rearms_the_same_failed_row_and_guards_states`, updated).
 
 ## 5. signal-cli Boundary
 

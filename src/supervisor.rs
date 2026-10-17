@@ -2540,8 +2540,23 @@ impl RuntimeSupervisor {
         self.dispatch_prepared(&engine, prepared).await
     }
 
+    /// messages.getByClientRequestId (contract 1.172, §4.172): the read-only
+    /// orphan-sweep probe — the service lock guards the in-memory projection
+    /// state, so this reads under the lock like the retry face; no engine
+    /// touch, no mutation.
+    pub async fn get_message_by_client_request(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        client_request_id: String,
+    ) -> Result<MessageRecord, ServiceError> {
+        let service = self.service.lock().await;
+        service.get_message_by_client_request(&account_id, &conversation_id, &client_request_id)
+    }
+
     /// Retry one definitively-failed outgoing text in place (contract 1.31,
-    /// implementation-plan §4.26). Same settlement path as `send_text` — the
+    /// implementation-plan §4.26, replay semantics §4.172). Same settlement
+    /// path as `send_text` — the
     /// pending row rearmed by `prepare_retry_text` keeps its original id, so
     /// success / unknown / failure all complete the SAME row the desktop
     /// bubble renders and no superseded duplicate row can appear.
