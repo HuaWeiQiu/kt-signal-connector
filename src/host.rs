@@ -673,6 +673,16 @@ where
                     Err(_) => break Err(HostError::InvalidFrame),
                 };
                 if let Err(error) = request.validate_envelope() {
+                    // KT (send latency probe): envelope 级校验拒绝归因
+                    // （requestId 形状 / params 非对象两闸；应答原样）。
+                    if error.code == "INVALID_REQUEST" {
+                        let field = if error.message.contains("requestId") {
+                            "requestId"
+                        } else {
+                            "params"
+                        };
+                        probe_reject_detail(&request.method, field, &error.message);
+                    }
                     let response = HostResponse::failure(request.request_id, error);
                     match enqueue_frame(&writer, &response) {
                         Ok(()) => {}
@@ -687,6 +697,12 @@ where
                     continue;
                 }
                 if !recent_ids.insert(request.request_id.clone()) {
+                    // KT (send latency probe): 会话级 requestId 重放闸归因。
+                    probe_reject_detail(
+                        &request.method,
+                        "requestId",
+                        "requestId was already used in this session",
+                    );
                     let response = HostResponse::failure(
                         request.request_id,
                         ApiError::new("INVALID_REQUEST", "requestId was already used in this session", false),
@@ -1115,6 +1131,32 @@ fn probe_prefix8(value: Option<&str>) -> String {
     value.unwrap_or("-").chars().take(8).collect()
 }
 
+/// KT (send latency probe): 校验拒绝结构化归因单点（connector.reject-detail，
+/// 既有 reject-gate 探针的补充维度——gate 行回答「哪个预算/容量闸拒的」，
+/// 本行回答「哪个方法哪个字段被哪条校验拒的」）。每个 INVALID_REQUEST
+/// 校验闸落一行：method=方法全名、field=校验失败字段名（参数形状闸固定
+/// "params"，多字段闸逗号并列）、reason=校验词（即该闸应答 message 原文
+/// ——全部静态字面量）。红线：只接受方法名/字段名/固定校验词，正文/
+/// 号码/群名永不入日志。
+fn probe_reject_detail(method: &str, field: &str, reason: &str) {
+    tracing::warn!(
+        target: "send_latency_probe",
+        stage = "connector.reject-detail",
+        method = %method,
+        field = %field,
+        reason = %reason,
+        "send-latency-probe",
+    );
+}
+
+/// 校验闸应答构造面：落 [`probe_reject_detail`] 归因行并返回与原
+/// `ApiError::new("INVALID_REQUEST", reason, false)` 逐字节相同的应答
+/// （wire 零变化——只是借道本单点同步落探针行）。
+fn reject_probe(method: &str, field: &str, reason: &'static str) -> ApiError {
+    probe_reject_detail(method, field, reason);
+    ApiError::new("INVALID_REQUEST", reason, false)
+}
+
 fn log_dispatch(
     method_class: &'static str,
     result_class: &'static str,
@@ -1300,10 +1342,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
         },
         "runtime.status" | "runtime.start" | "runtime.stop" => HostResponse::failure(
             request_id,
-            ApiError::new(
-                "INVALID_REQUEST",
+            reject_probe(
+                &request.method,
+                "params",
                 "this method requires empty params",
-                false,
             ),
         ),
         // Read-only diagnostic face (contract revision 1.97, §4.79): one
@@ -1316,10 +1358,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
         ),
         "runtime.doctor" => HostResponse::failure(
             request_id,
-            ApiError::new(
-                "INVALID_REQUEST",
+            reject_probe(
+                &request.method,
+                "params",
                 "this method requires empty params",
-                false,
             ),
         ),
         "accounts.list" if empty_params(&request.params) => match runtime.list_accounts().await {
@@ -1331,10 +1373,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
         },
         "accounts.list" => HostResponse::failure(
             request_id,
-            ApiError::new(
-                "INVALID_REQUEST",
+            reject_probe(
+                &request.method,
+                "params",
                 "this method requires empty params",
-                false,
             ),
         ),
         "accounts.deleteLocalData" => {
@@ -1348,10 +1390,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "accounts.deleteLocalData",
+                        "params",
                         "invalid accounts.deleteLocalData params",
-                        false,
                     ),
                 ),
             }
@@ -1364,10 +1406,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "accounts.updateConfiguration",
+                        "params",
                         "invalid accounts.updateConfiguration params",
-                        false,
                     ),
                 ),
             }
@@ -1380,10 +1422,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "accounts.setProfile",
+                        "params",
                         "invalid accounts.setProfile params",
-                        false,
                     ),
                 ),
             }
@@ -1396,10 +1438,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "accounts.setExpireTimer",
+                        "params",
                         "invalid accounts.setExpireTimer params",
-                        false,
                     ),
                 ),
             }
@@ -1415,10 +1457,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "accounts.setUsername",
+                        "params",
                         "invalid accounts.setUsername params",
-                        false,
                     ),
                 ),
             }
@@ -1434,10 +1476,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "accounts.getUsername",
+                        "params",
                         "invalid accounts.getUsername params",
-                        false,
                     ),
                 ),
             }
@@ -1453,10 +1495,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "accounts.deviceCapabilities",
+                        "params",
                         "invalid accounts.deviceCapabilities params",
-                        false,
                     ),
                 ),
             }
@@ -1478,10 +1520,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "accounts.getDevices",
+                        "params",
                         "invalid accounts.getDevices params",
-                        false,
                     ),
                 ),
             }
@@ -1494,10 +1536,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "accounts.unlinkDevice",
+                        "params",
                         "invalid accounts.unlinkDevice params",
-                        false,
                     ),
                 ),
             }
@@ -1512,7 +1554,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid username.lookup params", false),
+                reject_probe(
+                    "username.lookup",
+                    "params",
+                    "invalid username.lookup params",
+                ),
             ),
         },
         // Phone lookup (contract revision 1.164, §4.162): the CDSI batch read
@@ -1530,7 +1576,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid phone.lookup params", false),
+                reject_probe("phone.lookup", "params", "invalid phone.lookup params"),
             ),
         },
         "link.start" => match serde_json::from_value::<LinkStartParams>(request.params) {
@@ -1545,7 +1591,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             }
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid link.start params", false),
+                reject_probe("link.start", "params", "invalid link.start params"),
             ),
         },
         "link.finish" => match serde_json::from_value::<LinkSessionParams>(request.params) {
@@ -1558,7 +1604,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid link.finish params", false),
+                reject_probe("link.finish", "params", "invalid link.finish params"),
             ),
         },
         "link.cancel" => match serde_json::from_value::<LinkSessionParams>(request.params) {
@@ -1568,7 +1614,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid link.cancel params", false),
+                reject_probe("link.cancel", "params", "invalid link.cancel params"),
             ),
         },
         "conversations.list" => {
@@ -1587,14 +1633,18 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 }
                 Ok(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "limit must be between 1 and 200", false),
+                    reject_probe(
+                        "conversations.list",
+                        "limit",
+                        "limit must be between 1 and 200",
+                    ),
                 ),
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.list",
+                        "params",
                         "invalid conversations.list params",
-                        false,
                     ),
                 ),
             }
@@ -1607,10 +1657,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "history.importStatus",
+                        "params",
                         "invalid history.importStatus params",
-                        false,
                     ),
                 ),
             }
@@ -1628,10 +1678,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "history.importRetry",
+                        "params",
                         "invalid history.importRetry params",
-                        false,
                     ),
                 ),
             }
@@ -1649,10 +1699,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "history.importCancel",
+                        "params",
                         "invalid history.importCancel params",
-                        false,
                     ),
                 ),
             }
@@ -1670,10 +1720,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "history.attachmentDownload",
+                        "params",
                         "invalid history.attachmentDownload params",
-                        false,
                     ),
                 ),
             }
@@ -1692,10 +1742,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "attachments.download",
+                        "params",
                         "invalid attachments.download params",
-                        false,
                     ),
                 ),
             }
@@ -1716,10 +1766,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "stories.downloadAttachment",
+                        "params",
                         "invalid stories.downloadAttachment params",
-                        false,
                     ),
                 ),
             }
@@ -1740,10 +1790,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "stories.openAttachment",
+                        "params",
                         "invalid stories.openAttachment params",
-                        false,
                     ),
                 ),
             }
@@ -1755,7 +1805,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid backups.export params", false),
+                reject_probe("backups.export", "params", "invalid backups.export params"),
             ),
         },
         "backups.exportPlaintext" => {
@@ -1766,10 +1816,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "backups.exportPlaintext",
+                        "params",
                         "invalid backups.exportPlaintext params",
-                        false,
                     ),
                 ),
             }
@@ -1782,10 +1832,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "backups.exportStatus",
+                        "params",
                         "invalid backups.exportStatus params",
-                        false,
                     ),
                 ),
             }
@@ -1803,10 +1853,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 }
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "backups.exportFile.open",
+                        "params",
                         "invalid backups.exportFile.open params",
-                        false,
                     ),
                 ),
             }
@@ -1824,10 +1874,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 }
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "backups.exportFile.readChunk",
+                        "params",
                         "invalid backups.exportFile.readChunk params",
-                        false,
                     ),
                 ),
             }
@@ -1840,10 +1890,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "backups.exportFile.closeHandle",
+                        "params",
                         "invalid backups.exportFile.closeHandle params",
-                        false,
                     ),
                 ),
             }
@@ -1861,10 +1911,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 }
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "backups.importSnapshot",
+                        "params",
                         "invalid backups.importSnapshot params",
-                        false,
                     ),
                 ),
             }
@@ -1877,10 +1927,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "backups.importSnapshotStatus",
+                        "params",
                         "invalid backups.importSnapshotStatus params",
-                        false,
                     ),
                 ),
             }
@@ -1900,10 +1950,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "backups.restoreFromCloud",
+                        "params",
                         "invalid backups.restoreFromCloud params",
-                        false,
                     ),
                 ),
             }
@@ -1916,10 +1966,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "backups.cloudStatus",
+                        "params",
                         "invalid backups.cloudStatus params",
-                        false,
                     ),
                 ),
             }
@@ -1940,10 +1990,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "backups.uploadToCloud",
+                        "params",
                         "invalid backups.uploadToCloud params",
-                        false,
                     ),
                 ),
             }
@@ -1956,10 +2006,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "backups.uploadStatus",
+                        "params",
                         "invalid backups.uploadStatus params",
-                        false,
                     ),
                 ),
             }
@@ -1984,11 +2034,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             }
             Ok(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "limit must be between 1 and 200", false),
+                reject_probe("messages.list", "limit", "limit must be between 1 and 200"),
             ),
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid messages.list params", false),
+                reject_probe("messages.list", "params", "invalid messages.list params"),
             ),
         },
         // Adjacent visual-media probe (contract revision 1.93, §4.76): the
@@ -2017,14 +2067,18 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 }
                 Ok(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "limit must be between 1 and 20", false),
+                    reject_probe(
+                        "messages.adjacentMedia",
+                        "limit",
+                        "limit must be between 1 and 20",
+                    ),
                 ),
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.adjacentMedia",
+                        "params",
                         "invalid messages.adjacentMedia params",
-                        false,
                     ),
                 ),
             }
@@ -2043,7 +2097,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "invalid messages.getText params", false),
+                    reject_probe(
+                        "messages.getText",
+                        "params",
+                        "invalid messages.getText params",
+                    ),
                 ),
             }
         }
@@ -2068,11 +2126,19 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             }
             Ok(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "limit must be between 1 and 200", false),
+                reject_probe(
+                    "messages.search",
+                    "limit",
+                    "limit must be between 1 and 200",
+                ),
             ),
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid messages.search params", false),
+                reject_probe(
+                    "messages.search",
+                    "params",
+                    "invalid messages.search params",
+                ),
             ),
         },
         "messages.sendText" => {
@@ -2094,10 +2160,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                             peer_key,
                             peer_title,
                         }),
-                        _ => Err(ApiError::new(
-                            "INVALID_REQUEST",
+                        _ => Err(reject_probe(
+                            "messages.sendText",
+                            "conversationId,kind,peerKey",
                             "exactly one of conversationId or kind+peerKey must be provided",
-                            false,
                         )),
                     };
                     match target {
@@ -2127,7 +2193,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 }
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "invalid messages.sendText params", false),
+                    reject_probe(
+                        "messages.sendText",
+                        "params",
+                        "invalid messages.sendText params",
+                    ),
                 ),
             }
         }
@@ -2142,10 +2212,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.sendStory",
+                        "params",
                         "invalid messages.sendStory params",
-                        false,
                     ),
                 ),
             }
@@ -2161,10 +2231,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "stories.setDisabled",
+                        "params",
                         "invalid stories.setDisabled params",
-                        false,
                     ),
                 ),
             }
@@ -2180,10 +2250,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "stories.getDisabled",
+                        "params",
                         "invalid stories.getDisabled params",
-                        false,
                     ),
                 ),
             }
@@ -2200,10 +2270,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "stories.markViewed",
+                        "params",
                         "invalid stories.markViewed params",
-                        false,
                     ),
                 ),
             }
@@ -2224,10 +2294,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "stories.sendReaction",
+                        "params",
                         "invalid stories.sendReaction params",
-                        false,
                     ),
                 ),
             }
@@ -2247,10 +2317,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "stories.deleteForEveryone",
+                        "params",
                         "invalid stories.deleteForEveryone params",
-                        false,
                     ),
                 ),
             }
@@ -2275,10 +2345,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 }
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.retryText",
+                        "params",
                         "invalid messages.retryText params",
-                        false,
                     ),
                 ),
             }
@@ -2301,10 +2371,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                             peer_key,
                             peer_title,
                         }),
-                        _ => Err(ApiError::new(
-                            "INVALID_REQUEST",
+                        _ => Err(reject_probe(
+                            "messages.attachments.send",
+                            "conversationId,kind,peerKey",
                             "exactly one of conversationId or kind+peerKey must be provided",
-                            false,
                         )),
                     };
                     // §4.59 (contract revision 1.66): the singular and plural
@@ -2321,10 +2391,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     {
                         return HostResponse::failure(
                             request_id,
-                            ApiError::new(
-                                "INVALID_REQUEST",
+                            reject_probe(
+                                "messages.attachments.send",
+                                "attachments,voiceNote,viewOnce,gif",
                                 "voiceNote, viewOnce and gif apply to the singular attachment form only",
-                                false,
                             ),
                         );
                     }
@@ -2356,10 +2426,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                         (None, None, None, None, None, Some(entries)) => {
                             Ok(AttachmentSendForm::Plural { entries })
                         }
-                        _ => Err(ApiError::new(
-                            "INVALID_REQUEST",
+                        _ => Err(reject_probe(
+                            "messages.attachments.send",
+                            "dataBase64,sizeBytes,attachments",
                             "either dataBase64+sizeBytes or the attachments array must be provided, never both",
-                            false,
                         )),
                     };
                     match (target, form) {
@@ -2424,10 +2494,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 }
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.attachments.send",
+                        "params",
                         "invalid messages.attachments.send params",
-                        false,
                     ),
                 ),
             }
@@ -2443,10 +2513,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.sendSticker",
+                        "params",
                         "invalid messages.sendSticker params",
-                        false,
                     ),
                 ),
             }
@@ -2462,10 +2532,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "stickerPacks.getManifest",
+                        "params",
                         "invalid stickerPacks.getManifest params",
-                        false,
                     ),
                 ),
             }
@@ -2481,10 +2551,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "stickerPacks.getImage",
+                        "params",
                         "invalid stickerPacks.getImage params",
-                        false,
                     ),
                 ),
             }
@@ -2500,10 +2570,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.getBlocked",
+                        "params",
                         "invalid conversations.getBlocked params",
-                        false,
                     ),
                 ),
             }
@@ -2519,10 +2589,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.getAvatar",
+                        "params",
                         "invalid conversations.getAvatar params",
-                        false,
                     ),
                 ),
             }
@@ -2538,10 +2608,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.setBlocked",
+                        "params",
                         "invalid conversations.setBlocked params",
-                        false,
                     ),
                 ),
             }
@@ -2554,10 +2624,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.saveDraft",
+                        "params",
                         "invalid conversations.saveDraft params",
-                        false,
                     ),
                 ),
             }
@@ -2570,10 +2640,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.clearDraft",
+                        "params",
                         "invalid conversations.clearDraft params",
-                        false,
                     ),
                 ),
             }
@@ -2589,10 +2659,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.getState",
+                        "params",
                         "invalid conversations.getState params",
-                        false,
                     ),
                 ),
             }
@@ -2608,10 +2678,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.setState",
+                        "params",
                         "invalid conversations.setState params",
-                        false,
                     ),
                 ),
             }
@@ -2627,10 +2697,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.acceptRequest",
+                        "params",
                         "invalid conversations.acceptRequest params",
-                        false,
                     ),
                 ),
             }
@@ -2646,10 +2716,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.declineRequest",
+                        "params",
                         "invalid conversations.declineRequest params",
-                        false,
                     ),
                 ),
             }
@@ -2664,7 +2734,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid identities.get params", false),
+                reject_probe("identities.get", "params", "invalid identities.get params"),
             ),
         },
         "identities.verify" => {
@@ -2678,7 +2748,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "invalid identities.verify params", false),
+                    reject_probe(
+                        "identities.verify",
+                        "params",
+                        "invalid identities.verify params",
+                    ),
                 ),
             }
         }
@@ -2690,7 +2764,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "invalid calls.sendSignal params", false),
+                    reject_probe(
+                        "calls.sendSignal",
+                        "params",
+                        "invalid calls.sendSignal params",
+                    ),
                 ),
             }
         }
@@ -2709,10 +2787,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "calls.sendGroupCallUpdate",
+                        "params",
                         "invalid calls.sendGroupCallUpdate params",
-                        false,
                     ),
                 ),
             }
@@ -2724,7 +2802,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid calls.getState params", false),
+                reject_probe("calls.getState", "params", "invalid calls.getState params"),
             ),
         },
         // Call-link credential material passthrough (contract revision 1.88,
@@ -2743,10 +2821,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "calls.linkPresentation",
+                        "params",
                         "invalid calls.linkPresentation params",
-                        false,
                     ),
                 ),
             }
@@ -2759,10 +2837,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "calls.createLinkAuth",
+                        "params",
                         "invalid calls.createLinkAuth params",
-                        false,
                     ),
                 ),
             }
@@ -2775,7 +2853,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "invalid calls.groupProof params", false),
+                    reject_probe(
+                        "calls.groupProof",
+                        "params",
+                        "invalid calls.groupProof params",
+                    ),
                 ),
             }
         }
@@ -2787,10 +2869,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "calls.groupMembers",
+                        "params",
                         "invalid calls.groupMembers params",
-                        false,
                     ),
                 ),
             }
@@ -2803,10 +2885,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "calls.endorsementsPublicKey",
+                        "params",
                         "invalid calls.endorsementsPublicKey params",
-                        false,
                     ),
                 ),
             }
@@ -2824,7 +2906,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid calls.relays params", false),
+                reject_probe("calls.relays", "params", "invalid calls.relays params"),
             ),
         },
         // Call-event self-sync proxy (contract revision 1.151, §4.150): the
@@ -2843,10 +2925,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "calls.sendCallEvent",
+                        "params",
                         "invalid calls.sendCallEvent params",
-                        false,
                     ),
                 ),
             }
@@ -2862,10 +2944,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.getPinned",
+                        "params",
                         "invalid conversations.getPinned params",
-                        false,
                     ),
                 ),
             }
@@ -2881,10 +2963,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.setPinned",
+                        "params",
                         "invalid conversations.setPinned params",
-                        false,
                     ),
                 ),
             }
@@ -2900,10 +2982,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "conversations.setExpireTimer",
+                        "params",
                         "invalid conversations.setExpireTimer params",
-                        false,
                     ),
                 ),
             }
@@ -2919,10 +3001,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "stickerPacks.getSyncs",
+                        "params",
                         "invalid stickerPacks.getSyncs params",
-                        false,
                     ),
                 ),
             }
@@ -2938,10 +3020,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "stickerPacks.setSync",
+                        "params",
                         "invalid stickerPacks.setSync params",
-                        false,
                     ),
                 ),
             }
@@ -2957,7 +3039,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "invalid chatFolders.list params", false),
+                    reject_probe(
+                        "chatFolders.list",
+                        "params",
+                        "invalid chatFolders.list params",
+                    ),
                 ),
             }
         }
@@ -2972,10 +3058,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "chatFolders.setRecords",
+                        "params",
                         "invalid chatFolders.setRecords params",
-                        false,
                     ),
                 ),
             }
@@ -2991,10 +3077,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "notificationProfiles.list",
+                        "params",
                         "invalid notificationProfiles.list params",
-                        false,
                     ),
                 ),
             }
@@ -3010,10 +3096,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "notificationProfiles.setRecords",
+                        "params",
                         "invalid notificationProfiles.setRecords params",
-                        false,
                     ),
                 ),
             }
@@ -3029,10 +3115,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "storyDistributionLists.list",
+                        "params",
                         "invalid storyDistributionLists.list params",
-                        false,
                     ),
                 ),
             }
@@ -3048,10 +3134,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "storyDistributionLists.setRecords",
+                        "params",
                         "invalid storyDistributionLists.setRecords params",
-                        false,
                     ),
                 ),
             }
@@ -3067,10 +3153,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "storage.mergeContacts",
+                        "params",
                         "invalid storage.mergeContacts params",
-                        false,
                     ),
                 ),
             }
@@ -3086,10 +3172,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "storage.importGroups",
+                        "params",
                         "invalid storage.importGroups params",
-                        false,
                     ),
                 ),
             }
@@ -3105,10 +3191,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "storage.getCallLinks",
+                        "params",
                         "invalid storage.getCallLinks params",
-                        false,
                     ),
                 ),
             }
@@ -3124,10 +3210,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "storage.setCallLink",
+                        "params",
                         "invalid storage.setCallLink params",
-                        false,
                     ),
                 ),
             }
@@ -3153,7 +3239,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "invalid messages.edit params", false),
+                    reject_probe("messages.edit", "params", "invalid messages.edit params"),
                 ),
             }
         }
@@ -3165,10 +3251,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.remoteDelete",
+                        "params",
                         "invalid messages.remoteDelete params",
-                        false,
                     ),
                 ),
             }
@@ -3181,10 +3267,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.sendReaction",
+                        "params",
                         "invalid messages.sendReaction params",
-                        false,
                     ),
                 ),
             }
@@ -3200,10 +3286,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.sendPinMessage",
+                        "params",
                         "invalid messages.sendPinMessage params",
-                        false,
                     ),
                 ),
             }
@@ -3216,10 +3302,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.sendUnpinMessage",
+                        "params",
                         "invalid messages.sendUnpinMessage params",
-                        false,
                     ),
                 ),
             }
@@ -3232,10 +3318,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.sendAdminDelete",
+                        "params",
                         "invalid messages.sendAdminDelete params",
-                        false,
                     ),
                 ),
             }
@@ -3252,7 +3338,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "invalid messages.markRead params", false),
+                    reject_probe(
+                        "messages.markRead",
+                        "params",
+                        "invalid messages.markRead params",
+                    ),
                 ),
             }
         }
@@ -3264,10 +3354,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.markViewed",
+                        "params",
                         "invalid messages.markViewed params",
-                        false,
                     ),
                 ),
             }
@@ -3286,7 +3376,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "invalid messages.syncRead params", false),
+                    reject_probe(
+                        "messages.syncRead",
+                        "params",
+                        "invalid messages.syncRead params",
+                    ),
                 ),
             }
         }
@@ -3298,10 +3392,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.syncViewed",
+                        "params",
                         "invalid messages.syncViewed params",
-                        false,
                     ),
                 ),
             }
@@ -3320,10 +3414,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.deleteForMe",
+                        "params",
                         "invalid messages.deleteForMe params",
-                        false,
                     ),
                 ),
             }
@@ -3340,10 +3434,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.sendViewOnceOpen",
+                        "params",
                         "invalid messages.sendViewOnceOpen params",
-                        false,
                     ),
                 ),
             }
@@ -3356,10 +3450,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.markViewOnceOpened",
+                        "params",
                         "invalid messages.markViewOnceOpened params",
-                        false,
                     ),
                 ),
             }
@@ -3380,10 +3474,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.attachments.open",
+                        "params",
                         "invalid messages.attachments.open params",
-                        false,
                     ),
                 ),
             }
@@ -3402,10 +3496,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.attachments.readChunk",
+                        "params",
                         "invalid messages.attachments.readChunk params",
-                        false,
                     ),
                 ),
             }
@@ -3421,10 +3515,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.attachments.closeHandle",
+                        "params",
                         "invalid messages.attachments.closeHandle params",
-                        false,
                     ),
                 ),
             }
@@ -3439,7 +3533,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid contacts.sync params", false),
+                reject_probe("contacts.sync", "params", "invalid contacts.sync params"),
             ),
         },
         "contacts.list" => match serde_json::from_value::<ContactsListParams>(request.params) {
@@ -3457,11 +3551,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             }
             Ok(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "limit must be between 1 and 200", false),
+                reject_probe("contacts.list", "limit", "limit must be between 1 and 200"),
             ),
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid contacts.list params", false),
+                reject_probe("contacts.list", "params", "invalid contacts.list params"),
             ),
         },
         "groups.get" => match serde_json::from_value::<GroupsGetParams>(request.params) {
@@ -3474,7 +3568,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid groups.get params", false),
+                reject_probe("groups.get", "params", "invalid groups.get params"),
             ),
         },
         "groups.update" => match serde_json::from_value::<GroupsUpdateParams>(request.params) {
@@ -3484,7 +3578,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid groups.update params", false),
+                reject_probe("groups.update", "params", "invalid groups.update params"),
             ),
         },
         "groups.quit" => match serde_json::from_value::<GroupsQuitParams>(request.params) {
@@ -3494,7 +3588,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid groups.quit params", false),
+                reject_probe("groups.quit", "params", "invalid groups.quit params"),
             ),
         },
         // Group termination (contract revision 1.52, §4.50, capability
@@ -3510,7 +3604,11 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new("INVALID_REQUEST", "invalid groups.terminate params", false),
+                    reject_probe(
+                        "groups.terminate",
+                        "params",
+                        "invalid groups.terminate params",
+                    ),
                 ),
             }
         }
@@ -3528,10 +3626,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "groups.approveJoinRequests",
+                        "params",
                         "invalid groups.approveJoinRequests params",
-                        false,
                     ),
                 ),
             }
@@ -3551,10 +3649,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "groups.revokeInvites",
+                        "params",
                         "invalid groups.revokeInvites params",
-                        false,
                     ),
                 ),
             }
@@ -3576,10 +3674,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "groups.generateInviteLinkPassword",
+                        "params",
                         "invalid groups.generateInviteLinkPassword params",
-                        false,
                     ),
                 ),
             }
@@ -3595,10 +3693,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "groups.buildInviteLink",
+                        "params",
                         "invalid groups.buildInviteLink params",
-                        false,
                     ),
                 ),
             }
@@ -3614,10 +3712,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "groups.parseInviteLink",
+                        "params",
                         "invalid groups.parseInviteLink params",
-                        false,
                     ),
                 ),
             }
@@ -3633,10 +3731,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "groups.previewViaLink",
+                        "params",
                         "invalid groups.previewViaLink params",
-                        false,
                     ),
                 ),
             }
@@ -3649,10 +3747,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "groups.joinViaLink",
+                        "params",
                         "invalid groups.joinViaLink params",
-                        false,
                     ),
                 ),
             }
@@ -3665,10 +3763,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "groups.cancelJoinRequest",
+                        "params",
                         "invalid groups.cancelJoinRequest params",
-                        false,
                     ),
                 ),
             }
@@ -3688,7 +3786,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid groups.create params", false),
+                reject_probe("groups.create", "params", "invalid groups.create params"),
             ),
         },
         // Group migration (contract revision 1.123, §4.104): the GV1→GV2
@@ -3706,7 +3804,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             },
             Err(_) => HostResponse::failure(
                 request_id,
-                ApiError::new("INVALID_REQUEST", "invalid groups.migrate params", false),
+                reject_probe("groups.migrate", "params", "invalid groups.migrate params"),
             ),
         },
         // Contact-card send (contract revision 1.124, §4.105): the engine's
@@ -3722,10 +3820,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.sendContact",
+                        "params",
                         "invalid messages.sendContact params",
-                        false,
                     ),
                 ),
             }
@@ -3743,10 +3841,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.sendPollCreate",
+                        "params",
                         "invalid messages.sendPollCreate params",
-                        false,
                     ),
                 ),
             }
@@ -3759,10 +3857,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.sendPollVote",
+                        "params",
                         "invalid messages.sendPollVote params",
-                        false,
                     ),
                 ),
             }
@@ -3775,10 +3873,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.sendPollTerminate",
+                        "params",
                         "invalid messages.sendPollTerminate params",
-                        false,
                     ),
                 ),
             }
@@ -3797,10 +3895,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "messages.reportSpam",
+                        "params",
                         "invalid messages.reportSpam params",
-                        false,
                     ),
                 ),
             }
@@ -3813,10 +3911,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "contacts.setLocalAlias",
+                        "params",
                         "invalid contacts.setLocalAlias params",
-                        false,
                     ),
                 ),
             }
@@ -3829,10 +3927,10 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 },
                 Err(_) => HostResponse::failure(
                     request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
+                    reject_probe(
+                        "presence.setTypingMessage",
+                        "params",
                         "invalid presence.setTypingMessage params",
-                        false,
                     ),
                 ),
             }
