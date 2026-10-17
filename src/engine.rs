@@ -5929,7 +5929,16 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         }
         if let Some(sent) = sync.get("sentMessage").and_then(Value::as_object) {
             // JsonUnwrapped dataMessage fields sit on sentMessage itself.
-            let text = data_message_text(sent);
+            // A sticker transcript carries no body (official DataMessage
+            // .Sticker semantics — the sticker is the whole content and
+            // official clients send the body empty): cut a stale/non-empty
+            // body at the normalization authority so it never reaches the
+            // row's text column (the desktop would render it as a phantom
+            // body line under the sticker block). The shape probe runs
+            // before the state faces below; the full sticker face still
+            // parses at its ladder position further down.
+            let sticker_present = sent.get("sticker").and_then(Value::as_object).is_some();
+            let text = data_message_text(sent).filter(|_| !sticker_present);
             let group_id = data_message_group_id(sent);
             let quote = sent.get("quote").and_then(normalized_quote);
             let mut attachments = sent
@@ -6261,6 +6270,14 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             .get("sticker")
             .and_then(Value::as_object)
             .and_then(normalized_sticker);
+        // A sticker envelope carries no body (official DataMessage.Sticker
+        // semantics — official clients send the body empty and the sticker
+        // block is the whole row): cut a stale/non-empty body at the
+        // normalization authority so it never reaches the row's text column
+        // (the desktop would render it as a phantom body line under the
+        // sticker block). Cut after the sticker probe, before every text
+        // consumer below, so the sticker face wins and the body is dropped.
+        let text = text.filter(|_| sticker.is_none());
         if let Some((_, sticker_image)) = sticker.as_ref() {
             attachments.push(sticker_image.clone());
         }
@@ -6972,6 +6989,77 @@ mod tests {
         assert_eq!(without_data.direction, "skip");
         assert!(without_data.sticker.is_none());
         assert!(without_data.attachments.is_empty());
+    }
+
+    /// Sticker rows carry no body (official DataMessage.Sticker semantics —
+    /// official clients send the body empty and the sticker block is the
+    /// whole row). A stale/non-empty body riding a sticker envelope (written
+    /// by an old projection face — observed in the wild as a packId/hash-shaped
+    /// hex line under the sticker block) is cut at the normalization
+    /// authority: the sticker face wins, the body never reaches the row's
+    /// text column. Live arm and multi-device sent mirror both.
+    #[test]
+    fn sticker_envelope_never_carries_body_text() {
+        let inbound = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 59,
+                "dataMessage": {
+                    "message": "stale-body-sample",
+                    "sticker": {
+                        "packId": "abcdef01",
+                        "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+                        "stickerId": 7,
+                        "emoji": "🎉",
+                        "data": {
+                            "id": "att-1",
+                            "contentType": "image/webp",
+                            "size": 8192,
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(inbound.direction, "incoming");
+        assert!(
+            inbound.sticker.is_some(),
+            "sticker face survives the body cut"
+        );
+        assert!(inbound.text.is_none(), "sticker row never stores a body");
+        assert!(inbound.text_bytes.is_none());
+        assert_eq!(inbound.attachments.len(), 1);
+
+        let mirror = normalize_receive_fields(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 1727000001000u64,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1727000001000u64,
+                        "destinationNumber": "+15555550101",
+                        "message": "stale-body-sample",
+                        "sticker": {
+                            "packId": "abcdef01",
+                            "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+                            "stickerId": 7,
+                            "data": { "id": "att-1", "contentType": "image/webp" },
+                        },
+                    }
+                },
+            },
+        }))
+        .unwrap();
+        assert_eq!(mirror.direction, "outgoing");
+        assert!(
+            mirror.sticker.is_some(),
+            "mirror sticker face survives the body cut"
+        );
+        assert!(mirror.text.is_none(), "sticker mirror never stores a body");
+        assert!(mirror.text_bytes.is_none());
+        assert_eq!(mirror.attachments.len(), 1);
     }
 
     #[test]

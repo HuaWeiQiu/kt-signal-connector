@@ -625,6 +625,11 @@ impl<'a> Importer<'a> {
         // with the live-receive bounds; the data pointer rides the descriptor
         // list below, exactly as a live envelope's sticker image does.
         let sticker = import_sticker(value.get("sticker"));
+        // Official sticker rows carry no body (DataMessage.Sticker semantics):
+        // cut a stale archive body riding a sticker frame so the row's text
+        // column stays empty — live receive and the sent mirror enforce the
+        // same discipline at their normalization authorities.
+        let text = text.filter(|_| sticker.is_none());
         // The contact card (contract 1.78, §4.38) parses with char bounds;
         // the avatar pointer rides the descriptor list below, live-receive
         // attachment parity.
@@ -3141,6 +3146,60 @@ mod tests {
         let second =
             run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(second.imported, 0);
+    }
+
+    /// Official sticker rows carry no body (DataMessage.Sticker semantics): an
+    /// archive sticker frame riding a stale `text` lands the sticker face with
+    /// an empty text column — the same cutoff the live receive arm and the
+    /// sent mirror enforce at their normalization authorities.
+    #[test]
+    fn imported_sticker_rows_never_store_a_body() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        let pack_id = "9b".repeat(32);
+        let pack_key = "5j9vTQnMDqGtYvXq3KpeNbJZ2fM8x4mLr6hUcA1sW0E=";
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming",
+                    "text": "stale-archive-body",
+                    "sticker": {
+                        "packId": pack_id, "packKey": pack_key, "stickerId": 7,
+                        "emoji": "🎉",
+                        "data": {"contentType": "image/webp", "fileName": "s.webp", "size": 128}
+                    }
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        assert_eq!(counters.imported, 1);
+        let conversation = alice_conversation_id(&account.id);
+        let row = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation,
+                "incoming",
+                1000,
+                &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+            )
+            .unwrap()
+            .expect("imported sticker row");
+        assert!(row.sticker.is_some(), "sticker face survives the body cut");
+        assert!(row.text.is_none(), "sticker row never stores a body");
+        let wire = serde_json::to_value(&row).expect("wire row");
+        assert!(wire.get("text").is_none(), "no text key on the wire either");
     }
 
     /// Contract 1.76 (§4.38): the sticker face rides only whole — a missing

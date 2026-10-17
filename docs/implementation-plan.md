@@ -3810,6 +3810,17 @@ rows behave exactly like attachment rows (the sticker is body-less metadata, not
 kind). A sticker on a message that also carries `pinMessage`/`unpinMessage`/`adminDelete`
 control surfaces keeps working — the control plane is orthogonal (§4.28).
 
+**Sticker rows carry no body** (official `DataMessage.Sticker` semantics — official clients
+send the body empty and the sticker block is the whole row). All three normalization
+authorities cut a stale/non-empty body riding a sticker envelope before it can reach the
+row's text column: the live receive arm and the multi-device `sentMessage` mirror arm
+(`text.filter(|_| sticker.is_none())` right after the sticker probe, before every text
+consumer), and the history-import arm (same filter after `import_sticker`). Observed in
+the wild (2026-10-17): a sticker row whose body column held a packId/hash-shaped hex
+string leaked into the desktop timeline as a phantom body line under the sticker block.
+No wire shape change: sticker rows never had a documented body face, so pre-existing
+host read behavior is byte-identical.
+
 Bounds failures are deterministic `INVALID_REQUEST` before the pending row exists; unknown
 mutating outcomes answer `SEND_OUTCOME_UNKNOWN` and are never retried.
 
