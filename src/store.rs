@@ -822,6 +822,16 @@ fn extra_is_terminated(extra: Option<&str>) -> bool {
         == Some(true)
 }
 
+/// The §4.171 outbound-quote projection only names an author for an outgoing
+/// quoted row whose send outcome has reached an addressable rung of the §4.6
+/// resolve ladder (`service.rs` resolve_recipient): sent/delivered/read mean
+/// the row is a completed own-addressed send. `pending`/`failed` rows never
+/// resolve (the send-time ladder rejects them the same way), so a stored
+/// quote can only degrade to absent, never mis-address.
+fn outgoing_row_status_is_addressable(status: &str) -> bool {
+    matches!(status, "sent" | "delivered" | "read")
+}
+
 /// Contract 1.65 (§4.58): the engine-supplied message-request factor trio a
 /// conversation row's `mrr_factors_json` stores. Every member is optional:
 /// the stamp carries exactly what the engine answer exposed (the pinned
@@ -1252,6 +1262,17 @@ pub struct MessageRecord {
     /// bounded preview. Absent on rows without a quote.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quote_snapshot: Option<MessageQuoteSnapshot>,
+    /// The §5.4 v1.7 outbound quote projection (desktop contract revision
+    /// 1.160 / connector §4.171): the bounded summary of the row this
+    /// OUTGOING row quotes. Attached at read time by
+    /// `attach_outgoing_quotes` — never stored (the row carries only
+    /// `quote_message_id`; the projection derives from the quoted row's
+    /// current state, the `attach_edits` read-side precedent). Absent on
+    /// rows without a quote, on incoming rows (the `quote_snapshot` face),
+    /// and wherever the quoted target no longer resolves (deleted target,
+    /// group/system target) — the documented degrade.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote: Option<MessageQuoteSnapshot>,
     /// Attachment descriptors (metadata only, never bytes): inbound via
     /// engine normalization, outbound via send-attachment descriptors. Absent
     /// on rows without attachments.
@@ -3140,6 +3161,7 @@ impl Store {
         };
         self.attach_reactions(account_id, &mut items)?;
         self.attach_edits(account_id, &mut items)?;
+        self.attach_outgoing_quotes(account_id, &mut items)?;
         Ok(Page { items, next_cursor })
     }
 
@@ -3241,6 +3263,7 @@ impl Store {
         matches.truncate(limit as usize);
         self.attach_reactions(account_id, &mut matches)?;
         self.attach_edits(account_id, &mut matches)?;
+        self.attach_outgoing_quotes(account_id, &mut matches)?;
         Ok(matches)
     }
 
@@ -3329,6 +3352,7 @@ impl Store {
         };
         self.attach_reactions(account_id, &mut items)?;
         self.attach_edits(account_id, &mut items)?;
+        self.attach_outgoing_quotes(account_id, &mut items)?;
         Ok(Page { items, next_cursor })
     }
 
@@ -3371,6 +3395,7 @@ impl Store {
         if let Some(record) = record.as_mut() {
             self.attach_reactions(account_id, std::slice::from_mut(record))?;
             self.attach_edits(account_id, std::slice::from_mut(record))?;
+            self.attach_outgoing_quotes(account_id, std::slice::from_mut(record))?;
         }
         Ok(record)
     }
@@ -6604,6 +6629,132 @@ impl Store {
         Ok(())
     }
 
+    /// Attach the §5.4 v1.7 outbound quote projection (connector §4.171) to
+    /// the outgoing records that quote a message: one batched read per
+    /// conversation group over the quoted target rows, the same read-side
+    /// discipline as `attach_edits` — never stored, absent stays absent.
+    /// The projection takes the quoted row's CURRENT body (bounded to the
+    /// §5.4 128-codepoint preview) and its author follows the §4.6 resolve
+    /// ladder (the linked account's own number for addressable outgoing
+    /// rows, the conversation peer for direct incoming rows); a target that
+    /// no longer resolves (deleted, group or system row) leaves the
+    /// projection absent. Incoming rows never join (their `quote_snapshot`
+    /// face is authoritative) and rows already carrying the projection are
+    /// untouched.
+    pub fn attach_outgoing_quotes(
+        &self,
+        account_id: &str,
+        records: &mut [MessageRecord],
+    ) -> Result<(), StoreError> {
+        let mut conversation_groups: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, record) in records.iter().enumerate() {
+            if record.direction != "outgoing"
+                || record.quote.is_some()
+                || record.quote_message_id.is_none()
+            {
+                continue;
+            }
+            conversation_groups
+                .entry(record.conversation_id.clone())
+                .or_default()
+                .push(index);
+        }
+        if conversation_groups.is_empty() {
+            return Ok(());
+        }
+        let Some(account) = self.account_by_id(account_id)? else {
+            return Ok(());
+        };
+        for (conversation_id, indexes) in conversation_groups {
+            let Some(conversation) =
+                self.conversation_by_id(account_id, conversation_id.as_str())?
+            else {
+                continue;
+            };
+            let ids: Vec<&str> = indexes
+                .iter()
+                .filter_map(|index| records[*index].quote_message_id.as_deref())
+                .collect();
+            let mut quoted: std::collections::HashMap<String, MessageRecord> =
+                std::collections::HashMap::new();
+            {
+                let conn = self.lock_conn()?;
+                let placeholders = std::iter::repeat_n("?", ids.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                            body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                     FROM messages
+                     WHERE account_id=?1 AND conversation_id=?2 AND id IN ({placeholders})"
+                );
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&account_id, &conversation_id];
+                for id in &ids {
+                    bind.push(id);
+                }
+                let rows = stmt
+                    .query_map(bind.as_slice(), message_record_from_row)
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                for row in rows {
+                    let record = row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+                    quoted.insert(record.id.clone(), record);
+                }
+            }
+            for index in indexes {
+                let Some(target) = records[index].quote_message_id.as_deref() else {
+                    continue;
+                };
+                let Some(quoted_record) = quoted.get(target) else {
+                    continue;
+                };
+                // A retracted target (remote delete or admin delete) quotes
+                // as nothing: the row keeps its body bytes in the store, but
+                // the deletion face is the caller-visible truth — projecting
+                // the stale body would resurrect retracted content in the
+                // reply pill.
+                if quoted_record.admin_deleted || quoted_record.status == "remote-deleted" {
+                    continue;
+                }
+                let author = match quoted_record.direction {
+                    "outgoing" if outgoing_row_status_is_addressable(quoted_record.status) => {
+                        account.signal_account.clone()
+                    }
+                    "incoming" if conversation.kind == "direct" => conversation.peer_key.clone(),
+                    // Group incoming rows persist only a local sender hash and
+                    // system rows have no author at all — the §4.6 ladder
+                    // rejects the same targets at send time, so a stored quote
+                    // can only degrade here, never mis-address.
+                    _ => continue,
+                };
+                records[index].quote = Some(crate::engine::NormalizedQuote {
+                    id: quoted_record.sent_at,
+                    author,
+                    text: quoted_record
+                        .text
+                        .as_deref()
+                        .map(|text| text.chars().take(128).collect::<String>())
+                        .unwrap_or_default(),
+                    attachments: quoted_record
+                        .attachments
+                        .iter()
+                        .take(8)
+                        .map(|attachment| crate::engine::NormalizedQuoteAttachment {
+                            content_type: attachment.content_type.clone(),
+                            filename: attachment.filename.clone(),
+                            thumbnail: None,
+                        })
+                        .collect(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Snapshot the prior body of one message row (contract 1.32) inside the
     /// caller's transaction, then prune past the per-message cap. The
     /// snapshot rides the same transaction as the overwriting UPDATE, so a
@@ -8952,6 +9103,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         quote_snapshot: quote_snapshot
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
+        quote: None,
         attachments: attachments_json
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok())
@@ -9035,6 +9187,7 @@ mod tests {
             client_request_id: Some(client_request_id.into()),
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -9911,6 +10064,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -10972,6 +11126,7 @@ mod tests {
             client_request_id: Some("client-1".into()),
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -11043,6 +11198,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -11224,6 +11380,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments,
                 rich,
                 edited_at: None,
@@ -11432,6 +11589,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: if media {
                 vec![attachment(id)]
             } else {
@@ -11558,6 +11716,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -11686,6 +11845,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -12153,6 +12313,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -12271,6 +12432,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -12437,6 +12599,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -12541,6 +12704,7 @@ mod tests {
                     client_request_id: None,
                     quote_message_id: None,
                     quote_snapshot: None,
+                    quote: None,
                     attachments,
                     edited_at: None,
                     rich: None,
@@ -12685,6 +12849,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 edited_at: None,
                 rich: None,
@@ -12874,6 +13039,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 edited_at: None,
                 rich: None,
@@ -12979,6 +13145,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 edited_at: None,
                 rich: (!authors.is_empty()).then(|| NormalizedRich {
@@ -13105,6 +13272,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -13209,6 +13377,7 @@ mod tests {
             client_request_id: Some("request-pending".into()),
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -13316,6 +13485,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -13391,6 +13561,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -13471,6 +13642,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -13535,6 +13707,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -13615,6 +13788,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 edited_at: None,
                 rich: None,
@@ -13712,6 +13886,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 edited_at: None,
                 rich: None,
@@ -13815,6 +13990,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 edited_at: None,
                 rich: None,
@@ -13924,6 +14100,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 edited_at: None,
                 rich: None,
@@ -14008,6 +14185,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -14066,6 +14244,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -14165,6 +14344,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -14267,6 +14447,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -14374,6 +14555,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -14474,6 +14656,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -15236,6 +15419,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -15315,6 +15499,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -15414,6 +15599,7 @@ mod tests {
                     client_request_id: None,
                     quote_message_id: None,
                     quote_snapshot: None,
+                    quote: None,
                     attachments: Vec::new(),
                     edited_at: None,
                     rich: None,
@@ -15570,6 +15756,7 @@ mod tests {
             client_request_id: Some("request-pending".into()),
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -15650,6 +15837,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -15725,6 +15913,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -15803,6 +15992,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -16233,6 +16423,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -16286,6 +16477,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -16544,6 +16736,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: None,
@@ -16687,6 +16880,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: rich.then_some(NormalizedRich {
                     view_once: true,
@@ -16795,6 +16989,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: vec![NormalizedAttachment {
                 id: "att-view-1".into(),
                 content_type: Some("image/jpeg".into()),
@@ -16888,6 +17083,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -17615,6 +17811,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -17964,6 +18161,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -18102,6 +18300,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -18208,6 +18407,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -18319,6 +18519,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -19074,6 +19275,7 @@ mod tests {
                     client_request_id: None,
                     quote_message_id: None,
                     quote_snapshot: None,
+                    quote: None,
                     attachments: Vec::new(),
                     edited_at: None,
                     rich: Some(NormalizedRich {
@@ -19273,6 +19475,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 edited_at: None,
                 rich,
@@ -19457,6 +19660,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             edited_at: None,
             rich: Some(NormalizedRich {

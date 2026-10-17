@@ -733,6 +733,7 @@ impl<'a> Importer<'a> {
             client_request_id: None,
             quote_message_id,
             quote_snapshot: quote,
+            quote: None,
             attachments,
             // The rich faces ride the additive §4.37/§4.40 channel (contract
             // 1.78/1.81, §4.38) — persisted in `rich_json` without a store
@@ -894,6 +895,7 @@ impl<'a> Importer<'a> {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: Some(crate::engine::NormalizedRich {
                 is_expiration_update: true,
@@ -997,6 +999,7 @@ impl<'a> Importer<'a> {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: Some(crate::engine::NormalizedRich {
                 is_group_update: true,
@@ -2796,6 +2799,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,

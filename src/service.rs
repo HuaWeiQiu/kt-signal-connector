@@ -3035,6 +3035,7 @@ impl ConnectorService {
             client_request_id: Some(client_request_id.to_string()),
             quote_message_id: quote_message_id.map(str::to_string),
             quote_snapshot: None,
+            quote: None,
             attachments: vec![descriptor],
             edited_at: None,
             rich: None,
@@ -3147,6 +3148,7 @@ impl ConnectorService {
             client_request_id: Some(client_request_id.to_string()),
             quote_message_id: quote_message_id.map(str::to_string),
             quote_snapshot: None,
+            quote: None,
             attachments: attachment_descriptors,
             edited_at: None,
             // §4.36: a view-once send persists the marker on its own pending
@@ -7039,6 +7041,8 @@ impl ConnectorService {
                 .attach_reactions(account_id, std::slice::from_mut(record))?;
             self.store
                 .attach_edits(account_id, std::slice::from_mut(record))?;
+            self.store
+                .attach_outgoing_quotes(account_id, std::slice::from_mut(record))?;
         }
         Ok(record)
     }
@@ -8234,6 +8238,8 @@ impl ConnectorService {
             })?;
         self.store
             .attach_reactions(account_id, std::slice::from_mut(&mut updated.0))?;
+        self.store
+            .attach_outgoing_quotes(account_id, std::slice::from_mut(&mut updated.0))?;
         let (updated, status_transitioned) = updated;
         let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
             updated.clone(),
@@ -8700,6 +8706,7 @@ impl ConnectorService {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: receive.quote,
+            quote: None,
             attachments: receive.attachments,
             rich: receive.rich,
             edited_at: None,
@@ -8904,6 +8911,10 @@ impl ConnectorService {
                             .attach_reactions(account_id, std::slice::from_mut(&mut record))?;
                         self.store
                             .attach_edits(account_id, std::slice::from_mut(&mut record))?;
+                        self.store.attach_outgoing_quotes(
+                            account_id,
+                            std::slice::from_mut(&mut record),
+                        )?;
                         drained.push(HostSideEvent::MessageUpserted(record));
                     }
                 }
@@ -9310,6 +9321,7 @@ impl ConnectorService {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -9835,6 +9847,10 @@ impl ConnectorService {
                                 )?;
                                 self.store
                                     .attach_edits(&account.id, std::slice::from_mut(&mut record))?;
+                                self.store.attach_outgoing_quotes(
+                                    &account.id,
+                                    std::slice::from_mut(&mut record),
+                                )?;
                                 Ok(vec![HostSideEvent::MessageUpserted(record)])
                             }
                             // §4.91: same early-arrival buffer, keyed to the
@@ -10170,6 +10186,7 @@ impl ConnectorService {
                     client_request_id: None,
                     quote_message_id: None,
                     quote_snapshot: None,
+                    quote: None,
                     attachments: Vec::new(),
                     rich: Some(rich),
                     edited_at: None,
@@ -16359,6 +16376,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -20813,6 +20831,361 @@ mod tests {
         assert!(reactions.is_empty());
     }
 
+    /// §4.171 outbound quote projection — the author ladder on the read
+    /// faces: a direct incoming target quotes with the conversation peer,
+    /// an addressable own outgoing target quotes with the linked account's
+    /// number, and every unresolvable target degrades to absent (pending
+    /// own row, missing row). The projection rides the list face and the
+    /// single-row face alike; it is never stored.
+    #[test]
+    fn outgoing_quote_projection_follows_the_author_ladder_and_degrades_to_absent() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut incoming = expire_record_fixture(&account.id, &conversation.id, "m-in");
+        incoming.sent_at = 500;
+        incoming.text = Some("hello from peer".into());
+        service
+            .store_ref()
+            .insert_message(&incoming, None, None, false)
+            .unwrap();
+        let mut own = expire_record_fixture(&account.id, &conversation.id, "m-out");
+        own.direction = "outgoing";
+        own.status = "sent";
+        own.sender_id = account.id.clone();
+        own.sent_at = 600;
+        own.text = Some("my own line".into());
+        service
+            .store_ref()
+            .insert_message(&own, None, None, false)
+            .unwrap();
+        let mut inflight = expire_record_fixture(&account.id, &conversation.id, "m-pending");
+        inflight.direction = "outgoing";
+        inflight.status = "pending";
+        inflight.sender_id = account.id.clone();
+        inflight.sent_at = 650;
+        inflight.text = Some("still in flight".into());
+        service
+            .store_ref()
+            .insert_message(&inflight, None, None, false)
+            .unwrap();
+
+        for (id, target, sent_at) in [
+            ("m-quote-in", "m-in", 700),
+            ("m-quote-out", "m-out", 710),
+            ("m-quote-pending", "m-pending", 720),
+            ("m-quote-gone", "m-gone", 730),
+        ] {
+            let mut record = expire_record_fixture(&account.id, &conversation.id, id);
+            record.direction = "outgoing";
+            record.status = "sent";
+            record.sender_id = account.id.clone();
+            record.sent_at = sent_at;
+            record.text = Some("reply body".into());
+            record.quote_message_id = Some(target.into());
+            service
+                .store_ref()
+                .insert_message(&record, None, None, false)
+                .unwrap();
+        }
+
+        let page = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        let quote_of = |page: &crate::store::Page<MessageRecord>, id: &str| {
+            page.items
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap()
+                .quote
+                .clone()
+        };
+        let quoted_in = quote_of(&page, "m-quote-in").expect("direct incoming target resolves");
+        assert_eq!(quoted_in.id, 500);
+        assert_eq!(quoted_in.author, "+15555550101");
+        assert_eq!(quoted_in.text, "hello from peer");
+        let quoted_out = quote_of(&page, "m-quote-out").expect("own sent target resolves");
+        assert_eq!(quoted_out.id, 600);
+        assert_eq!(quoted_out.author, "+15555550100");
+        assert_eq!(quoted_out.text, "my own line");
+        assert!(
+            quote_of(&page, "m-quote-pending").is_none(),
+            "a pending own target never addresses"
+        );
+        assert!(
+            quote_of(&page, "m-quote-gone").is_none(),
+            "a missing target stays absent"
+        );
+        // The single-row read face carries the same projection.
+        let single = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, "m-quote-in")
+            .unwrap()
+            .unwrap();
+        assert_eq!(single.quote.as_ref().unwrap().author, "+15555550101");
+    }
+
+    /// §4.171 retraction and group guards: a group incoming target only
+    /// persists a local sender hash (no addressable author) and a
+    /// remote-deleted direct target keeps its body bytes but its deletion
+    /// face is the truth — both degrade to absent, never resurrect content
+    /// or guess an author.
+    #[test]
+    fn group_and_retracted_targets_never_project() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0x", "Fixture Group")
+            .unwrap();
+        let mut member_line = expire_record_fixture(&account.id, &group.id, "g-target");
+        member_line.sent_at = 900;
+        member_line.text = Some("group chatter".into());
+        service
+            .store_ref()
+            .insert_message(&member_line, None, None, false)
+            .unwrap();
+        let mut g_reply = expire_record_fixture(&account.id, &group.id, "g-quote");
+        g_reply.direction = "outgoing";
+        g_reply.status = "sent";
+        g_reply.sender_id = account.id.clone();
+        g_reply.sent_at = 910;
+        g_reply.quote_message_id = Some("g-target".into());
+        service
+            .store_ref()
+            .insert_message(&g_reply, None, None, false)
+            .unwrap();
+
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut d_target = expire_record_fixture(&account.id, &direct.id, "d-target");
+        d_target.sent_at = 920;
+        d_target.text = Some("to be retracted".into());
+        service
+            .store_ref()
+            .insert_message(&d_target, None, None, false)
+            .unwrap();
+        let mut d_reply = expire_record_fixture(&account.id, &direct.id, "d-quote");
+        d_reply.direction = "outgoing";
+        d_reply.status = "sent";
+        d_reply.sender_id = account.id.clone();
+        d_reply.sent_at = 930;
+        d_reply.quote_message_id = Some("d-target".into());
+        service
+            .store_ref()
+            .insert_message(&d_reply, None, None, false)
+            .unwrap();
+        service
+            .store_ref()
+            .mark_remote_deleted(&account.id, &direct.id, 920, "peer")
+            .unwrap();
+
+        let group_page = service
+            .store_ref()
+            .list_messages(&account.id, &group.id, 50, None)
+            .unwrap();
+        assert!(
+            group_page
+                .items
+                .iter()
+                .find(|item| item.id == "g-quote")
+                .unwrap()
+                .quote
+                .is_none(),
+            "a group incoming target has no addressable author"
+        );
+        let direct_page = service
+            .store_ref()
+            .list_messages(&account.id, &direct.id, 50, None)
+            .unwrap();
+        assert!(
+            direct_page
+                .items
+                .iter()
+                .find(|item| item.id == "d-quote")
+                .unwrap()
+                .quote
+                .is_none(),
+            "a remote-deleted target quotes as nothing"
+        );
+    }
+
+    /// §4.171 bounding: the projection previews the target's CURRENT body
+    /// capped at the §5.4 128-codepoint face.
+    #[test]
+    fn quote_projection_truncates_long_target_bodies_at_128_codepoints() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut target = expire_record_fixture(&account.id, &conversation.id, "m-long");
+        target.sent_at = 500;
+        target.text = Some("好".repeat(300));
+        service
+            .store_ref()
+            .insert_message(&target, None, None, false)
+            .unwrap();
+        let mut reply = expire_record_fixture(&account.id, &conversation.id, "m-quote-long");
+        reply.direction = "outgoing";
+        reply.status = "sent";
+        reply.sender_id = account.id.clone();
+        reply.sent_at = 510;
+        reply.quote_message_id = Some("m-long".into());
+        service
+            .store_ref()
+            .insert_message(&reply, None, None, false)
+            .unwrap();
+        let page = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        let quote = page
+            .items
+            .iter()
+            .find(|item| item.id == "m-quote-long")
+            .unwrap()
+            .quote
+            .clone()
+            .expect("long target still projects");
+        assert_eq!(quote.text.chars().count(), 128);
+        assert_eq!(quote.id, 500);
+    }
+
+    /// §4.171 upstream settlement faces: the sendText answer row (the row
+    /// the desktop settles its optimistic bubble with) and the edit
+    /// settlement both carry the projection — the reply pill is correct the
+    /// moment the send completes, with no extra round trip.
+    #[test]
+    fn complete_send_and_edit_answer_rows_carry_the_quote_projection() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut target = expire_record_fixture(&account.id, &conversation.id, "m-target");
+        target.sent_at = 500;
+        target.text = Some("hello from peer".into());
+        service
+            .store_ref()
+            .insert_message(&target, None, None, false)
+            .unwrap();
+        let message_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "a reply",
+                "req-quote-answer",
+                Some("m-target"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        let (updated, _events) = service
+            .complete_send_success(&message_id, &account.id, &conversation.id, 999)
+            .unwrap();
+        let quote = updated.quote.expect("answer row projects the quote");
+        assert_eq!(quote.id, 500);
+        assert_eq!(quote.author, "+15555550101");
+        assert_eq!(quote.text, "hello from peer");
+        let edited = service
+            .complete_edit_success(&account.id, &conversation.id, &message_id, "edited reply")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            edited.quote.as_ref().unwrap().author,
+            "+15555550101",
+            "edit settlement keeps the projection"
+        );
+    }
+
+    /// §4.171 direction discipline: incoming rows never join the projection
+    /// — their stored `quote_snapshot` face (the engine's authoritative
+    /// inbound quote) stays exactly as persisted, untouched.
+    #[test]
+    fn incoming_rows_keep_their_stored_quote_snapshot_face() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut quoter = expire_record_fixture(&account.id, &conversation.id, "m-in-quoter");
+        quoter.sent_at = 800;
+        quoter.quote_message_id = Some("m-anywhere".into());
+        quoter.quote_snapshot = Some(NormalizedQuote {
+            id: 42,
+            author: "+15555550101".into(),
+            text: "stored inbound face".into(),
+            attachments: Vec::new(),
+        });
+        service
+            .store_ref()
+            .insert_message(&quoter, None, None, false)
+            .unwrap();
+        let page = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        let row = page
+            .items
+            .iter()
+            .find(|item| item.id == "m-in-quoter")
+            .unwrap();
+        assert!(
+            row.quote.is_none(),
+            "incoming rows never join the projection"
+        );
+        let snapshot = row.quote_snapshot.as_ref().expect("stored face preserved");
+        assert_eq!(snapshot.id, 42);
+        assert_eq!(snapshot.text, "stored inbound face");
+    }
+
     /// One pin-family prepare callable under a uniform signature, so the
     /// guard loop drives all three methods over the same failing row.
     type PinPrepare<'a> =
@@ -22627,6 +23000,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: vec![NormalizedAttachment {
                 id: "att-view-1".into(),
                 content_type: Some("image/jpeg".into()),
@@ -29075,6 +29449,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -29239,6 +29614,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -29984,6 +30360,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -30099,6 +30476,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -30215,6 +30593,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -30352,6 +30731,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -30454,6 +30834,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,
@@ -30522,6 +30903,7 @@ mod tests {
                 client_request_id: None,
                 quote_message_id: None,
                 quote_snapshot: None,
+                quote: None,
                 attachments: Vec::new(),
                 rich: None,
                 edited_at: None,
@@ -30623,6 +31005,7 @@ mod tests {
             client_request_id: None,
             quote_message_id: None,
             quote_snapshot: None,
+            quote: None,
             attachments: Vec::new(),
             rich: None,
             edited_at: None,

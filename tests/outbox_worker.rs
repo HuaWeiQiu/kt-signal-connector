@@ -75,6 +75,7 @@ fn seed_queued_row(store: &Store, account_id: &str, conversation_id: &str, reque
         client_request_id: None,
         quote_message_id: None,
         quote_snapshot: None,
+        quote: None,
         attachments: Vec::new(),
         rich: None,
         edited_at: None,

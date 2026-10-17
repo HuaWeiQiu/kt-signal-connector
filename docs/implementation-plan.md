@@ -5,6 +5,35 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.171 (2026-10-17; §4.171 the outbound quote
+  projection: contract §5.4 v1.7 promised the desktop an outbound `quote`
+  face — an outgoing row that quotes answers with the quoted message's
+  Signal timestamp, author, bounded text preview and attachment metadata —
+  but no connector path ever produced it. The store kept only the raw
+  `quote_message_id` on outgoing rows, `quote_snapshot` was inbound-only,
+  and the desktop's bubble renders `quote`/`quoteSnapshot` alone, so a
+  sent reply showed its quote pill nowhere (not at the optimistic seed,
+  not at settlement, not after a restart) even though the quote reached
+  the peer. The projection is now derived at read time
+  (`Store::attach_outgoing_quotes`, the `attach_edits` discipline — never
+  stored, absent stays absent): the quoted target's CURRENT body previews
+  bounded at the §5.4 128-codepoint face, its attachments project
+  metadata-only (≤8, thumbnails absent), and the author follows the §4.6
+  resolve ladder — the linked account's own number for an addressable
+  (sent/delivered/read) outgoing target, the conversation peer for a
+  direct-chat incoming target. A pending own row, a group incoming row
+  (local sender hash only), a retracted target (remote- or admin-deleted —
+  the body bytes persist in the store but the deletion face is the truth)
+  and a missing target all degrade to absent, and incoming rows never join
+  (their stored `quote_snapshot` face stays authoritative). Attached at the
+  four store read faces (messages.list / adjacent media / search / by-id)
+  and the four upstream settlement faces that re-emit an outgoing record
+  (send success, edit success, the early-control edit flush, the live
+  sync-mirror edit), so the sendText answer row the desktop settles its
+  optimistic bubble with already carries the pill — no extra round trip.
+  `MessageRecord` gains a derived `quote` field, absent rows omit it from
+  every serialization; zero wire change elsewhere; the engine and desktop
+  repositories are untouched by this connector batch. Tests +5.)
 - Contract revision: 1.170 (2026-10-16; §4.170 the canonical memo key: the
   Note-to-Self conversation now lives on the account's own ACI
   (`accounts.aci`, contract 1.142) instead of its phone number. Three
@@ -14575,6 +14604,82 @@ The integration faces ride the same keys: the note-to-self skeleton test
 derives the answered ACI from the finish answer and asserts the upstream
 dispatch targets it, and the phase2 account delete runs with a fold ledger
 row present (the cascade face).
+
+### 4.171 The outbound quote projection: a sent reply shows its quote pill everywhere the row is read (contract revision 1.171, 2026-10-17)
+
+The desktop acceptance run surfaced a reply bug: a reply quoting an
+earlier message reached the peer (the quote rode the upstream send), but
+the local thread never rendered a quote block — not on the optimistic
+seed, not at send settlement, not after a refresh or restart. The wire
+contract was never the problem: §5.4 v1.7 has promised the outbound
+`quote` projection since it was written. The connector simply never
+produced it. An outgoing row persisted `quote_message_id` (the raw
+pointer the upstream send validated at §4.6 resolve time) and nothing
+else; `quote_snapshot` — the engine's normalized quote face — was
+captured on inbound rows only; and the desktop's bubble renders a quote
+from `view.quote` / `view.quoteSnapshot` alone. Both faces were
+structurally empty on outgoing rows, so every reader of a sent reply saw
+a quote-less bubble.
+
+**The projection is derived at read time, never stored.** The stored row
+gains nothing: `Store::attach_outgoing_quotes` walks a record batch the
+way `attach_edits` does, groups the outgoing rows that carry a
+`quote_message_id` and no projection yet by conversation, reads each
+conversation's quoted target rows in one batched query, and fills
+`MessageRecord.quote` in place. A row already carrying a projection is
+untouched; absent stays absent; the store schema does not move. The
+projection mirrors the §5.4 v1.7 face exactly: the quoted message's
+Signal timestamp (`sent_at`), an author, the bounded body preview (the
+target's CURRENT body, capped at the 128-codepoint §5.4 face) and the
+attachment metadata (≤8 entries, contentType/filename, thumbnails absent
+— the store keeps no quote thumbnails for outgoing rows).
+
+**The author ladder is the §4.6 resolve ladder in reverse.** The author
+of a quote must be an identity the desktop could itself address, or the
+pill would mislead: an addressable outgoing target (status
+sent/delivered/read) authors with the linked account's own number; a
+direct-chat incoming target authors with the conversation peer key. A
+pending own row is not yet an addressable message; a group incoming row
+persists only a local sender hash; a system row has no author at all; a
+retracted target (remote-deleted or admin-deleted) keeps its body bytes
+in the store but its deletion face is the caller-visible truth —
+projecting the stale body would resurrect retracted content in the reply
+pill. Each of these degrades to an absent projection; a stored quote can
+degrade, never mis-address.
+
+**Direction discipline.** Incoming rows never join: their
+`quote_snapshot` face is the engine's authoritative inbound quote and
+stays exactly as persisted. The projection exists to close the one face
+the store genuinely could not answer — what an own outgoing row quoted.
+
+**The attach faces.** Read side: `messages.list`, the adjacent-media
+probe, `messages.search` and the single-message face. Upstream
+settlement side: the send-success answer row (the row the desktop
+settles its optimistic bubble with — the pill is correct the moment the
+send completes, with no extra round trip), the edit settlement, the
+early-control edit flush and the live sync-mirror edit (a reply edited
+from another device re-emits with its pill). The plaintext export and
+audit faces stay raw — they project stored columns only, and the
+projection is a read-time derivation, not stored state.
+
+**Recorded boundaries.** A quoted target edited later re-quotes with its
+current text automatically (the projection reads the live body — the
+pill tracks the edit, the same semantics as the upstream quote: a
+pointer, not a snapshot). A quoted target retracted later drops the pill
+on the next read. Rows written before this revision project on their
+first post-revision read (the pointer was always stored); nothing
+backfills.
+
+Tests (+5): the author ladder across direct-incoming / own-sent /
+pending / missing targets on the list and single-row faces
+(`outgoing_quote_projection_follows_the_author_ladder_and_degrades_to_absent`);
+the group and retraction guards
+(`group_and_retracted_targets_never_project`); the 128-codepoint preview
+cap (`quote_projection_truncates_long_target_bodies_at_128_codepoints`);
+the send-success and edit answer rows carrying the projection
+(`complete_send_and_edit_answer_rows_carry_the_quote_projection`); the
+inbound `quote_snapshot` face staying untouched
+(`incoming_rows_keep_their_stored_quote_snapshot_face`).
 
 ## 5. signal-cli Boundary
 

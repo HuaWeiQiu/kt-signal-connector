@@ -114,6 +114,7 @@ fn seed_direct_history(store: &Store, account_id: &str) {
         client_request_id: None,
         quote_message_id: None,
         quote_snapshot: None,
+        quote: None,
         attachments: Vec::new(),
         edited_at: None,
         rich: None,
