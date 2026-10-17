@@ -5,6 +5,27 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.173 (2026-10-18; §4.173 the per-recipient group send
+  settlement face: the engine `send` reply's `results` array is counted into
+  success/failure entry totals and persisted on the OUTGOING row at
+  settlement (`sendOutcomes`, additive nullable JSON column + wire key, group
+  rows only — direct sends are single-recipient by construction and keep the
+  key absent). A group send where EVERY entry failed settles the row
+  definitively `failed` (plain, no automatic retry schedule — per-recipient
+  delivery failures are not a §4.123 family; the manual Retry Send face
+  stays) and answers `GROUP_SEND_FAILED` (retryable) so the desktop's
+  optimistic funnel marks the row retryable-failed; a mixed send keeps the
+  `sent` row and the counts drive the desktop's official partial-sent arm.
+  The desktop derives the official partial-sent / error display arms from
+  these counts and never re-derives the recipient set; absent keys
+  (pre-1.173 rows, direct rows, old connectors) degrade to the legacy
+  single-recipient semantics where the row status IS the highest success —
+  byte-for-byte identical display to 1.172. Retries overwrite the counts on
+  the same row (the outcomes describe the latest settled attempt). Zero
+  capability changes; the desktop contract's rendering half rides its own
+  1.172. Tests +2 store (outcomes persist and ride the wire face /
+  all-failed settlement persists counts) +1 supervisor (reply counting and
+  shapeless degrade).)
 - Contract revision: 1.172 (2026-10-17; §4.172 retryText idempotent replay +
   the orphan-sweep read probe + download-guard reject attribution: the
   method probe closed the loop on the resend-refusal deadlock — a retry
@@ -14801,7 +14822,49 @@ probe face agrees
 (`retry_replay_answers_the_terminal_projection_and_the_probe_face_agrees`);
 the guard-state chain moves the settled-row expectation from refusal
 to replay and the unknown-row expectation to `RETRY_OUTCOME_UNKNOWN`
-(`retry_text_rearms_the_same_failed_row_and_guards_states`, updated).
+
+### 4.173 The per-recipient group send settlement face: the reply's `results` array becomes the row's counted outcomes (contract revision 1.173, 2026-10-18)
+
+The desktop B-28 batch needs the group-row partial-failure truth: the
+official client derives `partial-sent` / `error` per message from the
+per-recipient send states (`MessageSendState.std.ts`), and the desktop's
+single-tier wire row cannot express "three of four delivered, one
+failed" — the row said `sent` for a send the engine answered `Ok` on,
+even when every recipient entry inside the reply carried a `failure`.
+The engine's group-send shape already carries the per-recipient truth
+(`{timestamp, results: [{recipientNumber, success:{timestamp}} |
+{recipientNumber, failure:{type}}]}`); the connector read only
+`timestamp` and dropped the rest.
+
+**The connector counts, it does not re-derive.** At dispatch settlement
+the reply's `results` array is counted into `MessageSendOutcomes
+{succeeded, failed}` (camelCase wire key `sendOutcomes`, additive
+nullable `messages.send_outcomes_json` column, group rows only). The
+desktop reads the counts and runs the official formula itself — it never
+sees, and never needs, the recipient set. `None` outcomes — direct
+sends, empty arrays, shape-hostile entries, pre-1.173 rows (never
+backfilled) — keep the row byte-shaped like 1.172, and the desktop
+degrades those rows to the legacy single-recipient semantics where the
+row status IS the highest success.
+
+**The all-recipient-failure arm settles failed.** A group send where
+every `results` entry failed delivered nothing, so the row settles
+definitively `failed` (plain — per-recipient delivery failures are not
+one of the §4.123 automatic-retry families, so the queue never picks the
+row up; the manual Retry Send face stays) and the dispatcher answers
+`GROUP_SEND_FAILED` (retryable=true) so the desktop's optimistic funnel
+marks the row retryable-failed exactly like a definitive engine error. A
+mixed send keeps the `sent` row and the counts; the desktop's formula
+then shows `partial-sent`. Retry settlement overwrites the counts on the
+same row — the outcomes always describe the latest settled attempt
+(a direct-send retry clears the face, which direct rows never had).
+
+Tests: `group_send_outcomes_persist_and_ride_the_wire_face` (counts
+persist, camelCase wire key present on group rows and absent on direct
+rows), `all_failed_group_settlement_persists_the_outcome_counts` (failed
+settlement with counts, queue face retired),
+`send_outcomes_from_reply_counts_group_results_entries` (reply counting;
+shapeless/empty replies degrade to `None`).
 
 ## 5. signal-cli Boundary
 

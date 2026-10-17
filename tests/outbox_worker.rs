@@ -84,6 +84,7 @@ fn seed_queued_row(store: &Store, account_id: &str, conversation_id: &str, reque
         delivered_at: None,
         read_at: None,
         viewed_at: None,
+        send_outcomes: None,
         sticker: None,
         expire_seconds: None,
         expire_start_at: None,
@@ -97,7 +98,7 @@ fn seed_queued_row(store: &Store, account_id: &str, conversation_id: &str, reque
         .insert_message(&record, Some(request), None, false)
         .unwrap();
     store
-        .settle_send_failed(&id, now_ms(), SendRetrySchedule::Backoff)
+        .settle_send_failed(&id, now_ms(), SendRetrySchedule::Backoff, None)
         .unwrap()
         .expect("the seeded pending row settles failed-and-queued");
 }

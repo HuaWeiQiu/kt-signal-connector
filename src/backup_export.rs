@@ -2207,6 +2207,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,

@@ -14,7 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 26;
+const SCHEMA_VERSION: i64 = 27;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -1223,6 +1223,24 @@ pub struct MessageReactionActor {
     pub reacted_at: u64,
 }
 
+/// Per-recipient group send settlement face (contract 1.173, §4.173): the
+/// engine `send` reply's `results` array counted into success/failure entry
+/// totals and persisted on the OUTGOING group row at settlement (both the
+/// `sent` settlement and the all-recipient-failure failed settlement). A
+/// direct send is single-recipient by construction and never carries the
+/// face (absent key). The desktop derives the official partial-sent / error
+/// display arms from these counts and never re-derives the recipient set;
+/// absent keys (pre-1.173 rows, direct rows) degrade to the legacy
+/// single-recipient semantics where the row status IS the highest success.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageSendOutcomes {
+    #[serde(default)]
+    pub succeeded: u32,
+    #[serde(default)]
+    pub failed: u32,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageRecord {
@@ -1314,6 +1332,11 @@ pub struct MessageRecord {
     /// on rows never viewed and on every pre-1.94 row (never backfilled).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub viewed_at: Option<u64>,
+    /// Per-recipient group send settlement counts (contract 1.173, §4.173).
+    /// Absent on direct rows, pre-1.173 rows (never backfilled), and
+    /// engine-facing sends whose reply carried no `results` array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send_outcomes: Option<MessageSendOutcomes>,
     /// Group admin-delete tombstone (contract 1.33): an inbound adminDelete
     /// envelope marked this row "deleted by admin". The body stays for the
     /// audit window and retention prunes the row normally. Absent (false) on
@@ -3128,7 +3151,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -3214,7 +3237,7 @@ impl Store {
                     AdjacentMediaDirection::Older => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -3224,7 +3247,7 @@ impl Store {
                     AdjacentMediaDirection::Newer => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
@@ -3316,7 +3339,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                      FROM messages
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
@@ -3365,7 +3388,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -3385,7 +3408,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -3414,7 +3437,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -3677,7 +3700,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -3725,7 +3748,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -3801,6 +3824,7 @@ impl Store {
         message_id: &str,
         now: u64,
         schedule: SendRetrySchedule,
+        outcomes: Option<&MessageSendOutcomes>,
     ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
         let conn = self.lock_conn()?;
         let transaction = conn
@@ -3824,14 +3848,22 @@ impl Store {
             // Plain settlement (ineligible error class, non-text row, or the
             // caller's explicit no-schedule): the row leaves the queue face
             // entirely, so nothing scheduled survives on a row the queue no
-            // longer owns.
+            // longer owns. §4.173: an all-recipient-failure group send
+            // settles through this arm and its counted outcomes ride the row
+            // (the desktop's error face reads them); `None` keeps the column
+            // untouched — a plain engine-error settlement never had a
+            // `results` face to count.
             transaction
                 .execute(
                     "UPDATE messages SET status='failed',
                             first_send_attempted_at=NULL, retry_attempt_count=0,
-                            next_attempt_at=NULL
+                            next_attempt_at=NULL, send_outcomes_json=COALESCE(?2, send_outcomes_json)
                      WHERE id=?1 AND status='pending'",
-                    params![message_id],
+                    params![
+                        message_id,
+                        outcomes
+                            .map(|counted| serde_json::to_string(counted).expect("send outcomes json")),
+                    ],
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?
         };
@@ -3843,7 +3875,7 @@ impl Store {
                 .query_row(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                      FROM messages WHERE id=?1",
                     params![message_id],
                     message_record_from_row,
@@ -4188,7 +4220,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -4264,7 +4296,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -4337,7 +4369,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -4521,7 +4553,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages
                  WHERE id=?1",
                 params![message_id],
@@ -4578,7 +4610,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3 AND sender_id=?4
                  ORDER BY id ASC LIMIT 1",
@@ -4768,7 +4800,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -5644,7 +5676,7 @@ impl Store {
                     m.body, m.body_bytes, m.body_truncated, m.status, m.quote_message_id, m.client_request_id,
                     m.quote_snapshot, m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
                     m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
-                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.server_timestamp, m.viewed_at
+                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.server_timestamp, m.viewed_at, m.send_outcomes_json
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id AND c.account_id = m.account_id
              WHERE m.account_id = ?1 AND m.sent_at = ?2 AND m.rich_json IS NOT NULL
@@ -5726,7 +5758,7 @@ impl Store {
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
                         quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self,
-                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
@@ -5823,7 +5855,7 @@ impl Store {
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
                             received_at, body, body_bytes, body_truncated, status,
                             quote_message_id, client_request_id, quote_snapshot,
-                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                        AND direction='outgoing'
@@ -5868,6 +5900,7 @@ impl Store {
                                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
                             viewed_confirmed.push(MessageRecord {
                                 viewed_at: Some(when),
+                                send_outcomes: None,
                                 server_guid: None,
                                 server_timestamp: None,
                                 is_story: false,
@@ -6064,7 +6097,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming' AND sent_at=?3",
             )
@@ -6223,7 +6256,7 @@ impl Store {
         let sql = format!(
             "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
                    AND sent_at > ?3
@@ -6262,7 +6295,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3 AND direction='incoming'",
             )
@@ -6686,7 +6719,7 @@ impl Store {
                 let sql = format!(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND id IN ({placeholders})"
                 );
@@ -6807,6 +6840,7 @@ impl Store {
         account_id: &str,
         conversation_id: &str,
         sent_at: u64,
+        outcomes: Option<&MessageSendOutcomes>,
     ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
         let conn = self.lock_conn()?;
         let transaction = conn
@@ -6858,9 +6892,16 @@ impl Store {
             .execute(
                 "UPDATE messages SET status='sent', sent_at=?2,
                         first_send_attempted_at=NULL, retry_attempt_count=0,
-                        next_attempt_at=NULL
+                        next_attempt_at=NULL, send_outcomes_json=?5
                  WHERE id=?1 AND account_id=?3 AND conversation_id=?4",
-                params![message_id, sent_at as i64, account_id, conversation_id],
+                params![
+                    message_id,
+                    sent_at as i64,
+                    account_id,
+                    conversation_id,
+                    outcomes
+                        .map(|counted| serde_json::to_string(counted).expect("send outcomes json")),
+                ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         if updated != 1 {
@@ -8638,6 +8679,23 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         // seams (account sync, link.finish) where the identity is fresh and
         // the conversation.changed lane exists, not at database-open time.
     }
+    if current < 27 {
+        // Contract revision 1.173 (§4.173): the per-recipient group send
+        // settlement ledger. One additive nullable JSON column beside
+        // `rich_json` — the engine `send` reply's `results` array counted
+        // into success/failure entry totals at settlement. Pre-1.173 rows
+        // legitimately carry none and are never backfilled: the
+        // per-recipient outcome of a past send was never stored, and the
+        // desktop degrades those rows to the legacy single-recipient
+        // semantics (the row status IS the highest success).
+        if !table_has_column(conn, "messages", "send_outcomes_json")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN send_outcomes_json TEXT",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -9123,6 +9181,9 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         sticker: row
             .get::<_, Option<String>>(22)?
             .and_then(|json| serde_json::from_str(&json).ok()),
+        send_outcomes: row
+            .get::<_, Option<String>>(29)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
         expire_seconds: row
             .get::<_, Option<i64>>(23)?
             .map(|value| value.max(0) as u64),
@@ -9196,6 +9257,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -9345,6 +9407,7 @@ mod tests {
                 "m-curve",
                 first_failure,
                 crate::store::SendRetrySchedule::Backoff,
+                None,
             )
             .unwrap()
             .unwrap();
@@ -9366,6 +9429,7 @@ mod tests {
                 "m-curve",
                 first_failure + 190,
                 crate::store::SendRetrySchedule::Backoff,
+                None,
             )
             .unwrap()
             .unwrap();
@@ -9416,6 +9480,7 @@ mod tests {
                 "m-ratelimit",
                 first_failure,
                 crate::store::SendRetrySchedule::RateLimit,
+                None,
             )
             .unwrap()
             .unwrap();
@@ -9449,6 +9514,7 @@ mod tests {
                 "m-ratelimit-spent",
                 first_failure,
                 crate::store::SendRetrySchedule::RateLimit,
+                None,
             )
             .unwrap()
             .unwrap();
@@ -9620,7 +9686,12 @@ mod tests {
             None,
         );
         store
-            .settle_send_failed("m-over-cap", now, crate::store::SendRetrySchedule::Backoff)
+            .settle_send_failed(
+                "m-over-cap",
+                now,
+                crate::store::SendRetrySchedule::Backoff,
+                None,
+            )
             .unwrap()
             .unwrap();
         let (status, first, count, next) = retry_face(&store, "m-over-cap");
@@ -9646,6 +9717,7 @@ mod tests {
                 "m-other-account",
                 now,
                 crate::store::SendRetrySchedule::Backoff,
+                None,
             )
             .unwrap()
             .unwrap();
@@ -9686,7 +9758,12 @@ mod tests {
             None,
         );
         store
-            .settle_send_failed("m-spent", now, crate::store::SendRetrySchedule::Backoff)
+            .settle_send_failed(
+                "m-spent",
+                now,
+                crate::store::SendRetrySchedule::Backoff,
+                None,
+            )
             .unwrap()
             .unwrap();
         let (status, first, count, next) = retry_face(&store, "m-spent");
@@ -10073,6 +10150,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -11135,6 +11213,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -11207,6 +11286,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -11389,6 +11469,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 admin_deleted: false,
                 sticker: None,
                 expire_seconds: None,
@@ -11602,6 +11683,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             admin_deleted: false,
             sticker: None,
             expire_seconds: None,
@@ -11725,6 +11807,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -11854,6 +11937,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -12322,6 +12406,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             admin_deleted: false,
             sticker: None,
             expire_seconds: None,
@@ -12441,6 +12526,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -12608,6 +12694,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -12713,6 +12800,7 @@ mod tests {
                     delivered_at: None,
                     read_at: None,
                     viewed_at: None,
+                    send_outcomes: None,
                     sticker: None,
                     expire_seconds: None,
                     expire_start_at: None,
@@ -12858,6 +12946,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -13048,6 +13137,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -13166,6 +13256,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -13281,6 +13372,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -13386,6 +13478,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -13424,7 +13517,7 @@ mod tests {
             .unwrap();
 
         let (completed, transitioned) = store
-            .complete_outgoing_send("pending", &account.id, &conversation.id, 99)
+            .complete_outgoing_send("pending", &account.id, &conversation.id, 99, None)
             .unwrap()
             .unwrap();
         assert_eq!(completed.status, "sent");
@@ -13432,7 +13525,7 @@ mod tests {
         // A replayed completion finds the row already sent and reports no
         // transition, so the service layer emits no duplicate status event.
         let (_, replayed_transition) = store
-            .complete_outgoing_send("pending", &account.id, &conversation.id, 99)
+            .complete_outgoing_send("pending", &account.id, &conversation.id, 99, None)
             .unwrap()
             .unwrap();
         assert!(!replayed_transition);
@@ -13494,6 +13587,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -13570,6 +13664,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -13651,6 +13746,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -13716,6 +13812,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -13797,6 +13894,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -13895,6 +13993,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -13999,6 +14098,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -14040,7 +14140,7 @@ mod tests {
         // The slow send completes with its upstream timestamp (450): the
         // pre-guard code dragged the ending back to 450; now it stays.
         store
-            .complete_outgoing_send("slow-send", &account.id, &conversation.id, 450)
+            .complete_outgoing_send("slow-send", &account.id, &conversation.id, 450, None)
             .unwrap()
             .expect("the pending row exists");
         assert_eq!(ending(&store), (Some(500), 2, Some(500)));
@@ -14052,7 +14152,7 @@ mod tests {
         row(&store, "fast-send", "outgoing", &account.id, 1, "pending");
         assert_eq!(ending(&store), (Some(500), 2, Some(500)));
         store
-            .complete_outgoing_send("fast-send", &account.id, &conversation.id, 600)
+            .complete_outgoing_send("fast-send", &account.id, &conversation.id, 600, None)
             .unwrap()
             .expect("the pending row exists");
         assert_eq!(ending(&store), (Some(600), 2, Some(600)));
@@ -14109,6 +14209,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -14194,6 +14295,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -14253,6 +14355,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -14353,6 +14456,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -14456,6 +14560,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -14564,6 +14669,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -14665,6 +14771,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -15428,6 +15535,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -15508,6 +15616,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -15608,6 +15717,7 @@ mod tests {
                     delivered_at: None,
                     read_at: None,
                     viewed_at: None,
+                    send_outcomes: None,
                     sticker: None,
                     expire_seconds: None,
                     expire_start_at: None,
@@ -15765,6 +15875,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -15846,6 +15957,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -15922,6 +16034,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -16001,6 +16114,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -16432,6 +16546,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -16486,6 +16601,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -16745,6 +16861,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -16892,6 +17009,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -17018,6 +17136,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -17092,6 +17211,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -17820,6 +17940,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -18170,6 +18291,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -18309,6 +18431,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -18416,6 +18539,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -18528,6 +18652,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -19293,6 +19418,7 @@ mod tests {
                     delivered_at: None,
                     read_at: None,
                     viewed_at: None,
+                    send_outcomes: None,
                     sticker: None,
                     expire_seconds: None,
                     expire_start_at: None,
@@ -19484,6 +19610,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -19683,6 +19810,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -19736,5 +19864,137 @@ mod tests {
                 .unwrap()
                 .terminated
         );
+    }
+
+    // ------------------------------------------------------------------
+    // §4.173 per-recipient group send settlement face (contract 1.173)
+    // ------------------------------------------------------------------
+
+    /// §4.173: a group send answered `Ok` with per-recipient `results`
+    /// persists its counted outcomes on the row, and the wire projection
+    /// carries them under the camelCase `sendOutcomes` key (the desktop's
+    /// deriveSignalSendStatus reads exactly that face). `None` outcomes —
+    /// the direct-send shape — keep the key absent (pre-1.173 wire parity).
+    #[test]
+    fn group_send_outcomes_persist_and_ride_the_wire_face() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "group-hash-1", "Group")
+            .unwrap();
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-group-partial",
+            "req-group-partial",
+            "pending",
+            None,
+            0,
+            None,
+        );
+        let settled = store
+            .complete_outgoing_send(
+                "m-group-partial",
+                &account.id,
+                &conversation.id,
+                1_000,
+                Some(&MessageSendOutcomes {
+                    succeeded: 2,
+                    failed: 1,
+                }),
+            )
+            .unwrap()
+            .expect("the pending row exists");
+        assert_eq!(
+            settled.0.send_outcomes,
+            Some(MessageSendOutcomes {
+                succeeded: 2,
+                failed: 1,
+            })
+        );
+        let wire = serde_json::to_value(&settled.0).unwrap();
+        assert_eq!(
+            wire.get("sendOutcomes"),
+            Some(&serde_json::json!({ "succeeded": 2, "failed": 1 }))
+        );
+
+        // A direct send (no results face) settles without the key: the
+        // desktop degrades to single-recipient semantics.
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        seed_retry_row(
+            &store,
+            &account.id,
+            &direct.id,
+            "m-direct",
+            "req-direct",
+            "pending",
+            None,
+            0,
+            None,
+        );
+        let settled = store
+            .complete_outgoing_send("m-direct", &account.id, &direct.id, 1_100, None)
+            .unwrap()
+            .expect("the pending row exists");
+        assert_eq!(settled.0.send_outcomes, None);
+        let wire = serde_json::to_value(&settled).unwrap();
+        assert!(wire.get("sendOutcomes").is_none());
+    }
+
+    /// §4.173: the all-recipient-failure arm settles the group row
+    /// definitively failed (plain — no automatic retry schedule) with the
+    /// counted outcomes riding the row, so the desktop's error face and the
+    /// retry affordance both read the same persisted truth.
+    #[test]
+    fn all_failed_group_settlement_persists_the_outcome_counts() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "group-hash-2", "Group")
+            .unwrap();
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-group-all-failed",
+            "req-group-all-failed",
+            "pending",
+            None,
+            0,
+            None,
+        );
+        let settled = store
+            .settle_send_failed(
+                "m-group-all-failed",
+                2_000,
+                SendRetrySchedule::None,
+                Some(&MessageSendOutcomes {
+                    succeeded: 0,
+                    failed: 3,
+                }),
+            )
+            .unwrap()
+            .expect("the pending row exists");
+        assert_eq!(settled.0.status, "failed");
+        assert_eq!(
+            settled.0.send_outcomes,
+            Some(MessageSendOutcomes {
+                succeeded: 0,
+                failed: 3,
+            })
+        );
+        // The queue face stays retired: the retry affordance is the manual
+        // Retry Send path, never the automatic queue.
+        let (_, first, count, next) = retry_face(&store, "m-group-all-failed");
+        assert_eq!((first, count, next), (None, 0, None));
     }
 }

@@ -2574,6 +2574,28 @@ impl RuntimeSupervisor {
         self.dispatch_prepared(&engine, prepared).await
     }
 
+    /// §4.173: count the engine `send` reply's per-recipient `results` array
+    /// (the group send shape: `{recipientNumber, success:{timestamp}}` /
+    /// `{recipientNumber, failure:{type}}` entries) into success/failure
+    /// totals. `None` — no array, an empty array, or no recognizable entry —
+    /// keeps the row on the pre-1.173 shape (no outcomes face; direct sends
+    /// always land here).
+    fn send_outcomes_from_reply(result: &Value) -> Option<crate::store::MessageSendOutcomes> {
+        let entries = result.get("results")?.as_array()?;
+        let mut counted = crate::store::MessageSendOutcomes {
+            succeeded: 0,
+            failed: 0,
+        };
+        for entry in entries {
+            if entry.get("success").is_some() {
+                counted.succeeded = counted.succeeded.saturating_add(1);
+            } else if entry.get("failure").is_some() {
+                counted.failed = counted.failed.saturating_add(1);
+            }
+        }
+        (counted.succeeded > 0 || counted.failed > 0).then_some(counted)
+    }
+
     async fn dispatch_prepared(
         &self,
         engine: &EngineHandle,
@@ -2593,11 +2615,45 @@ impl RuntimeSupervisor {
                         .get("timestamp")
                         .and_then(Value::as_u64)
                         .unwrap_or(pending_sent_at);
+                    // §4.173: the reply's per-recipient `results` array (the
+                    // group send shape) counted into success/failure totals.
+                    // Absent on direct sends (single recipient — the row
+                    // status is the whole story) and on any shape-hostile
+                    // array, which degrade to the pre-1.173 behavior.
+                    let outcomes = Self::send_outcomes_from_reply(&result);
+                    if outcomes
+                        .as_ref()
+                        .is_some_and(|counted| counted.succeeded == 0)
+                    {
+                        // Every recipient failed: nothing was delivered, so
+                        // the row settles definitively failed (retryable —
+                        // nobody got it, a resend carries no duplicate risk)
+                        // and the answer reports GROUP_SEND_FAILED.
+                        let events = self
+                            .service
+                            .lock()
+                            .await
+                            .complete_send_failed_group_outcomes(
+                                &pending_id,
+                                outcomes
+                                    .as_ref()
+                                    .expect("guarded by the succeeded == 0 check"),
+                            )?;
+                        for event in events {
+                            let _ = self.host_events.send(event);
+                        }
+                        return Err(ServiceError::Api(ApiError::new(
+                            "GROUP_SEND_FAILED",
+                            "send failed for every recipient",
+                            true,
+                        )));
+                    }
                     let (message, events) = self.service.lock().await.complete_send_success(
                         &pending_id,
                         &account_id,
                         &conversation_id,
                         sent_at,
+                        outcomes.as_ref(),
                     )?;
                     for event in events {
                         let _ = self.host_events.send(event);
@@ -9277,6 +9333,46 @@ mod tests {
 
     use tokio::time::{sleep, timeout};
 
+    /// §4.173: the send reply's `results` array counts into success/failure
+    /// totals; direct sends (no array), empty arrays, and shape-hostile
+    /// entries degrade to `None` (the pre-1.173 shape — no outcomes face).
+    #[test]
+    fn send_outcomes_from_reply_counts_group_results_entries() {
+        assert_eq!(
+            RuntimeSupervisor::send_outcomes_from_reply(&json!({
+                "timestamp": 7,
+                "results": [
+                    { "recipientNumber": "+1", "success": { "timestamp": 7 } },
+                    { "recipientNumber": "+2", "success": { "timestamp": 7 } },
+                    { "recipientNumber": "+3", "failure": { "type": "NetworkFailure" } }
+                ]
+            })),
+            Some(crate::store::MessageSendOutcomes {
+                succeeded: 2,
+                failed: 1,
+            })
+        );
+        // No recognizable entry counts as no face (never an all-zero Some).
+        assert_eq!(
+            RuntimeSupervisor::send_outcomes_from_reply(&json!({
+                "timestamp": 7,
+                "results": [{ "recipientNumber": "+1" }]
+            })),
+            None
+        );
+        assert_eq!(
+            RuntimeSupervisor::send_outcomes_from_reply(&json!({ "timestamp": 7 })),
+            None
+        );
+        assert_eq!(
+            RuntimeSupervisor::send_outcomes_from_reply(&json!({
+                "timestamp": 7,
+                "results": []
+            })),
+            None
+        );
+    }
+
     use super::{
         EngineStderrClass, HistoryImportProbe, IMPORT_FAILURE_NO_ARCHIVE,
         MAX_IMPORT_FAILURE_CODE_CHARS, RECEIPT_FAILURE_MAP_CAP, RuntimeSupervisor,
@@ -9927,6 +10023,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             admin_deleted: false,
             sticker: None,
             expire_seconds: None,
@@ -10131,6 +10228,7 @@ mod tests {
                     delivered_at: None,
                     read_at: None,
                     viewed_at: None,
+                    send_outcomes: None,
                     sticker: None,
                     expire_seconds: None,
                     expire_start_at: None,
@@ -10619,7 +10717,7 @@ mod tests {
             .service
             .lock()
             .await
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 421)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 421, None)
             .unwrap();
 
         assert_eq!(
@@ -10713,7 +10811,7 @@ mod tests {
             .service
             .lock()
             .await
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 423)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 423, None)
             .unwrap();
 
         assert_eq!(
@@ -10807,7 +10905,7 @@ mod tests {
             .service
             .lock()
             .await
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 424)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 424, None)
             .unwrap();
         let mut host_lane = supervisor.subscribe_host();
 
@@ -11013,7 +11111,7 @@ mod tests {
             .service
             .lock()
             .await
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 424)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 424, None)
             .unwrap();
 
         assert_eq!(
@@ -11107,7 +11205,7 @@ mod tests {
             .service
             .lock()
             .await
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 426)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 426, None)
             .unwrap();
         let mut host_lane = supervisor.subscribe_host();
 
@@ -11329,6 +11427,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             admin_deleted: false,
             sticker: None,
             expire_seconds: Some(60),
@@ -12832,6 +12931,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -12981,6 +13081,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,

@@ -3063,6 +3063,7 @@ impl ConnectorService {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             admin_deleted: false,
             sticker: Some(sticker),
             expire_seconds: None,
@@ -3217,6 +3218,7 @@ impl ConnectorService {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             admin_deleted: false,
             sticker: None,
             expire_seconds: None,
@@ -6964,6 +6966,7 @@ impl ConnectorService {
                 &row.id,
                 now_ms(),
                 crate::store::SendRetrySchedule::None,
+                None,
             )?;
             return Err(ServiceError::Store(StoreError::MessageNotFound));
         }
@@ -8337,6 +8340,7 @@ impl ConnectorService {
         account_id: &str,
         conversation_id: &str,
         sent_at: u64,
+        outcomes: Option<&crate::store::MessageSendOutcomes>,
     ) -> Result<(MessageRecord, Vec<HostSideEvent>), ServiceError> {
         // A missing pending row at this point means the local state vanished
         // underneath a send that already completed upstream (e.g. the account's
@@ -8346,7 +8350,7 @@ impl ConnectorService {
         // SEND_OUTCOME_UNKNOWN with retryable=false.
         let mut updated = self
             .store
-            .complete_outgoing_send(pending_id, account_id, conversation_id, sent_at)?
+            .complete_outgoing_send(pending_id, account_id, conversation_id, sent_at, outcomes)?
             .ok_or_else(|| {
                 ServiceError::Api(ApiError::new(
                     "SEND_OUTCOME_UNKNOWN",
@@ -8595,6 +8599,29 @@ impl ConnectorService {
             pending_id,
             now_ms(),
             schedule,
+            None,
+        )?))
+    }
+
+    /// §4.173 the all-recipient-failure arm of a group send the engine
+    /// answered `Ok` for: every entry of the reply's `results` array carried
+    /// a `failure`, so nothing was delivered. The row settles definitively
+    /// failed (plain — per-recipient delivery failures are not one of the
+    /// §4.123 automatic-retry families, so the queue never picks the row up;
+    /// the manual Retry Send face stays), the counted outcomes ride the row
+    /// for the desktop's error face, and the caller answers
+    /// `GROUP_SEND_FAILED` (retryable) so the optimistic funnel marks the
+    /// row retryable-failed like any definitive engine error.
+    pub fn complete_send_failed_group_outcomes(
+        &self,
+        pending_id: &str,
+        outcomes: &crate::store::MessageSendOutcomes,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        Ok(status_change_events(self.store.settle_send_failed(
+            pending_id,
+            now_ms(),
+            crate::store::SendRetrySchedule::None,
+            Some(outcomes),
         )?))
     }
 
@@ -8833,6 +8860,7 @@ impl ConnectorService {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             admin_deleted: false,
             sticker: receive.sticker,
             // A timer notice records the announced value in the text and the
@@ -9448,6 +9476,7 @@ impl ConnectorService {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 admin_deleted: false,
                 sticker: None,
                 expire_seconds: None,
@@ -10313,6 +10342,7 @@ impl ConnectorService {
                     delivered_at: None,
                     read_at: None,
                     viewed_at: None,
+                    send_outcomes: None,
                     admin_deleted: false,
                     sticker: None,
                     // A timer notice records the announced value in the text
@@ -16514,6 +16544,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -18849,7 +18880,7 @@ mod tests {
         assert_eq!(prepared["account"], json!("+15555550100"));
         // Settlement completes the SAME row and clears the queue face.
         let (sent, _) = service
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 777)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 777, None)
             .unwrap();
         assert_eq!(sent.status, "sent");
         let face = service
@@ -19190,7 +19221,7 @@ mod tests {
 
         // Settlement completes the SAME row; the history stays one row.
         let (sent, _) = service
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 777)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 777, None)
             .unwrap();
         assert_eq!(sent.status, "sent");
         let rows = service
@@ -19325,7 +19356,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         let (settled, _) = service
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 999)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 999, None)
             .unwrap();
 
         // The replay is byte-shaped like the first success answer: same row
@@ -19585,7 +19616,7 @@ mod tests {
         );
 
         let (sent, _) = service
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 99)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 99, None)
             .unwrap();
         assert_eq!(
             sent.client_request_id.as_deref(),
@@ -19661,7 +19692,7 @@ mod tests {
         );
 
         let error = service
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 100)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 100, None)
             .unwrap_err();
         let ServiceError::Api(api) = error else {
             panic!("missing pending row must be an API error, got {error:?}");
@@ -19671,7 +19702,8 @@ mod tests {
 
         // A pending id that never existed lands on the same non-retryable path.
         let error =
-            match service.complete_send_success("absent", &account.id, &conversation.id, 100) {
+            match service.complete_send_success("absent", &account.id, &conversation.id, 100, None)
+            {
                 Err(ServiceError::Api(api)) => api,
                 other => panic!("missing pending row must fail, got {other:?}"),
             };
@@ -20252,7 +20284,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 4242)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 4242, None)
             .unwrap();
 
         match service
@@ -20473,7 +20505,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&direct_id, &account.id, &direct.id, 777)
+            .complete_send_success(&direct_id, &account.id, &direct.id, 777, None)
             .unwrap();
         let prepared = service
             .prepare_remote_delete(&account.id, &direct.id, &direct_id)
@@ -20516,7 +20548,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&group_message_id, &account.id, &group.id, 888)
+            .complete_send_success(&group_message_id, &account.id, &group.id, 888, None)
             .unwrap();
         let prepared = service
             .prepare_remote_delete(&account.id, &group.id, &group_message_id)
@@ -20685,7 +20717,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&sent_id, &account.id, &direct.id, 777)
+            .complete_send_success(&sent_id, &account.id, &direct.id, 777, None)
             .unwrap();
         let prepared = service
             .prepare_send_reaction(&account.id, &direct.id, &sent_id, "👍", false)
@@ -20769,7 +20801,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&group_message_id, &account.id, &group.id, 888)
+            .complete_send_success(&group_message_id, &account.id, &group.id, 888, None)
             .unwrap();
         let prepared = service
             .prepare_send_reaction(&account.id, &group.id, &group_message_id, "👍", false)
@@ -20960,7 +20992,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&message_id, &account.id, &conversation.id, 777)
+            .complete_send_success(&message_id, &account.id, &conversation.id, 777, None)
             .unwrap();
         for status in ["sent", "delivered", "read"] {
             service
@@ -21011,7 +21043,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&message_id, &account.id, &conversation.id, 888)
+            .complete_send_success(&message_id, &account.id, &conversation.id, 888, None)
             .unwrap();
         let prepared = service
             .prepare_send_reaction(&account.id, &conversation.id, &message_id, "👍", false)
@@ -21350,7 +21382,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         let (updated, _events) = service
-            .complete_send_success(&message_id, &account.id, &conversation.id, 999)
+            .complete_send_success(&message_id, &account.id, &conversation.id, 999, None)
             .unwrap();
         let quote = updated.quote.expect("answer row projects the quote");
         assert_eq!(quote.id, 500);
@@ -21459,7 +21491,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&sent_id, &account.id, &direct.id, 777)
+            .complete_send_success(&sent_id, &account.id, &direct.id, 777, None)
             .unwrap();
 
         // Pin with a duration: every upstream key carries the reaction
@@ -21561,7 +21593,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&group_message_id, &account.id, &group.id, 888)
+            .complete_send_success(&group_message_id, &account.id, &group.id, 888, None)
             .unwrap();
         let prepared = service
             .prepare_send_pin_message(&account.id, &group.id, &group_message_id, None)
@@ -21720,7 +21752,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&sent_id, &account.id, &conversation.id, 410)
+            .complete_send_success(&sent_id, &account.id, &conversation.id, 410, None)
             .unwrap();
         assert_eq!(
             service
@@ -21796,7 +21828,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&own_row, &account.id, &conversation.id, 888)
+            .complete_send_success(&own_row, &account.id, &conversation.id, 888, None)
             .unwrap();
 
         // Timed pin on the own row: the summary projects the pin bar with an
@@ -22137,7 +22169,7 @@ mod tests {
         };
 
         let (_, events) = service
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 55)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 55, None)
             .unwrap();
         assert_eq!(
             status_events(&events),
@@ -22146,7 +22178,7 @@ mod tests {
 
         // A replayed completion reports no transition -> no duplicate event.
         let (_, replayed) = service
-            .complete_send_success(&pending_id, &account.id, &conversation.id, 55)
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 55, None)
             .unwrap();
         assert!(status_events(&replayed).is_empty());
 
@@ -23258,6 +23290,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -29640,7 +29673,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&prepared, account_id, conversation_id, sent_at)
+            .complete_send_success(&prepared, account_id, conversation_id, sent_at, None)
             .unwrap();
         prepared
     }
@@ -29687,6 +29720,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -29852,6 +29886,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -30598,6 +30633,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -30714,6 +30750,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -30831,6 +30868,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -30969,6 +31007,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -31072,6 +31111,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -31141,6 +31181,7 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 viewed_at: None,
+                send_outcomes: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -31243,6 +31284,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             viewed_at: None,
+            send_outcomes: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -33659,7 +33701,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         service
-            .complete_send_success(&message_id, &account.id, &direct.id, 800)
+            .complete_send_success(&message_id, &account.id, &direct.id, 800, None)
             .unwrap();
         (account.id, direct.id, message_id)
     }
