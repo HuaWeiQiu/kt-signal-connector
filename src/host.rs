@@ -736,6 +736,7 @@ where
                             target: "send_latency_probe",
                             stage = "connector.reject-gate",
                             gate = "admit_capacity",
+                            method = %method,
                             op = %request
                                 .params
                                 .get("clientRequestId")
@@ -848,6 +849,7 @@ where
                         tracing::warn!(
                             target: "send_latency_probe",
                             stage = "connector.engine-call-start",
+                            method = %method,
                             op = %probe_op,
                             account8 = %probe_prefix8(account_id.as_deref()),
                             wait_ms = started.elapsed().as_millis() as u64,
@@ -891,6 +893,7 @@ where
                         tracing::warn!(
                             target: "send_latency_probe",
                             stage = "connector.send-result",
+                            method = %method,
                             op = %probe_op,
                             code = error.code,
                             class = result_class,
@@ -1253,6 +1256,7 @@ async fn acquire_within_stall_budget(
                     target: "send_latency_probe",
                     stage = "connector.reject-gate",
                     gate = "lane_wait_budget",
+                    method = %method,
                     account8 = %probe_prefix8(account_id),
                     stall_after_ms = HOST_DISPATCH_STALL_WARN_AFTER.as_millis() as u64,
                     "send-latency-probe",
@@ -1301,6 +1305,7 @@ async fn dispatch_within_stall_budget(
                     target: "send_latency_probe",
                     stage = "connector.reject-gate",
                     gate = "dispatch_budget",
+                    method = %method,
                     req8 = %probe_prefix8(Some(&request_id)),
                     account8 = %probe_prefix8(account_id),
                     stall_after_ms = HOST_DISPATCH_STALL_WARN_AFTER.as_millis() as u64,
