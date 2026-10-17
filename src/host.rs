@@ -713,6 +713,22 @@ where
                         request_bytes,
                         "host request rejected: capacity exceeded"
                     );
+                    // KT (send latency probe): queue-full gate face (admit
+                    // budget) — the rejection reason behind the counters.
+                    if metrics::method_class(&method) == "send" {
+                        tracing::warn!(
+                            target: "send_latency_probe",
+                            stage = "connector.reject-gate",
+                            gate = "admit_capacity",
+                            op = %request
+                                .params
+                                .get("clientRequestId")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("-"),
+                            account8 = %probe_prefix8(account_id.as_deref()),
+                            "send-latency-probe",
+                        );
+                    }
                     let response = HostResponse::failure(
                         request.request_id,
                         ApiError::new(
@@ -739,6 +755,16 @@ where
                 let task_writer = writer.clone();
                 let task_limits = limits.clone();
                 dispatches.push(async move {
+                    // KT (send latency probe): the clientRequestId is the
+                    // cross-repo join key (desktop main probe logs the same
+                    // value); fall back to "-" for send-family methods that
+                    // do not carry one. Red-line safe: id-shaped only.
+                    let probe_op = request
+                        .params
+                        .get("clientRequestId")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("-")
+                        .to_string();
                     // A rejected acquire (mutating work on an account whose
                     // delete is draining, a second concurrent finish in one
                     // group) never reaches dispatch; it is answered directly
@@ -798,6 +824,20 @@ where
                         )
                         .await
                     };
+                    // KT (send latency probe): admit → engine-call start.
+                    // Everything before this point is the queueing segment
+                    // (lane permit + per-account mutex + delete barrier) the
+                    // dispatch duration_ms never exposed.
+                    if acquired.is_ok() && metrics::method_class(&method) == "send" {
+                        tracing::warn!(
+                            target: "send_latency_probe",
+                            stage = "connector.engine-call-start",
+                            op = %probe_op,
+                            account8 = %probe_prefix8(account_id.as_deref()),
+                            wait_ms = started.elapsed().as_millis() as u64,
+                            "send-latency-probe",
+                        );
+                    }
                     // The permit itself must stay bound for the whole
                     // dispatch: dropping it early (e.g. by reducing the
                     // acquire result to its error) would release the account
@@ -824,6 +864,25 @@ where
                     let method_class = metrics::method_class(&method);
                     let result_class = metrics::result_class(response.error.as_ref());
                     metrics::record_request(method_class, result_class, elapsed);
+                    // KT (send latency probe): one line per send-class
+                    // failure carrying the wire rejection reason — the error
+                    // code names the gate (validation / account busy /
+                    // link conflict / upstream deny). Codes are fixed
+                    // classification literals; nothing content-shaped.
+                    if method_class == "send"
+                        && let Some(error) = response.error.as_ref()
+                    {
+                        tracing::warn!(
+                            target: "send_latency_probe",
+                            stage = "connector.send-result",
+                            op = %probe_op,
+                            code = error.code,
+                            class = result_class,
+                            retryable = error.retryable,
+                            dur_ms = elapsed.as_millis() as u64,
+                            "send-latency-probe",
+                        );
+                    }
                     // The doctor's recent-error ring (§4.79): every host
                     // dispatch failure lands its wire error code as a family.
                     if let Some(error) = response.error.as_ref() {
@@ -1050,6 +1109,12 @@ fn spawn_metrics_log(runtime: std::sync::Weak<ProxyGroupRuntime>) {
 /// category, opaque account id, request size, duration, and result class. A
 /// successful read/control poll stays at debug level so the default output
 /// shows mutating work and failures only.
+/// 发送延迟探针账号/请求 id 前缀：前 8 字符（字符界安全截取）。红线：
+/// 只接受 id 与固定分类词，正文/号码/群名永不入日志。
+fn probe_prefix8(value: Option<&str>) -> String {
+    value.unwrap_or("-").chars().take(8).collect()
+}
+
 fn log_dispatch(
     method_class: &'static str,
     result_class: &'static str,
@@ -1139,6 +1204,18 @@ async fn acquire_within_stall_budget(
                 stall_after_ms = HOST_DISPATCH_STALL_WARN_AFTER.as_millis() as u64,
                 "host request still pending; no lane permit was granted before the stall budget expired"
             );
+            // KT (send latency probe): lane-permit wait exceeded the stall
+            // budget — the "lane full / wedged earlier dispatch" face.
+            if metrics::method_class(method) == "send" {
+                tracing::warn!(
+                    target: "send_latency_probe",
+                    stage = "connector.reject-gate",
+                    gate = "lane_wait_budget",
+                    account8 = %probe_prefix8(account_id),
+                    stall_after_ms = HOST_DISPATCH_STALL_WARN_AFTER.as_millis() as u64,
+                    "send-latency-probe",
+                );
+            }
             Err(ApiError::new(
                 "INTERNAL_ERROR",
                 "connector dispatch budget expired before dispatch",
@@ -1175,6 +1252,19 @@ async fn dispatch_within_stall_budget(
                 stall_after_ms = HOST_DISPATCH_STALL_WARN_AFTER.as_millis() as u64,
                 "host request still pending; every bounded face budget is exhausted"
             );
+            // KT (send latency probe): the dispatch itself wedged past every
+            // bounded budget and was abandoned (engine no-answer face).
+            if metrics::method_class(method) == "send" {
+                tracing::warn!(
+                    target: "send_latency_probe",
+                    stage = "connector.reject-gate",
+                    gate = "dispatch_budget",
+                    req8 = %probe_prefix8(Some(&request_id)),
+                    account8 = %probe_prefix8(account_id),
+                    stall_after_ms = HOST_DISPATCH_STALL_WARN_AFTER.as_millis() as u64,
+                    "send-latency-probe",
+                );
+            }
             HostResponse::failure(
                 request_id,
                 ApiError::new(
