@@ -1757,13 +1757,13 @@ pub struct SyncAttachmentBackfillResponse {
 const MAX_QUOTE_TEXT_CHARS: usize = 128;
 pub(crate) const MAX_INBOUND_ATTACHMENTS: usize = 32;
 const MAX_ATTACHMENT_ID_CHARS: usize = 128;
-/// The inbound filename bound (contract revision 1.183, §4.183): the sender's
+/// The inbound filename bound (contract revision 1.184, §4.184): the sender's
 /// name rides verbatim up to this clamp — the clamp is boundedness insurance,
 /// not a rewrite rule. The budget is filesystem-name scale (255 UTF-16 units,
 /// the common per-component cap, reach 1020 UTF-8 bytes), so every name a real
 /// sender's filesystem can produce passes byte-exact and only a hostile
 /// oversized face clamps. The previous 128-byte budget rewrote real names and
-/// is retired (§4.183).
+/// is retired (§4.184).
 const MAX_ATTACHMENT_FILENAME_BYTES: usize = 1024;
 const MAX_ATTACHMENT_CONTENT_TYPE_CHARS: usize = 64;
 /// The voice waveform's base64 bound (contract 1.150, §4.149): the engine's
@@ -4452,7 +4452,7 @@ pub(crate) fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
-/// One inbound attachment filename (contract revision 1.183, §4.183): the
+/// One inbound attachment filename (contract revision 1.184, §4.184): the
 /// sender's name rides verbatim — long names, Unicode, spaces, multi-
 /// extensions — the official receive posture
 /// (`processDataMessage.preload.ts:128` `fileName: fileName ?? undefined`,
@@ -4475,7 +4475,7 @@ pub(crate) fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
 ///
 /// The result is clamped to [`MAX_ATTACHMENT_FILENAME_BYTES`] — boundedness
 /// insurance at filesystem-name scale, not a rewrite rule (real names never
-/// reach it, §4.183).
+/// reach it, §4.184).
 pub(crate) fn sanitize_inbound_filename(name: &str) -> String {
     let flattened = name
         .rsplit(['/', '\\'])
@@ -4563,7 +4563,7 @@ fn normalized_quote(value: &Value) -> Option<NormalizedQuote> {
 /// carrying none of the three keys says nothing and drops whole. The
 /// thumbnail rides the same bounded attachment parser the message face runs,
 /// so an id-less pointer drops rather than rendering half a face; the
-/// filename rides the same §4.183 face (the official filters only, never a
+/// filename rides the same §4.184 face (the official filters only, never a
 /// length rewrite — the D4-era ≤128-byte bound is retired).
 fn normalized_quote_attachment(
     object: &serde_json::Map<String, Value>,
@@ -4597,7 +4597,7 @@ fn normalized_quote_attachment(
 }
 
 /// Bounded inbound attachment descriptors (§4.13): metadata only, entries past
-/// the cap are dropped; the filename rides the §4.183 verbatim posture (the
+/// the cap are dropped; the filename rides the §4.184 verbatim posture (the
 /// official safety filters only — never a length rewrite), the remaining
 /// strings truncate to their bound.
 fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
@@ -4626,7 +4626,7 @@ fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
 /// over-cap drops whole, never truncated), the duration any positive float —
 /// and the two stay independent (pairing is the engine's generation
 /// invariant, not a connector gate: the connector forwards what is stated).
-/// The filename rides the §4.183 face: the sender's name verbatim through
+/// The filename rides the §4.184 face: the sender's name verbatim through
 /// [`sanitize_inbound_filename`] — the official's own two filters only, the
 /// length rewrite retired.
 fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<NormalizedAttachment> {
@@ -9410,7 +9410,7 @@ mod tests {
         assert!(!legacy.is_gif);
     }
 
-    /// The inbound filename face (contract 1.183, §4.183): the sender's name
+    /// The inbound filename face (contract 1.184, §4.184): the sender's name
     /// rides verbatim — long Unicode names, spaces, multi-extensions — where
     /// the retired 128-byte budget rewrote real names. The only rewrites are
     /// the official's own filters: path components flatten (basename, both
@@ -9438,7 +9438,7 @@ mod tests {
         };
 
         // A 200-CJK-char name (600+ bytes) with spaces and multi-extensions —
-        // every byte of it filesystem-legal and, since 1.183, wire-exact (the
+        // every byte of it filesystem-legal and, since 1.184, wire-exact (the
         // old 128-byte budget truncated this to a quarter).
         let long_unicode = format!("{}项目 报告 草稿.backup.final.pdf", "文".repeat(200));
         assert_eq!(filename(&long_unicode), Some(long_unicode.clone()));

@@ -1357,7 +1357,7 @@ impl<'a> Importer<'a> {
                     .get("fileName")
                     .and_then(Value::as_str)
                     // The archive line carries the sender's name the same way
-                    // the live pointer does — the §4.183 face applies to both
+                    // the live pointer does — the §4.184 face applies to both
                     // (verbatim through the official filters, never a length
                     // rewrite; the empty filter turns a flattened-nothing
                     // name into key absence).
@@ -2304,9 +2304,9 @@ mod tests {
         assert_eq!(faces[0].key.as_deref(), Some(key_b64));
     }
 
-    /// The import filename face (contract 1.183, §4.183): the archive line
+    /// The import filename face (contract 1.184, §4.184): the archive line
     /// carries the sender's name the same way the live pointer does, so the
-    /// §4.183 posture applies to both — verbatim through the official
+    /// §4.184 posture applies to both — verbatim through the official
     /// filters (long Unicode names ride whole; traversal components flatten;
     /// the bidi set maps to U+FFFD; flatten-to-nothing answers absent), the
     /// retired live-arm length rewrite never appearing here either.

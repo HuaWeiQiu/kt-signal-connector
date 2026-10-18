@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.183 (2026-10-19; §4.183 the inbound attachment filename
+- Contract revision: 1.184 (2026-10-19; §4.184 the inbound attachment filename
   rides verbatim: the audit convicted the connector's inbound arm for rewriting
   the sender's filename to a 128-byte budget — a real-name truncation (255
   UTF-16-unit filesystem names reach 1020 UTF-8 bytes) that broke the official
@@ -15666,7 +15666,7 @@ false, store unchanged), and
 `conversation_delete_sync_ignores_unresolvable_identities` (an unknown
 identity drops nothing and forwards unenriched).
 
-### 4.183 The inbound attachment filename rides verbatim: the official's own filters only, the 128-byte rewrite retired (contract revision 1.183, 2026-10-19)
+### 4.183 The inbound attachment filename rides verbatim: the official's own filters only, the 128-byte rewrite retired (contract revision 1.184, 2026-10-19)
 
 The inbound-arm audit convicted the connector's receive face: both filename
 arms — the message attachment descriptor (§4.13) and the quoted-attachment
@@ -15700,7 +15700,7 @@ one; the connector lifts whatever arrived. The engine is verbatim too
 JSON) — the connector's 128-byte budget was the chain's only rewriter.
 
 The receive face now runs one shared sanitizer,
-`engine::sanitize_inbound_filename` (§4.183), on every filename arm:
+`engine::sanitize_inbound_filename` (§4.184), on every filename arm:
 
 - **Verbatim through the official filter family only.** Path components
   flatten with basename semantics on both separators (the official
