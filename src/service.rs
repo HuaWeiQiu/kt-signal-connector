@@ -1866,6 +1866,20 @@ struct EarlyControlEntry {
     payload: EarlyControlPayload,
 }
 
+/// §4.189: the terminate envelope's own notice-row material — the envelope
+/// timestamp (the notice row's identity stamp: the official row's `sent_at`
+/// is the terminate's own timestamp, so a stampless envelope keeps the fold
+/// and drops the row, and a replay can never mint a second row) and the
+/// disappearing pair the official notice row carries beside the poll. It
+/// buffers verbatim inside the §4.91 entry so a flush-minted row is
+/// byte-identical to the live arm's.
+#[derive(Clone, Debug, Default)]
+struct PollTerminateNoticeMaterial {
+    envelope_sent_at: Option<u64>,
+    expire_seconds: Option<u64>,
+    expire_start_at: Option<u64>,
+}
+
 /// What to apply when the target row lands. `Edit` carries the direction
 /// (peer edit vs own multi-device mirror — the two store paths differ) and
 /// the verbatim body the live arm would have written; the texts arrive
@@ -1889,7 +1903,13 @@ enum EarlyControlPayload {
         voter_id: String,
         option_indexes: Vec<u32>,
     },
-    PollTerminate,
+    /// §4.118 + §4.189: a buffered termination. The flush folds the
+    /// addressed poll row exactly like the live arm and — when the fold is
+    /// the first flip — mints the standalone notice row the official
+    /// timeline keeps beside the poll, from the buffered envelope material.
+    PollTerminate {
+        notice: PollTerminateNoticeMaterial,
+    },
 }
 
 pub struct ConnectorService {
@@ -9488,7 +9508,7 @@ impl ConnectorService {
                         drained.push(HostSideEvent::MessageUpserted(record));
                     }
                 }
-                EarlyControlPayload::PollTerminate => {
+                EarlyControlPayload::PollTerminate { notice } => {
                     if let Some(mut record) = self.store.fold_poll_terminate(
                         account_id,
                         conversation_id,
@@ -9500,7 +9520,19 @@ impl ConnectorService {
                             .attach_reactions(account_id, std::slice::from_mut(&mut record))?;
                         self.store
                             .attach_edits(account_id, std::slice::from_mut(&mut record))?;
-                        drained.push(HostSideEvent::MessageUpserted(record));
+                        drained.push(HostSideEvent::MessageUpserted(record.clone()));
+                        // §4.189: the flush-minted notice row is the live
+                        // arm's verbatim — the buffered envelope material
+                        // rides the same mint, so a converged notice is
+                        // byte-identical whether the terminate envelope
+                        // arrived early or late.
+                        drained.extend(self.land_poll_terminate_notice(
+                            account_id,
+                            conversation_id,
+                            &record,
+                            &legacy_sender_id(kind, peer_key, account_id),
+                            &notice,
+                        )?);
                     }
                 }
             }
@@ -9521,6 +9553,10 @@ impl ConnectorService {
     /// hits nothing buffers §4.91-style per candidate (keyed to each
     /// candidate's sender projection, so the poll row's landing flush
     /// applies it); a fold whose voter cannot be attributed drops.
+    /// §4.189: a termination whose fold is the first flip also lands the
+    /// standalone notice row the official timeline keeps beside the poll
+    /// (`notice` carries the terminate envelope's own material; the vote
+    /// leg and the no-conversation probe pass `None` and mint nothing).
     #[allow(clippy::too_many_arguments)]
     fn apply_poll_fold(
         &mut self,
@@ -9533,6 +9569,7 @@ impl ConnectorService {
         target_author: &str,
         target_timestamp: u64,
         vote: Option<&[u32]>,
+        notice: Option<PollTerminateNoticeMaterial>,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
         // The voter is the envelope source (a peer's vote) or the account
         // itself (the multi-device sent echo) — the same attribution the
@@ -9605,7 +9642,21 @@ impl ConnectorService {
                     .attach_reactions(&account.id, std::slice::from_mut(&mut record))?;
                 self.store
                     .attach_edits(&account.id, std::slice::from_mut(&mut record))?;
-                return Ok(vec![HostSideEvent::MessageUpserted(record)]);
+                let mut events = vec![HostSideEvent::MessageUpserted(record.clone())];
+                // §4.189: the official timeline keeps the terminate as its
+                // own system row beside the poll bubble — the first flip
+                // mints it from the terminate envelope's own material (the
+                // store fold's first-flip-only answer is the replay gate).
+                if let Some(notice) = notice.as_ref() {
+                    events.extend(self.land_poll_terminate_notice(
+                        &account.id,
+                        conversation_id,
+                        &record,
+                        legacy_sender,
+                        notice,
+                    )?);
+                }
+                return Ok(events);
             }
         }
         // Nothing to fold into yet — §4.91: buffer per candidate so the
@@ -9618,7 +9669,9 @@ impl ConnectorService {
                 voter_id,
                 option_indexes: option_indexes.to_vec(),
             },
-            None => EarlyControlPayload::PollTerminate,
+            None => EarlyControlPayload::PollTerminate {
+                notice: notice.unwrap_or_default(),
+            },
         };
         for (sender_id, _) in &candidates {
             self.buffer_early_control(EarlyControlEntry {
@@ -9632,6 +9685,144 @@ impl ConnectorService {
             });
         }
         Ok(Vec::new())
+    }
+
+    /// §4.189: the standalone poll-terminate notice row — the official
+    /// timeline renders the terminate as its own `poll-terminate` system
+    /// row beside the poll bubble (PollTerminateNotification, behavior
+    /// reference, zero code copied), so the fold that first flips the
+    /// `terminated` bit lands the same row: `system` direction, the
+    /// terminate envelope's own timestamp as the row identity (the
+    /// official `sent_at` = `terminate.timestamp`; the first-flip-only
+    /// fold answer and the stable id together gate replays), the folded
+    /// poll face as the material (question + the poll row's own timestamp
+    /// — the official `pollTerminateNotification {question, pollTimestamp}`),
+    /// and the poll row's author projection as the sender face (the fold's
+    /// author-keyed addressing IS the official terminator==creator check,
+    /// so the row's author can honestly carry the you/other split: the
+    /// account's own outgoing mirror means the account ended its poll).
+    /// The official View-poll jump button and the row's unread/notify face
+    /// are chrome the desktop's pill does not carry (the 1.181 system-row
+    /// family ledger) — recorded, never faked here.
+    fn land_poll_terminate_notice(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        poll_record: &MessageRecord,
+        legacy_sender_id: &str,
+        notice: &PollTerminateNoticeMaterial,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        // The notice row's identity is the terminate envelope's own stamp —
+        // a stampless envelope keeps the fold and drops the row (the §4.75
+        // stamp gate: a locally invented stamp would turn a replay into a
+        // second row).
+        let Some(sent_at) = notice.envelope_sent_at.filter(|at| *at > 0) else {
+            return Ok(Vec::new());
+        };
+        // The folded face is the material source; a record without one can
+        // only be a foreign row the fold never touched (honest guard, the
+        // store fold already refused those).
+        let Some(poll) = poll_record
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll.as_ref())
+        else {
+            return Ok(Vec::new());
+        };
+        let sender_id = poll_record.sender_id.clone();
+        if self
+            .store
+            .message_by_signal_identity(
+                account_id,
+                conversation_id,
+                "system",
+                sent_at,
+                &sender_id,
+                legacy_sender_id,
+            )?
+            .is_some()
+        {
+            return Ok(Vec::new());
+        }
+        let message_id = stable_hash_id(&[
+            "signal-message-v2",
+            account_id,
+            conversation_id,
+            "system",
+            &sent_at.to_string(),
+            &sender_id,
+        ]);
+        let rich = crate::engine::NormalizedRich {
+            poll_terminate: Some(crate::engine::NormalizedPollTerminate {
+                poll_question: poll.question.clone(),
+                poll_sent_at: poll_record.sent_at,
+                self_terminated: poll_record.direction == "outgoing",
+            }),
+            ..Default::default()
+        };
+        let message = MessageRecord {
+            id: message_id,
+            account_id: account_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            direction: "system",
+            sender_id,
+            // The notice row carries no author-name copy — the desktop
+            // joins its name ladder from the sender face (the system-row
+            // family posture, §4.75's row verbatim).
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: Some(now_ms()),
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            text_retrievable: true,
+            status: "system",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(rich),
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            admin_deleted: false,
+            sticker: None,
+            // The official notice row carries the terminate envelope's
+            // disappearing pair; the sweep deadline falls back to the
+            // stored-at stamp when the envelope stated no start (§4.41
+            // ladder). The notice never sweeps on its own without a stated
+            // timer.
+            expire_seconds: notice.expire_seconds,
+            expire_start_at: notice.expire_start_at,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        // Bodyless notice row: no preview material (the bodyless-poll-row
+        // posture), no unread bump (the §4.118 control family's read-neutral
+        // landing — the official unread/notify face is the recorded
+        // boundary, not a local invention).
+        let inserted = self.store.insert_message(&message, None, None, false)?;
+        if !inserted {
+            return Ok(Vec::new());
+        }
+        let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
+            message,
+        ))];
+        if let Some(summary) = self
+            .store
+            .conversation_summary(account_id, conversation_id)?
+        {
+            events.push(HostSideEvent::ConversationChanged(summary));
+        }
+        Ok(events)
     }
 
     /// Persist-and-notify one control-plane receive (contract 1.15): reaction
@@ -10150,6 +10341,17 @@ impl ConnectorService {
                         ControlReceive::PollVote { option_indexes, .. } => Some(option_indexes),
                         _ => None,
                     },
+                    // §4.189: the buffered terminate carries its envelope's
+                    // own notice material so the flush mints the same row
+                    // the live arm would have.
+                    match &control {
+                        ControlReceive::PollTerminate { .. } => Some(PollTerminateNoticeMaterial {
+                            envelope_sent_at: receive.timestamp,
+                            expire_seconds: receive.expire_seconds,
+                            expire_start_at: receive.expire_start_at,
+                        }),
+                        _ => None,
+                    },
                 );
             }
             if let Some(event) =
@@ -10601,6 +10803,7 @@ impl ConnectorService {
                 &target_author,
                 target_timestamp,
                 Some(&option_indexes),
+                None,
             ),
             ControlReceive::PollTerminate { target_timestamp } => {
                 // The proto terminate carries no author: the official
@@ -10628,6 +10831,13 @@ impl ConnectorService {
                     &anchor,
                     target_timestamp,
                     None,
+                    // §4.189: the terminate envelope's own material rides
+                    // the fold — the first flip mints the notice row.
+                    Some(PollTerminateNoticeMaterial {
+                        envelope_sent_at: receive.timestamp,
+                        expire_seconds: receive.expire_seconds,
+                        expire_start_at: receive.expire_start_at,
+                    }),
                 )
             }
             ControlReceive::GroupTimerUpdate {
@@ -34696,7 +34906,8 @@ mod tests {
     /// the history shape, a later vote folds the voter (the envelope source)
     /// into that row and re-emits it on `message.upserted` — the edit arm's
     /// event shape — and the termination flips the `terminated` bit in place.
-    /// No poll control ever mints a row of its own.
+    /// A vote never mints a row; §4.189 adds the termination's standalone
+    /// notice row beside the poll (the official timeline posture).
     #[test]
     fn live_poll_create_lands_and_later_vote_and_terminate_fold_in() {
         let (_temp, mut service) = service();
@@ -34790,7 +35001,10 @@ mod tests {
         let events = service
             .ingest_receive(terminate, crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
-        assert_eq!(events.len(), 1);
+        // §4.189: the first flip now carries the official standalone notice
+        // row — the folded poll row's upsert, the notice row's upsert, and
+        // the summary refresh.
+        assert_eq!(events.len(), 3, "{:?}", events);
         let HostSideEvent::MessageUpserted(row) = &events[0] else {
             panic!("expected message.upserted, got {:?}", events[0]);
         };
@@ -34801,13 +35015,34 @@ mod tests {
             .expect("the fold keeps the poll face");
         assert!(poll.terminated);
         assert_eq!(poll.votes.len(), 1, "termination never touches votes");
+        let HostSideEvent::MessageUpserted(notice) = &events[1] else {
+            panic!("expected the notice row's upsert, got {:?}", events[1]);
+        };
+        assert_eq!(notice.direction, "system");
+        assert_eq!(notice.status, "system");
+        // The notice's identity stamp is the terminate envelope's own
+        // timestamp (the control_receive helper's 500), never the poll's.
+        assert_eq!(notice.sent_at, 500);
+        assert_eq!(notice.sender_id, row.sender_id);
+        let face = notice
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll_terminate.as_ref())
+            .expect("the notice carries the pollTerminate face");
+        assert_eq!(face.poll_question, "Lunch?");
+        assert_eq!(face.poll_sent_at, 1000);
+        assert!(
+            !face.self_terminated,
+            "a peer's terminate is the other-branch copy"
+        );
 
         let listed = service
             .list_messages(&account.id, &row.conversation_id, 10, None)
             .unwrap()
             .items;
-        assert_eq!(listed.len(), 1, "poll controls never mint rows");
-        assert_eq!(listed[0].id, row.id);
+        assert_eq!(listed.len(), 2, "the fold plus its notice row");
+        assert!(listed.iter().any(|item| item.id == row.id));
+        assert!(listed.iter().any(|item| item.id == notice.id));
     }
 
     /// §4.118 + §4.91: a vote that arrives before its poll create buffers
@@ -34992,6 +35227,277 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.unread_count, 0, "folds never count as unread");
+    }
+
+    /// §4.189 idempotence and honest edges: a replayed termination (the row
+    /// already terminated) folds nothing and mints nothing — the store fold's
+    /// first-flip-only answer is the replay gate — and a stampless terminate
+    /// envelope keeps the fold but lands no notice row (the §4.75 stamp gate:
+    /// a locally invented stamp would turn a replay into a second row).
+    #[test]
+    fn poll_terminate_notice_replay_and_stampless_edges() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+
+        let create = NormalizedReceive {
+            timestamp: Some(1000),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".to_string()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: Some("group-key".into()),
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(crate::engine::NormalizedRich {
+                poll: Some(crate::engine::NormalizedPoll {
+                    question: "Lunch?".into(),
+                    options: vec!["Ramen".into(), "Sushi".into()],
+                    allow_multiple: false,
+                    terminated: false,
+                    votes: Vec::new(),
+                }),
+                ..Default::default()
+            }),
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+        };
+        let landed = service
+            .ingest_receive(create, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let HostSideEvent::MessageUpserted(row) = &landed[0] else {
+            panic!("expected the create's upsert, got {:?}", landed[0]);
+        };
+        let conversation_id = row.conversation_id.clone();
+
+        // A stampless terminate folds the bit but mints no row.
+        let mut stampless = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::PollTerminate {
+                target_timestamp: 1000,
+            },
+        );
+        stampless.timestamp = None;
+        stampless.group_id = Some("group-key".into());
+        let events = service
+            .ingest_receive(stampless, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "the fold re-emits the row; the stampless notice never lands"
+        );
+        let listed = service
+            .list_messages(&account.id, &conversation_id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(listed.len(), 1, "no notice without the envelope stamp");
+
+        // A later terminate envelope (a real second stamp) is the honest
+        // no-op: the row is already terminated, the fold answers None, no
+        // events, no second notice row.
+        let mut replay = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::PollTerminate {
+                target_timestamp: 1000,
+            },
+        );
+        replay.timestamp = Some(600);
+        replay.group_id = Some("group-key".into());
+        let events = service
+            .ingest_receive(replay, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(events.is_empty(), "an already-terminated poll no-ops");
+        let listed = service
+            .list_messages(&account.id, &conversation_id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(listed.len(), 1, "the replay never mints a row");
+
+        // The own sent echo on the account's own outgoing poll mints the
+        // self-flagged notice (the you-branch copy material).
+        let own_create = NormalizedReceive {
+            timestamp: Some(2000),
+            content_kind: "syncMessage",
+            direction: "outgoing",
+            account_present: true,
+            account: Some("+15555550100".to_string()),
+            source: None,
+            source_uuid: None,
+            peer_name: None,
+            group_id: Some("group-key".into()),
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(crate::engine::NormalizedRich {
+                poll: Some(crate::engine::NormalizedPoll {
+                    question: "Dinner?".into(),
+                    options: vec!["Tea".into(), "Coffee".into()],
+                    allow_multiple: false,
+                    terminated: false,
+                    votes: Vec::new(),
+                }),
+                ..Default::default()
+            }),
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+        };
+        let landed = service
+            .ingest_receive(own_create, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let HostSideEvent::MessageUpserted(own_row) = &landed[0] else {
+            panic!("expected the echo's upsert, got {:?}", landed[0]);
+        };
+        assert_eq!(own_row.direction, "outgoing");
+        let mut own_terminate = control_receive(
+            "+15555550100",
+            "+15555550100",
+            ControlReceive::PollTerminate {
+                target_timestamp: 2000,
+            },
+        );
+        own_terminate.direction = "outgoing";
+        own_terminate.timestamp = Some(2500);
+        own_terminate.group_id = Some("group-key".into());
+        let events = service
+            .ingest_receive(own_terminate, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 3, "{:?}", events);
+        let HostSideEvent::MessageUpserted(notice) = &events[1] else {
+            panic!("expected the notice row's upsert, got {:?}", events[1]);
+        };
+        assert_eq!(notice.sent_at, 2500);
+        let face = notice
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll_terminate.as_ref())
+            .expect("the own echo carries the pollTerminate face");
+        assert_eq!(face.poll_question, "Dinner?");
+        assert_eq!(face.poll_sent_at, 2000);
+        assert!(
+            face.self_terminated,
+            "the account's own echo is the you-branch copy"
+        );
+    }
+
+    /// §4.118 + §4.91 + §4.189 convergence: a termination that arrives
+    /// before its poll create buffers silently, and the create's landing
+    /// flush applies the fold AND mints the notice row — byte-identical to
+    /// the live arm's (the buffered envelope material rides the flush).
+    #[test]
+    fn terminate_before_create_buffers_and_the_flush_mints_the_notice() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+
+        let mut early = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::PollTerminate {
+                target_timestamp: 1000,
+            },
+        );
+        early.timestamp = Some(900);
+        early.group_id = Some("group-key".into());
+        let buffered = service
+            .ingest_receive(early, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            buffered.is_empty(),
+            "an early terminate is buffered, not applied"
+        );
+
+        let create = NormalizedReceive {
+            timestamp: Some(1000),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".to_string()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: Some("group-key".into()),
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(crate::engine::NormalizedRich {
+                poll: Some(crate::engine::NormalizedPoll {
+                    question: "Lunch?".into(),
+                    options: vec!["Ramen".into(), "Sushi".into()],
+                    allow_multiple: false,
+                    terminated: false,
+                    votes: Vec::new(),
+                }),
+                ..Default::default()
+            }),
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+        };
+        let events = service
+            .ingest_receive(create, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        // Land-then-converge: the create's upsert, the flushed fold's
+        // upsert, then the flush-minted notice and the summary refresh.
+        let HostSideEvent::MessageUpserted(landed) = &events[0] else {
+            panic!("expected the create's upsert, got {:?}", events[0]);
+        };
+        let HostSideEvent::MessageUpserted(folded) = &events[1] else {
+            panic!("expected the flushed fold, got {:?}", events[1]);
+        };
+        assert_eq!(landed.id, folded.id, "both fold events name the one row");
+        let folded_poll = folded
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll.as_ref())
+            .expect("folded face");
+        assert!(folded_poll.terminated, "the flush applies the terminate");
+        let HostSideEvent::MessageUpserted(notice) = &events[2] else {
+            panic!("expected the flush-minted notice, got {:?}", events[2]);
+        };
+        assert_eq!(notice.direction, "system");
+        assert_eq!(
+            notice.sent_at, 900,
+            "the buffered envelope's own stamp is the notice identity"
+        );
+        let face = notice
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll_terminate.as_ref())
+            .expect("the flush-minted notice carries the face");
+        assert_eq!(face.poll_question, "Lunch?");
+        assert_eq!(face.poll_sent_at, 1000);
+        assert!(!face.self_terminated);
+
+        let listed = service
+            .list_messages(&account.id, &landed.conversation_id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(listed.len(), 2, "the poll row plus its notice");
     }
 
     /// §4.118 fail-closed: a vote or termination addressing a row with no

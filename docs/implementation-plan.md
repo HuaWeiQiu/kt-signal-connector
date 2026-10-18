@@ -5,6 +5,21 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.189 (2026-10-19; §4.189 the poll-terminate notice
+  row: the live terminate fold's first flip lands the official standalone
+  `poll-terminate` system row beside the poll — the terminate envelope's
+  own stamp as the row identity, the folded poll face as the material
+  (`pollTerminate {pollQuestion, pollSentAt, selfTerminated}` additive
+  rich key), the poll row's author projection as the sender face (the
+  author-keyed fold IS the official terminator==creator check), the
+  first-flip-only fold answer as the replay gate, and the §4.91 buffered
+  terminate flushing into the byte-identical row. Closes desktop 1.230's
+  recorded gap ③; the desktop render half is desktop contract 1.240.
+  Boundaries recorded: the this-device send keeps the §4.106
+  no-local-effect posture (the row converges on the echo), the
+  View-poll button/unread/notify faces are the 1.181 desktop pill-chrome
+  ledger, and the §4.38 archive chain has no terminate events to mint.)
+
 - Contract revision: 1.188 (2026-10-19; §4.188 the two arms extracted from
   the stale pre-merge branches, everything those branches carried that a
   merged batch already supersedes dropped by record: the
@@ -16173,6 +16188,102 @@ dispatching as the engine's `announcementsOnly` true/false with the host
 permission words never reaching the wire, the mixed refusal set still
 dispatching nothing, and the quit-dispatch filter excluding the new fold
 key the way it excludes the 1.180 password).
+
+### 4.189 The poll-terminate notice row: the live fold's first flip lands the official standalone system row (contract revision 1.189, 2026-10-19)
+
+Provenance: desktop contract 1.230 (the polls face close-out) recorded
+the gap as its 记档差异 ③ — the official PollTerminate renders as its own
+system row in the timeline, but the connector's §4.118 terminate was a
+control receive that folded the addressed poll row and minted nothing
+("无 connector 行面"). This batch opens that row face; the desktop half
+(consumer render arm, wire key `pollTerminate`) is desktop contract
+1.240, landed in the same construction pass.
+
+**Official anchors (upstream Signal-Desktop @ `abe80d3`, read-only, AGPL
+zero code copied).** The terminate arrives as a message modifier and the
+official client materializes TWO effects: the poll message's state and a
+brand-new standalone row. Trigger:
+`ts/messageModifiers/Polls.preload.ts:540-598` (`handlePollTerminate` —
+the terminator must be the poll creator, `:546-572` "Termination
+rejected - not from poll creator"; the poll face gets `terminatedAt`,
+`:574-582`; then `conversation.addPollTerminateNotification`, `:589-598`).
+Row mint: `ts/models/conversations.preload.ts:3628-3680` — a NEW
+`MessageModel` of `type: 'poll-terminate'` carrying
+`pollTerminateNotification {question, pollTimestamp}`, the terminator as
+`sourceServiceId`, `sent_at = terminate.timestamp` (the terminate
+envelope's own stamp, not the poll's), and the read state split
+`isMeTerminating ? Read : Unread`. Timeline classification:
+`ts/state/selectors/message.preload.ts:1230-1235` routes `isPollTerminate`
+(`:1878-1880`, `message.type === 'poll-terminate'`) to the standalone
+`'pollTerminate'` item — an independent system row in the timeline, not a
+face on the poll bubble. Render:
+`ts/components/conversation/PollTerminateNotification.dom.tsx:53-88` —
+`SystemMessage symbol="poll"` with `icu:PollTerminate--you`「You ended
+the poll: {poll}」/ `icu:PollTerminate--other`「{name} ended the poll:
+{poll}」 plus the `icu:PollTerminate__view-poll` jump button.
+
+**The arm.** `fold_poll_terminate`'s first-flip-only answer (§4.118: the
+already-terminated mutator returns false → `None`) is exactly the
+official one-notification-per-termination gate, so the fold's
+`Some(record)` — in the live arm and the §4.91 buffered flush alike —
+additionally mints the notice row through the §4.75 timer-notice
+discipline verbatim: `system` direction/status, the terminate envelope's
+own timestamp as the row identity (a stampless envelope keeps the fold
+and drops the row — the §4.75 stamp gate), the stable
+`signal-message-v2` id keyed to (account, conversation, system, stamp,
+sender), the `message_by_signal_identity` pre-check as the replay
+belt-and-suspenders, `insert_message` with no preview (the bodyless-row
+posture) and no unread bump, and `message.upserted` +
+`conversation.changed` as the events. The material rides one new rich
+face — `pollTerminate {pollQuestion, pollSentAt, selfTerminated}` —
+flattened onto the wire row like every rich key: the question and the
+poll row's own upstream timestamp are read off the folded poll face (the
+official `pollTerminateNotification` pair), and the self flag is the
+poll row's direction (the account's own outgoing mirror = the account
+ended its own poll = the official `isMeTerminating` you-branch; any
+other row = the other-branch). The terminator authorship needs no
+separate check: the fold addresses the poll row through the terminate
+envelope's own sender identity (§4.118), so a fold that hit IS the
+official terminator==creator verification — a non-creator's terminate
+addresses no row, folds nothing, mints nothing. The notice row's sender
+face is the folded poll row's sender projection (the desktop's name
+ladder joins it; the system rows carry no author-name copy, §4.75
+posture). The official notice row's disappearing pair rides verbatim
+(the terminate envelope's `expireSeconds`/`expireStartAt`, buffered with
+the §4.91 entry so a flush-minted row is byte-identical to the live
+arm's).
+
+**Recorded boundaries (honest, with follow-up triggers).** (a) The
+this-device send: `messages.sendPollTerminate` keeps the §4.106 send
+family's no-local-effect posture — no fold, no notice row at send time
+(official lands both at send completion via `handlePollTerminate`
+FromThisDevice); the row converges when the multi-device/phone echo (or
+a peer's view of the same termination) arrives as a receive, and the
+desktop's optimistic End-poll chain (1.230) covers the interim. The
+send-side local-effect arm is a same-discipline follow-up if ever
+taken. (b) The View-poll jump button, the row icon, and the unread/
+notify face of the official row are desktop pill chrome — the 1.181
+system-row family ledger's no-button/no-icon posture; the desktop half
+renders the official text copy and records the button 另案. (c) The
+§4.38 archive import chain stays as-is: the signal-cli archive face
+carries the poll's `hasEnded` on the poll row only and no standalone
+terminate events, so there is nothing to import-mint (official imports
+land terminate rows only when the backup itself carries them).
+
+Wire: one additive rich key on message rows; zero new methods, events,
+error codes, store moves, or capability bits; no schema change (the face
+rides `rich_json`). Tests (updated + additive):
+`live_poll_create_lands_and_later_vote_and_terminate_fold_in` (the
+terminate section now asserts the notice row's full shape beside the
+fold — system direction/status, the envelope stamp as `sent_at`, the
+sender face, and the `pollTerminate` material pair),
+`poll_terminate_notice_replay_and_stampless_edges` (a stampless
+terminate folds but mints no row; a second terminate envelope no-ops —
+no events, no second row; the own sent echo mints the `selfTerminated`
+notice), and `terminate_before_create_buffers_and_the_flush_mints_the_notice`
+(the §4.91 flush mints the byte-identical notice from the buffered
+envelope material — land-then-converge with the notice as the third
+event).
 
 ## 5. signal-cli Boundary
 
