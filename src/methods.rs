@@ -229,6 +229,15 @@ pub const METHODS: &[MethodRow] = &[
     // runtime state since contract 1.98: the handshake omits the tag unless
     // the media table is armed.
     ("attachments.download", Lane::Send, true, "send"),
+    // Attachment backfill request (contract revision 1.175, §4.175): the
+    // request half of the official backfill loop — receipt-class fire-and-
+    // forget posture, control lane (no payload delivery).
+    (
+        "attachments.requestBackfill",
+        Lane::Control,
+        false,
+        "control",
+    ),
     // Disappearing-message timer set (contract revision 1.42, §4.41):
     // mutating, send-lane upstream traffic — the reaction class verbatim,
     // same-account mutex and delete barrier included. Direct conversations
