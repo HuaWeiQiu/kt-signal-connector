@@ -6851,13 +6851,50 @@ async fn groups_update_quit_round_trip_and_guards() {
     assert_eq!(second_passwords.len(), 2);
     assert_ne!(second_passwords[0], second_passwords[1]);
 
+    // Contract 1.188 (§4.188): the send-messages permission fold — the
+    // host word pair rides the engine's own `announcementsOnly` bool in
+    // one dispatch (only-admins → true, every-member → false, both real
+    // write intents; the host permission words never reach the wire).
+    for (request_id, word) in [
+        ("update-announce-on", "only-admins"),
+        ("update-announce-off", "every-member"),
+    ] {
+        let sent = request(
+            &mut client,
+            request_id,
+            "groups.update",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "permissionSendMessages": word,
+            }),
+        )
+        .await;
+        assert_eq!(sent["result"]["status"], "sent", "{request_id}: {sent}");
+    }
+    let announce_calls: Vec<Value> = group_dispatches()
+        .into_iter()
+        .filter(|params| params.get("announcementsOnly").is_some())
+        .collect();
+    assert_eq!(announce_calls.len(), 2, "{announce_calls:?}");
+    assert_eq!(announce_calls[0]["announcementsOnly"], json!(true));
+    assert_eq!(announce_calls[1]["announcementsOnly"], json!(false));
+    for call in &announce_calls {
+        assert!(
+            call.get("setPermissionSendMessages").is_none()
+                && call.get("permissionSendMessages").is_none(),
+            "the engine face carries only the folded bool: {call:?}"
+        );
+    }
+
     // Any change key outside the engine subset (description, the admin and
-    // ban families, the permission trio, the member label pair — resetLink
-    // left this family in 1.180 §4.180) still answers the honest whole-call
+    // ban families, the remaining permission pair, the member label pair —
+    // resetLink left this family in 1.180 §4.180 and permissionSendMessages
+    // in 1.188 §4.188) still answers the honest whole-call
     // refusal — naming the offending keys, retryable=false — and dispatches
     // nothing: never a partial application of the change set. (The set below
-    // also carries resetLink, which now folds — but the other offenders
-    // still refuse the whole call.)
+    // also carries resetLink and permissionSendMessages, which now fold —
+    // but the other offenders still refuse the whole call.)
     let dispatches_before = group_dispatches().len();
     let refused_update = request(
         &mut client,
@@ -6987,6 +7024,9 @@ async fn groups_update_quit_round_trip_and_guards() {
                 // 1.180 §4.180: the reset-link dispatches carry
                 // inviteLinkPassword — not the quit face.
                 && params.get("inviteLinkPassword").is_none()
+                // 1.188 §4.188: the announcements-only dispatches carry
+                // announcementsOnly — not the quit face.
+                && params.get("announcementsOnly").is_none()
         })
         .collect();
     assert_eq!(quit_calls.len(), 1, "{quit_calls:?}");

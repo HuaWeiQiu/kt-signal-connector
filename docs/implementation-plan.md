@@ -5,6 +5,27 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.188 (2026-10-19; §4.188 the two arms extracted from
+  the stale pre-merge branches, everything those branches carried that a
+  merged batch already supersedes dropped by record: the
+  `groups.update setPermissionSendMessages` write fold onto the engine's
+  `announcementsOnly` bool (from `fix/admin-write` — its capture/read
+  halves landed as the 1.181 supply batch in better shape) and the
+  group-description read face — `group_extra_json` captures the engine
+  listGroups `description` under the write face's own
+  `GROUP_DESCRIPTION_MAX_BYTES` whole-value budget and `groups.get`
+  projects the optional `description` (from `fix/panel-group-read` — its
+  linkState arm landed as 1.180, its `groups.common` as 1.181). Engine
+  verification first: the announcementsOnly write arm exists on the
+  engine's pushed integration line (`origin/fix/attachment-backfill-loop`
+  @ `abede69`, engine `8ea56f6`, containing engine main) — not yet on
+  engine `origin/main`, recorded honestly; the engine's updateGroup
+  carries **no** description write arm, so the `groupDescription` write
+  key keeps its whole-call CAPABILITY_UNAVAILABLE refusal with the engine
+  gap recorded (the un-refusal is a same-discipline follow-up the day the
+  engine grows the arm). Version-numbering note: 1.186/1.187 are the
+  in-flight read-ledger/pin-queue batches; this batch takes the next
+  sequential 1.188.)
 - Contract revision: 1.185 (2026-10-19; §4.185 the media-story caption leg
   on `messages.sendStory`: the connector half of the engine's sendStory
   caption batch (engine `48e69a2`, already on the engine mainline) — the
@@ -15877,6 +15898,115 @@ forwarding ungated) and the integration arm
 engine's sendStory arm echoing the caption in-cap-out through the 1.161
 pointer stub — the frame-level forward and the answer-level ride proving
 both directions of the caption chain through the connector).
+
+### 4.188 The extracted arms: the `setPermissionSendMessages`→`announcementsOnly` write fold and the group-description read face (contract revision 1.188, 2026-10-19)
+
+Provenance: two early branches sat unmerged past their sell-by date —
+`fix/admin-write` (`ceb7f1e`, contract 1.177 on its own line) and
+`fix/panel-group-read` (`4a10157`, contracts 1.186/1.187 on its own line,
+both numbers since taken by the read-ledger and pin-queue batches). The
+verification batch judged both bases stale against the merge line, so this
+batch extracts only the arms nothing superseded and drops the rest by
+record: the admin-write branch's capture/read halves (announcementsOnly
+verbatim capture, the GV2 role-word admin fold, the `groups.get`
+announcementsOnly projection) landed as the 1.181 supply batch; the
+panel-group-read branch's linkState arm landed as 1.180 (`linkAccess`, the
+surviving vocabulary) and its `groups.common` landed as 1.181. What
+remained missing was exactly two arms, and both land here.
+
+**The write arm.** Official anchor (transcribed from the source branch and
+its same-batch engine commit): the announcements-only write path is the
+groups_v2 change action `modifyAnnouncementsOnly`
+(`ts/models/groups.preload.ts:895-904` `buildAnnouncementsOnlyChange`,
+version = revision + 1; the change row projects
+`ts/models/groups.preload.ts:4997-5004` announcements-only detail). The
+desktop speaks it through the permission vocabulary — the composer gate is
+`announcementsOnly && !areWeAdmin`
+(`ts/components/ConversationCompositionArea/CompositionArea.dom.tsx:1108-1120`).
+Since 1.45 the connector's `groups.update` has carried
+`setPermissionSendMessages` (every-member | only-admins) with its params
+ladder intact but the whole arm refused CAPABILITY_UNAVAILABLE — the
+engine had no arm to fold onto. Engine verification (this batch, before
+any code): the engine's `updateGroup` now carries the optional
+`announcementsOnly` bool (engine `8ea56f6`, the B-24 engine half —
+`announcements_only → build_update_change` synthesizing
+`modify_announcements_only`, field 21, a plaintext bool like the official
+line face; both values count as real write intent, false = lifting). The
+arm is on the engine's pushed integration line
+(`origin/fix/attachment-backfill-loop` @ `abede69`, containing engine
+main); it is not yet on engine `origin/main` — recorded, not papered
+over: against an engine build without the arm the folded send answers the
+engine's plain -32603 through the structured ladder as UPSTREAM_ERROR
+retryable=false (a deterministic refusal, the same honest degradation the
+§4.96 seam always answers — never a connector-side success lie).
+
+The fold: `setPermissionSendMessages` leaves the refusal family and maps
+only-admins → `announcementsOnly: true`, every-member →
+`announcementsOnly: false` (lifting is a real write, not an absent key —
+the engine counts both toward its at-least-one-write gate). The host
+vocabulary keeps the official permission word pair; the params ladder is
+unchanged (a word outside the two answers INVALID_REQUEST before the
+fold). The remaining permission pair (permissionAddMember /
+permissionEditDetails) keeps its whole-call CAPABILITY_UNAVAILABLE — the
+engine face still does not carry them, and the refusal keeps naming the
+caller's schema vocabulary. The fold composes with the other carried keys
+in one atomic engine change set (the 1.115 single-broadcast discipline).
+
+**The description read arm.** The engine's listGroups projects each
+group's decrypted description as the optional `description` key (engine
+`list_groups`, absent when the group state carries none); the pinned
+signal-cli JsonGroup never set one. Two landings:
+
+- `group_extra_json` captures the upstream `description` under the write
+  face's own `GROUP_DESCRIPTION_MAX_BYTES = 4096` **whole-value budget** —
+  trimmed, non-empty, and only when it fits whole: an over-budget
+  description drops the key entirely rather than truncating into a lie
+  (the 1.67 label discipline). Both capture paths ride it (the contacts
+  sync and the §4.167 single-group resync run the same function). The
+  captured value is cache material like the roster — it never enters any
+  log (the no-content-logs discipline).
+- `groups.get` projects the optional `description`, re-checking the
+  whole-value budget at read (a row written by a future wider budget must
+  not smuggle an over-budget value past the face; a malformed stored value
+  drops, never fails the read — the linkAccess discipline). Absent stays
+  absent for every honest reason: pre-1.188 rows, engines without the
+  face, and groups with no description — the desktop keeps its honest
+  unsynced placeholder, never an invented empty-known state.
+
+**The description write key stays refused.** The adjacent observation from
+the same verification: `groups.update groupDescription` (validated at
+1-4096 bytes, §4.44) still answers whole-call CAPABILITY_UNAVAILABLE
+because the engine's `updateGroup` write face carries no description arm —
+`GroupUpdateWrite` on the pushed engine line carries
+expiration/title/avatar/member arrays/link-access/link-password/
+announcements-only, no description. Recorded gap: the day the engine grows
+the arm, the un-refusal is a same-discipline follow-up (fold `description`
+verbatim under the shared budget, one line in the refusal map retires);
+until then the refusal is the honest answer, and the read arm above is
+what converges descriptions edited on other devices (the engine's group
+change rows already carry `{type: description}` detail for the receive
+projection).
+
+Wire additive: one optional read key on `groups.get`, one existing write
+key un-refused on `groups.update`; zero new methods, events, error codes,
+store moves, or capability bits. Schema: the `groups.get` description
+chain gains the `description` key semantics; the `groups.update`
+description rewrites the refusal inventory (the send-messages fold beside
+the 1.180 resetLink fold, the remaining permission pair named). Tests
+(additive): `groups_update_announcements_only_folds_onto_engine_face`
+(the two words folding to the engine bool, the remaining pair's refusal
+naming the host vocabulary, the invalid-word INVALID_REQUEST outranking
+the fold), `group_extra_json_captures_the_bounded_roster` extended (the
+description captured under budget, over-budget dropped not truncated,
+blank dropped, the pinned signal-cli shape never setting the key), and
+`get_group_projects_the_cached_group_row` extended (the wire projection
+camelCase, the read-side budget re-check, pre-1.188 and malformed rows
+absent), and the integration arm in
+`groups_update_quit_round_trip_and_guards` (the two permission words
+dispatching as the engine's `announcementsOnly` true/false with the host
+permission words never reaching the wire, the mixed refusal set still
+dispatching nothing, and the quit-dispatch filter excluding the new fold
+key the way it excludes the 1.180 password).
 
 ## 5. signal-cli Boundary
 

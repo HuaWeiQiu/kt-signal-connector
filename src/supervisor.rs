@@ -7865,6 +7865,14 @@ fn fold_invite_candidates(
 /// recorded when the upstream `JsonGroup` carries it (the §4.50 verified read
 /// source; false and absent collapse to absent, the same informative-keys
 /// discipline as `admin` — the read projection answers the default false).
+/// `description` (contract 1.188, §4.188) is the engine `listGroups` entry's
+/// decrypted group description under the write face's own
+/// [`crate::service::GROUP_DESCRIPTION_MAX_BYTES`] budget — trimmed,
+/// non-empty, and only
+/// when it fits whole (the label discipline: an over-budget description
+/// drops rather than truncating into a lie); engines without the face (the
+/// pinned signal-cli JsonGroup) never set the key, and the captured value
+/// is cache material only, never logged.
 fn group_extra_json(members: &[Value], group: &Value) -> String {
     let admin_ids: std::collections::BTreeSet<String> = group
         .get("admins")
@@ -7951,6 +7959,22 @@ fn group_extra_json(members: &[Value], group: &Value) -> String {
     // without it keeps the key absent (unknown, never a guessed false).
     if let Some(flag) = group.get("announcementsOnly").and_then(Value::as_bool) {
         extra.insert("announcementsOnly".to_string(), json!(flag));
+    }
+    // Contract 1.188 (§4.188): the engine's decrypted group description
+    // under the write face's own whole-value budget — the label
+    // discipline: an over-budget description drops the key rather than
+    // truncating into a lie. Engines without the face (the pinned
+    // signal-cli JsonGroup) never set the key; the captured value is
+    // cache material only, never logged.
+    if let Some(description) = group
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= crate::service::GROUP_DESCRIPTION_MAX_BYTES
+        })
+    {
+        extra.insert("description".to_string(), json!(description));
     }
     Value::Object(extra).to_string()
 }
@@ -10877,6 +10901,56 @@ mod tests {
         ))
         .unwrap();
         assert!(malformed_flag.get("announcementsOnly").is_none());
+
+        // Contract 1.188 (§4.188): the engine's decrypted group description
+        // rides the sync capture under the write face's whole-value budget —
+        // an over-budget description drops the key whole (never a truncated
+        // lie), blank drops, a non-string drops, and the pinned signal-cli
+        // JsonGroup shape (no description key — every earlier block above)
+        // never sets it.
+        let described = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true, "description": "周五晚上聚餐，地点老地方"}),
+        ))
+        .unwrap();
+        assert_eq!(
+            described["description"],
+            serde_json::json!("周五晚上聚餐，地点老地方")
+        );
+        // Trim lands, blank never does.
+        let padded = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true, "description": "  spaced  "}),
+        ))
+        .unwrap();
+        assert_eq!(padded["description"], serde_json::json!("spaced"));
+        let blank = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true, "description": "   "}),
+        ))
+        .unwrap();
+        assert!(blank.get("description").is_none());
+        // The budget boundary: exactly 4096 bytes lands, 4097 drops whole.
+        let at_budget = "d".repeat(crate::service::GROUP_DESCRIPTION_MAX_BYTES);
+        let over_budget = "d".repeat(crate::service::GROUP_DESCRIPTION_MAX_BYTES + 1);
+        let fits = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true, "description": at_budget.clone()}),
+        ))
+        .unwrap();
+        assert_eq!(fits["description"], serde_json::json!(at_budget));
+        let drops = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true, "description": over_budget}),
+        ))
+        .unwrap();
+        assert!(drops.get("description").is_none());
+        let malformed_description = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true, "description": 7}),
+        ))
+        .unwrap();
+        assert!(malformed_description.get("description").is_none());
     }
 
     #[test]
