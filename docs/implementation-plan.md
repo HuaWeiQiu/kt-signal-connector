@@ -5,6 +5,23 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.183 (2026-10-19; §4.183 the inbound attachment filename
+  rides verbatim: the audit convicted the connector's inbound arm for rewriting
+  the sender's filename to a 128-byte budget — a real-name truncation (255
+  UTF-16-unit filesystem names reach 1020 UTF-8 bytes) that broke the official
+  passthrough semantics. The receive face now carries the name verbatim
+  (long names, Unicode, spaces, multi-extensions) through the official's own
+  filter family only: path components flatten (basename, both separators,
+  official `attachments.preload.ts:257` save-layer posture pulled to the
+  connector face) with `.`/`..`/flatten-to-nothing answering key absence, and
+  the official schema-v9 bidi-control set maps to U+FFFD
+  (`Attachment.std.ts:123-143` `replaceUnicodeV2`; the official ingest itself
+  is verbatim, `processDataMessage.preload.ts:128`) — no C0 sweep, no
+  extension verdict, and the length rewrite retired in favor of a
+  filesystem-scale 1024-byte clamp that only hostile oversized faces can
+  reach. The quote face and the §4.38 import arm share the one posture.
+  Revision 1.182 is the conversation-delete-sync batch's; this batch continues
+  the merge sequence, no gap.)
 - Contract revision: 1.181 (2026-10-18; §4.181 the supply-batch contract for
   the desktop's auxiliary batch B (ledger §10): four connector-side landings —
   the receive-path mention self-match now also folds the account ACI (the
@@ -15648,6 +15665,78 @@ account total repaired), `local_only_conversation_delete_keeps_the_server_side_s
 false, store unchanged), and
 `conversation_delete_sync_ignores_unresolvable_identities` (an unknown
 identity drops nothing and forwards unenriched).
+
+### 4.183 The inbound attachment filename rides verbatim: the official's own filters only, the 128-byte rewrite retired (contract revision 1.183, 2026-10-19)
+
+The inbound-arm audit convicted the connector's receive face: both filename
+arms — the message attachment descriptor (§4.13) and the quoted-attachment
+entry (§4.81 D4) — rewrote the sender's name through
+`truncate_utf8_bytes(…, 128)`. The budget truncated real names (a legal
+255-UTF-16-unit filesystem component reaches 1020 UTF-8 bytes, so CJK-heavy
+names lost half to two-thirds of themselves at 128) and broke the official
+passthrough semantics: the protocol layer carries the sender's filename as
+sent and every consumer-side adjustment happens above it.
+
+Official anchors (upstream Signal-Desktop, read-only, AGPL — semantics
+only): `ts/textsecure/processDataMessage.preload.ts:128` — the ingest is
+`fileName: fileName ?? undefined`, byte-verbatim, no length rule and no
+rewriting (the quote face `:236` is the same `?? ''` passthrough;
+`ATTACHMENT_MAX = 32` bounds entries, not name shape). The official's own
+filename filters live elsewhere: `ts/util/Attachment.std.ts:123-143`
+(`replaceUnicodeV2`, message schema v9 — `ts/types/Message2.preload.ts:513`)
+maps the bidi-override controls U+202A–U+202E, U+2066–U+2069, U+200E, U+200F,
+U+061C to U+FFFD and nothing else (no C0/C1 sweep); the sender's name never
+becomes a receive-side disk path (`ts/util/attachmentPath.node.ts:24-26`
+stores bytes under generated 64-hex names); at save time
+`getSuggestedFilename` returns `fileName` verbatim when present
+(`ts/util/Attachment.std.ts:647-652`) and the disk write joins
+`basename(name)` (`ts/windows/main/attachments.preload.ts:257`) with
+`getUnusedFilename` deduping; `isFileDangerous` is a save-time UI warning,
+not a protocol filter. Overlong names are never truncated in the pipeline —
+render truncation is CSS and saving goes through the dialog — so the
+overlong-name policy is a desktop render/save-layer concern, not a protocol
+one; the connector lifts whatever arrived. The engine is verbatim too
+(`project_attachment_pointer`: `pointer.file_name` straight to the wire
+JSON) — the connector's 128-byte budget was the chain's only rewriter.
+
+The receive face now runs one shared sanitizer,
+`engine::sanitize_inbound_filename` (§4.183), on every filename arm:
+
+- **Verbatim through the official filter family only.** Path components
+  flatten with basename semantics on both separators (the official
+  save-layer posture pulled to the connector face — the connector never
+  exposes arbitrary file paths, so the host face cannot carry a path
+  fragment at all); a name that flattens to nothing, `.`, or `..` answers
+  key absence (never a made-up or half-safe name). The official bidi set
+  maps to U+FFFD char-for-char. Everything else rides byte-exact: long
+  names, Unicode, spaces, tabs/newlines, leading and trailing dots,
+  multi-extensions, and the `isFileDangerous` extension family — filtering
+  beyond the official family would rewrite names the official renders as
+  sent.
+- **The length rewrite is retired.** The clamp moves to
+  `MAX_ATTACHMENT_FILENAME_BYTES = 1024` — boundedness insurance at
+  filesystem-name scale (the 255-UTF-16-unit per-component cap's UTF-8
+  worst case), reachable only by a hostile oversized face, never by a real
+  sender's name. The receive-queue budget stays honest:
+  `estimated_bytes` counts the filename verbatim (§4.13 queue discipline).
+- **Arms covered.** The live message attachment parse and the sent-sync
+  echo share the one `normalized_attachment` parser; the quote attachment
+  entry (and its thumbnail, which rides the same parser) shares it too;
+  and the §4.38 history-import arm — whose `fileName` read was already
+  verbatim — now runs the same sanitizer, so a hostile archive line gets
+  the identical face. The §4.12/1.66 outbound send-descriptor budget
+  (1–128 bytes, no separators/controls, the caller's own composition face)
+  is a different surface and stays untouched; the wire schema describes the
+  inbound descriptor's shape, not bounds, and needs no change.
+
+Tests (additive): `inbound_filename_rides_verbatim_and_official_filters_only`
+(the 637-byte CJK name byte-exact where the old budget kept a quarter; the
+flatten family both separators; `.`/`..`/`dir/..`/`/` absent; `...`/`..a`
+legal; the bidi set to U+FFFD; newline/tab/`.vbs` riding untouched; the
+ASCII and CJK clamp on a char boundary; the quote face sharing the parser)
+and `imported_filename_shares_the_inbound_posture` (the archive arm: the
+long name verbatim, the traversal name flattened, the bidi name replaced,
+the pure-traversal name absent).
 
 ## 5. signal-cli Boundary
 
