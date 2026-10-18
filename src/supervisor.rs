@@ -10430,6 +10430,7 @@ mod tests {
                 expire_start_at: None,
                 control: None,
                 server_guid: None,
+                reporting_token: None,
                 server_timestamp: None,
             })
             .await

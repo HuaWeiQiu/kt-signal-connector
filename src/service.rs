@@ -4462,6 +4462,19 @@ impl ConnectorService {
             })
             .collect::<Vec<_>>();
         upstream["serverGuids"] = json!(pairs.iter().map(|(_, guid)| guid).collect::<Vec<_>>());
+        // The spam-report token (reportSpam data plane, official
+        // `addReportSpamJob` reads `conversation.reportingToken` the same
+        // way): the conversation's latest envelope-borne token rides the
+        // upstream POST body when one was ever captured. Absent when no
+        // envelope carried one or the row predates the column — the engine
+        // treats the key as optional (the official `jsonData={token}` with
+        // undefined serializes to `{}`), so the report still rides.
+        if let Some(token) = self
+            .store
+            .conversation_report_token(&account.id, &conversation.id)?
+        {
+            upstream["token"] = json!(token);
+        }
         Ok(PreparedReportSpam { upstream, pairs })
     }
 
@@ -7701,12 +7714,25 @@ impl ConnectorService {
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
     ) -> Result<PreparedReceipts, ServiceError> {
-        self.prepare_receipt(
+        let prepared = self.prepare_receipt(
             account_id,
             conversation_id,
             message_ids,
             ReceiptResupply::UnissuedRead,
-        )
+        )?;
+        // The read-position watermark's local-first advance (B-27, 水位制):
+        // the official markConversationRead flips local read state before
+        // any receipt rides, so the stamp lands at prepare time and never
+        // waits for the fan-out's confirmation. Best-effort — a store hiccup
+        // costs the durable divider re-derivation once, never the receipt
+        // legs themselves.
+        if let Err(error) = self
+            .store
+            .advance_read_watermark_latest(account_id, conversation_id)
+        {
+            tracing::warn!(error_class = error.class(), "read watermark advance failed");
+        }
+        Ok(prepared)
     }
 
     /// messages.markViewed: identical addressing, selection, and grouping,
@@ -7753,12 +7779,25 @@ impl ConnectorService {
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
     ) -> Result<PreparedReceipts, ServiceError> {
-        self.prepare_receipt(
+        let prepared = self.prepare_receipt(
             account_id,
             conversation_id,
             message_ids,
             ReceiptResupply::Any,
-        )
+        )?;
+        // The same local-first watermark advance as the peer leg (B-27): the
+        // sync leg is what fires on EVERY true read (the desktop's
+        // read-receipts flag never gates it), so this is the watermark's
+        // primary write seam — the §4.89 "zero local writes" discipline gains
+        // exactly this one deliberate exception, the read-position authority
+        // the 水位制 ruling stores here.
+        if let Err(error) = self
+            .store
+            .advance_read_watermark_latest(account_id, conversation_id)
+        {
+            tracing::warn!(error_class = error.class(), "read watermark advance failed");
+        }
+        Ok(prepared)
     }
 
     /// messages.syncViewed (contract revision 1.108, §4.89): identical
@@ -9130,6 +9169,17 @@ impl ConnectorService {
         {
             self.store
                 .set_conversation_title(&conversation.id, group_name)?;
+        }
+        // The spam-report token's conversation landing (reportSpam data
+        // plane): official `updateReportingToken` keeps the LATEST token on
+        // the conversation — every envelope carrying one overwrites, absent
+        // never clears. A store hiccup costs only the token until the next
+        // token-bearing envelope re-lands it; a report without a token still
+        // rides (the engine treats the body key as optional, the official
+        // `jsonData={token}` with undefined → `{}`).
+        if let Some(token) = receive.reporting_token.as_deref() {
+            self.store
+                .store_conversation_report_token(&account.id, &conversation.id, token)?;
         }
         let mut message = MessageRecord {
             id: message_id,
@@ -11106,6 +11156,19 @@ impl ConnectorService {
             if !read_ids.is_empty() {
                 self.store
                     .stamp_incoming_read(&account.id, &conversation.id, &read_ids, when)?;
+                // The read-position watermark's remote-read advance (B-27,
+                // 水位制): reading on another linked device is a true read —
+                // the synced rows' newest sent_at folds into the watermark
+                // with the same monotonic max discipline as the local legs,
+                // so the desktop's restart re-derivation converges with the
+                // remote device instead of resurrecting its divider.
+                if let Some(newest) = read_rows.iter().map(|row| row.sent_at).max()
+                    && let Err(error) =
+                        self.store
+                            .advance_read_watermark_to(&account.id, &conversation.id, newest)
+                {
+                    tracing::warn!(error_class = error.class(), "read watermark advance failed");
+                }
                 for record in read_rows.iter().filter(|record| record.read_at.is_none()) {
                     events.push(HostSideEvent::MessageStatusChanged {
                         account_id: record.account_id.clone(),
@@ -18896,6 +18959,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -18970,6 +19034,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -20594,6 +20659,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         service
@@ -20735,6 +20801,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
 
@@ -20809,6 +20876,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         assert!(
@@ -20851,6 +20919,7 @@ mod tests {
             text: Some("好的".into()),
             text_bytes: Some(6),
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
             ..receive
         };
@@ -20918,6 +20987,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 }
             };
@@ -21070,6 +21140,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         assert!(
@@ -21099,6 +21170,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         assert!(
@@ -21220,6 +21292,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
 
@@ -21523,6 +21596,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -21744,6 +21818,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -21951,6 +22026,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -22078,6 +22154,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -22219,6 +22296,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -22870,6 +22948,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -23022,6 +23101,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -23207,6 +23287,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -23749,6 +23830,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -27712,6 +27794,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let events = service
@@ -27775,6 +27858,7 @@ mod tests {
                 expire_seconds: None,
                 expire_start_at: None,
                 server_guid: None,
+                reporting_token: None,
                 server_timestamp: None,
             }
         };
@@ -29475,6 +29559,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let story_reply_receive = crate::engine::NormalizedReceive {
@@ -29504,6 +29589,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
 
@@ -30028,6 +30114,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let events = service
@@ -30314,6 +30401,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let events = service
@@ -31291,6 +31379,7 @@ mod tests {
             expire_start_at: None,
             control: Some(control),
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         }
     }
@@ -31509,6 +31598,278 @@ mod tests {
         assert!(
             events.is_empty(),
             "an unknown sender stays silent: {events:?}"
+        );
+    }
+
+    /// §4.186 (B-27, the 水位制 ruling): both read legs advance the
+    /// read-position watermark local-first at prepare time — the official
+    /// markConversationRead flips local read state before any receipt rides,
+    /// so the stamp never waits for the fan-out's confirmation. The stamp is
+    /// the conversation's NEWEST incoming row's sent_at (the read legs are
+    /// whole-conversation reads in the KT flow), and the fold is monotonic.
+    #[test]
+    fn read_legs_advance_the_watermark_local_first() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        let watermark = || {
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .read_watermark_ms
+        };
+        assert_eq!(watermark(), None, "pre-ledger absence is the honest state");
+
+        let seed = |id: &str, direction: &'static str, sent_at: u64| {
+            let record = expire_record_fixture(&account.id, &conversation.id, id);
+            let mut record = record;
+            record.direction = direction;
+            record.sent_at = sent_at;
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, None, true)
+                    .unwrap()
+            );
+        };
+        seed("m-in", "incoming", 10);
+        seed("m-in-2", "incoming", 30);
+        seed("m-out", "outgoing", 40);
+
+        // messages.markRead prepare: stamps to the newest INCOMING row.
+        service
+            .prepare_mark_read(&account.id, &conversation.id, None)
+            .unwrap();
+        assert_eq!(watermark(), Some(30));
+
+        // messages.syncRead prepare: same fold, never rewinds below 30 even
+        // when the selection addresses only the older row.
+        service
+            .prepare_sync_read(&account.id, &conversation.id, Some(vec!["m-in".into()]))
+            .unwrap();
+        assert_eq!(watermark(), Some(30));
+    }
+
+    /// §4.186 (B-27): the remote read-sync receive folds the MATCHED rows'
+    /// newest sent_at into the watermark — reading on another linked device
+    /// is a true read and the desktop's restart re-derivation converges with
+    /// the remote device instead of resurrecting its divider. A timestamp
+    /// that names no local row folds nothing (conservative: honest unread
+    /// beats a silent read).
+    #[test]
+    fn remote_read_sync_folds_the_watermark() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        const ACI: &str = "11111111-1111-1111-1111-111111111111";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, ACI, &conversation.peer_key)
+            .unwrap();
+
+        let seed = |id: &str, sent_at: u64| {
+            let mut record = expire_record_fixture(&account.id, &conversation.id, id);
+            record.sent_at = sent_at;
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, None, true)
+                    .unwrap()
+            );
+        };
+        seed("m1", 10);
+        seed("m2", 20);
+
+        let watermark = |svc: &ConnectorService| {
+            svc.store_ref()
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .read_watermark_ms
+        };
+
+        let mut receive = control_receive(
+            "+15555550100",
+            "+15555550100",
+            ControlReceive::SyncReadState {
+                read: vec![crate::engine::SyncReadEntry {
+                    sender_uuid: ACI.into(),
+                    sender_number: None,
+                    timestamp: 10,
+                }],
+                viewed: Vec::new(),
+            },
+        );
+        receive.source = None;
+        receive.source_uuid = None;
+        service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(watermark(&service), Some(10));
+
+        // The row-less timestamp (999) folds nothing; the m2 match folds 20.
+        let mut receive = control_receive(
+            "+15555550100",
+            "+15555550100",
+            ControlReceive::SyncReadState {
+                read: vec![crate::engine::SyncReadEntry {
+                    sender_uuid: ACI.into(),
+                    sender_number: None,
+                    timestamp: 20,
+                }],
+                viewed: Vec::new(),
+            },
+        );
+        receive.source = None;
+        receive.source_uuid = None;
+        service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(watermark(&service), Some(20));
+    }
+
+    /// §4.186 (the reportSpam data plane): the conversation's stored
+    /// envelope-borne reporting token rides the upstream POST body — the
+    /// official addReportSpamJob reads conversation.reportingToken the same
+    /// way. Absent token = the key stays absent (the official
+    /// jsonData={token} with undefined serializes to {}).
+    #[test]
+    fn report_spam_body_carries_the_conversation_reporting_token() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let aci = "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10";
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", aci, "Peer")
+            .unwrap();
+
+        let mut guided = expire_record_fixture(&account.id, &direct.id, "m1");
+        guided.server_guid = Some("guid-1".into());
+        service
+            .store_ref()
+            .insert_message(&guided, None, None, true)
+            .unwrap();
+
+        // No envelope ever carried a token: the body rides without the key.
+        let params = |conversation_id: String| MessagesReportSpamParams {
+            account_id: account.id.clone(),
+            conversation_id,
+            message_ids: vec!["m1".into()],
+        };
+        let prepared = service
+            .prepare_report_spam(&params(direct.id.clone()))
+            .unwrap();
+        assert!(prepared.upstream.get("token").is_none());
+        assert_eq!(
+            prepared.upstream["serverGuids"],
+            serde_json::json!(["guid-1"])
+        );
+
+        // The latest token-bearing envelope landed on the conversation: the
+        // report attaches it verbatim.
+        service
+            .store_ref()
+            .store_conversation_report_token(&account.id, &direct.id, "dG9rZW4tYWJj")
+            .unwrap();
+        let prepared = service
+            .prepare_report_spam(&params(direct.id.clone()))
+            .unwrap();
+        assert_eq!(
+            prepared.upstream["token"],
+            serde_json::json!("dG9rZW4tYWJj")
+        );
+    }
+
+    /// §4.186 (the reportSpam data plane): every envelope carrying
+    /// reportingToken lands latest-wins on the conversation at ingest — the
+    /// official conversation.reportingToken shape; a token-less envelope
+    /// never clears the stored copy.
+    #[test]
+    fn receive_lands_the_reporting_token_latest_wins() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+
+        let receive = |token: Option<&str>, timestamp: u64| NormalizedReceive {
+            timestamp: Some(timestamp),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: Some("Peer".into()),
+            group_id: None,
+            text: Some("hi".into()),
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            reporting_token: token.map(str::to_owned),
+            server_timestamp: None,
+        };
+
+        let first = service
+            .ingest_receive(receive(Some("token-a"), 10), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation_id = first
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message.conversation_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            service
+                .store_ref()
+                .conversation_report_token(&account.id, &conversation_id)
+                .unwrap()
+                .as_deref(),
+            Some("token-a")
+        );
+
+        // Latest-wins: the next token-bearing envelope overwrites.
+        service
+            .ingest_receive(receive(Some("token-b"), 20), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(
+            service
+                .store_ref()
+                .conversation_report_token(&account.id, &conversation_id)
+                .unwrap()
+                .as_deref(),
+            Some("token-b")
+        );
+
+        // A token-less envelope never clears the stored copy.
+        service
+            .ingest_receive(receive(None, 30), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(
+            service
+                .store_ref()
+                .conversation_report_token(&account.id, &conversation_id)
+                .unwrap()
+                .as_deref(),
+            Some("token-b")
         );
     }
 
@@ -33870,6 +34231,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         service
@@ -33937,6 +34299,7 @@ mod tests {
                 expire_start_at: None,
                 control: None,
                 server_guid: None,
+                reporting_token: None,
                 server_timestamp: None,
             };
             service
@@ -34064,6 +34427,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         service
@@ -34138,6 +34502,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         service
@@ -34251,6 +34616,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let landed = service
@@ -34385,6 +34751,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let events = service
@@ -34454,6 +34821,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let landed = service
@@ -34539,6 +34907,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         service
@@ -34621,6 +34990,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let events = service
@@ -34709,6 +35079,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let events = service
@@ -34794,6 +35165,7 @@ mod tests {
                 expire_start_at: None,
                 control: None,
                 server_guid: None,
+                reporting_token: None,
                 server_timestamp: None,
             };
             service
@@ -35020,6 +35392,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -35246,6 +35619,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         service
@@ -35392,6 +35766,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         service
@@ -35481,6 +35856,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         service
@@ -35574,6 +35950,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let events = service
@@ -35663,6 +36040,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let events = service
@@ -35748,6 +36126,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let events = service
@@ -36516,6 +36895,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let events = service
@@ -36567,6 +36947,7 @@ mod tests {
             text: Some("已更新消息定时消失：已关闭".into()),
             expire_seconds: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
             ..timer_change
         };
@@ -37874,6 +38255,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
         let events = service
@@ -37913,6 +38295,7 @@ mod tests {
                 ..Default::default()
             }),
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
             ..group_update.clone()
         };
@@ -37946,6 +38329,7 @@ mod tests {
                 ..Default::default()
             }),
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
             ..group_update
         };
@@ -38003,6 +38387,7 @@ mod tests {
             source: None,
             source_uuid: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
             peer_name: None,
             group_id: Some("group-id-1".into()),
@@ -38177,6 +38562,7 @@ mod tests {
             source: None,
             source_uuid: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
             peer_name: None,
             group_id: Some("group-id-1".into()),
@@ -38391,6 +38777,7 @@ mod tests {
                     source: None,
                     source_uuid: None,
                     server_guid: None,
+                    reporting_token: None,
                     server_timestamp: None,
                     peer_name: None,
                     group_id: Some("dW5rbm93bi1ncm91cA==".into()),
@@ -38451,6 +38838,7 @@ mod tests {
             source: None,
             source_uuid: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
             peer_name: None,
             group_id: None,
@@ -38734,6 +39122,7 @@ mod tests {
             source: None,
             source_uuid: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
             peer_name: None,
             group_id: None,

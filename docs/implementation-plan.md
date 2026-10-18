@@ -5,6 +5,22 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.186 (2026-10-18; §4.186 the authoritative
+  read-position watermark and the spam-report token: schema v28 adds the
+  nullable `read_watermark_ms` and `report_spam_token` conversation
+  columns. The watermark (sent_at basis, a row is unread iff incoming
+  with `sent_at > watermark`) advances local-first at both read legs'
+  prepare (`messages.markRead` / `messages.syncRead` — the §4.89
+  zero-local-writes discipline's one deliberate exception) and folds the
+  matched rows on the §4.81 remote read-sync receive; the view path
+  never advances it. `ConversationSummary` projects the optional
+  `readWatermarkMs` key. The reportSpam data plane closes: the receive
+  envelope's engine-projected `reportingToken` lands latest-wins on the
+  conversation (128-char whole-value budget, over-bound folds to None —
+  a credential is never truncated) and `messages.reportSpam` attaches it
+  to the upstream POST body (absent token = absent key, the official
+  `jsonData={token}` with undefined). Desktop contract 1.186 lands in
+  the kt-desktop read-ledger batch; no engine change.)
 - Contract revision: 1.185 (2026-10-19; §4.185 the media-story caption leg
   on `messages.sendStory`: the connector half of the engine's sendStory
   caption batch (engine `48e69a2`, already on the engine mainline) — the
@@ -15877,6 +15893,83 @@ forwarding ungated) and the integration arm
 engine's sendStory arm echoing the caption in-cap-out through the 1.161
 pointer stub — the frame-level forward and the answer-level ride proving
 both directions of the caption chain through the connector).
+
+### 4.186 The authoritative read-position watermark and the spam-report token: `readWatermarkMs` rides the conversation row, both read legs advance it local-first, and the report face attaches the envelope-borne token (contract revision 1.186, 2026-10-18)
+
+The desktop's B-27 batch convicted a persistence gap: with the
+read-receipts flag off (the default) the connector had no durable
+"read up to here" anywhere — `messages.syncRead` writes nothing locally
+(the §4.89 discipline), `messages.list` clears the badge counter on
+first view (the §4.81 coarse-count cost), and the desktop's in-memory
+1666 divider anchor dies at restart. The official client flips per-row
+read state at `markConversationRead` time in one watermark-batched SQL
+transaction (rows with `received_at` ≤ the read message's watermark all
+flip); the user's 水位制 ruling stores the equivalent single watermark
+on the conversation row instead of per-row state.
+
+Schema v28 adds two nullable conversation columns:
+
+- `read_watermark_ms` — epoch-ms `sent_at` of the newest incoming row
+  this account has truly read. Semantics: a row is unread iff it is
+  incoming with `sent_at > watermark`. Write seams (exactly three,
+  all monotonic max-fold, never lowered):
+  - `messages.markRead` / `messages.syncRead` prepare stamps it to the
+    conversation's newest incoming row's `sent_at` **before** the
+    receipt fan-out (local-first — the official flip precedes the
+    receipt too; a store hiccup is logged and costs the durable
+    re-derivation once, never the receipt legs). This is the §4.89
+    "zero local writes" discipline's one deliberate exception: the
+    read-position authority the ruling stores here.
+  - The §4.81 remote read-sync receive folds the MATCHED rows' newest
+    `sent_at` (reading on another linked device is a true read; a
+    timestamp naming no local row folds nothing — honest unread beats
+    a silent read).
+  - The view path (`messages.list`) never advances it — viewing clears
+    only the badge counter, exactly the gap this column exists to close.
+  Pre-existing rows stay NULL: absence is the honest "no authoritative
+  read position" and the desktop keeps its legacy behavior (never
+  invents a watermark). A whole-conversation read with zero incoming
+  rows leaves the watermark untouched (no newest row = no position to
+  claim; NULL is never coerced to 0).
+- `report_spam_token` — the conversation's LATEST envelope-borne
+  spam-report token (the official `conversation.reportingToken` shape:
+  the envelope's `reportSpamToken` rides `Bytes.isNotEmpty`-gated onto
+  the conversation at receive, latest-wins; a token-less envelope never
+  clears it). The engine already projects the receive envelope's base64
+  `reportingToken`; the connector captures it trimmed under the 128-char
+  opaqueId-family whole-value budget — an over-bound token folds to
+  `None` rather than truncating a credential (a corrupted token would
+  mis-address the upstream report). `messages.reportSpam` attaches the
+  stored token to the upstream `reportSpam` POST body verbatim
+  (`token` key); absent token = the key stays absent, matching the
+  official `jsonData={token}` with undefined serializing to `{}`.
+
+`ConversationSummary` gains the optional camelCase `readWatermarkMs`
+key (absent-when-None wire; pre-1.186 hosts read byte-identical
+shapes). The official anchors for both faces live in desktop contract
+1.186 (markConversationRead.preload.ts:36-101, Server.node.ts:8982-8990
+LIMIT 3 / 6326-6401, MessageReceiver.preload.ts:468-471,
+addReportSpamJob.dom.ts:24-38, WebAPI.preload.ts:2685-2698). The
+engine changes nothing this revision — the `reportSpam` token param and
+the receive-envelope `reportingToken` projection landed in earlier
+batches.
+
+Tests: `read_watermark_advances_to_newest_incoming_and_never_rewinds`
+(absent pre-ledger state, all-outgoing no-claim, newest-incoming stamp
+below an outgoing row, the monotonic fold both legs),
+`report_spam_token_lands_latest_wins_and_absent_never_clears`,
+`read_legs_advance_the_watermark_local_first` (markRead + syncRead
+prepare, older-row addressing still stamps the newest position),
+`remote_read_sync_folds_the_watermark` (matched fold, row-less
+timestamp folds nothing),
+`report_spam_body_carries_the_conversation_reporting_token` (absent
+key vs verbatim attach),
+`receive_lands_the_reporting_token_latest_wins` (latest-wins,
+token-less never clears), plus the engine-side capture quadruple
+(`receive_captures_reporting_token`: trim / absent / blank /
+over-bound). The desktop half (signalReadLedger derivation module, the
+selectConversation restart arm, the cap-3 report alignment, desktop
+contract 1.186) lands in the kt-desktop read-ledger batch.
 
 ## 5. signal-cli Boundary
 
