@@ -8082,6 +8082,63 @@ impl ConnectorService {
         })
     }
 
+    /// attachments.requestBackfill (contract revision 1.175, §4.175) — the
+    /// request half of the official attachment-backfill loop: the desktop
+    /// hit an honest media miss (`attachments.download`'s no-pointer face)
+    /// and asks the primary device for fresh transit pointers. Same row
+    /// addressing as `attachments.download`; the resolution derives the
+    /// official target triple — the conversation identity (direct peer key
+    /// or group master key) and the addressable message (author = the
+    /// row's sender, the account's own number for outgoing rows; sent stamp
+    /// = the row's upstream `sent_at`). Everything is validated before any
+    /// engine traffic: the id ladder, the row's direction-agnostic
+    /// presence, and a positive upstream stamp (a 0-stamp row never went
+    /// upstream and cannot be backfilled). The engine's
+    /// `requestAttachmentBackfill` carries the protocol half; the response
+    /// arrives as the `syncMessage.attachmentBackfillResponse` consume arm
+    /// and merges the fresh pointers into this row's live-locator column.
+    pub fn prepare_request_attachment_backfill(
+        &self,
+        params: &AttachmentBackfillRequestParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        validate_opaque_id(&params.conversation_id, "conversationId")?;
+        validate_opaque_id(&params.message_id, "messageId")?;
+        let (account, conversation, message) = self.resolve_target(
+            &params.account_id,
+            &params.conversation_id,
+            &params.message_id,
+        )?;
+        if message.sent_at == 0 {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "message has no upstream timestamp to backfill",
+                false,
+            )));
+        }
+        let author = match message.direction {
+            "outgoing" => account.signal_account.clone(),
+            _ => {
+                if message.sender_id.is_empty() {
+                    conversation.peer_key.clone()
+                } else {
+                    message.sender_id.clone()
+                }
+            }
+        };
+        let mut prepared = json!({
+            "account": account.signal_account,
+            "author": author,
+            "sentTimestamp": message.sent_at,
+        });
+        if conversation.kind == "group" {
+            prepared["groupId"] = json!(conversation.peer_key);
+        } else {
+            prepared["recipient"] = json!(conversation.peer_key);
+        }
+        Ok(prepared)
+    }
+
     /// The pointer face behind one descriptor index (contract revision 1.61,
     /// §4.54): the live-receive column first (schema 19 — an engine that
     /// projects receive locators fills it), then the schema-18 import column
@@ -8898,6 +8955,22 @@ impl ConnectorService {
             self.store
                 .insert_message(&message, None, preview.as_deref(), increment_unread)?;
         if !inserted {
+            // Contract revision 1.175 (§4.175): the row already exists — the
+            // optimistic outgoing row predates its sent-sync echo, and
+            // `INSERT OR IGNORE` dropped the echo's transit locator faces.
+            // Merge them into the existing row's empty live-locator slots so
+            // the outgoing echo's pointer face becomes downloadable (the
+            // first face wins; a row the receive arm already stored locators
+            // for is never moved).
+            self.store.merge_live_attachment_locators(
+                &account.id,
+                &message.id,
+                &message
+                    .attachments
+                    .iter()
+                    .map(|descriptor| descriptor.locator.clone())
+                    .collect::<Vec<_>>(),
+            )?;
             return Ok(Vec::new());
         }
         // §4.91: the row just landed — apply any edit/remoteDelete that
@@ -9357,6 +9430,16 @@ impl ConnectorService {
         // same interception family as the verified/call-event siblings above.
         if let ControlReceive::SyncContacts { contacts } = &control {
             return self.apply_sync_contacts(&account, contacts);
+        }
+        // Contract 1.175 (§4.175): the backfill-response sync addresses its
+        // own target (the face carries its conversation identity), never an
+        // envelope source (the envelope is our own account) — the same
+        // interception family as the verified/call-event siblings above. The
+        // pointer faces merge into the target row's empty live-locator slots
+        // only; the error arm and status entries change nothing (the
+        // official keep-as-is posture).
+        if let ControlReceive::SyncAttachmentBackfillResponse { response } = &control {
+            return self.apply_sync_attachment_backfill_response(&account, response);
         }
         // Contract 1.140 (§4.136 consume arm): the blocked sync addresses its
         // own subjects (the identities carry themselves), never an envelope
@@ -10495,12 +10578,117 @@ impl ConnectorService {
             // identities name their own subjects); this arm is the same
             // unreachable-in-practice guard.
             ControlReceive::SyncBlocked { .. } => Ok(Vec::new()),
+            // The §4.175 backfill-response sync is intercepted the same way
+            // (its target names its own conversation); this arm is the same
+            // unreachable-in-practice guard.
+            ControlReceive::SyncAttachmentBackfillResponse { .. } => Ok(Vec::new()),
             // The §4.117 conversation-less transient family is intercepted
             // before the ladder like the story face; these arms are the same
             // unreachable-in-practice guards.
             ControlReceive::GroupTerminated { .. }
             | ControlReceive::ContactProfileUpdated { .. } => Ok(Vec::new()),
         }
+    }
+
+    /// Consume the attachment-backfill response sync (contract revision
+    /// 1.175, §4.175): the primary device answered our
+    /// `requestAttachmentBackfill` with fresh transit pointers. The target's
+    /// conversation resolves through the message-request-response ladder
+    /// family (group leg keys directly; the service-id/e164 leg walks the
+    /// ACI→peer-key candidates); the row resolves by its upstream sent
+    /// stamp in either direction (the phone mirrors our own outgoing rows
+    /// back, so `incoming_rows_by_sent_at`'s direction filter cannot apply),
+    /// preferring the row whose sender matches the target author (one
+    /// sender, one stamp, one row — the preference only breaks a
+    /// pathological collision). The pointer faces merge into the row's
+    /// empty live-locator slots ([`Store::merge_live_attachment_locators`]
+    /// — first face wins, never overwritten); the error arm
+    /// (MESSAGE_NOT_FOUND) and status entries change nothing, the official
+    /// `handleResponse` keep-as-is posture. No host event is minted: the
+    /// desktop's bounded retry loop re-asks `attachments.download` and the
+    /// fresh locator face is what answers. Every miss is warn-only quiet
+    /// convergence — a vanished conversation or row is not an error, the
+    /// request side already answered honestly.
+    fn apply_sync_attachment_backfill_response(
+        &mut self,
+        account: &AccountRow,
+        response: &crate::engine::SyncAttachmentBackfillResponse,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        if response.error.is_some() {
+            tracing::warn!(
+                kind = "attachment_backfill_response",
+                "backfill response carried an error arm; nothing merged"
+            );
+            return Ok(Vec::new());
+        }
+        let identity = response
+            .conversation_service_id
+            .as_deref()
+            .or(response.conversation_e164.as_deref());
+        let (kind, peer_key) = if let Some(group_id) = response.conversation_group_id.as_deref() {
+            ("group", group_id.to_string())
+        } else if let Some(aci) = identity {
+            let mut peer_keys = vec![aci.to_string()];
+            peer_keys.extend(self.store.peer_keys_for_aci(&account.id, aci)?);
+            let digits = address_digits(aci);
+            if !digits.is_empty() {
+                for key in self.store.contact_peer_keys(&account.id)? {
+                    let candidate = address_digits(&key);
+                    if !candidate.is_empty() && candidate.ends_with(&digits) {
+                        peer_keys.push(key);
+                    }
+                }
+            }
+            peer_keys.sort();
+            peer_keys.dedup();
+            let Some(peer_key) = peer_keys.into_iter().find_map(|peer_key| {
+                self.store
+                    .conversation_by_peer(&account.id, "direct", &peer_key)
+                    .ok()
+                    .flatten()
+                    .map(|_| peer_key)
+            }) else {
+                tracing::warn!(
+                    kind = "attachment_backfill_response",
+                    "backfill response matched no local conversation; dropped"
+                );
+                return Ok(Vec::new());
+            };
+            ("direct", peer_key)
+        } else {
+            return Ok(Vec::new());
+        };
+        let Some(conversation) = self
+            .store
+            .conversation_by_peer(&account.id, kind, &peer_key)?
+        else {
+            tracing::warn!(
+                kind = "attachment_backfill_response",
+                "backfill response matched no local conversation; dropped"
+            );
+            return Ok(Vec::new());
+        };
+        let rows =
+            self.store
+                .rows_by_sent_at(&account.id, &conversation.id, response.sent_timestamp)?;
+        let record = rows
+            .iter()
+            .find(|record| {
+                record.sender_id == response.author
+                    || (!address_digits(&response.author).is_empty()
+                        && address_digits(&record.sender_id) == address_digits(&response.author))
+            })
+            .or_else(|| rows.first());
+        let Some(record) = record else {
+            tracing::warn!(
+                kind = "attachment_backfill_response",
+                "backfill response matched no local row; dropped"
+            );
+            return Ok(Vec::new());
+        };
+        self.store
+            .merge_live_attachment_locators(&account.id, &record.id, &response.locators)?;
+        Ok(Vec::new())
     }
 
     /// Consume one view-once open sync (contract revision 1.38, §4.37): find
@@ -12858,6 +13046,19 @@ pub struct AttachmentDownloadParams {
     pub message_id: String,
     #[serde(deserialize_with = "parse_attachment_index")]
     pub attachment_index: usize,
+}
+
+/// attachments.requestBackfill params (contract revision 1.175, §4.175):
+/// the same row addressing `attachments.download` rides — the local media
+/// miss names a message, not one attachment (the official
+/// `AttachmentBackfill.request` asks the primary for every attachment of
+/// the message at once).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentBackfillRequestParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
 }
 
 /// attachments.download result: the `HistoryAttachmentDownloadView` shape
@@ -16658,6 +16859,219 @@ mod tests {
         assert!(matches!(
             gone,
             Err(ServiceError::Store(StoreError::InvalidCursor))
+        ));
+    }
+
+    /// The backfill-response consume arm (contract revision 1.175, §4.175):
+    /// the primary's fresh transit pointers merge into the target row's
+    /// empty live-locator slots — the row the receive arm never filled (or
+    /// the optimistic outgoing row the echo could not overwrite) becomes
+    /// downloadable. The error arm changes nothing.
+    #[test]
+    fn backfill_response_merges_locators_into_the_target_row() {
+        let (_temp, mut service) = service();
+        let summary = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let account = service
+            .store_ref()
+            .account_by_id(&summary.id)
+            .unwrap()
+            .expect("account row");
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let descriptor = |id: &str| NormalizedAttachment {
+            id: id.into(),
+            content_type: Some("image/png".into()),
+            filename: None,
+            size: Some(2048),
+            width: None,
+            height: None,
+            is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
+            locator: None,
+            waveform: None,
+            duration: None,
+        };
+        let mut row = expire_record_fixture(&account.id, &conversation.id, "m-backfill");
+        row.sent_at = 1726999999000;
+        row.attachments = vec![descriptor("att-a"), descriptor("att-b")];
+        service
+            .store_ref()
+            .insert_message(&row, None, None, true)
+            .unwrap();
+        // The insert stored all-default faces index-aligned — the merge's
+        // empty slots.
+        let initial = service
+            .store_ref()
+            .live_attachment_locators(&account.id, "m-backfill")
+            .unwrap();
+        assert_eq!(initial.len(), 2);
+        assert!(
+            initial
+                .iter()
+                .all(|face| face == &crate::store::HistoryAttachmentLocator::default())
+        );
+
+        let face = |cdn: &str| crate::store::HistoryAttachmentLocator {
+            key: Some("a2F0LWtleQ==".into()),
+            cdn_key: Some(cdn.into()),
+            cdn_number: Some(3),
+            upload_timestamp: Some(1700000000000),
+            digest: None,
+            plaintext_hash: None,
+        };
+        let response = crate::engine::SyncAttachmentBackfillResponse {
+            author: "peer".into(),
+            sent_timestamp: 1726999999000,
+            conversation_service_id: None,
+            conversation_group_id: None,
+            conversation_e164: Some("+15555550101".into()),
+            error: None,
+            locators: vec![Some(face("cdn-a")), None],
+        };
+        let events = service
+            .apply_sync_attachment_backfill_response(&account, &response)
+            .unwrap();
+        assert!(events.is_empty(), "the merge mints no host event");
+        let faces = service
+            .store_ref()
+            .live_attachment_locators(&account.id, "m-backfill")
+            .unwrap();
+        assert_eq!(faces.len(), 2);
+        assert_eq!(faces[0], face("cdn-a"));
+        assert_eq!(faces[1], crate::store::HistoryAttachmentLocator::default());
+
+        // The error arm: nothing merged, quiet convergence.
+        let response = crate::engine::SyncAttachmentBackfillResponse {
+            author: "peer".into(),
+            sent_timestamp: 1726999999000,
+            conversation_service_id: None,
+            conversation_group_id: None,
+            conversation_e164: Some("+15555550101".into()),
+            error: Some("MESSAGE_NOT_FOUND".into()),
+            locators: Vec::new(),
+        };
+        service
+            .apply_sync_attachment_backfill_response(&account, &response)
+            .unwrap();
+        let faces = service
+            .store_ref()
+            .live_attachment_locators(&account.id, "m-backfill")
+            .unwrap();
+        assert_eq!(faces[0], face("cdn-a"), "error arm never moves a face");
+    }
+
+    /// attachments.requestBackfill prepare (contract revision 1.175, §4.175):
+    /// the official target triple derives from the resolved row — direct leg
+    /// carries the peer key with the row's sender as author, an outgoing row
+    /// names the account itself, the group leg carries the master key, and a
+    /// zero-stamp row fails closed before any engine traffic.
+    #[test]
+    fn prepare_request_attachment_backfill_derives_the_official_target() {
+        let (_temp, service) = service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cA==", "Group")
+            .unwrap();
+        let mut incoming = expire_record_fixture(&account.id, &conversation.id, "m-in");
+        incoming.sent_at = 1726999999000;
+        service
+            .store_ref()
+            .insert_message(&incoming, None, None, true)
+            .unwrap();
+        let mut outgoing = expire_record_fixture(&account.id, &conversation.id, "m-out");
+        outgoing.direction = "outgoing";
+        outgoing.sent_at = 1726999999001;
+        service
+            .store_ref()
+            .insert_message(&outgoing, None, None, false)
+            .unwrap();
+        let mut group_row = expire_record_fixture(&account.id, &group.id, "m-group");
+        group_row.sent_at = 1726999999002;
+        service
+            .store_ref()
+            .insert_message(&group_row, None, None, true)
+            .unwrap();
+
+        let prepared = service
+            .prepare_request_attachment_backfill(&AttachmentBackfillRequestParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                message_id: "m-in".into(),
+            })
+            .unwrap();
+        assert_eq!(prepared["account"], json!("+15555550100"));
+        assert_eq!(prepared["recipient"], json!("+15555550101"));
+        assert_eq!(prepared["author"], json!("peer"));
+        assert_eq!(prepared["sentTimestamp"], json!(1726999999000u64));
+        assert!(prepared.get("groupId").is_none());
+
+        // The outgoing row names the account itself as the author.
+        let prepared = service
+            .prepare_request_attachment_backfill(&AttachmentBackfillRequestParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                message_id: "m-out".into(),
+            })
+            .unwrap();
+        assert_eq!(prepared["author"], json!("+15555550100"));
+        assert_eq!(prepared["sentTimestamp"], json!(1726999999001u64));
+
+        // The group leg rides the master key.
+        let prepared = service
+            .prepare_request_attachment_backfill(&AttachmentBackfillRequestParams {
+                account_id: account.id.clone(),
+                conversation_id: group.id.clone(),
+                message_id: "m-group".into(),
+            })
+            .unwrap();
+        assert_eq!(prepared["groupId"], json!("ZmFrZS1ncm91cA=="));
+        assert!(prepared.get("recipient").is_none());
+
+        // The id ladder still runs first.
+        let unknown =
+            service.prepare_request_attachment_backfill(&AttachmentBackfillRequestParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                message_id: "m-absent".into(),
+            });
+        assert!(matches!(
+            unknown,
+            Err(ServiceError::Store(StoreError::MessageNotFound))
+        ));
+
+        // A zero-stamp row never went upstream and cannot be backfilled.
+        let mut zero = expire_record_fixture(&account.id, &conversation.id, "m-zero");
+        zero.sent_at = 0;
+        service
+            .store_ref()
+            .insert_message(&zero, None, None, true)
+            .unwrap();
+        let zero = service.prepare_request_attachment_backfill(&AttachmentBackfillRequestParams {
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            message_id: "m-zero".into(),
+        });
+        assert!(matches!(
+            zero,
+            Err(ServiceError::Api(ref error)) if error.code == "INVALID_REQUEST"
         ));
     }
 

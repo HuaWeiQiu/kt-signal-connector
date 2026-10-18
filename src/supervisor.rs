@@ -1243,6 +1243,40 @@ impl RuntimeSupervisor {
         .await
     }
 
+    /// attachments.requestBackfill (contract revision 1.175, §4.175): the
+    /// request half of the official attachment-backfill loop. The
+    /// deterministic prepare runs inside the service lock (id ladder, row
+    /// resolution, the official target triple), then the engine's
+    /// `requestAttachmentBackfill` fires on the send lane. The answer is the
+    /// receipt-class posture: `sent` when the engine confirmed the write,
+    /// `unknown` when the engine is unreachable or refused — the desktop
+    /// treats either as fire-and-forget (its bounded retry loop re-asks the
+    /// download; a duplicate request the primary already answered is
+    /// harmless, the official #pendingRequests de-dup posture). The
+    /// response itself arrives asynchronously as the
+    /// `syncMessage.attachmentBackfillResponse` consume arm and merges the
+    /// fresh pointers into the row's live-locator column.
+    pub async fn request_attachment_backfill(
+        &self,
+        params: crate::service::AttachmentBackfillRequestParams,
+    ) -> Result<&'static str, ServiceError> {
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_request_attachment_backfill(&params)?
+        };
+        let engine = match self.running_engine().await {
+            Ok(engine) => engine,
+            Err(_) => return Ok("unknown"),
+        };
+        match engine
+            .call("requestAttachmentBackfill", prepared, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(_) => Ok("unknown"),
+        }
+    }
+
     /// stories.downloadAttachment (contract revision 1.86, §4.71): the
     /// story-anchored face onto the same chain as
     /// [`Self::attachment_download`] — the prepare half gates the
