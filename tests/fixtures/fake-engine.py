@@ -869,6 +869,27 @@ for line in sys.stdin:
             for value in os.environ.get("KT_FAKE_LABELED_GROUPS", "").split(",")
             if value.strip()
         }
+        # KT_FAKE_ANNOUNCEMENT_GROUPS: group ids whose JsonGroup answers the
+        # announcements-only flag true (contract 1.181, §4.181 — the engine's
+        # real face carries the flag verbatim; unlisted groups keep the key
+        # absent so the pre-1.181 byte-identical face stays exercisable).
+        announcement_ids = {
+            value.strip()
+            for value in os.environ.get("KT_FAKE_ANNOUNCEMENT_GROUPS", "").split(",")
+            if value.strip()
+        }
+        # KT_FAKE_ROLE_GROUPS=<groupId>=<comma numbers>: those groups' members
+        # ride the engine's GV2 role word — ADMINISTRATOR for the listed
+        # numbers, DEFAULT for the rest — instead of the legacy uuid/isAdmin
+        # marks, the 1.181 capture's real engine wire shape.
+        role_admins: dict[str, set[str]] = {}
+        for entry in os.environ.get("KT_FAKE_ROLE_GROUPS", "").split(";"):
+            if "=" not in entry:
+                continue
+            group_id, _, numbers = entry.partition("=")
+            role_admins[group_id.strip()] = {
+                number.strip() for number in numbers.split(",") if number.strip()
+            }
         fixture_members = [
             {"number": LINKED_ACCOUNT},
             {
@@ -881,6 +902,17 @@ for line in sys.stdin:
             fixture_members[0]["label"] = "Ops"
             fixture_members[1]["labelEmoji"] = "🛠️"
             fixture_members[1]["label"] = "Builders"
+        if "ZmFrZS1ncm91cC0x" in role_admins:
+            admins = role_admins["ZmFrZS1ncm91cC0x"]
+            fixture_members = [
+                {
+                    "number": member["number"],
+                    "role": "ADMINISTRATOR"
+                    if member["number"] in admins
+                    else "DEFAULT",
+                }
+                for member in fixture_members
+            ]
         result = [
             {
                 "id": "ZmFrZS1ncm91cC0x",
@@ -908,6 +940,8 @@ for line in sys.stdin:
         # the real wire shape (a filtered query that drops its subject).
         if (SIGNAL_DATA_DIR / ".fixture-groups-empty").exists():
             result = []
+        elif "ZmFrZS1ncm91cC0x" in announcement_ids and result:
+            result[0]["announcementsOnly"] = True
     elif method == "deleteLocalAccountData":
         if DELETE_MODE == "crash_after_delete_once" and DELETED_MARKER.exists():
             response = {

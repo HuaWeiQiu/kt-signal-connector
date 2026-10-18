@@ -23,45 +23,46 @@ use crate::service::{
     AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUnlinkDeviceParams,
     AccountsUpdateConfigurationParams, AttachmentSendTarget, AvatarDownload, BlockedConversations,
     CallLinkSyncs, CallsSendGroupCallUpdateParams, CallsSendSignalParams, ChatFolderSyncs,
-    ChatFoldersListParams, ChatFoldersSetRecordsParams, ConnectorService, ContactsSyncOutcome,
-    ConversationState, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
-    ConversationsGetPinnedParams, ConversationsGetStateParams, ConversationsSetBlockedParams,
-    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
-    ConversationsSetPinnedParams, ConversationsSetStateParams, DeviceList,
-    GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails,
-    GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword, GroupInviteLinkPreview,
-    GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams,
-    GroupsCreateParams, GroupsCreateResult, GroupsInviteLinkPasswordParams,
-    GroupsJoinViaLinkParams, GroupsMigrateParams, GroupsMigrateResult, GroupsParseInviteLinkParams,
-    GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
-    GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams,
-    IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary,
-    MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS,
-    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary,
-    MessageRequestOutcome, MessageRequestParams, MessagesDeleteForMeParams,
-    MessagesReportSpamParams, MessagesSendContactParams, MessagesSendPollCreateParams,
-    MessagesSendPollTerminateParams, MessagesSendPollVoteParams, MessagesSendStickerParams,
-    MessagesSendStoryParams, NotificationProfileSyncs, NotificationProfilesListParams,
-    NotificationProfilesSetRecordsParams, PeerTarget, PhoneLookupEntry, PhoneLookupParams,
-    PhoneLookupResult, PinnedConversations, PreparedHistoryDownload, PreparedSend,
-    ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams,
-    SendTextStyleParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
-    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
-    StickerPackSetSyncParams, StickerPackSyncs, StorageGetCallLinksParams, StorageIngestParams,
-    StorageSetCallLinkParams, StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams,
-    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListSyncs,
-    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, StorySendGroupFace,
-    StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
-    UsernameLookupParams, UsernameLookupResult, account_device_capabilities_from_engine,
-    account_limit_error, blocked_conversations_result, call_link_syncs_result,
-    chat_folder_syncs_result, conversation_state_from_engine, device_list_from_engine,
-    group_create_result_from_engine, group_invite_join_status_from_engine,
-    group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
-    group_invite_link_preview_from_engine, group_migrate_result_from_engine, identity_from_engine,
-    import_groups_summary_from_engine, merge_contacts_summary_from_engine,
-    notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
-    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
-    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
+    ChatFoldersListParams, ChatFoldersSetRecordsParams, CommonGroupsDetails, ConnectorService,
+    ContactsSyncOutcome, ConversationState, ConversationsGetAvatarParams,
+    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
+    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
+    ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, ConversationsSetStateParams,
+    DeviceList, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES,
+    GroupDetails, GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword,
+    GroupInviteLinkPreview, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
+    GroupsCancelJoinRequestParams, GroupsCreateParams, GroupsCreateResult,
+    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
+    GroupsMigrateResult, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
+    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
+    HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
+    IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary, MAX_AVATAR_DATA_URI_CHARS,
+    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView,
+    MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary, MessageRequestOutcome,
+    MessageRequestParams, MessagesDeleteForMeParams, MessagesReportSpamParams,
+    MessagesSendContactParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
+    MessagesSendPollVoteParams, MessagesSendStickerParams, MessagesSendStoryParams,
+    NotificationProfileSyncs, NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
+    PeerTarget, PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
+    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
+    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
+    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
+    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
+    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams, StoriesDisabled,
+    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
+    StoriesSetDisabledParams, StoryDistributionListSyncs, StoryDistributionListsListParams,
+    StoryDistributionListsSetRecordsParams, StorySendGroupFace, StorySendRecipientResult,
+    StorySendResult, StorySendSuccess, UsernameLookupEntry, UsernameLookupParams,
+    UsernameLookupResult, account_device_capabilities_from_engine, account_limit_error,
+    blocked_conversations_result, call_link_syncs_result, chat_folder_syncs_result,
+    conversation_state_from_engine, device_list_from_engine, group_create_result_from_engine,
+    group_invite_join_status_from_engine, group_invite_link_parse_from_engine,
+    group_invite_link_password_from_engine, group_invite_link_preview_from_engine,
+    group_migrate_result_from_engine, identity_from_engine, import_groups_summary_from_engine,
+    merge_contacts_summary_from_engine, notification_profile_syncs_result,
+    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
+    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
+    store_list_conversations, store_list_messages, store_search_messages,
     story_distribution_lists_result, validate_account_delete_operation_id,
 };
 use crate::store::{
@@ -7143,6 +7144,24 @@ impl RuntimeSupervisor {
     /// face without the requesting array, answers the cached row without the
     /// key (the desktop renders no approval section) — the cache face the
     /// method has always promised stays intact.
+    /// Contract 1.181 (§4.181): the store-only groups-in-common read —
+    /// no engine call, no resync (the panel answer derives from the cached
+    /// rosters exactly like the official local derivation; staleness is the
+    /// regular contacts sync's business, `syncedAt` on each group read the
+    /// host's signal).
+    pub async fn groups_common(
+        &self,
+        account_id: String,
+        conversation_id: String,
+    ) -> Result<CommonGroupsDetails, ServiceError> {
+        // Store-only read: the service lock guards in-memory state only.
+        let store = Arc::clone(&self.store);
+        blocking_service(move || {
+            crate::service::store_groups_common(&store, &account_id, &conversation_id)
+        })
+        .await
+    }
+
     pub async fn get_group(
         &self,
         account_id: String,
@@ -7876,7 +7895,12 @@ fn group_extra_json(members: &[Value], group: &Value) -> String {
                         .collect::<String>()
                 });
             let admin = object.get("isAdmin").and_then(Value::as_bool) == Some(true)
-                || admin_ids.contains(&id);
+                || admin_ids.contains(&id)
+                // Contract 1.181 (§4.181): the engine face's GV2 role word —
+                // ADMINISTRATOR is the only admin role (DEFAULT and UNKNOWN
+                // are member states); the legacy isAdmin/admins reads above
+                // stay for the signal-cli JsonGroup face.
+                || object.get("role").and_then(Value::as_str) == Some("ADMINISTRATOR");
             let label_emoji = bounded_upstream_label(
                 object.get("labelEmoji").and_then(Value::as_str),
                 GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES,
@@ -7919,6 +7943,14 @@ fn group_extra_json(members: &[Value], group: &Value) -> String {
         && matches!(word, "ANY" | "ADMINISTRATOR" | "UNSATISFIABLE")
     {
         extra.insert("linkAccess".to_string(), json!(word));
+    }
+    // Contract 1.181 (§4.181): the announcements-only flag the upstream
+    // JsonGroup carries verbatim (the engine's listGroups always does; the
+    // CompositionArea.dom.tsx:1108 `announcementsOnly && !areWeAdmin` banner
+    // gate). Stored only when the upstream supplied the key — a legacy face
+    // without it keeps the key absent (unknown, never a guessed false).
+    if let Some(flag) = group.get("announcementsOnly").and_then(Value::as_bool) {
+        extra.insert("announcementsOnly".to_string(), json!(flag));
     }
     Value::Object(extra).to_string()
 }
@@ -10727,11 +10759,20 @@ mod tests {
             ]
         );
 
-        // Engine shape (kt-signal-engine listGroups): bare number
-        // entries, no uuid key, no admin face — the projection difference
-        // §4.39 records.
+        // Engine shape (kt-signal-engine listGroups): number-labeled entries
+        // without a uuid key, carrying the GV2 `role` word — the
+        // ADMINISTRATOR fold landed with contract 1.181 (§4.39's
+        // "engine-mode rosters carry none" boundary described the capture's
+        // own silence, not the engine's face); DEFAULT and UNKNOWN are
+        // member states and never admin.
         let engine_group = json!({"id": "aWQ", "name": "g", "isMember": true});
-        let engine_members = json!([{"number": "+15555550100"}, {"number": "+15555550101"}]);
+        let engine_members = json!([
+            {"number": "+15555550100", "role": "ADMINISTRATOR"},
+            {"number": "+15555550101", "role": "DEFAULT"},
+            {"number": "+15555550102", "role": "UNKNOWN"},
+            {"number": "+15555550103"},
+            {"number": "+15555550104", "role": "administrator"},
+        ]);
         let extra: serde_json::Value = serde_json::from_str(&group_extra_json(
             engine_members.as_array().unwrap(),
             &engine_group,
@@ -10739,7 +10780,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             extra["members"],
-            json!([{"id": "+15555550100"}, {"id": "+15555550101"}])
+            json!([
+                {"id": "+15555550100", "admin": true},
+                {"id": "+15555550101"},
+                {"id": "+15555550102"},
+                {"id": "+15555550103"},
+                {"id": "+15555550104"},
+            ])
         );
 
         // The roster cap is the official group-size ceiling; memberCount
@@ -10804,6 +10851,32 @@ mod tests {
         ))
         .unwrap();
         assert!(no_word.get("linkAccess").is_none());
+
+        // Contract 1.181 (§4.181): the announcements-only flag is captured
+        // verbatim when the upstream JsonGroup carries the key (the engine's
+        // listGroups always does — true and false both land); a face without
+        // the key keeps the key absent (unknown, never a guessed false), and
+        // a malformed value drops rather than fails the capture.
+        for flag in [true, false] {
+            let extra = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+                members.as_array().unwrap(),
+                &json!({"id": "aWQ", "isMember": true, "announcementsOnly": flag}),
+            ))
+            .unwrap();
+            assert_eq!(extra["announcementsOnly"], serde_json::json!(flag));
+        }
+        let no_flag = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true}),
+        ))
+        .unwrap();
+        assert!(no_flag.get("announcementsOnly").is_none());
+        let malformed_flag = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true, "announcementsOnly": "yes"}),
+        ))
+        .unwrap();
+        assert!(malformed_flag.get("announcementsOnly").is_none());
     }
 
     #[test]

@@ -1934,14 +1934,21 @@ fn import_payment(raw: Option<&Value>) -> Option<crate::engine::NormalizedPaymen
 /// onto the desktop's wire vocabulary. The receipt-credential presentation
 /// stays engine-side: zk credential material with no desktop data face (the
 /// recorded projection gap). A non-object face, or a state that is not a
-/// string, answers None — plain routing behind it.
+/// string, answers None — plain routing behind it. Contract 1.181 (§4.181)
+/// parses the countdown pair when the archive carries it (the current
+/// engine archive arm records it has no zk parse face, so archive rows keep
+/// both keys absent — additive, byte-identical for them).
 fn import_gift_badge(raw: Option<&Value>) -> Option<crate::engine::NormalizedGiftBadge> {
-    let state = raw?
-        .as_object()?
-        .get("state")?
-        .as_str()?
-        .to_ascii_lowercase();
-    Some(crate::engine::NormalizedGiftBadge { state })
+    let object = raw?.as_object()?;
+    let state = object.get("state")?.as_str()?.to_ascii_lowercase();
+    Some(crate::engine::NormalizedGiftBadge {
+        state,
+        expiration_ms: object
+            .get("expiration")
+            .and_then(Value::as_u64)
+            .filter(|stamp| *stamp > 0),
+        level: object.get("level").and_then(Value::as_u64),
+    })
 }
 
 /// The archive's `adminDeleted` face (contract 1.81, §4.38): the row's own

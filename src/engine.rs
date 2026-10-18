@@ -997,10 +997,19 @@ pub struct NormalizedPayment {
 /// every non-FAILED state) stays engine-side: it is zk credential material
 /// with no desktop data face (the projection gap the desktop batch
 /// records). Rides [`NormalizedRich`].
+/// Contract 1.181 (§4.181) adds the countdown pair additively: the live
+/// receive face's zkgroup-parsed `expiration` (wall-clock ms — the official
+/// remaining days/hours/minutes material) and donation `level`. Absent-key
+/// when the upstream face carries neither — archive rows keep both absent
+/// (the engine's archive arm records it has no zk parse face).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedGiftBadge {
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<u64>,
 }
 
 /// Delivery tier of an inbound receipt (`envelope.receiptMessage`). Order is
@@ -4664,6 +4673,17 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
     if let Some(poll) = message.get("poll").and_then(Value::as_object) {
         rich.poll = normalized_live_poll(poll);
     }
+    // Live gift-badge face (contract 1.181, §4.181): the engine's P14
+    // receive projection `{state, expiration, level,
+    // receiptCredentialPresentation}` — the official processGiftBadge
+    // posture (processDataMessage.preload.ts:476) — parses onto the §4.38
+    // archive twin's `NormalizedGiftBadge`, now with the countdown pair.
+    // The zk credential presentation stays engine-side (the recorded 1.81
+    // gap, unchanged); a degraded shape (non-object, no state word) drops
+    // the key and never the row.
+    if let Some(badge) = message.get("giftBadge").and_then(Value::as_object) {
+        rich.gift_badge = normalized_live_gift_badge(badge);
+    }
     rich.view_once = message
         .get("viewOnce")
         .and_then(Value::as_bool)
@@ -4802,6 +4822,29 @@ fn normalized_live_poll(poll: &serde_json::Map<String, Value>) -> Option<Normali
             .unwrap_or(false),
         terminated: false,
         votes: Vec::new(),
+    })
+}
+
+/// The engine's live gift-badge face (contract 1.181, §4.181): the P14
+/// receive projection `{state, expiration, level,
+/// receiptCredentialPresentation}` onto the §4.38 archive twin — the state
+/// word lowercased onto the desktop vocabulary (the engine's live face
+/// spells it uppercase, the archive face capitalized; both land the same
+/// wire word), the countdown pair bounded to positive stamps (a zero or
+/// missing expiration is no countdown, an absent level no tier). The zk
+/// credential presentation is never captured — engine-side material, the
+/// recorded 1.81 gap. A missing or non-string state drops the face.
+fn normalized_live_gift_badge(
+    badge: &serde_json::Map<String, Value>,
+) -> Option<NormalizedGiftBadge> {
+    let state = badge.get("state")?.as_str()?.to_ascii_lowercase();
+    Some(NormalizedGiftBadge {
+        state,
+        expiration_ms: badge
+            .get("expiration")
+            .and_then(Value::as_u64)
+            .filter(|stamp| *stamp > 0),
+        level: badge.get("level").and_then(Value::as_u64),
     })
 }
 
@@ -6603,6 +6646,30 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         // precedence is untouched (a state marker never coexists with a
         // card); anything else bodyless keeps the skip.
         if rich.as_ref().is_some_and(|rich| rich.contact.is_some()) {
+            return Ok(with_expire(
+                make(
+                    timestamp,
+                    "dataMessage",
+                    "incoming",
+                    peer_source,
+                    group_id,
+                    None,
+                    quote,
+                    attachments,
+                    rich,
+                    None,
+                ),
+                expire_seconds,
+                expire_start_at,
+            ));
+        }
+        // Bodyless live gift badge (contract 1.181, §4.181): the official
+        // gift-badge message carries no body — the badge is the whole row
+        // (processDataMessage.preload.ts:476 lands it on the message model
+        // with no text arm). The same NormalizedGiftBadge face the §4.38
+        // import chain lands, checked beside the poll/contact bodyless
+        // arms; anything else bodyless keeps the skip.
+        if rich.as_ref().is_some_and(|rich| rich.gift_badge.is_some()) {
             return Ok(with_expire(
                 make(
                     timestamp,
@@ -8804,6 +8871,82 @@ mod tests {
         // A plain message carries nothing.
         let plain = normalize(json!({ "message": "hello" }));
         assert!(plain.rich.is_none());
+    }
+
+    /// Live gift-badge face (contract 1.181, §4.181): the engine's P14
+    /// receive projection `{state, expiration, level,
+    /// receiptCredentialPresentation}` parses onto the §4.38 archive twin —
+    /// state lowercased onto the desktop wire vocabulary, the countdown pair
+    /// kept (a zero expiration is no countdown), the zk credential
+    /// presentation never captured, and degraded shapes dropping the key
+    /// without dropping the row.
+    #[test]
+    fn live_gift_badge_parses_the_countdown_pair_and_drops_degraded_shapes() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+        };
+        let rich = normalize(json!({
+            "message": "",
+            "giftBadge": {
+                "state": "UNOPENED",
+                "expiration": 1767225600000u64,
+                "level": 1,
+                "receiptCredentialPresentation": "cHJlc2VudGF0aW9u",
+            },
+        }))
+        .rich
+        .expect("the gift badge alone is rich");
+        let badge = rich.gift_badge.expect("gift badge face");
+        assert_eq!(badge.state, "unopened");
+        assert_eq!(badge.expiration_ms, Some(1767225600000u64));
+        assert_eq!(badge.level, Some(1));
+        // The zk credential material never rides the row.
+        let wire = serde_json::to_value(&badge).unwrap();
+        assert_eq!(
+            wire,
+            json!({"state": "unopened", "expirationMs": 1767225600000u64, "level": 1})
+        );
+
+        // A FAILED badge with no countdown pair keeps the state alone.
+        let rich = normalize(json!({ "message": "", "giftBadge": {"state": "Failed"} }))
+            .rich
+            .expect("rich payload");
+        assert_eq!(
+            serde_json::to_value(rich.gift_badge.unwrap()).unwrap(),
+            json!({"state": "failed"})
+        );
+
+        // A zero expiration is no countdown; a missing level stays absent.
+        let rich = normalize(json!({
+            "message": "",
+            "giftBadge": {"state": "OPENED", "expiration": 0, "level": 2},
+        }))
+        .rich
+        .expect("rich payload");
+        let badge = rich.gift_badge.unwrap();
+        assert_eq!(badge.state, "opened");
+        assert_eq!(badge.expiration_ms, None);
+        assert_eq!(badge.level, Some(2));
+
+        // Degraded shapes drop the key, never the row.
+        for degraded in [
+            json!({"state": 7}),
+            json!({"expiration": 1767225600000u64}),
+            json!("not-an-object"),
+        ] {
+            let face = normalize(json!({ "message": "", "giftBadge": degraded }));
+            assert!(
+                face.rich.is_none(),
+                "a degraded gift badge carries no rich payload"
+            );
+        }
     }
 
     /// Rich bounds (§4.20): entries past a cap drop, oversized strings

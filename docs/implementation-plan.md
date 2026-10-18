@@ -5,6 +5,30 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.181 (2026-10-18; §4.181 the supply-batch contract for
+  the desktop's auxiliary batch B (ledger §10): four connector-side landings —
+  the receive-path mention self-match now also folds the account ACI (the
+  1.29 number-only recorded boundary held until 1.142 persisted the engine's
+  own-ACI answer; a group mention whose author rides only the ACI — the
+  engine-mode face's common shape — now counts as `mentionsSelf`/`unreadMentions`,
+  completing the desktop batch-2 phase-2 G-T-3/G-T-4 supply of self ACI +
+  mention.author); the sync capture keeps the upstream JsonGroup's
+  `announcementsOnly` flag and the roster member's GV2 `role` word (admin =
+  ADMINISTRATOR; the §4.39 "engine-mode rosters carry none" boundary is stale
+  — the engine's listGroups projects both since its group-write batches),
+  projected onto `groups.get` as the optional `announcementsOnly` key and a
+  now-populated roster `admin` mark plus an ACI-matched roster `self` mark;
+  a new read-only `groups.common` face answers the official groups-in-common
+  panel (ConversationDetails.preload.tsx:80-100 — the direct peer's identity
+  against the captured rosters, title-sorted) off the local cache; and the
+  live receive face parses the engine's P14 `giftBadge` projection onto the
+  §4.38 archive twin's `NormalizedGiftBadge`, extended additively with the
+  receipt `expirationMs`/`level` — the countdown material of the desktop's
+  D#62 badge face, while the zk receipt-credential presentation itself stays
+  engine-side (credential material, no desktop data face) and the send-side
+  donation plane is recorded absent on both sides. The rest of the batch's
+  fields are recorded in §4.181 with the four-element contract (source /
+  projection / freshness / empty semantics) and their dispositions.)
 - Contract revision: 1.180 (2026-10-18; §4.180 the group-link read face and
   the reset-link write arm: the sync capture keeps the upstream JsonGroup's
   `addFromInviteLink` word — only the official vocabulary ANY /
@@ -15364,6 +15388,216 @@ official words captured verbatim; MEMBER/UNKNOWN/malformed collapse to an
 absent key), and `get_group_projects_the_cached_group_row` extended (the
 captured word projects as `linkAccess`; pre-1.180 rows and malformed
 stored values answer an absent key — byte-identical to the 1.177 shape).
+
+### 4.181 The supply-batch contract: mention self-match by ACI, the announcements-only capture, `groups.common`, and the live gift-badge face (contract revision 1.181, 2026-10-18)
+
+The desktop's auxiliary batch B (construction ledger §10) exists because
+fifteen diff rows plus three named dependencies share one root cause: a
+connector/engine data-plane absence the desktop cannot render around. This
+revision is the batch's connector half — the supply contract first, then
+the fields. Four landings below; every other field of the batch is
+recorded after them with the four-element contract (source / projection /
+freshness / empty semantics) and its disposition.
+
+**A. The mention self-match folds the account ACI.** The official
+muted-group exception arms key off `message.mentionsMe`
+(maybeNotify.preload.ts:69-77 `isMention`; :290-310
+`notifyWhileMuted.mentions && isMention(args)` piercing the muted
+conversation, the notifyWhileMuted.std.ts:63-74
+conversation-over-global resolution with the official defaults
+`{calls: false, mentions: true, replies: true}`). The connector's twin is
+the receive-path `mentionsSelf` capture (contract 1.29), whose recorded
+boundary was number-only — the pinned upstream face exposed the account
+only by number, so a mention author carrying only a UUID could not be
+attributed to self. Contract 1.142 (§4.138) ended that premise: the
+engine's own-ACI answer is a persisted `accounts.aci` column, and the
+engine-mode receive face commonly keys mention authors by exactly that ACI
+(the 1.40 promotion). The match now folds it: an incoming mention counts
+when its `author` equals the account number (the 1.29 arm, unchanged),
+when its `authorAci` canonicalizes to the account ACI, or when its
+`author` *is* the ACI string (the engine-mode shape) — both sides compared
+through `canonical_aci` (§4.138), so the dashed/bare/case spelling never
+splits a match. `unreadMentions` needs no change: it increments in the
+same receive transaction off `mentions_self` (the 1.29 lockstep). With
+this, the desktop batch-2 phase-2 (G-T-3 exception arm, G-T-4 piercing)
+supply is complete: self ACI rides `accounts.list[].aci` (1.142), the
+per-row verdict rides `mentionsSelf`, and the raw material rides
+`rich.mentions[].{author, authorAci, name}` (1.25/1.40) on every read
+face and the `message.upserted` event. The reply half of G-T-4 is already
+supply-side complete: a quote-of-self is `quote.author` resolving through
+the same identity derivations the §4.178 deep link trusts.
+
+**B. The announcements-only capture and the roster's role word.** The
+official composer replaces itself with the AnnouncementsOnlyGroupBanner
+exactly when `announcementsOnly && !areWeAdmin`
+(CompositionArea.dom.tsx:1108-1120; the flag is a first-class group field,
+groups.preload.ts:896/901). The engine's `listGroups` has carried
+`announcementsOnly`, per-member `role` (the GV2 vocabulary
+ADMINISTRATOR / DEFAULT / UNKNOWN), and the computed `isMember` since its
+group-write batches — but the sync capture kept none of them, and §4.39's
+recorded boundary "engine-mode rosters carry none [no admin mark]" described
+that silence. The boundary was stale, not the engine. The capture now
+keeps both: `group_extra_json` stores the upstream `announcementsOnly`
+verbatim when the JsonGroup carries it (true or false — the engine always
+does; a legacy face without the key keeps the absent key), and a roster
+entry's `admin` mark now also folds the `role` word (admin =
+ADMINISTRATOR; DEFAULT and UNKNOWN are member states, never admin) beside
+the legacy `isAdmin`/`admins` reads. `groups.get` projects the flag as the
+optional `announcementsOnly` key — absent on pre-1.181 rows and captures
+without the key (unknown, never a lie; a malformed stored value drops,
+never fails the read — the linkAccess discipline, which §4.180's
+convergence sentence anticipated). The roster projection's `self` mark
+extends to the account ACI the same way (the engine roster id falls back
+to the member's ACI service-id string when the contacts lookup misses, so
+the §4.42/§4.43 `peer_key_is_self` ladder — number or ACI — now governs
+the roster too). The desktop derives F0-9's banner and C#56's pin-permission
+gate from `announcementsOnly` + the roster's `admin`/`self` marks; both are
+pure reads over one `groups.get` answer.
+
+**C. `groups.common` — the groups-in-common panel's supply.** The official
+contact-details panel answers groups-in-common locally
+(ConversationDetails.preload.tsx:80-100: for a direct conversation, every
+composable group whose `memberships[].aci` equals the contact's
+`serviceId`, sorted by title; ConversationDetailsGroups.dom.tsx:16-53
+renders the N / "No groups in common" face and the Add-to-a-group row).
+The connector's mirror is a new read-only method over the §4.39 captured
+rosters — no engine call, READ lane, contacts class, zero writes:
+`groups.common {accountId, conversationId}` resolves the target
+conversation (a direct chat; a group target answers INVALID_REQUEST — this
+is a contact face), builds the contact's identity set (the conversation
+peer key in both phone spellings, its `peer_identities` ACI, and the
+reverse peer keys when the peer key is itself ACI-shaped), and scans the
+account's group rows for any roster entry whose `id` or `uuid` lands in
+the set. The answer is title-sorted like the official panel, bounded by
+the roster cap per group and the one-row-per-group §6.5 cache scale, and
+carries `{peerKey, title}` pairs the desktop addresses the group reads
+with. An empty set is the honest no-groups-in-common answer — the capture
+only knows what the last contacts sync saw, and `syncedAt` on each
+`groups.get` answer remains the staleness signal.
+
+**D. The live gift-badge face.** The desktop's D#62 badge row needs the
+state word plus the receipt countdown (spec-D:64: unopened gift box;
+opened/redeemed badge with remaining days/hours/minutes). The engine's
+live receive projection already parses the zkgroup receipt
+(`giftBadge {state, expiration ms, level, receiptCredentialPresentation}`,
+the official processGiftBadge posture, processDataMessage.preload.ts:476),
+but the connector's live normalization dropped the whole face — only the
+§4.38 backfill archive twin survived, and state-only at that. The live
+face now parses onto the same `NormalizedGiftBadge`, extended additively
+with `expirationMs` and `level` (absent-key when the engine face carries
+neither — archive rows keep both absent: the engine's archive arm records
+it has no zk parse face). The receipt-credential presentation itself
+stays engine-side in both faces — zk credential material with no desktop
+data face, the 1.81 recorded gap, unchanged. The send side is recorded
+absent on both sides: minting a presentation requires a *purchased
+donation* receipt credential (the ReceiptCredentialRequest/Response dance
+with Signal's donation endpoints, donations.preload.ts:1109-1120), and
+neither presage nor the engine implements any donation plane — only the
+raw proto GiftBadge type exists. D#62's display and countdown are now
+supply-complete; its open/redeem actions and any gift-sending face stay
+matrix until an engine payments batch exists.
+
+**The rest of the batch — four-element records and dispositions.**
+
+- **self ACI** — source: the engine's `registration_data` `service_ids`
+  aci, persisted on `accounts.aci` (1.142); projection:
+  `accounts.list[].aci`, canonical dashed lowercase; freshness: every
+  engine landing / account sync; empty: absent = the engine has not
+  answered — never minted from the row id. **Already landed (1.142);
+  nothing to do.**
+- **mention.author** — source: `dataMessage.mentions` normalized at
+  receive (1.25) with the ACI promotion (1.40); projection:
+  `rich.mentions[].{author, authorAci, name, start, length}` on every
+  message read face and `message.upserted`; freshness: stored at receive;
+  empty: non-mention rows carry no `mentions` key. **Already landed
+  (1.25/1.40); the self-attribution gap closes in landing A above.**
+- **typing sender identity** (D#28's connector half) — source: the typing
+  envelope's source and display name (the engine's P14 face, group typing
+  included via `typingMessage.groupId`); projection:
+  `conversation.typing {senderId, senderName}` (1.138, §4.128);
+  freshness: rate-limited at receive; empty: keys absent when the envelope
+  named nobody. **Already landed (1.138) — the remaining work is the
+  desktop's avatar composition.**
+- **duplicate-name verdicts** (C#49/C#50) — **already landed by the
+  desktop's signalNameResolver three-source chain (9bff424c, desktop
+  contract 1.186).**
+- **deletion three-state** (B-R58) — source: the row's `status`
+  remote-deleted tombstone × `direction` plus the `adminDeleted` mark
+  (1.33, §4.28); projection: `MessageRecord.{status, direction,
+  adminDeleted}` on every read face; freshness: the delete / adminDelete
+  envelope lands them; empty: a live row carries neither. **Faces already
+  landed — the three-state wording (self-deleted = outgoing ×
+  remote-deleted, author-deleted = incoming × remote-deleted,
+  admin-deleted = `adminDeleted`) is a desktop derivation over existing
+  keys. Recorded; no connector change.**
+- **story presence** (C#4) — source: the `story.received` /
+  `story.viewed` / `story.deleted` event family (1.76 lineage) plus
+  `stories.markViewed`; projection: the transient event payloads;
+  freshness: emitted at receive, nothing persisted; empty: no events = no
+  story state to render. **Faces already landed — the avatar-ring
+  aggregation is desktop consumption. Recorded; no connector change.**
+- **authoritative unread counts** (D#18/D#21) — source:
+  `conversations.unread_count` / `accounts.unread_count`, maintained in
+  the receive and markRead transactions; projection: every conversation
+  summary face; freshness: transactional with the rows; empty: 0.
+  **Faces already landed — the separator's totalUnseen is a desktop
+  reading-semantics item that may re-read the authoritative count at any
+  time. Recorded; no connector change.**
+- **multiple pinned messages** (C#54) — the official multi-pin feature
+  syncs through group state (`pinnedMessages`); presage's `Group` model
+  carries no such field, so the engine cannot sync it and the §4.28
+  single-pin face (sendPinMessage/sendUnpinMessage + the
+  `pinnedMessage` summary) remains the whole local truth. **Engine-side
+  absence, recorded — needs a presage group-model extension batch before
+  any connector face can exist.**
+- **pin permission** (C#56) — the official gate is the announcements-only
+  group restricting pins to admins; the supply is exactly landing B's
+  `announcementsOnly` + roster `admin`/`self` marks. **Supply lands in
+  this revision; the desktop gate is consumption.**
+- **per-recipient receipts** (E81/R100, E47's source) — the existing
+  faces aggregate: `send_outcomes` (1.173, the per-recipient send
+  settlement at dispatch time) and the row-level `delivered_at` /
+  `read_at` / `viewed_at` first-stamp ladder (1.32/1.94). The official
+  per-recipient Pending→Sent→Delivered→Read→Viewed progression needs a
+  new store face — receipt events persisted per (message, recipient) —
+  plus the engine's per-sender receipt envelopes projected per
+  destination. **Recorded and deferred: a receipt-ledger batch of its own;
+  the desktop's partial-sent/paused rows stay matrix until then.**
+- **receipt credential** (D#62's action half) — see landing D: the zk
+  presentation is engine-side-only material; the send-side donation plane
+  is absent on both sides. **Recorded.**
+- **server-side delete protocol** (R73) — the official Delete chat?
+  confirms a delete that syncs across devices; the KT tombstone is local
+  by design. Closing the semantics gap needs an engine write + sync face
+  (a multi-device conversation-delete protocol batch), not a projection.
+  **Recorded and deferred; the desktop keeps its honest local-copy copy.**
+- **announcements-only admin bit** (F0-9's supply) — the engine half has
+  been there (listGroups `announcementsOnly`/`role`/`isMember`); the
+  connector capture is landing B. **Supply lands in this revision; the
+  banner is desktop consumption.**
+
+Tests (only additions): `group_extra_json_captures_the_bounded_roster`
+extended (the `role` word folds the admin mark — ADMINISTRATOR only;
+DEFAULT/UNKNOWN do not; `announcementsOnly` captured verbatim, absent key
+on faces without it), `get_group_projects_the_cached_group_row` extended
+(`announcementsOnly` projects from the capture; pre-1.181 rows and
+malformed stored values answer an absent key; the roster `self` mark
+matches the account ACI), the new `mention_self_match_folds_the_account_aci`
+(the stranger no-match arm, the engine-mode ACI author, the canonical
+authorAci spelling, the 1.29 number arm, the outgoing gate — and the
+`unreadMentions` lockstep across all five), `live_gift_badge_parses_the_
+countdown_pair_and_drops_degraded_shapes` (the live face parses
+state/expiration/level; the presentation never rides the row; the FAILED
+no-countdown arm; degraded shapes drop the key), `groups_in_common_matches_
+the_identity_ladder_and_sorts_by_title` (both phone spellings, both ACI
+directions, roster id/uuid matching, malformed-roster skip, title sort,
+the honest empty set), `groups_common_serves_the_panel_answer_and_guards_
+the_target_kind` (the panel answer, the group-target INVALID_REQUEST, the
+bogus-id CONVERSATION_NOT_FOUND), and the end-to-end
+`groups_common_and_the_announcement_role_capture_end_to_end` (the fixture's
+new KT_FAKE_ANNOUNCEMENT_GROUPS / KT_FAKE_ROLE_GROUPS arms drive the whole
+ladder — engine listGroups → capture → groups.get — plus the host-frame
+groups.common round trip over the staged conversations).
 
 ## 5. signal-cli Boundary
 
