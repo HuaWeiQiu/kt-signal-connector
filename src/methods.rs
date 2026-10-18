@@ -848,7 +848,17 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// face is the engine projection's product and stays opaque transit for
 /// the desktop's own read-back chain (zero CDN resolution, zero pointer
 /// consumption); absent stays absent, every pre-1.161 answer reads
-/// byte-identically; the same no-new-bit discipline) and by revision
+/// byte-identically; the same no-new-bit discipline) and by revision 1.185
+/// (the §4.185 media-story caption leg on the `messages.sendStory` face —
+/// the engine's sendStory caption batch (engine `48e69a2`), the official
+/// `AttachmentPointer.caption=11` alignment: the optional host `caption`
+/// key riding the engine frame verbatim on the 1.156 attachment transit
+/// class — no connector leg gate, no byte gate, the engine's documented
+/// parse owning the whole value domain (empty, over the official 64 KiB
+/// MAX_BODY_ATTACHMENT_BYTE_LENGTH budget, or riding without the attachment
+/// leg answer its plain -32603); absence never becomes a key, every
+/// pre-1.185 frame reads byte-identically; the same no-new-bit
+/// discipline) and by revision
 /// 1.160 (the §4.158 own-story sync
 /// transcript — the engine's `syncMessage.sentMessage.storyMessage`
 /// projection riding home as the outgoing row face the desktop's

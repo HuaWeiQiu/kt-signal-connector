@@ -106,6 +106,7 @@ fn params(
         preview_url: None,
         preview_title: None,
         attachment: attachment.map(str::to_string),
+        caption: None,
         group: group.map(str::to_string).map(Value::String),
     }
 }

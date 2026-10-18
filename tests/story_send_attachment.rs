@@ -86,6 +86,7 @@ fn params(
     account_id: &str,
     message: Option<&str>,
     attachment: Option<&str>,
+    caption: Option<&str>,
 ) -> MessagesSendStoryParams {
     MessagesSendStoryParams {
         account_id: account_id.to_string(),
@@ -99,6 +100,7 @@ fn params(
         preview_url: None,
         preview_title: None,
         attachment: attachment.map(str::to_string),
+        caption: caption.map(str::to_string),
         group: None,
     }
 }
@@ -124,7 +126,7 @@ async fn story_media_leg_rides_the_engine_frame_verbatim() {
     // byte-verbatim (filename parameter and base64 payload untouched).
     let media_uri = "data:image/jpeg;filename=story%20pic.jpg;base64,QUJDREVGRw==";
     let answered: StorySendResult = supervisor
-        .send_story(params(&account_id, None, Some(media_uri)))
+        .send_story(params(&account_id, None, Some(media_uri), None))
         .await
         .unwrap();
     assert!(answered.timestamp > 0);
@@ -142,7 +144,7 @@ async fn story_media_leg_rides_the_engine_frame_verbatim() {
 
     // The text leg alone: the pre-1.156 shape, no attachment key.
     supervisor
-        .send_story(params(&account_id, Some("text story body"), None))
+        .send_story(params(&account_id, Some("text story body"), None, None))
         .await
         .unwrap();
     let log = log_lines(&data_dir);
@@ -157,6 +159,7 @@ async fn story_media_leg_rides_the_engine_frame_verbatim() {
             &account_id,
             Some("caption body"),
             Some("data:image/png;base64,AAAA"),
+            None,
         ))
         .await
         .unwrap();
@@ -168,7 +171,7 @@ async fn story_media_leg_rides_the_engine_frame_verbatim() {
     // The empty-string attachment rides as-is: the zero-local-gate
     // posture (the engine's parse owns the refusal).
     supervisor
-        .send_story(params(&account_id, None, Some("")))
+        .send_story(params(&account_id, None, Some(""), None))
         .await
         .unwrap();
     let log = log_lines(&data_dir);
@@ -178,7 +181,7 @@ async fn story_media_leg_rides_the_engine_frame_verbatim() {
     // The bare no-payload frame (no message, no attachment) forwards
     // as-is and is the engine's refusal, never a connector gate.
     supervisor
-        .send_story(params(&account_id, None, None))
+        .send_story(params(&account_id, None, None, None))
         .await
         .unwrap();
     let log = log_lines(&data_dir);
@@ -211,6 +214,7 @@ async fn story_media_leg_error_faces_ride_the_wire_verbatim() {
             &"k".repeat(129),
             None,
             Some("data:image/png;base64,AAAA"),
+            None,
         ))
         .await
         .err()
@@ -232,6 +236,7 @@ async fn story_media_leg_error_faces_ride_the_wire_verbatim() {
             &account_id,
             Some("caption body"),
             Some("data:image/png;base64,AAAA"),
+            None,
         ))
         .await
         .err()
@@ -255,6 +260,7 @@ async fn story_media_leg_error_faces_ride_the_wire_verbatim() {
             &down_account,
             None,
             Some("data:image/png;base64,AAAA"),
+            None,
         ))
         .await
         .err()
@@ -262,4 +268,71 @@ async fn story_media_leg_error_faces_ride_the_wire_verbatim() {
         .into_api();
     assert_eq!(error.code, "RUNTIME_NOT_RUNNING");
     assert!(!error.retryable, "{error:?}");
+}
+
+/// The caption leg (contract revision 1.185, §4.185): the media story's
+/// caption rides the engine frame verbatim — the frame-level forward (the
+/// SEND_LOG pin) and the answer-level ride (the fixture's pointer stub
+/// echoing the caption in-cap-out through the 1.161 `fileAttachment` face)
+/// proving both directions of the caption chain through the connector.
+/// The engine's own caption gates (empty, over the official 64 KiB budget,
+/// the media-leg-only rule) are the real engine's parse, which the fixture
+/// deliberately does not re-implement — the frame carries what the caller
+/// sent, byte-for-byte.
+#[tokio::test]
+async fn story_send_caption_rides_and_echoes_through_the_pointer() {
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("signal-data");
+    let (_store, supervisor, account_id) = story_send_supervisor(
+        &temp,
+        &data_dir,
+        r#"{"number":"+15555550100","dir":"accounts/lk-abc"}"#,
+    );
+    supervisor.start().await.unwrap();
+
+    // The caption beside the attachment leg: the frame carries it verbatim
+    // and the answer's pointer face carries it back (the official caption
+    // rides the upload's returned pointer — in-cap-out).
+    let media_uri = "data:image/jpeg;base64,QUJDREVGRw==";
+    let answered: StorySendResult = supervisor
+        .send_story(params(&account_id, None, Some(media_uri), Some("a sunset")))
+        .await
+        .unwrap();
+    assert!(answered.timestamp > 0);
+    let log = log_lines(&data_dir);
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(
+        log[0],
+        json!({
+            "account": SIGNAL_ACCOUNT,
+            "recipients": ["+15555550101"],
+            "allowsReplies": false,
+            "attachment": media_uri,
+            "caption": "a sunset",
+        })
+    );
+    assert_eq!(
+        answered.file_attachment.as_ref().unwrap()["caption"],
+        json!("a sunset"),
+        "the pointer answer echoes the caption in-cap-out"
+    );
+
+    // The pre-1.185 media frame (no caption key) and its pointer answer
+    // stay caption-free: absence never serializes on either direction.
+    let answered: StorySendResult = supervisor
+        .send_story(params(&account_id, None, Some(media_uri), None))
+        .await
+        .unwrap();
+    let log = log_lines(&data_dir);
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert!(log[1].get("caption").is_none());
+    assert!(
+        answered
+            .file_attachment
+            .as_ref()
+            .unwrap()
+            .get("caption")
+            .is_none(),
+        "the fixture's no-caption frame answers a caption-free pointer"
+    );
 }
