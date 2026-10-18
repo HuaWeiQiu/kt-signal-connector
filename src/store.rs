@@ -14,7 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 27;
+const SCHEMA_VERSION: i64 = 28;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -175,6 +175,8 @@ CREATE TABLE IF NOT EXISTS conversations (
   pinned INTEGER NOT NULL DEFAULT 0,
   expire_timer_seconds INTEGER,
   mrr_factors_json TEXT,
+  read_watermark_ms INTEGER,
+  report_spam_token TEXT,
   UNIQUE(account_id, kind, peer_key),
   FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
@@ -602,6 +604,19 @@ pub struct ConversationSummary {
     /// is per-conversation too). Absent when zero.
     #[serde(skip_serializing_if = "u32_is_zero")]
     pub unread_mentions: u32,
+    /// The authoritative read-position watermark (B-27, the 水位制 ruling):
+    /// epoch-ms `sent_at` of the newest incoming row this account has truly
+    /// read — a row is unread iff it is incoming with `sent_at > watermark`.
+    /// Advanced local-first by the read legs (`messages.markRead` /
+    /// `messages.syncRead` prepare — the official `markConversationRead`
+    /// flips local state before any receipt rides) and by the remote read
+    /// sync receive; the view path never advances it (`messages.list` clears
+    /// only the badge counter). The desktop re-derives its unread divider
+    /// from this after a restart. Absent on pre-ledger rows and on
+    /// conversations never truly read — absence is the honest "no
+    /// authoritative read position", never zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_watermark_ms: Option<u64>,
     pub muted: bool,
     pub pinned: bool,
     /// Contract 1.33: the conversation's current pinned message, projected
@@ -2984,7 +2999,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
                         unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key,
-                        mrr_factors_json
+                        mrr_factors_json, read_watermark_ms
                  FROM conversations
                  WHERE account_id=?1
                    AND (
@@ -3037,6 +3052,7 @@ impl Store {
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
                         unread_mentions: row.get::<_, i64>(7)? as u32,
+                        read_watermark_ms: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
                         muted: row.get::<_, i64>(8)? != 0,
                         pinned: row.get::<_, i64>(9)? != 0,
                         pinned_message: None,
@@ -3692,6 +3708,115 @@ impl Store {
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(prev as u32)
+    }
+
+    /// The read-position watermark's local-first advance (B-27, 水位制): the
+    /// read legs (`messages.markRead` / `messages.syncRead` prepare) stamp the
+    /// watermark to the conversation's NEWEST incoming row's `sent_at` — the
+    /// official `markConversationRead` flips local read state before any
+    /// receipt rides, so the stamp never waits for upstream confirmation. A
+    /// whole-conversation read with zero incoming rows leaves the watermark
+    /// untouched (no newest row = no position to claim). Monotonic by
+    /// construction: the max-fold never lowers a past watermark (a race with
+    /// retention deleting the newest row must not rewind the read position).
+    pub fn advance_read_watermark_latest(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        // MAX over an empty incoming set answers one NULL row — no newest
+        // row means no position to claim, and the watermark (including its
+        // absent NULL) stays untouched; a 0 would masquerade as "read
+        // everything before the epoch".
+        let newest: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(sent_at) FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'",
+                params![account_id, conversation_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if let Some(newest) = newest.filter(|value| *value > 0) {
+            conn.execute(
+                "UPDATE conversations
+                 SET read_watermark_ms = MAX(COALESCE(read_watermark_ms, 0), ?3)
+                 WHERE id=?2 AND account_id=?1",
+                params![account_id, conversation_id, newest],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        Ok(())
+    }
+
+    /// The read-position watermark's remote-read advance: the §4.81 read-sync
+    /// receive folds the synced rows' newest `sent_at` into the watermark —
+    /// reading on another linked device is a true read, the official sync
+    /// converges the same state. Same monotonic max-fold as the local leg.
+    pub fn advance_read_watermark_to(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        sent_at: u64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE conversations
+             SET read_watermark_ms = MAX(COALESCE(read_watermark_ms, 0), ?3)
+             WHERE id=?2 AND account_id=?1",
+            params![account_id, conversation_id, sent_at],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// The spam-report token's latest-wins landing (reportSpam data plane):
+    /// every envelope carrying `reportingToken` overwrites the conversation's
+    /// stored copy — the official `conversation.reportingToken` shape. Absent
+    /// never clears (only message cleanup owns the clear upstream; the
+    /// connector never clears it — a stale token is at worst ignored by the
+    /// server, a missing one cannot be invented).
+    pub fn store_conversation_report_token(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        token: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE conversations SET report_spam_token=?3 WHERE id=?2 AND account_id=?1",
+            params![account_id, conversation_id, token],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// The conversation's stored spam-report token (reportSpam data plane):
+    /// the report face attaches it to the upstream POST body — the official
+    /// `addReportSpamJob` reads `conversation.reportingToken` the same way.
+    /// Absent when no envelope ever carried one (or the row predates the
+    /// column) — the report then rides without the key, matching the
+    /// official `jsonData={token}` with undefined.
+    pub fn conversation_report_token(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        // The row mapping itself must be Option<String>: `.optional()` only
+        // answers the no-rows case, and a plain String target would fail
+        // with InvalidColumnType on the NULL column (a conversation no
+        // token-bearing envelope has landed yet) — the exact honest-absent
+        // case this face exists to answer.
+        let token = conn
+            .query_row(
+                "SELECT report_spam_token FROM conversations WHERE id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(token.flatten())
     }
 
     /// Update one message's status. Returns the row after the write together
@@ -7100,7 +7225,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
                         unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key,
-                        mrr_factors_json
+                        mrr_factors_json, read_watermark_ms
                  FROM conversations WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
                 |row| {
@@ -7128,6 +7253,7 @@ impl Store {
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
                         unread_mentions: row.get::<_, i64>(7)? as u32,
+                        read_watermark_ms: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
                         muted: row.get::<_, i64>(8)? != 0,
                         pinned: row.get::<_, i64>(9)? != 0,
                         pinned_message: None,
@@ -8866,6 +8992,41 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         if !table_has_column(conn, "messages", "send_outcomes_json")? {
             conn.execute(
                 "ALTER TABLE messages ADD COLUMN send_outcomes_json TEXT",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
+    if current < 28 {
+        // The read-position watermark ledger (B-27, the 水位制 ruling) and
+        // the spam-report token landing (the reportSpam data plane). Two
+        // additive nullable conversation columns:
+        // - `read_watermark_ms` — the authoritative "read up to here"
+        //   watermark (sent_at basis). The official client flips per-row
+        //   readStatus at `markConversationRead` time; the connector has no
+        //   per-row local read state, so the user's ruling stores the single
+        //   watermark instead. Advanced local-first by the read legs
+        //   (markRead/syncRead prepare) and by the remote read sync receive;
+        //   never by the view path (`messages.list` clears only the badge
+        //   counter). Pre-existing rows stay NULL — the desktop treats an
+        //   absent watermark as "no authoritative read position" and keeps
+        //   its legacy behavior; inventing one would lie about reads that
+        //   were never recorded.
+        // - `report_spam_token` — the conversation's LATEST envelope-borne
+        //   spam-report token (the official `conversation.reportingToken`,
+        //   latest-wins at receive). Never backfilled: the token only ever
+        //   arrives live, and a report for a pre-column conversation rides
+        //   without it (the engine's POST body key is optional).
+        if !table_has_column(conn, "conversations", "read_watermark_ms")? {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN read_watermark_ms INTEGER",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        if !table_has_column(conn, "conversations", "report_spam_token")? {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN report_spam_token TEXT",
                 [],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -20360,5 +20521,159 @@ mod tests {
         // Retry Send path, never the automatic queue.
         let (_, first, count, next) = retry_face(&store, "m-group-all-failed");
         assert_eq!((first, count, next), (None, 0, None));
+    }
+
+    // ------------------------------------------------------------------
+    // §4.186 the read-position watermark + spam-report token (store faces)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn read_watermark_advances_to_newest_incoming_and_never_rewinds() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        let summary_watermark = || {
+            store
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .read_watermark_ms
+        };
+
+        // Pre-ledger row: absence is the honest "no authoritative read
+        // position", never zero.
+        assert_eq!(summary_watermark(), None);
+
+        // An all-outgoing conversation: MAX over an empty incoming set is
+        // NULL — no newest row means no position to claim, the watermark
+        // stays absent (a 0 would masquerade as "read everything").
+        store
+            .advance_read_watermark_latest(&account.id, &conversation.id)
+            .unwrap();
+        assert_eq!(summary_watermark(), None);
+
+        let row = |id: &str, direction: &'static str, sent_at: u64| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction,
+            sender_id: "peer".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        assert!(
+            store
+                .insert_message(&row("m-in", "incoming", 10), None, None, true)
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_message(&row("m-in-2", "incoming", 30), None, None, true)
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_message(&row("m-out", "outgoing", 40), None, None, true)
+                .unwrap()
+        );
+
+        // The local-first leg stamps to the NEWEST INCOMING row's sent_at —
+        // the outgoing row (40) is above the watermark's read domain.
+        store
+            .advance_read_watermark_latest(&account.id, &conversation.id)
+            .unwrap();
+        assert_eq!(summary_watermark(), Some(30));
+
+        // Monotonic max-fold: a lower explicit advance (the remote-read leg
+        // folding an older synced row) must never rewind the position.
+        store
+            .advance_read_watermark_to(&account.id, &conversation.id, 20)
+            .unwrap();
+        assert_eq!(summary_watermark(), Some(30));
+        // The explicit leg folds forward the same way.
+        store
+            .advance_read_watermark_to(&account.id, &conversation.id, 35)
+            .unwrap();
+        assert_eq!(summary_watermark(), Some(35));
+    }
+
+    #[test]
+    fn report_spam_token_lands_latest_wins_and_absent_never_clears() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        // No envelope ever carried one: absent, and the absent leg is a
+        // no-op (a stale token is at worst ignored by the server, a missing
+        // one cannot be invented — never cleared by an absent key).
+        assert_eq!(
+            store
+                .conversation_report_token(&account.id, &conversation.id)
+                .unwrap()
+                .as_deref(),
+            None
+        );
+
+        store
+            .store_conversation_report_token(&account.id, &conversation.id, "token-a")
+            .unwrap();
+        assert_eq!(
+            store
+                .conversation_report_token(&account.id, &conversation.id)
+                .unwrap()
+                .as_deref(),
+            Some("token-a")
+        );
+
+        // Latest-wins: every token-bearing envelope overwrites.
+        store
+            .store_conversation_report_token(&account.id, &conversation.id, "token-b")
+            .unwrap();
+        assert_eq!(
+            store
+                .conversation_report_token(&account.id, &conversation.id)
+                .unwrap()
+                .as_deref(),
+            Some("token-b")
+        );
     }
 }

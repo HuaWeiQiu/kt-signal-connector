@@ -67,6 +67,13 @@ const MAX_INBOUND_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 /// the §4.83 delete-for-me author field mirrors the same bound (the
 /// schema-pairing test pins the two together).
 pub const MAX_RECEIVE_ID_CHARS: usize = 128;
+/// The spam-report token's inbound bound (reportSpam data plane): the official
+/// `reportSpamToken` is a small server-issued opaque blob (base64 on the
+/// engine's envelope face); 128 chars is the opaqueId-family bound applied to
+/// the stored copy — an oversized inbound token is truncated-away evidence of
+/// a misbehaving engine, never a contract address, so a longer one folds to
+/// `None` rather than truncating a credential.
+const MAX_REPORTING_TOKEN_CHARS: usize = 128;
 const STDERR_QUEUE_CAPACITY: usize = 64;
 const STDERR_LINE_LIMIT: usize = 4 * 1024;
 
@@ -500,6 +507,16 @@ pub struct NormalizedReceive {
     /// NULL); connector-internal, never serialized.
     #[serde(skip)]
     pub server_timestamp: Option<u64>,
+    /// Envelope `reportingToken` (the reportSpam data plane, official
+    /// `conversation.reportingToken` parity): the base64 spam-report token
+    /// the engine projects from the envelope's `reportSpamToken` proto bit
+    /// when present. The service layer records it on the conversation at
+    /// ingest (latest-wins, the official `updateReportingToken` shape) so
+    /// `messages.reportSpam` can attach it to the upstream POST body —
+    /// official `jsonData={token}`; connector-internal, never serialized,
+    /// absent on envelopes without the key.
+    #[serde(skip)]
+    pub reporting_token: Option<String>,
 }
 
 /// Inbound quote snapshot: the quoted message's upstream identity plus a
@@ -5973,6 +5990,19 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         .get("serverTimestamp")
         .and_then(Value::as_u64)
         .filter(|value| *value > 0);
+    // The spam-report token (reportSpam data plane): the engine projects the
+    // envelope's `reportingToken` (base64 std of the proto `reportSpamToken`)
+    // when present — the official `Bytes.isNotEmpty` non-empty gate mirrors
+    // here (empty string folds to None). Latest-wins onto the conversation at
+    // ingest; the report face attaches it to the POST body verbatim. An
+    // over-bound token folds to None — a credential is never truncated
+    // (silently corrupting it would mis-address the report upstream).
+    let reporting_token = envelope
+        .get("reportingToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.chars().count() <= MAX_REPORTING_TOKEN_CHARS)
+        .map(str::to_string);
 
     let make = |timestamp: Option<u64>,
                 content_kind: &'static str,
@@ -6005,6 +6035,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         expire_start_at: None,
         server_guid: server_guid.clone(),
         server_timestamp,
+        reporting_token: reporting_token.clone(),
     };
 
     // Typing and body-less reaction / remote-delete receives carry no message
@@ -6910,6 +6941,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
 
@@ -7388,6 +7420,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
 
@@ -7440,6 +7473,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            reporting_token: None,
             server_timestamp: None,
         };
 
@@ -12458,6 +12492,59 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(blank.server_guid.is_none());
+    }
+
+    /// The spam-report token (reportSpam data plane): the envelope's
+    /// `reportingToken` (the engine's base64 projection of the proto
+    /// `reportSpamToken`) is captured connector-internal — trimmed, bounded,
+    /// never serialized. An absent key, a blank value, and an over-bound
+    /// value all fold to None (a credential is never truncated: silently
+    /// corrupting it would mis-address the upstream report).
+    #[test]
+    fn receive_captures_reporting_token() {
+        let normalized = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "reportingToken": "  dG9rZW4tYWJj  ",
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(normalized.reporting_token.as_deref(), Some("dG9rZW4tYWJj"));
+        let bare = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(bare.reporting_token.is_none());
+        let blank = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "reportingToken": "   ",
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(blank.reporting_token.is_none());
+        let oversized = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "reportingToken": "x".repeat(MAX_REPORTING_TOKEN_CHARS + 1),
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(oversized.reporting_token.is_none());
     }
 
     /// Contract 1.128 (§4.109): the envelope `serverTimestamp` key (P15c
