@@ -39,7 +39,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::engine::{NormalizedAttachment, NormalizedQuote, truncate_utf8_bytes};
+use crate::engine::{
+    NormalizedAttachment, NormalizedQuote, sanitize_inbound_filename, truncate_utf8_bytes,
+};
 use crate::ids::{mask_address, stable_hash_id};
 use crate::service::{GROUP_NAME_MAX_BYTES, MAX_HOST_TEXT_PREVIEW_BYTES, MAX_INBOUND_TEXT_BYTES};
 use crate::store::{
@@ -1354,8 +1356,13 @@ impl<'a> Importer<'a> {
                 filename: raw
                     .get("fileName")
                     .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-                    .map(str::to_string),
+                    // The archive line carries the sender's name the same way
+                    // the live pointer does — the §4.184 face applies to both
+                    // (verbatim through the official filters, never a length
+                    // rewrite; the empty filter turns a flattened-nothing
+                    // name into key absence).
+                    .map(sanitize_inbound_filename)
+                    .filter(|text| !text.is_empty()),
                 size: raw.get("size").and_then(Value::as_u64),
                 width: None,
                 height: None,
@@ -2295,6 +2302,67 @@ mod tests {
             .unwrap();
         assert_eq!(faces.len(), 1);
         assert_eq!(faces[0].key.as_deref(), Some(key_b64));
+    }
+
+    /// The import filename face (contract 1.184, §4.184): the archive line
+    /// carries the sender's name the same way the live pointer does, so the
+    /// §4.184 posture applies to both — verbatim through the official
+    /// filters (long Unicode names ride whole; traversal components flatten;
+    /// the bidi set maps to U+FFFD; flatten-to-nothing answers absent), the
+    /// retired live-arm length rewrite never appearing here either.
+    #[test]
+    fn imported_filename_shares_the_inbound_posture() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        let long_unicode = format!("{}季度 总结 会 v2.final.pdf", "文".repeat(200));
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming", "text": "names",
+                    "attachments": [
+                        {"contentType": "image/png", "fileName": long_unicode, "size": 12},
+                        {"contentType": "application/pdf", "fileName": "合同/..\\账单.pdf", "size": 3},
+                        {"contentType": "text/plain", "fileName": "\u{202E}fdp.txt", "size": 2},
+                        {"contentType": "text/plain", "fileName": "..", "size": 1}
+                    ]
+                })
+                .to_string(),
+            ],
+        );
+        run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        let conversation = alice_conversation_id(&account.id);
+        let row = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation,
+                "incoming",
+                1000,
+                &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+            )
+            .unwrap()
+            .expect("imported row");
+        let names: Vec<Option<&str>> = row
+            .attachments
+            .iter()
+            .map(|entry| entry.filename.as_deref())
+            .collect();
+        assert_eq!(names.len(), 4);
+        assert_eq!(names[0], Some(long_unicode.as_str()));
+        assert_eq!(names[1], Some("账单.pdf"));
+        assert_eq!(names[2], Some("\u{FFFD}fdp.txt"));
+        assert_eq!(
+            names[3], None,
+            "pure traversal answers absent, never a name"
+        );
     }
 
     /// The voice-waveform pair (contract 1.150, §4.149) never rides an

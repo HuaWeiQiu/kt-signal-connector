@@ -1757,7 +1757,14 @@ pub struct SyncAttachmentBackfillResponse {
 const MAX_QUOTE_TEXT_CHARS: usize = 128;
 pub(crate) const MAX_INBOUND_ATTACHMENTS: usize = 32;
 const MAX_ATTACHMENT_ID_CHARS: usize = 128;
-const MAX_ATTACHMENT_FILENAME_BYTES: usize = 128;
+/// The inbound filename bound (contract revision 1.184, §4.184): the sender's
+/// name rides verbatim up to this clamp — the clamp is boundedness insurance,
+/// not a rewrite rule. The budget is filesystem-name scale (255 UTF-16 units,
+/// the common per-component cap, reach 1020 UTF-8 bytes), so every name a real
+/// sender's filesystem can produce passes byte-exact and only a hostile
+/// oversized face clamps. The previous 128-byte budget rewrote real names and
+/// is retired (§4.184).
+const MAX_ATTACHMENT_FILENAME_BYTES: usize = 1024;
 const MAX_ATTACHMENT_CONTENT_TYPE_CHARS: usize = 64;
 /// The voice waveform's base64 bound (contract 1.150, §4.149): the engine's
 /// fixed shape is a 100-byte bucket vector (136 base64 chars); the cap is the
@@ -4445,6 +4452,52 @@ pub(crate) fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
+/// One inbound attachment filename (contract revision 1.184, §4.184): the
+/// sender's name rides verbatim — long names, Unicode, spaces, multi-
+/// extensions — the official receive posture
+/// (`processDataMessage.preload.ts:128` `fileName: fileName ?? undefined`,
+/// the quote face `:236` alike). The only rewrites are the official's own
+/// safety filters, pulled forward to this one connector face:
+///
+/// - **Path components flatten** (basename semantics, both separators — the
+///   official save layer joins `basename(name)`
+///   (`attachments.preload.ts:257`); the connector never exposes arbitrary
+///   file paths, so the host face cannot carry a path fragment at all). A
+///   name that flattens to nothing, `.` or `..` says nothing usable and
+///   answers empty — the caller's empty filter turns that into protocol
+///   absence, never a made-up name.
+/// - **Bidi-override controls map to U+FFFD**, the official schema-v9
+///   `replaceUnicodeV2` set verbatim (`Attachment.std.ts:123-143`:
+///   U+202A–U+202E, U+2066–U+2069, U+200E, U+200F, U+061C). No C0/C1 sweep,
+///   no extension verdict (`isFileDangerous` is the official's own save-time
+///   warning, not a protocol filter) — filtering beyond the official family
+///   would rewrite names the official renders as sent.
+///
+/// The result is clamped to [`MAX_ATTACHMENT_FILENAME_BYTES`] — boundedness
+/// insurance at filesystem-name scale, not a rewrite rule (real names never
+/// reach it, §4.184).
+pub(crate) fn sanitize_inbound_filename(name: &str) -> String {
+    let flattened = name
+        .rsplit(['/', '\\'])
+        .find(|component| !component.is_empty())
+        .unwrap_or_default();
+    if flattened.is_empty() || flattened == "." || flattened == ".." {
+        return String::new();
+    }
+    let un_bidi: String = flattened
+        .chars()
+        .map(|c| match c {
+            '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}' => '\u{FFFD}',
+            _ => c,
+        })
+        .collect();
+    truncate_utf8_bytes(&un_bidi, MAX_ATTACHMENT_FILENAME_BYTES)
+}
+
 fn normalized_text(text: &str) -> Option<NormalizedText> {
     if text.is_empty() {
         return None;
@@ -4509,7 +4562,9 @@ fn normalized_quote(value: &Value) -> Option<NormalizedQuote> {
 /// (contract 1.100, §4.81 D4). Key absence is protocol absence; an entry
 /// carrying none of the three keys says nothing and drops whole. The
 /// thumbnail rides the same bounded attachment parser the message face runs,
-/// so an id-less pointer drops rather than rendering half a face.
+/// so an id-less pointer drops rather than rendering half a face; the
+/// filename rides the same §4.184 face (the official filters only, never a
+/// length rewrite — the D4-era ≤128-byte bound is retired).
 fn normalized_quote_attachment(
     object: &serde_json::Map<String, Value>,
 ) -> Option<NormalizedQuoteAttachment> {
@@ -4526,7 +4581,7 @@ fn normalized_quote_attachment(
     let filename = object
         .get("filename")
         .and_then(Value::as_str)
-        .map(|s| truncate_utf8_bytes(s, MAX_ATTACHMENT_FILENAME_BYTES))
+        .map(sanitize_inbound_filename)
         .filter(|s| !s.is_empty());
     let thumbnail = object
         .get("thumbnail")
@@ -4542,7 +4597,9 @@ fn normalized_quote_attachment(
 }
 
 /// Bounded inbound attachment descriptors (§4.13): metadata only, entries past
-/// the cap are dropped, oversized strings are truncated to their bound.
+/// the cap are dropped; the filename rides the §4.184 verbatim posture (the
+/// official safety filters only — never a length rewrite), the remaining
+/// strings truncate to their bound.
 fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
     let Some(entries) = value.as_array() else {
         return Vec::new();
@@ -4569,6 +4626,9 @@ fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
 /// over-cap drops whole, never truncated), the duration any positive float —
 /// and the two stay independent (pairing is the engine's generation
 /// invariant, not a connector gate: the connector forwards what is stated).
+/// The filename rides the §4.184 face: the sender's name verbatim through
+/// [`sanitize_inbound_filename`] — the official's own two filters only, the
+/// length rewrite retired.
 fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<NormalizedAttachment> {
     const MAX_LOCATOR_BASE64_CHARS: usize = 512;
     let id = object
@@ -4590,7 +4650,7 @@ fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<Norm
     let filename = object
         .get("filename")
         .and_then(Value::as_str)
-        .map(|s| truncate_utf8_bytes(s, MAX_ATTACHMENT_FILENAME_BYTES))
+        .map(sanitize_inbound_filename)
         .filter(|s| !s.is_empty());
     let caption = object
         .get("caption")
@@ -9348,6 +9408,117 @@ mod tests {
         assert_eq!(legacy.chunk_size, None);
         assert!(!legacy.is_borderless);
         assert!(!legacy.is_gif);
+    }
+
+    /// The inbound filename face (contract 1.184, §4.184): the sender's name
+    /// rides verbatim — long Unicode names, spaces, multi-extensions — where
+    /// the retired 128-byte budget rewrote real names. The only rewrites are
+    /// the official's own filters: path components flatten (basename, both
+    /// separators), the schema-v9 bidi set maps to U+FFFD — and nothing else
+    /// is touched (no C0 sweep, no extension verdict), the pure-traversal and
+    /// flatten-to-nothing faces answering absent rather than invented, the
+    /// filesystem-scale clamp bounding only hostile oversized faces.
+    #[test]
+    fn inbound_filename_rides_verbatim_and_official_filters_only() {
+        let attachments = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": { "attachments": [data] },
+                },
+            }))
+            .unwrap()
+            .attachments
+        };
+        let filename = |raw: &str| {
+            attachments(json!({ "id": "att-1", "filename": raw }))[0]
+                .filename
+                .clone()
+        };
+
+        // A 200-CJK-char name (600+ bytes) with spaces and multi-extensions —
+        // every byte of it filesystem-legal and, since 1.184, wire-exact (the
+        // old 128-byte budget truncated this to a quarter).
+        let long_unicode = format!("{}项目 报告 草稿.backup.final.pdf", "文".repeat(200));
+        assert_eq!(filename(&long_unicode), Some(long_unicode.clone()));
+        // Far past the retired 128-byte budget — the rewrite this batch removes.
+        assert!(long_unicode.len() > 128);
+
+        // The official filter family: path components flatten, both
+        // separators, basename semantics.
+        assert_eq!(filename("a/b.txt").as_deref(), Some("b.txt"));
+        assert_eq!(filename("..\\..\\win.txt").as_deref(), Some("win.txt"));
+        assert_eq!(filename("报告/合同.docx").as_deref(), Some("合同.docx"));
+        assert_eq!(filename("a//b.txt").as_deref(), Some("b.txt"));
+        assert_eq!(filename("a/b/.txt").as_deref(), Some(".txt"));
+        // Dots that are not traversal ride: "..." is a legal name.
+        assert_eq!(filename("...").as_deref(), Some("..."));
+        assert_eq!(filename("..a").as_deref(), Some("..a"));
+
+        // Pure traversal or flatten-to-nothing faces answer absent — never a
+        // made-up or half-safe name.
+        assert_eq!(filename(".."), None);
+        assert_eq!(filename("."), None);
+        assert_eq!(filename("dir/.."), None);
+        assert_eq!(filename("/"), None);
+        assert_eq!(filename(""), None);
+
+        // The official schema-v9 bidi set maps to U+FFFD (replaceUnicodeV2),
+        // every other byte riding untouched.
+        assert_eq!(
+            filename("invoice\u{202E}fdp.exe").as_deref(),
+            Some("invoice\u{FFFD}fdp.exe")
+        );
+        assert_eq!(
+            filename("\u{200E}note\u{2066}x\u{061C}").as_deref(),
+            Some("\u{FFFD}note\u{FFFD}x\u{FFFD}")
+        );
+
+        // 仅限官方同款: the official has no C0 filter and no extension
+        // verdict at the protocol layer — newlines, tabs and the
+        // isFileDangerous family ride exactly as sent.
+        assert_eq!(
+            filename("line1\nline2\treport.vbs").as_deref(),
+            Some("line1\nline2\treport.vbs")
+        );
+
+        // The clamp is boundedness insurance at filesystem-name scale (1024
+        // bytes = the 255-UTF-16-unit per-component cap's UTF-8 worst case):
+        // ASCII clamps to the budget, CJK clamps on a char boundary.
+        let ascii_herd = "F".repeat(2000);
+        let clamped = filename(&ascii_herd).unwrap();
+        assert_eq!(clamped.len(), 1024);
+        let cjk_herd = "長".repeat(400);
+        let clamped = filename(&cjk_herd).unwrap();
+        assert_eq!(clamped, "長".repeat(341));
+        assert_eq!(clamped.len(), 1023);
+
+        // The quote face shares the one parser: a long quoted name rides
+        // verbatim too.
+        let quote = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "dataMessage": {
+                    "message": "replying to media",
+                    "quote": {
+                        "id": 7,
+                        "authorNumber": "+15555550102",
+                        "attachments": [{ "filename": long_unicode }],
+                    },
+                },
+            },
+        }))
+        .unwrap()
+        .unwrap()
+        .quote
+        .unwrap();
+        assert_eq!(
+            quote.attachments[0].filename.as_deref(),
+            Some(long_unicode.as_str())
+        );
     }
 
     /// The engine's voice-waveform pair (contract 1.150, §4.149) parses
