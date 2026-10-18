@@ -7480,7 +7480,14 @@ async fn sync_contacts_with(
         // connector ships no copy of its own.
         let title = compose_contact_display_name(&item)
             .unwrap_or_else(|| crate::ids::mask_address(peer_key));
-        synced.push(("contact".to_string(), peer_key.to_string(), title, None));
+        // Contract 1.176 (§4.176): the raw upstream `JsonContact.username`
+        // rides the row's `extra` JSON verbatim (trimmed, bounded) — the
+        // desktop's official getTitleNoDefault last-tier material
+        // (profileName → number → username). Absent upstream leaves the
+        // extra empty, the same informative-keys discipline as the group
+        // rows' markers.
+        let extra = contact_extra_json(item.get("username").and_then(Value::as_str));
+        synced.push(("contact".to_string(), peer_key.to_string(), title, extra));
         contact_count += 1;
     }
     for item in groups_result.as_array().cloned().unwrap_or_default() {
@@ -9123,6 +9130,23 @@ fn compose_contact_display_name(item: &Value) -> Option<String> {
         .map(|s| s.chars().take(64).collect())
 }
 
+/// Contract 1.176 (§4.176): the `kind='contact'` row's `extra` JSON — the raw
+/// upstream `JsonContact.username` under its own key, verbatim-trimmed and
+/// bounded. `None`/empty/over-budget usernames leave the extra empty (absent
+/// marker), the same informative-keys discipline as the group rows: the
+/// desktop answers unknown for a row with no username evidence, never
+/// invents one. Budget: Signal usernames are nickname(≤32)+discriminator;
+/// 64 chars whole-value headroom with the over-budget key dropped, not
+/// clipped (a clipped username would resolve the wrong account).
+const CONTACT_USERNAME_MAX_CHARS: usize = 64;
+
+fn contact_extra_json(username: Option<&str>) -> Option<String> {
+    let username = username
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= CONTACT_USERNAME_MAX_CHARS)?;
+    Some(serde_json::json!({ "username": username }).to_string())
+}
+
 /// Project the engine's `getStickerPackManifest` result (contract 1.36,
 /// §4.32): bounded title/author (KT 256-char bound, the official decoder
 /// applies none), the optional cover, and the sticker list truncated at the
@@ -9981,6 +10005,28 @@ mod tests {
             compose_contact_display_name(&item).as_deref(),
             Some("Ada Lovelace")
         );
+    }
+
+    /// Contract 1.176 (§4.176): the contact row's `extra` JSON carries the
+    /// raw upstream `JsonContact.username` verbatim-trimmed and bounded —
+    /// absent/blank leaves no marker, over-budget drops the key whole (a
+    /// clipped username would resolve the wrong account), so pre-1.176 rows
+    /// and peers without a username stay byte-identical on the wire.
+    #[test]
+    fn contact_extra_json_captures_bounded_username() {
+        use super::contact_extra_json;
+        assert_eq!(
+            contact_extra_json(Some("ybx0614.42")),
+            Some(r#"{"username":"ybx0614.42"}"#.to_string())
+        );
+        assert_eq!(
+            contact_extra_json(Some("  ybx0614.42  ")),
+            Some(r#"{"username":"ybx0614.42"}"#.to_string())
+        );
+        assert_eq!(contact_extra_json(None), None);
+        assert_eq!(contact_extra_json(Some("   ")), None);
+        assert!(contact_extra_json(Some(&"a".repeat(64))).is_some());
+        assert_eq!(contact_extra_json(Some(&"a".repeat(65))), None);
     }
 
     /// Contract 1.65 (§4.58): the factor stamp serializes exactly the flags

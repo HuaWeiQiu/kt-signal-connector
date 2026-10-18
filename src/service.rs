@@ -11822,6 +11822,28 @@ pub(crate) fn store_get_group_with_requesting(
     })
 }
 
+/// Contract 1.176 (§4.176): the read-time (name, username) pair for one
+/// member identity — each contacts-cache map resolves id-first with the
+/// uuid tail, the same ladder the §4.39 name resolution runs. A cache row
+/// with no captured username contributes no pair member; the projection
+/// answers absent, never invents one.
+fn member_name_username(
+    titles: &std::collections::HashMap<String, String>,
+    usernames: &std::collections::HashMap<String, String>,
+    id: &str,
+    uuid: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let name = titles
+        .get(id)
+        .or_else(|| uuid.and_then(|uuid| titles.get(uuid)))
+        .cloned();
+    let username = usernames
+        .get(id)
+        .or_else(|| uuid.and_then(|uuid| usernames.get(uuid)))
+        .cloned();
+    (name, username)
+}
+
 /// One live requesting-member projection (contract revision 1.62, §4.53
 /// appendix): the connector-wide first-wins address ladder picks the id the
 /// desktop addresses the approval write with (the fold accepts either
@@ -11836,6 +11858,7 @@ fn project_requesting_members(
     entries: &[Value],
 ) -> Result<Vec<GroupRequestingMemberView>, ServiceError> {
     let titles = store.contact_title_map(account_id)?;
+    let usernames = store.contact_username_map(account_id)?;
     Ok(entries
         .iter()
         .take(MAX_GROUP_MEMBERS)
@@ -11867,11 +11890,13 @@ fn project_requesting_members(
                         .take(MAX_GROUP_MEMBER_ID_CHARS)
                         .collect::<String>()
                 });
-            let name = titles
-                .get(&id)
-                .or_else(|| uuid.as_deref().and_then(|uuid| titles.get(uuid)))
-                .cloned();
-            Some(GroupRequestingMemberView { id, uuid, name })
+            let (name, username) = member_name_username(&titles, &usernames, &id, uuid.as_deref());
+            Some(GroupRequestingMemberView {
+                id,
+                uuid,
+                name,
+                username,
+            })
         })
         .collect())
 }
@@ -11892,6 +11917,7 @@ fn project_pending_members(
     entries: &[Value],
 ) -> Result<Vec<GroupPendingMemberView>, ServiceError> {
     let titles = store.contact_title_map(account_id)?;
+    let usernames = store.contact_username_map(account_id)?;
     Ok(entries
         .iter()
         .take(MAX_GROUP_MEMBERS)
@@ -11923,11 +11949,13 @@ fn project_pending_members(
                         .take(MAX_GROUP_MEMBER_ID_CHARS)
                         .collect::<String>()
                 });
-            let name = titles
-                .get(&id)
-                .or_else(|| uuid.as_deref().and_then(|uuid| titles.get(uuid)))
-                .cloned();
-            Some(GroupPendingMemberView { id, uuid, name })
+            let (name, username) = member_name_username(&titles, &usernames, &id, uuid.as_deref());
+            Some(GroupPendingMemberView {
+                id,
+                uuid,
+                name,
+                username,
+            })
         })
         .collect())
 }
@@ -11947,6 +11975,7 @@ fn project_group_roster(
     roster: &[Value],
 ) -> Result<Vec<GroupMemberView>, ServiceError> {
     let titles = store.contact_title_map(account_id)?;
+    let usernames = store.contact_username_map(account_id)?;
     Ok(roster
         .iter()
         .take(MAX_GROUP_MEMBERS)
@@ -11974,10 +12003,7 @@ fn project_group_roster(
                         .take(MAX_GROUP_MEMBER_ID_CHARS)
                         .collect::<String>()
                 });
-            let name = titles
-                .get(&id)
-                .or_else(|| uuid.as_deref().and_then(|uuid| titles.get(uuid)))
-                .cloned();
+            let (name, username) = member_name_username(&titles, &usernames, &id, uuid.as_deref());
             let label_emoji = super_supervisor_label_bound(
                 object.get("labelEmoji").and_then(Value::as_str),
                 GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES,
@@ -11991,6 +12017,7 @@ fn project_group_roster(
                 id,
                 uuid,
                 name,
+                username,
                 admin: object.get("admin").and_then(Value::as_bool) == Some(true),
                 label_emoji,
                 label,
@@ -12457,6 +12484,14 @@ pub struct GroupMemberView {
     pub uuid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Contract 1.176 (§4.176): the raw upstream `JsonContact.username` the
+    /// contacts cache holds for this member, resolved at read time like
+    /// `name` — the desktop's official getTitleNoDefault last-tier material
+    /// (profileName → number → username). Absent when the cache row carries
+    /// none; the desktop answers its localized unknown-contact placeholder,
+    /// never invents one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     #[serde(rename = "self", skip_serializing_if = "std::ops::Not::not")]
     pub is_self: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -12482,6 +12517,11 @@ pub struct GroupRequestingMemberView {
     pub uuid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Contract 1.176 (§4.176): the raw `JsonContact.username` resolved at
+    /// read time like `name` — the official getTitleNoDefault last-tier
+    /// material. Absent when the cache row carries none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 /// One projected pending-invite row (contract revision 1.64, §4.57): the
@@ -12505,6 +12545,11 @@ pub struct GroupPendingMemberView {
     pub uuid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Contract 1.176 (§4.176): the raw `JsonContact.username` resolved at
+    /// read time like `name` — the official getTitleNoDefault last-tier
+    /// material. Absent when the cache row carries none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 /// with. `emoji`/`contentType` are absent when the pack did not declare
 /// them (the official proto treats both as optional).
@@ -29939,6 +29984,128 @@ mod tests {
             .prepare_set_local_alias(&account.id, "+15555550101", &"x".repeat(129))
             .unwrap_err();
         assert_eq!(oversized.into_api().code, "INVALID_REQUEST");
+    }
+
+    /// Contract 1.176 (§4.176): the raw `JsonContact.username` the contacts
+    /// cache holds projects onto the roster / requesting / pending member
+    /// rows at read time — id-first with the uuid tail, the same ladder the
+    /// name resolution runs. Members the cache has no username for keep the
+    /// absent key (never invented); an over-budget stored marker drops the
+    /// key at read (a clipped username would resolve the wrong account).
+    #[test]
+    fn get_group_projects_member_usernames_from_contacts_cache() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        // The §4.39 stored roster: one number-keyed member with an upstream
+        // uuid tail, one bare ACI-keyed member (username-only registrations
+        // carry no number).
+        let mut extra = serde_json::Map::new();
+        extra.insert("memberCount".to_string(), json!(2));
+        extra.insert(
+            "members".to_string(),
+            json!([
+                {"id": "+15555550101", "uuid": "9f0fd6a2-1111-4000-8000-000000000001"},
+                {"id": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"},
+            ]),
+        );
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "ZmFrZS1ncm91cC0x",
+                "Fixture Group",
+                Some(&Value::Object(extra).to_string()),
+                1725300000,
+            )
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "contact",
+                "+15555550101",
+                "Alice Contact",
+                Some(r#"{"username":"alice.01"}"#),
+                1725300000,
+            )
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "contact",
+                "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1",
+                "Stranger",
+                None,
+                1725300000,
+            )
+            .unwrap();
+        let over_budget = format!(r#"{{"username":"{}"}}"#, "x".repeat(65));
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "contact",
+                "+15555550102",
+                "Budget Peer",
+                Some(&over_budget),
+                1725300000,
+            )
+            .unwrap();
+
+        let alice =
+            json!({"number": "+15555550101", "uuid": "9f0fd6a2-1111-4000-8000-000000000001"});
+        let details = store_get_group_with_requesting(
+            service.store_ref(),
+            &account.id,
+            "ZmFrZS1ncm91cC0x",
+            Some(std::slice::from_ref(&alice)),
+            Some(&[alice.clone(), json!({"number": "+15555550102"})]),
+        )
+        .unwrap();
+
+        let members = details.members.expect("stored roster projects");
+        let members_wire = serde_json::to_value(&members).unwrap();
+        assert_eq!(
+            members_wire[0],
+            json!({
+                "id": "+15555550101",
+                "uuid": "9f0fd6a2-1111-4000-8000-000000000001",
+                "name": "Alice Contact",
+                "username": "alice.01",
+            }),
+            "id-first resolution lands the cached username beside the name"
+        );
+        assert_eq!(
+            members_wire[1],
+            json!({"id": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1", "name": "Stranger"}),
+            "a member the cache has no username for keeps the absent key"
+        );
+        let requesting_wire =
+            serde_json::to_value(details.requesting_members.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            requesting_wire[0],
+            json!({
+                "id": "+15555550101",
+                "uuid": "9f0fd6a2-1111-4000-8000-000000000001",
+                "name": "Alice Contact",
+                "username": "alice.01",
+            }),
+            "the requesting face runs the same username resolution"
+        );
+        let pending_wire = serde_json::to_value(details.pending_members.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            pending_wire[1],
+            json!({"id": "+15555550102", "name": "Budget Peer"}),
+            "an over-budget stored username drops the key whole at read"
+        );
     }
 
     /// presence.setTypingMessage prepare (contract revision 1.11, §4.10):

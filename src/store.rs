@@ -822,6 +822,21 @@ fn extra_is_terminated(extra: Option<&str>) -> bool {
         == Some(true)
 }
 
+/// Contract 1.176 (§4.176): the raw `JsonContact.username` marker the sync
+/// captured under the contact row's `extra` JSON — trimmed, non-empty, and
+/// only when whole-value within the §4.176 budget (a clipped username would
+/// resolve the wrong account, so over-budget values drop the key, the same
+/// read-side discipline the §4.60 labels run).
+fn extra_username(extra: Option<&str>) -> Option<String> {
+    let parsed = extra.and_then(|extra| serde_json::from_str::<Value>(extra).ok())?;
+    parsed
+        .get("username")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 64)
+        .map(str::to_owned)
+}
+
 /// The §4.171 outbound-quote projection only names an author for an outgoing
 /// quoted row whose send outcome has reached an addressable rung of the §4.6
 /// resolve ladder (`service.rs` resolve_recipient): sent/delivered/read mean
@@ -1558,6 +1573,15 @@ pub struct ContactSummary {
     /// pre-1.146 hosts read byte-identical rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_id: Option<String>,
+    /// Contract 1.176 (§4.176): the raw upstream `JsonContact.username` the
+    /// sync captured into the row's `extra` JSON — the desktop's official
+    /// getTitleNoDefault last-tier material (profileName → number →
+    /// username). Absent when the row carries none (pre-1.176 sync rows,
+    /// engines without the face, peers without a username) — the desktop
+    /// answers its localized unknown-contact placeholder, never invents one.
+    /// Group rows answer absent (JsonGroup has no username face).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 /// One recorded reaction (contract 1.15): the actor's emoji state on a target
@@ -7541,6 +7565,39 @@ impl Store {
         Ok(map)
     }
 
+    /// Contract 1.176 (§4.176): the cached `kind='contact'` raw usernames of
+    /// one account, keyed by peer_key — the same read-time resolution the
+    /// [`contact_title_map`] names run, for the official getTitleNoDefault
+    /// last tier (profileName → number → username). Rows without a captured
+    /// username contribute nothing; the projection answers absent for those
+    /// members, never invents one.
+    pub fn contact_username_map(
+        &self,
+        account_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT peer_key, extra
+                 FROM contacts
+                 WHERE account_id=?1 AND kind='contact'",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (peer_key, extra) = row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if let Some(username) = extra_username(extra.as_deref()) {
+                map.insert(peer_key, username);
+            }
+        }
+        Ok(map)
+    }
+
     /// Read-only paged view of the contacts cache, ordered by (kind, peer_key).
     /// `query` is an optional case-insensitive substring filter over title/peer_key.
     pub fn list_contacts(
@@ -7627,6 +7684,17 @@ impl Store {
                         peer_key,
                         title: row.get(3)?,
                         service_id,
+                        // Contract 1.176 (§4.176): the username marker the
+                        // sync captured, verbatim-trimmed at capture and
+                        // re-checked whole-value here (a clipped username
+                        // would resolve the wrong account — over-budget
+                        // reads drop). Group rows never carry the face:
+                        // JsonGroup has no username projection.
+                        username: if kind == "contact" {
+                            extra_username(extra.as_deref())
+                        } else {
+                            None
+                        },
                     })
                 },
             )
@@ -9413,6 +9481,85 @@ mod tests {
 
     /// The window judgment: a queue entry whose `first_send_attempted_at +
     /// 24 h` has run out dies in the queue — the claim pass retires its
+    /// Contract 1.176 (§4.176): the raw `JsonContact.username` the sync
+    /// captured into the contact row's `extra` JSON projects on the
+    /// `contacts.list` wire and the read-time username map; absent,
+    /// blank, and over-budget markers all answer absent (the informative-
+    /// keys discipline — pre-1.176 rows read byte-identical).
+    #[test]
+    fn list_contacts_projects_captured_username() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .upsert_synced_contacts(
+                &account.id,
+                &[
+                    SyncedContact {
+                        kind: "contact",
+                        peer_key: "+15555550101",
+                        title: "Alice Contact",
+                        extra: Some(r#"{"username":"alice.01"}"#),
+                    },
+                    SyncedContact {
+                        kind: "contact",
+                        peer_key: "+15555550102",
+                        title: "Budget Peer",
+                        extra: Some(&format!(r#"{{"username":"{}"}}"#, "x".repeat(65))),
+                    },
+                    SyncedContact {
+                        kind: "contact",
+                        peer_key: "+15555550103",
+                        title: "No Username",
+                        extra: None,
+                    },
+                ],
+                1_725_300_000,
+            )
+            .unwrap();
+
+        let page = store.list_contacts(&account.id, None, 50, None).unwrap();
+        let wire = serde_json::to_value(&page.items).unwrap();
+        assert_eq!(wire[0]["username"], serde_json::json!("alice.01"));
+        assert!(wire[1].get("username").is_none(), "over-budget drops");
+        assert!(wire[2].get("username").is_none(), "absent stays absent");
+        // group rows never carry a username face
+        store
+            .upsert_synced_contacts(
+                &account.id,
+                &[SyncedContact {
+                    kind: "group",
+                    peer_key: "ZmFrZS1ncm91cC0x",
+                    title: "Fixture Group",
+                    extra: Some(r#"{"username":"group.01","memberCount":1}"#),
+                }],
+                1_725_300_000,
+            )
+            .unwrap();
+        let with_group = store.list_contacts(&account.id, None, 50, None).unwrap();
+        let group_wire = serde_json::to_value(&with_group.items).unwrap();
+        let group_row = group_wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "group")
+            .expect("the group row projects");
+        assert!(
+            group_row.get("username").is_none(),
+            "JsonGroup has no username face — the key never rides a group row"
+        );
+
+        let usernames = store.contact_username_map(&account.id).unwrap();
+        assert_eq!(
+            usernames.get("+15555550101").map(String::as_str),
+            Some("alice.01")
+        );
+        assert!(!usernames.contains_key("+15555550102"));
+        assert!(!usernames.contains_key("+15555550103"));
+    }
+
     /// schedule and claims nothing for it (the row stays `failed`,
     /// terminal), while a live-window control row in the same pass is
     /// claimed normally.
