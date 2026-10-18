@@ -32,9 +32,9 @@ use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
 use crate::media::{MEDIA_CHUNK_BYTES, MediaGovernor, MediaHandleError, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::store::{
-    AccountDeletePlan, AccountRow, AccountSummary, AdjacentMediaDirection, ContactSummary,
-    ConversationRow, ConversationSummary, MessageRecord, Page, ReceiptResupply, RetryClaim, Store,
-    StoreError, SyncedContact,
+    AccountDeletePlan, AccountRow, AccountSummary, AdjacentMediaDirection, CommonGroupRow,
+    ContactSummary, ConversationRow, ConversationSummary, MessageRecord, Page, ReceiptResupply,
+    RetryClaim, Store, StoreError, SyncedContact,
 };
 
 /// Bounds below are the code-side enforcement of the host-facing schema
@@ -2138,6 +2138,22 @@ impl ConnectorService {
         group_key: &str,
     ) -> Result<GroupDetails, ServiceError> {
         store_get_group(&self.store, account_id, group_key)
+    }
+
+    /// Contract 1.181 (§4.181): the groups-in-common answer for one direct
+    /// contact — the official ConversationDetails.preload.tsx:80-100
+    /// derivation (the peer's identity against every captured roster,
+    /// title-sorted) served from the local contacts cache, zero engine calls.
+    /// The target must be a direct conversation: the official face lives on
+    /// the contact-details panel, and a group target answers INVALID_REQUEST
+    /// (an honest shape refusal, not a NOT_FOUND lie). An empty set is the
+    /// honest no-groups-in-common answer.
+    pub fn groups_common(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<CommonGroupsDetails, ServiceError> {
+        store_groups_common(&self.store, account_id, conversation_id)
     }
 
     // --- Shared target resolution for the prepare_* family -----------------
@@ -8903,19 +8919,33 @@ impl ConnectorService {
             _ => "delivered",
         };
         // Contract 1.29: a row @mentions the linked account when one of its
-        // normalized mention authors resolves to the account's own number.
-        // The match is number-based because the pinned upstream jsonRpc
-        // surface exposes the account only by number (`listAccounts` returns
-        // `{number}`; the account UUID is not queryable), so a mention author
-        // carrying only a UUID cannot be attributed to self — recorded as the
-        // revision's known boundary. Mention authors prefer the resolved
-        // number (`number` first, `uuid` fallback), so the common group case
-        // matches. Computed before the record consumes the rich payload.
+        // normalized mention authors resolves to the account's own identity.
+        // The match was number-only at 1.29 (the pinned upstream jsonRpc
+        // surface exposed the account only by number) — the recorded boundary
+        // held until contract 1.142 (§4.138) persisted the engine's own-ACI
+        // answer on the account row. Contract 1.181 (§4.181) folds the ACI,
+        // the engine-mode face's common author shape (the 1.40 promotion):
+        // a mention counts when its author is the number (unchanged), when
+        // its authorAci canonicalizes to the account ACI, or when its author
+        // IS the ACI string — both spellings through `canonical_aci`, so
+        // dashed/bare/case never splits a match. Computed before the record
+        // consumes the rich payload.
+        let mention_flags_self = |mention: &crate::engine::NormalizedMention| {
+            mention.author == signal_account
+                || account.aci.as_deref().is_some_and(|aci| {
+                    mention.author == *aci
+                        || mention
+                            .author_aci
+                            .as_deref()
+                            .and_then(crate::store::canonical_aci)
+                            .is_some_and(|canonical| canonical == *aci)
+                })
+        };
         let mentions_self = direction == "incoming"
             && receive
                 .rich
                 .as_ref()
-                .is_some_and(|rich| rich.mentions.iter().any(|m| m.author == signal_account));
+                .is_some_and(|rich| rich.mentions.iter().any(mention_flags_self));
         // Contract 1.42 (§4.41): a timer-notice system row mirrors the
         // conversation's new timer state before the row lands, so the summary
         // refetched below for conversation.changed already carries it. The
@@ -11796,6 +11826,33 @@ pub(crate) fn store_clear_conversation_draft(
         .ok_or(ServiceError::Store(StoreError::ConversationNotFound))
 }
 
+/// Contract 1.181 (§4.181): the store-only `groups.common` read — the
+/// official groups-in-common derivation (ConversationDetails.preload.tsx:80-100)
+/// over the §4.39 captured rosters. The target must be a direct conversation
+/// (the official face lives on the contact-details panel; a group target
+/// answers INVALID_REQUEST — an honest shape refusal, not a NOT_FOUND lie),
+/// and the answer is title-sorted like the official panel with an empty set
+/// as the honest no-groups-in-common face.
+pub(crate) fn store_groups_common(
+    store: &Store,
+    account_id: &str,
+    conversation_id: &str,
+) -> Result<CommonGroupsDetails, ServiceError> {
+    let conversation = store
+        .conversation_by_id(account_id, conversation_id)?
+        .ok_or(ServiceError::Store(StoreError::ConversationNotFound))?;
+    if conversation.kind == "group" {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "groups in common is a direct-contact face — the target conversation must be a direct chat",
+            false,
+        )));
+    }
+    Ok(CommonGroupsDetails {
+        groups: store.groups_in_common(account_id, &conversation.peer_key)?,
+    })
+}
+
 pub(crate) fn store_list_contacts(
     store: &Store,
     account_id: &str,
@@ -11880,6 +11937,16 @@ pub(crate) fn store_get_group_with_requesting(
             "ANY" | "ADMINISTRATOR" | "UNSATISFIABLE" => Some(word.to_string()),
             _ => None,
         });
+    // Contract 1.181 (§4.181): the announcements-only flag the sync captured
+    // — the CompositionArea.dom.tsx:1108 `announcementsOnly && !areWeAdmin`
+    // banner gate's first half; the roster's admin/self marks answer the
+    // second. Stored verbatim (true or false) only when the upstream carried
+    // the key, so absent = unknown (pre-1.181 rows, a legacy face without
+    // the flag) — never a guessed false; a malformed stored value drops,
+    // never fails the read.
+    let announcements_only = extra
+        .as_ref()
+        .and_then(|extra| extra.get("announcementsOnly").and_then(Value::as_bool));
     // Contract 1.62 (§4.53 appendix): the live requesting-members projection —
     // resolved against the same read-time contacts-cache name map the roster
     // uses, bounded to the roster cap. `None` (store-only callers, pre-1.62
@@ -11904,6 +11971,7 @@ pub(crate) fn store_get_group_with_requesting(
         members: members?,
         is_terminated,
         link_access,
+        announcements_only,
         requesting_members,
         pending_members,
         synced_at,
@@ -12064,6 +12132,10 @@ fn project_group_roster(
 ) -> Result<Vec<GroupMemberView>, ServiceError> {
     let titles = store.contact_title_map(account_id)?;
     let usernames = store.contact_username_map(account_id)?;
+    // Contract 1.181 (§4.181): the account's stored ACI for the roster's
+    // self mark — one indexed read, absent on accounts the engine has not
+    // answered yet (the honest absent face, never minted).
+    let account_aci = store.account_aci(account_id)?;
     Ok(roster
         .iter()
         .take(MAX_GROUP_MEMBERS)
@@ -12100,8 +12172,16 @@ fn project_group_roster(
                 object.get("label").and_then(Value::as_str),
                 GROUP_MEMBER_LABEL_SERVER_MAX_BYTES,
             );
+            // Contract 1.181 (§4.181): the self mark folds the account ACI
+            // beside the number — the engine roster id falls back to the
+            // member's ACI service-id string when the contacts lookup misses,
+            // so the §4.42/§4.43 identity ladder governs the roster too.
+            let is_self = id == account.signal_account
+                || account_aci
+                    .as_deref()
+                    .is_some_and(|aci| id == *aci || uuid.as_deref() == Some(aci));
             Some(GroupMemberView {
-                is_self: id == account.signal_account,
+                is_self,
                 id,
                 uuid,
                 name,
@@ -12550,6 +12630,13 @@ pub struct GroupDetails {
     pub is_terminated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_access: Option<String>,
+    /// Contract 1.181 (§4.181): the announcements-only flag the sync
+    /// captured from the upstream JsonGroup (the engine's listGroups always
+    /// carries it). Absent on pre-1.181 rows and every capture without the
+    /// key — unknown, never a guessed false; the row converges through the
+    /// next sync like every other captured flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub announcements_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requesting_members: Option<Vec<GroupRequestingMemberView>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12557,20 +12644,33 @@ pub struct GroupDetails {
     pub synced_at: u64,
 }
 
+/// The `groups.common` answer (contract 1.181, §4.181): the direct contact's
+/// groups in common over the §4.39 captured rosters, title-sorted like the
+/// official panel (ConversationDetails.preload.tsx:80-100). An empty list is
+/// the honest no-groups-in-common answer — the capture only knows what the
+/// last contacts sync saw.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommonGroupsDetails {
+    pub groups: Vec<CommonGroupRow>,
+}
+
 /// One projected group member (contract revision 1.40, §4.39): the official
 /// member row's minimal set. `id` follows the connector-wide first-wins
 /// address ladder so roster entries join against contact peer keys, message
 /// senders, and mention authors; `uuid` is present only when the upstream
 /// supplied one; `name` resolves from the contacts cache at read time and is
-/// absent for a peer the cache does not know; `self` is the number-based §4.24
-/// boundary (the own ACI is not queryable upstream); `admin` is the upstream
-/// admin mark the sync captured, collapsed to an absent key when false or
-/// never provided (engine-mode rosters carry none — §4.39 records the
-/// projection difference). `labelEmoji` / `label` (contract 1.67, §4.60) are
+/// absent for a peer the cache does not know; `self` matches the linked
+/// account's number or its stored ACI (contract 1.181 — the engine roster id
+/// falls back to the member's ACI service-id string when the number lookup
+/// misses, the §4.42/§4.43 `peer_key_is_self` ladder); `admin` is the
+/// upstream admin mark the sync captured — the GV2 `role` word
+/// (ADMINISTRATOR) since 1.181 beside the legacy `isAdmin`/`admins` reads —
+/// collapsed to an absent key when false or never provided.
+/// `labelEmoji` / `label` (contract 1.67, §4.60) are
 /// the upstream member's own label the sync captured verbatim, collapsed to
 /// absent keys when the member carries none (the pinned upstream emits both
-/// `@JsonInclude(NON_NULL)`; engine-mode rosters carry neither — same
-/// projection difference as `admin`). The write face (§4.44
+/// `@JsonInclude(NON_NULL)`). The write face (§4.44
 /// `groups.update memberLabel`/`memberLabelEmoji`, self only per the pinned
 /// `GroupHelper.updateGroupV2`) converges the values through the next sync —
 /// this read projects, it never composes.
@@ -14858,6 +14958,17 @@ pub struct ContactsListParams {
 pub struct GroupsGetParams {
     pub account_id: String,
     pub group_key: String,
+}
+
+/// groups.common params (contract revision 1.181, §4.181): the direct
+/// conversation whose contact the groups-in-common answer is for. A group
+/// conversation target answers INVALID_REQUEST — the face lives on the
+/// official contact-details panel.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsCommonParams {
+    pub account_id: String,
+    pub conversation_id: String,
 }
 
 /// groups.update params (contract revision 1.45, §4.44, capability
@@ -20437,6 +20548,333 @@ mod tests {
             .unwrap();
         assert_eq!(summary.last_message_direction, Some("outgoing"));
         assert_eq!(summary.last_message_author_name, None);
+    }
+
+    /// Contract 1.181 (§4.181): the receive-path mention self-match folds the
+    /// account ACI beside the 1.29 number arm — the engine-mode face's common
+    /// author shapes (the ACI as `author`, or a differently-spelled
+    /// `authorAci`) now flag `mentionsSelf` and bump `unreadMentions` in the
+    /// same transaction, while a non-self author and an outgoing mention
+    /// never count.
+    #[test]
+    fn mention_self_match_folds_the_account_aci() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[(
+                    "+15555550100".into(),
+                    Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
+                )],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            account.aci.as_deref(),
+            Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10")
+        );
+        let mention_receive =
+            |timestamp: u64, direction: &'static str, mention: crate::engine::NormalizedMention| {
+                NormalizedReceive {
+                    timestamp: Some(timestamp),
+                    content_kind: "dataMessage",
+                    direction,
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550101".into()),
+                    source_uuid: None,
+                    peer_name: Some("Peer".into()),
+                    group_id: Some("group-one".into()),
+                    text: Some("@you".into()),
+                    text_bytes: Some(4),
+                    text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    rich: Some(crate::engine::NormalizedRich {
+                        mentions: vec![mention],
+                        ..Default::default()
+                    }),
+                    sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
+                    control: None,
+                    server_guid: None,
+                    server_timestamp: None,
+                }
+            };
+
+        // A stranger's mention never counts (the 1.29 no-match arm).
+        let mut receive = mention_receive(
+            200,
+            "incoming",
+            crate::engine::NormalizedMention {
+                author: "+15555550999".into(),
+                author_aci: None,
+                name: Some("Stranger".into()),
+                start: 0,
+                length: 4,
+            },
+        );
+        assert!(
+            !service
+                .ingest_receive(receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        // The engine-mode shape: the mention author IS the account ACI.
+        receive = mention_receive(
+            300,
+            "incoming",
+            crate::engine::NormalizedMention {
+                author: "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into(),
+                author_aci: None,
+                name: None,
+                start: 0,
+                length: 4,
+            },
+        );
+        assert!(
+            !service
+                .ingest_receive(receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        // The canonical-compare arm: a bare, uppercase authorAci spelling.
+        receive = mention_receive(
+            400,
+            "incoming",
+            crate::engine::NormalizedMention {
+                author: "+15555550999".into(),
+                author_aci: Some("0B7FCA5712344D0E9B0F4F6C1F8A2E10".into()),
+                name: None,
+                start: 0,
+                length: 4,
+            },
+        );
+        assert!(
+            !service
+                .ingest_receive(receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        // The 1.29 number arm still matches.
+        receive = mention_receive(
+            500,
+            "incoming",
+            crate::engine::NormalizedMention {
+                author: "+15555550100".into(),
+                author_aci: None,
+                name: None,
+                start: 0,
+                length: 4,
+            },
+        );
+        assert!(
+            !service
+                .ingest_receive(receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        // An outgoing self-mention never counts (the direction gate).
+        receive = mention_receive(
+            600,
+            "outgoing",
+            crate::engine::NormalizedMention {
+                author: "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into(),
+                author_aci: None,
+                name: None,
+                start: 0,
+                length: 4,
+            },
+        );
+        assert!(
+            !service
+                .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+
+        let conversation = service
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .remove(0);
+        // Four incoming rows, three of them @self: the lockstep counters.
+        assert_eq!(conversation.unread_count, 4);
+        assert_eq!(conversation.unread_mentions, 3);
+        let rows = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        let self_flags: Vec<bool> = rows.iter().map(|row| row.mentions_self).collect();
+        // Rows come newest-first: outgoing (never), number, canonical, aci,
+        // stranger (never).
+        assert_eq!(self_flags, vec![false, true, true, true, false]);
+        let wire = serde_json::to_value(&rows[1]).unwrap();
+        assert_eq!(wire["mentionsSelf"], true);
+    }
+
+    /// Contract 1.181 (§4.181): `groups.common` serves the official
+    /// groups-in-common panel from the captured rosters — the direct peer's
+    /// identity ladder against each roster — title-sorted, with an honest
+    /// empty set for a stranger, INVALID_REQUEST for a group target (the
+    /// face lives on the contact panel), and CONVERSATION_NOT_FOUND for a
+    /// bogus id.
+    #[test]
+    fn groups_common_serves_the_panel_answer_and_guards_the_target_kind() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let receive = NormalizedReceive {
+            timestamp: Some(200),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: Some("Peer".into()),
+            group_id: None,
+            text: Some("hi".into()),
+            text_bytes: Some(2),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            server_timestamp: None,
+        };
+        assert!(
+            !service
+                .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        let group_landing = NormalizedReceive {
+            timestamp: Some(300),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: Some("Peer".into()),
+            group_id: Some("group-one".into()),
+            text: Some("hi".into()),
+            text_bytes: Some(2),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            server_timestamp: None,
+        };
+        assert!(
+            !service
+                .ingest_receive(group_landing, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        let direct = service
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|conversation| conversation.kind == "direct")
+            .unwrap();
+
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z3JvdXAtYmV0YQ",
+                "Beta Group",
+                Some(r#"{"memberCount":2,"members":[{"id":"+15555550101"}]}"#),
+                1725300000,
+            )
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z3JvdXAtYWxwaGE",
+                "Alpha Group",
+                Some(r#"{"memberCount":2,"members":[{"id":"+15555550999","uuid":"0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10"}]}"#),
+                1725300000,
+            )
+            .unwrap();
+        // The contact's ACI observed under its number: the ladder reaches the
+        // uuid-keyed roster entry above.
+        service
+            .store_ref()
+            .upsert_peer_identity(
+                &account.id,
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "+15555550101",
+            )
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z3JvdXAtb3RoZXI",
+                "Other Group",
+                Some(r#"{"memberCount":1,"members":[{"id":"+15555550777"}]}"#),
+                1725300000,
+            )
+            .unwrap();
+
+        let answer = service.groups_common(&account.id, &direct.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&answer).unwrap(),
+            json!({
+                "groups": [
+                    {"peerKey": "Z3JvdXAtYWxwaGE", "title": "Alpha Group"},
+                    {"peerKey": "Z3JvdXAtYmV0YQ", "title": "Beta Group"},
+                ]
+            })
+        );
+
+        // A group conversation target is the wrong face: INVALID_REQUEST,
+        // never a NOT_FOUND lie.
+        let group_conversation = service
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|conversation| conversation.kind == "group")
+            .unwrap();
+        let error = service
+            .groups_common(&account.id, &group_conversation.id)
+            .unwrap_err();
+        match &error {
+            ServiceError::Api(api) => assert_eq!(api.code, "INVALID_REQUEST"),
+            other => panic!("expected INVALID_REQUEST, got {other:?}"),
+        }
+        // A bogus id answers the ladder's CONVERSATION_NOT_FOUND.
+        let error = service
+            .groups_common(&account.id, "no-such-conversation")
+            .unwrap_err();
+        match &error {
+            ServiceError::Store(StoreError::ConversationNotFound) => {}
+            other => panic!("expected CONVERSATION_NOT_FOUND, got {other:?}"),
+        }
     }
 
     #[test]
@@ -29681,6 +30119,87 @@ mod tests {
             wire[2],
             json!({"id": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"})
         );
+
+        // Contract 1.181 (§4.181): the announcements-only flag projects from
+        // the capture verbatim, and the roster's self mark folds the account
+        // ACI — the engine roster id falls back to the member's ACI
+        // service-id string when the number lookup misses. The account gets
+        // its ACI now (the sync seam's canonical form); the roster carries
+        // one number-keyed stranger and two self spellings (id and uuid).
+        service
+            .store_ref()
+            .set_account_aci(&account.id, Some("0b7fca57-6c3d-4a9e-b3e8-2f14c5d6a7b9"))
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "YW5ub3VuY2UtZ3JvdXA",
+                "Announcement Group",
+                Some(
+                    json!({
+                        "memberCount": 3,
+                        "announcementsOnly": true,
+                        "members": [
+                            {"id": "+15555550101"},
+                            {"id": "0b7fca57-6c3d-4a9e-b3e8-2f14c5d6a7b9", "admin": true},
+                            {"id": "+15555550999", "uuid": "0b7fca57-6c3d-4a9e-b3e8-2f14c5d6a7b9"},
+                        ],
+                    })
+                    .to_string()
+                    .as_str(),
+                ),
+                1725300003,
+            )
+            .unwrap();
+        let announced = service
+            .get_group(&account.id, "YW5ub3VuY2UtZ3JvdXA")
+            .unwrap();
+        assert_eq!(announced.announcements_only, Some(true));
+        let wire = serde_json::to_value(&announced).unwrap();
+        assert_eq!(wire["announcementsOnly"], true);
+        let members = wire["members"].as_array().unwrap();
+        // The ACI-keyed member IS self, admin-marked; the uuid-keyed entry
+        // marks self through the uuid tail; the stranger stays bare.
+        assert_eq!(
+            members[1],
+            json!({"id": "0b7fca57-6c3d-4a9e-b3e8-2f14c5d6a7b9", "self": true, "admin": true})
+        );
+        assert_eq!(
+            members[2],
+            json!({"id": "+15555550999", "uuid": "0b7fca57-6c3d-4a9e-b3e8-2f14c5d6a7b9", "self": true})
+        );
+        assert_eq!(
+            members[0],
+            json!({"id": "+15555550101", "name": "Alice Contact"})
+        );
+
+        // Pre-1.181 rows (no captured flag) and malformed stored values
+        // answer an absent key — unknown, never a lie, and never a failed
+        // read (the linkAccess discipline).
+        let legacy = service.get_group(&account.id, "ZmFrZS1ncm91cC0x").unwrap();
+        assert_eq!(legacy.announcements_only, None);
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "YmFkLWZsYWctZ3JvdXA",
+                "Bad Flag Group",
+                Some(r#"{"memberCount":1,"announcementsOnly":"yes"}"#),
+                1725300004,
+            )
+            .unwrap();
+        let malformed = service
+            .get_group(&account.id, "YmFkLWZsYWctZ3JvdXA")
+            .unwrap();
+        assert_eq!(malformed.announcements_only, None);
+        // The number-keyed self member of the earlier roster still marks
+        // self after the ACI landed (both ladder rungs live side by side).
+        let roster = service.get_group(&account.id, "cm9zdGVyLWdyb3Vw").unwrap();
+        let wire = serde_json::to_value(roster.members.unwrap()).unwrap();
+        assert_eq!(wire[0], json!({"id": "+15555550100", "self": true}));
 
         // The roster cap holds even for a hostile oversized capture: the
         // projection returns at most the official group-size ceiling.

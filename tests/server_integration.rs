@@ -3858,6 +3858,181 @@ async fn groups_get_carries_the_member_label_projection() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract 1.181 (§4.181) end to end: the sync capture keeps the upstream
+/// JsonGroup's `announcementsOnly` flag and the engine's GV2 role word (the
+/// stub's KT_FAKE_ROLE_GROUPS arm swaps the fixture roster onto the real
+/// engine member shape — ADMINISTRATOR for Alice, DEFAULT for self), the
+/// groups.get projection lands both (the banner gate's supply), and
+/// `groups.common` answers the official groups-in-common panel over the
+/// cached rosters for the direct Alice conversation — INVALID_REQUEST on a
+/// group target, the honest shape refusal.
+#[tokio::test]
+async fn groups_common_and_the_announcement_role_capture_end_to_end() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [57_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[
+            ("KT_FAKE_ANNOUNCEMENT_GROUPS", "ZmFrZS1ncm91cC0x"),
+            ("KT_FAKE_ROLE_GROUPS", "ZmFrZS1ncm91cC0x=+15555550101"),
+        ],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    // Stage one group message before linking: finishLink's receive burst
+    // delivers it after the default direct receive, so the group conversation
+    // exists for the INVALID_REQUEST arm below.
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550101",
+                "timestamp": 90,
+                "dataMessage": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "message": "group hello"
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-SupplyB" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let _ = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+
+    // The announcements-only flag and the role-word admin mark land together:
+    // Alice is the group's ADMINISTRATOR (roster admin via the GV2 role word,
+    // no legacy uuid key in this arm), self is a DEFAULT member — the
+    // CompositionArea.dom.tsx:1108 banner gate's exact supply.
+    let group = request(
+        &mut client,
+        "groups-get",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    assert_eq!(group["result"]["announcementsOnly"], true);
+    assert_eq!(
+        group["result"]["members"],
+        json!([
+            {"id": "+15555550100", "name": "Test User", "self": true},
+            {"id": "+15555550101", "name": "Alice Example", "admin": true},
+        ])
+    );
+
+    // The direct Alice conversation (the fixture's default receive) answers
+    // the panel over the captured rosters.
+    let conversations = request(
+        &mut client,
+        "conversations-list",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let direct = conversations["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "direct")
+        .unwrap();
+    let direct_id = direct["id"].as_str().unwrap().to_string();
+    let common = request(
+        &mut client,
+        "groups-common",
+        "groups.common",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_id
+        }),
+    )
+    .await;
+    assert_eq!(
+        common["result"]["groups"],
+        json!([{ "peerKey": "ZmFrZS1ncm91cC0x", "title": "Fixture Group" }])
+    );
+
+    // A group conversation target is the wrong face — INVALID_REQUEST, the
+    // honest shape refusal (a NOT_FOUND would be a lie: the conversation
+    // exists).
+    let group_conversation = conversations["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "group")
+        .map(|item| item["id"].as_str().unwrap().to_string())
+        .expect("the staged group receive created the group conversation");
+    let refused = request(
+        &mut client,
+        "groups-common-group",
+        "groups.common",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation
+        }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(refused["error"]["retryable"], false);
+
+    // A bogus conversation id answers the ladder's CONVERSATION_NOT_FOUND.
+    let missing = request(
+        &mut client,
+        "groups-common-missing",
+        "groups.common",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation"
+        }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "CONVERSATION_NOT_FOUND");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// groups.get carries the live requesting-members projection (contract
 /// 1.62, §4.53 appendix): the stub answers one requesting member for the
 /// fixture group, so the full ladder — single-group listGroups live read →

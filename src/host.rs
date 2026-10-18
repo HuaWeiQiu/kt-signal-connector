@@ -44,7 +44,7 @@ use crate::service::{
     ConversationsGetStateParams, ConversationsListParams, ConversationsSaveDraftParams,
     ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
     ConversationsSetStateParams, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
-    GroupsCancelJoinRequestParams, GroupsCreateParams, GroupsGetParams,
+    GroupsCancelJoinRequestParams, GroupsCommonParams, GroupsCreateParams, GroupsGetParams,
     GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
     GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
     GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
@@ -3633,6 +3633,19 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             Err(_) => HostResponse::failure(
                 request_id,
                 reject_probe("groups.get", "params", "invalid groups.get params"),
+            ),
+        },
+        "groups.common" => match serde_json::from_value::<GroupsCommonParams>(request.params) {
+            Ok(params) => match runtime.groups_common(params).await {
+                Ok(details) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(details).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                reject_probe("groups.common", "params", "invalid groups.common params"),
             ),
         },
         "groups.update" => match serde_json::from_value::<GroupsUpdateParams>(request.params) {

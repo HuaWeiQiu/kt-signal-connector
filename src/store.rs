@@ -724,6 +724,16 @@ pub struct ConversationPinnedMessage {
     pub expires_at: Option<u64>,
 }
 
+/// One conversations row of the groups-in-common answer (contract 1.181,
+/// §4.181): the group's peer key (the face the desktop addresses group reads
+/// with) and its cached title, title-sorted like the official panel.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommonGroupRow {
+    pub peer_key: String,
+    pub title: String,
+}
+
 /// Serde gate for optional-count fields (contract 1.29): zero collapses to an
 /// absent key so pre-1.29 hosts read byte-identical summaries.
 fn u32_is_zero(value: &u32) -> bool {
@@ -1059,6 +1069,22 @@ fn aci_for_peer_key_on(
     Ok(aci)
 }
 
+/// The alternate spelling of a phone-shaped key (contract 1.146, §4.144):
+/// `+`-prefixed E.164 against bare digits, the two forms the identity
+/// writers spell the same number in. None for a key that is not
+/// phone-shaped (a group key, a UUID, arbitrary text) or differs by nothing.
+fn alternate_phone_spelling(peer_key: &str) -> Option<String> {
+    match peer_key.strip_prefix('+') {
+        Some(bare) if !bare.is_empty() => Some(bare.to_string()),
+        _ => {
+            if peer_key.is_empty() || !peer_key.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            Some(format!("+{peer_key}"))
+        }
+    }
+}
+
 /// Contract 1.146 (§4.144): the phone-keyed reverse lookup with the two-form
 /// number normalization. The identity writers spell the same number either
 /// way — the receive chain's contacts hit resolves to the engine's
@@ -1077,16 +1103,10 @@ fn aci_for_phone_key_on(
     if let Some(aci) = aci_for_peer_key_on(conn, account_id, peer_key)? {
         return Ok(Some(aci));
     }
-    let alternate = match peer_key.strip_prefix('+') {
-        Some(bare) => bare.to_string(),
-        None => {
-            if peer_key.is_empty() || !peer_key.chars().all(|c| c.is_ascii_digit()) {
-                return Ok(None);
-            }
-            format!("+{peer_key}")
-        }
-    };
-    aci_for_peer_key_on(conn, account_id, &alternate)
+    match alternate_phone_spelling(peer_key) {
+        Some(alternate) => aci_for_peer_key_on(conn, account_id, &alternate),
+        None => Ok(None),
+    }
 }
 
 /// One summary row's derived identifiers (§4.129): each leg absent-key on
@@ -2041,6 +2061,22 @@ impl Store {
             )
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Contract 1.181 (§4.181): the account's stored ACI (contract 1.142 —
+    /// the engine's `registration_data` answer, persisted canonical). Absent
+    /// on accounts the engine has not answered: the honest absent face, never
+    /// minted from the row id.
+    pub fn account_aci(&self, account_id: &str) -> Result<Option<String>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT aci FROM accounts WHERE id=?1",
+                params![account_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+            .map(|row| row.flatten())
     }
 
     pub fn account_by_signal(
@@ -4915,6 +4951,97 @@ impl Store {
     ) -> Result<Option<String>, StoreError> {
         let conn = self.lock_conn()?;
         aci_for_peer_key_on(&conn, account_id, peer_key)
+    }
+
+    /// Contract 1.181 (§4.181): the groups-in-common answer over the §4.39
+    /// captured rosters — the official ConversationDetails.preload.tsx:80-100
+    /// derivation (a direct peer's identity against every group's member
+    /// list) served from the local cache, zero engine calls. The identity set
+    /// is the peer key (both phone spellings), its `peer_identities` ACI, and
+    /// the reverse peer keys when the peer key is itself ACI-shaped; a group
+    /// matches when any roster entry's `id` or `uuid` lands in the set.
+    /// Title-sorted like the official panel; one pass over the account's
+    /// group-kind contacts cache (one row per group, the §6.5 sync scale),
+    /// each roster bounded to the capture cap. A malformed roster never fails
+    /// the read (the hostile-roster discipline).
+    pub fn groups_in_common(
+        &self,
+        account_id: &str,
+        peer_key: &str,
+    ) -> Result<Vec<CommonGroupRow>, StoreError> {
+        let conn = self.lock_conn()?;
+        // The contact's identity set: the peer key itself, its alternate
+        // phone spelling, the ACI the identity table holds for either
+        // spelling (the §4.144 two-form resolution), and — when the peer key
+        // is itself an ACI — every peer key observed under it.
+        let mut identities = std::collections::BTreeSet::from([peer_key.to_string()]);
+        if let Some(alternate) = alternate_phone_spelling(peer_key) {
+            identities.insert(alternate);
+        }
+        let mut acis = Vec::new();
+        for key in identities.iter() {
+            if let Some(aci) = aci_for_phone_key_on(&conn, account_id, key)? {
+                acis.push(aci);
+            }
+        }
+        identities.extend(acis);
+        if crate::engine::is_uuid_shaped(peer_key) {
+            let mut stmt = conn
+                .prepare("SELECT peer_key FROM peer_identities WHERE account_id=?1 AND aci=?2")
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let rows = stmt
+                .query_map(params![account_id, peer_key], |row| row.get::<_, String>(0))
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            identities.extend(rows);
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT peer_key, title, extra FROM contacts
+                 WHERE account_id=?1 AND kind='group'",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut groups: Vec<CommonGroupRow> = rows
+            .into_iter()
+            .filter_map(|(id, title, extra)| {
+                let members = extra
+                    .as_deref()
+                    .and_then(|extra| serde_json::from_str::<serde_json::Value>(extra).ok())
+                    .and_then(|extra| extra.get("members").cloned())
+                    .and_then(|members| members.as_array().cloned())?;
+                let hit = members
+                    .iter()
+                    .take(crate::service::MAX_GROUP_MEMBERS)
+                    .any(|entry| {
+                        entry.as_object().is_some_and(|object| {
+                            ["id", "uuid"].iter().any(|key| {
+                                object
+                                    .get(*key)
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|value| identities.contains(value))
+                            })
+                        })
+                    });
+                hit.then_some(CommonGroupRow {
+                    peer_key: id,
+                    title,
+                })
+            })
+            .collect();
+        groups.sort_by(|a, b| a.title.cmp(&b.title).then(a.peer_key.cmp(&b.peer_key)));
+        Ok(groups)
     }
 
     // -------------------------------------------------------------------------
@@ -17786,6 +17913,136 @@ mod tests {
         assert_eq!(
             store.peer_keys_for_aci(&other.id, "aci-1").unwrap(),
             vec!["+15555550300".to_string()]
+        );
+    }
+
+    /// Contract 1.181 (§4.181): the groups-in-common scan resolves the
+    /// contact through the whole identity ladder — the peer key's two phone
+    /// spellings, the ACI the identity table holds for either, and the
+    /// reverse peer keys when the key itself is ACI-shaped — matches roster
+    /// id and uuid entries, skips malformed rosters, title-sorts like the
+    /// official panel, and answers an honest empty set for a stranger.
+    #[test]
+    fn groups_in_common_matches_the_identity_ladder_and_sorts_by_title() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        // The contact's ACI, observed under the bare-digit phone spelling.
+        store
+            .upsert_peer_identity(
+                &account.id,
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "15555550101",
+            )
+            .unwrap();
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z3JvdXAtYmV0YQ",
+                "Beta Group",
+                Some(r#"{"memberCount":2,"members":[{"id":"0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10"}]}"#),
+                1725300000,
+            )
+            .unwrap();
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z3JvdXAtYWxwaGE",
+                "Alpha Group",
+                Some(r#"{"memberCount":2,"members":[{"id":"+15555550999","uuid":"0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10"}]}"#),
+                1725300000,
+            )
+            .unwrap();
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z3JvdXAtb3RoZXI",
+                "Other Group",
+                Some(r#"{"memberCount":1,"members":[{"id":"+15555550777"}]}"#),
+                1725300000,
+            )
+            .unwrap();
+        // A malformed extra never fails the scan (the hostile-roster
+        // discipline); a group without a roster cannot match.
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z3JvdXAtYmFk",
+                "Bad JSON",
+                Some("not-json"),
+                1725300000,
+            )
+            .unwrap();
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z3JvdXAtcGxhaW4",
+                "No Roster",
+                None,
+                1725300000,
+            )
+            .unwrap();
+        // Contact-kind rows never join the scan.
+        store
+            .upsert_contact(
+                &account.id,
+                "contact",
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "The Contact",
+                None,
+                1725300000,
+            )
+            .unwrap();
+
+        let expected = vec![
+            CommonGroupRow {
+                peer_key: "Z3JvdXAtYWxwaGE".into(),
+                title: "Alpha Group".into(),
+            },
+            CommonGroupRow {
+                peer_key: "Z3JvdXAtYmV0YQ".into(),
+                title: "Beta Group".into(),
+            },
+        ];
+        // The plus-spelled conversation key reaches the ACI-keyed roster id
+        // and the uuid-keyed entry through the identity table.
+        assert_eq!(
+            store.groups_in_common(&account.id, "+15555550101").unwrap(),
+            expected
+        );
+        // The bare spelling answers the same set.
+        assert_eq!(
+            store.groups_in_common(&account.id, "15555550101").unwrap(),
+            expected
+        );
+        // The ACI-shaped key resolves through the reverse ladder to the same
+        // two groups.
+        assert_eq!(
+            store
+                .groups_in_common(&account.id, "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10")
+                .unwrap(),
+            expected
+        );
+        // A stranger answers the honest empty set.
+        assert!(
+            store
+                .groups_in_common(&account.id, "+15555550333")
+                .unwrap()
+                .is_empty()
+        );
+        // Another account's cache is disjoint.
+        assert!(
+            store
+                .groups_in_common("no-such-account", "+15555550101")
+                .unwrap()
+                .is_empty()
         );
     }
 

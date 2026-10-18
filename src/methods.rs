@@ -143,6 +143,10 @@ pub const METHODS: &[MethodRow] = &[
     ("contacts.sync", Lane::Read, true, "contacts"),
     ("contacts.list", Lane::Read, false, "contacts"),
     ("groups.get", Lane::Read, false, "contacts"),
+    // Groups in common (contract 1.181, §4.181): the contact-details panel's
+    // groups-in-common answer over the §4.39 captured rosters — a pure
+    // local-cache read beside groups.get, no engine traffic, no writes.
+    ("groups.common", Lane::Read, false, "contacts"),
     ("contacts.setLocalAlias", Lane::Send, true, "send"),
     ("presence.setTypingMessage", Lane::Send, true, "send"),
     // Sticker pack browsing (contract 1.36, §4.32): anonymous CDN traffic
@@ -994,6 +998,7 @@ mod tests {
             "contacts.sync",
             "contacts.list",
             "groups.get",
+            "groups.common",
             "accounts.deviceCapabilities",
             "accounts.getDevices",
             "stickerPacks.getManifest",

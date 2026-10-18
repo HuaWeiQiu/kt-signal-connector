@@ -1775,6 +1775,19 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// groups.common (contract 1.181, §4.181): a pure local-cache read over
+    /// the account's captured rosters — routed to the owning supervisor like
+    /// every other account-addressed face, zero engine traffic.
+    pub async fn groups_common(
+        &self,
+        params: crate::service::GroupsCommonParams,
+    ) -> Result<crate::service::CommonGroupsDetails, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .groups_common(params.account_id, params.conversation_id)
+            .await
+    }
+
     /// groups.update / groups.quit (contract revision 1.45, §4.44,
     /// capability group-management): the group state lives with the account's
     /// engine, so both writes route through the account's owning supervisor
