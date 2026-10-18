@@ -5,6 +5,16 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.175 (2026-10-18; §4.175 the attachment-backfill
+  loop: the engine's `syncMessage.attachmentBackfillResponse` projection
+  gains a consume arm that merges the primary device's fresh transit
+  pointers into the target row's empty live-locator slots; the sent-sync
+  echo's locator faces merge the same way on the optimistic outgoing row
+  (the `INSERT OR IGNORE` duplicate-insert early-return no longer drops
+  them); and the new `attachments.requestBackfill` host method carries the
+  request half — the official `AttachmentBackfill.request` chain closes
+  end to end. Wire additive; the desktop half lands in desktop contract
+  1.178.)
 - Contract revision: 1.174 (2026-10-18; §4.174 the sweep probe's not-found face
   stays clean end to end: the desktop's 2026-10-18 false-failure-flicker
   evidence convicted the probe chain and the connector-side review acquitted
@@ -14888,6 +14898,100 @@ rows), `all_failed_group_settlement_persists_the_outcome_counts` (failed
 settlement with counts, queue face retired),
 `send_outcomes_from_reply_counts_group_results_entries` (reply counting;
 shapeless/empty replies degrade to `None`).
+
+### 4.175 The attachment-backfill loop closes: the backfill response merges fresh transit pointers into the row's live-locator column, the sent-sync echo's locator faces land on the optimistic outgoing row, and `attachments.requestBackfill` carries the request half (contract revision 1.175, 2026-10-18)
+
+The desktop's 2026-10-18 user evidence (history and outgoing attachments
+rendering "the local media data is unavailable", outgoing 317KB message
+with the download button and read receipts, where the official client
+shows the same messages fine) convicted the batch-VI outbox-local half:
+the honest-error face was correct, but nothing ever walked the official
+remote-recovery chain. The official chain (Signal-Desktop, read-only
+forensics): `AttachmentDownloadManager.addJob` finds the attachment
+undownloadable (`:352-377`) or the transit tier answers 404 (`:675-713`)
+→ `AttachmentBackfill.request` (jobs/helpers/attachmentBackfill.preload
+.ts:77-109, a 10s pending-request window plus de-duplication) →
+`getAttachmentBackfillSyncMessage` (SendMessage.preload.ts:1987-2018)
+self-sends `SyncMessage.content oneof attachmentBackfillRequest=24` →
+the primary re-uploads and answers `attachmentBackfillResponse` →
+`handleResponse` updates the pointers and queues `BACKFILL`-source
+downloads (`:282-356`).
+
+This revision lands the connector half of that loop; the engine's
+request side (`engine.requestAttachmentBackfill`, capability bit flipped
+to true) shipped the same day, and the desktop trigger plus bounded
+retry lands in desktop contract 1.178.
+
+**Consume arm.** The engine's `syncMessage.attachmentBackfillResponse`
+projection (engine contract, attachmentBackfillResponse block) gains the
+same consume family treatment the read/viewed/delete-for-me syncs carry:
+`normalized_sync_attachment_backfill_response` parses the face
+all-or-nothing on the target — author plus positive upstream stamp plus
+exactly one conversation leg (serviceId / groupId / e164); a malformed
+target keeps the plain `syncMessage` skip (宁缺勿错, the official
+strictAssert-drop posture). The data face parses leniently per entry
+while keeping the official index alignment: a pointer entry contributes
+its locator face (`None` when the pointer carried no locator material),
+a status entry (`PENDING` / `TERMINAL_ERROR`) contributes `None` — keep-
+as-is, never a shifted row — and the error arm (`MESSAGE_NOT_FOUND`)
+rides its bounded word with no locators and changes nothing (the
+official `handleResponse` keep-as-is posture). The `longText` entry is
+deliberately not consumed: KT long-text bodies ride the row's text
+column, so no locator column exists to merge into (recorded here). The
+consume arm resolves the conversation through the
+message-request-response ladder family (the group leg keys directly; the
+service-id/e164 leg walks the ACI→peer-key candidates), finds the row by
+its upstream sent stamp in either direction (`rows_by_sent_at` — the
+phone mirrors our own outgoing rows back, so the incoming-only reader
+cannot apply), preferring the row whose sender matches the target author
+to break a pathological stamp collision, and merges the pointer faces
+into the row's schema-19 `live_attachment_locators` column.
+
+**The merge primitive.** `Store::merge_live_attachment_locators` fills
+only empty slots: an existing non-default face is authoritative and never
+overwritten (the first face wins — a later echo cannot move a locator
+the receive arm already stored), a longer new face extends the column
+index-aligned (default-padded), and an all-default new face or an absent
+row answers a quiet `Ok(false)` (the same posture the duplicate-insert
+early-return takes). No host event is minted: the desktop's bounded
+retry loop re-asks `attachments.download` and the fresh locator face is
+what answers.
+
+**Outgoing echo.** `apply_receive`'s duplicate-insert early return (the
+optimistic outgoing row predates its sent-sync echo, and
+`INSERT OR IGNORE` drops the echo whole) now merges the echo's locator
+faces into the existing row before returning — the outgoing row's
+pointer face becomes downloadable without waiting for a backfill round
+trip. That closes the outgoing 317KB evidence family at the projection
+level; rows persisted before the engine's locator projection shipped
+(and sticker rows whose locators predate schema 19) still arrive through
+the backfill loop.
+
+**Request face.** `attachments.requestBackfill` takes the same row
+addressing as `attachments.download` (the official request asks the
+primary for every attachment of the message at once, so no positional
+index). The service-layer prepare validates the id ladder, resolves the
+row, and derives the official target triple: the author is the row's
+sender for incoming rows and the account's own number for outgoing rows
+(the engine's `resolve_author_aci` maps it to the own ACI); the direct
+leg carries the conversation's peer key, the group leg the master key;
+and a zero upstream stamp fails closed `INVALID_REQUEST` (a stamp-0 row
+never went upstream and cannot be backfilled). The supervisor fires the
+engine's `requestAttachmentBackfill` on the mutating lane and answers the
+receipt-class `{status: "sent" | "unknown"}` — `unknown` never retries
+automatically; the desktop's bounded retry loop re-asks the download, and
+a duplicate request the primary already answered is harmless (the
+official `#pendingRequests` de-dup posture).
+
+**Tests.** `sync_attachment_backfill_response_routes_target_and_entries`
+(pointer/status/unparseable entry index alignment, the error arm, three
+malformed-target plain skips), `merge_live_attachment_locators_fills_
+only_empty_slots` (empty-slot fill, first-face-wins, index-aligned
+extension, quiet no-ops), `backfill_response_merges_locators_into_the_
+target_row` (the e164 conversation leg, the merge, the error arm never
+moving a face, no host event), and `prepare_request_attachment_backfill_
+derives_the_official_target` (direct/outgoing/group legs, the id ladder,
+the zero-stamp rejection).
 
 ### 4.174 The sweep probe's not-found face stays clean end to end: `MessageNotFound` maps to `MESSAGE_NOT_FOUND`, and the desktop's admission gate is the reviewed fix (contract revision 1.174, 2026-10-18)
 
