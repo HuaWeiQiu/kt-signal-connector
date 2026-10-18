@@ -14,7 +14,13 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 27;
+const SCHEMA_VERSION: i64 = 28;
+/// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
+/// store keeps at most this many pins per conversation; a pin past the cap
+/// replaces the row with the oldest `pinned_at` (the official
+/// PinMessageDialog replace-earliest discipline enforced receiver-side so the
+/// queue stays bounded no matter what a peer's client sent).
+pub const CONVERSATION_PIN_LIMIT: usize = 3;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -281,7 +287,7 @@ CREATE TABLE IF NOT EXISTS conversation_pins (
   target_sent_at INTEGER NOT NULL,
   pinned_at INTEGER NOT NULL,
   expires_at INTEGER,
-  PRIMARY KEY(account_id, conversation_id),
+  PRIMARY KEY(account_id, conversation_id, target_author, target_sent_at),
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
   FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
@@ -609,8 +615,20 @@ pub struct ConversationSummary {
     /// without replaying events. Absent when nothing is pinned, the pin
     /// expired (connector-clock computed), or the pinned row is no longer in
     /// the local history (retention) — an unrenderable pin is not surfaced.
+    /// Multi-pin queue note (diff-C #54): this is the legacy single-pin face
+    /// — the newest pin of the queue; the authoritative full list rides
+    /// [`Self::pinned_messages`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_message: Option<ConversationPinnedMessage>,
+    /// Multi-pin queue projection (diff-C #54): every renderable pin of the
+    /// conversation (expired and retention-pruned rows excluded at read
+    /// time), `pinned_at` ASC — the official queue order, capped at
+    /// `CONVERSATION_PIN_LIMIT` (official `getPinnedMessagesLimit` = 3).
+    /// Absent when the queue is empty so pre-multi-pin hosts read
+    /// byte-identical summaries; the desktop prefers this face and falls
+    /// back to the single `pinnedMessage` key.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pinned_messages: Vec<ConversationPinnedMessage>,
     /// Contract 1.42 (§4.41): the conversation's current disappearing-message
     /// timer in seconds as the last timer-change event set it — `0` is the
     /// timer explicitly off, `N` counts down every message from its own
@@ -3040,6 +3058,7 @@ impl Store {
                         muted: row.get::<_, i64>(8)? != 0,
                         pinned: row.get::<_, i64>(9)? != 0,
                         pinned_message: None,
+                        pinned_messages: Vec::new(),
                         expire_timer_seconds: row
                             .get::<_, Option<i64>>(10)?
                             .map(|value| value.max(0) as u64),
@@ -3085,7 +3104,8 @@ impl Store {
             item.last_message_status = meta.status;
             item.last_message_author_name = meta.author_name;
             item.last_message_reactions = meta.reactions;
-            item.pinned_message = pinned_message_for_conversation(&conn, account_id, &item.id)?;
+            item.pinned_messages = pinned_messages_for_conversation(&conn, account_id, &item.id)?;
+            item.pinned_message = item.pinned_messages.last().cloned();
             // Contract 1.65 (§4.58): the same read-time accepted derivation
             // the single-row summary applies, over the same held guard — a
             // reloaded page and an event-driven window cannot disagree.
@@ -4654,11 +4674,15 @@ impl Store {
         Ok(record.map(|record| (record, changed > 0)))
     }
 
-    /// Record the conversation's pinned state (contract 1.33). The official
-    /// model keeps at most one pinned message per conversation, so the
-    /// (account, conversation) primary key turns a newer pin into a
-    /// replacement of the older one. `pinned_at` is the connector clock at
-    /// pin time; `expires_at` is that clock plus `pinDurationSeconds`
+    /// Record one pin (contract 1.33; multi-pin queue, diff-C #54). The
+    /// official model keeps up to `CONVERSATION_PIN_LIMIT` pinned messages
+    /// per conversation (`getPinnedMessagesLimit` = 3) with the
+    /// replace-earliest discipline at the cap, so a distinct target identity
+    /// inserts as a queue member (re-pinning the same target refreshes its
+    /// stamp) and a queue past the cap drops the row with the oldest
+    /// `pinned_at` — receiver-side enforcement keeps the queue bounded no
+    /// matter what a peer's client sent. `pinned_at` is the connector clock
+    /// at pin time; `expires_at` is that clock plus `pinDurationSeconds`
     /// (absent duration = forever pin, no expiry). A missing target row is
     /// not an error: the state is still derived (the summary projection only
     /// surfaces pins whose row is locally renderable).
@@ -4673,27 +4697,39 @@ impl Store {
         let pinned_at = crate::link::now_ms();
         let expires_at =
             duration_seconds.map(|seconds| pinned_at.saturating_add(u64::from(seconds) * 1_000));
-        self.lock_conn()?
-            .execute(
-                "INSERT INTO conversation_pins(
-                    account_id, conversation_id, target_author, target_sent_at,
-                    pinned_at, expires_at
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(account_id, conversation_id) DO UPDATE SET
-                   target_author=excluded.target_author,
-                   target_sent_at=excluded.target_sent_at,
-                   pinned_at=excluded.pinned_at,
-                   expires_at=excluded.expires_at",
-                params![
-                    account_id,
-                    conversation_id,
-                    target_author,
-                    target_sent_at as i64,
-                    pinned_at as i64,
-                    expires_at.map(|value| value as i64),
-                ],
-            )
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO conversation_pins(
+                account_id, conversation_id, target_author, target_sent_at,
+                pinned_at, expires_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(account_id, conversation_id, target_author, target_sent_at) DO UPDATE SET
+               pinned_at=excluded.pinned_at,
+               expires_at=excluded.expires_at",
+            params![
+                account_id,
+                conversation_id,
+                target_author,
+                target_sent_at as i64,
+                pinned_at as i64,
+                expires_at.map(|value| value as i64),
+            ],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // Receiver-side cap: drop the oldest-pinned_at rows past the limit
+        // (official replace-earliest). The upsert above may have refreshed an
+        // existing member, so the count is re-read after the write.
+        conn.execute(
+            "DELETE FROM conversation_pins
+             WHERE rowid IN (
+               SELECT rowid FROM conversation_pins
+                WHERE account_id=?1 AND conversation_id=?2
+                ORDER BY pinned_at DESC, rowid DESC
+                LIMIT -1 OFFSET ?3
+             )",
+            params![account_id, conversation_id, CONVERSATION_PIN_LIMIT as i64],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(())
     }
 
@@ -7131,6 +7167,7 @@ impl Store {
                         muted: row.get::<_, i64>(8)? != 0,
                         pinned: row.get::<_, i64>(9)? != 0,
                         pinned_message: None,
+                        pinned_messages: Vec::new(),
                         expire_timer_seconds: row
                             .get::<_, Option<i64>>(10)?
                             .map(|value| value.max(0) as u64),
@@ -7176,8 +7213,9 @@ impl Store {
                 summary.last_message_status = meta.status;
                 summary.last_message_author_name = meta.author_name;
                 summary.last_message_reactions = meta.reactions;
-                summary.pinned_message =
-                    pinned_message_for_conversation(&conn, account_id, conversation_id)?;
+                summary.pinned_messages =
+                    pinned_messages_for_conversation(&conn, account_id, conversation_id)?;
+                summary.pinned_message = summary.pinned_messages.last().cloned();
                 // Contract 1.60 (§4.54): the same read-time terminated
                 // projection the list applies — the summary that rides
                 // conversation.changed carries the flag, so an event-driven
@@ -8871,6 +8909,45 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 28 {
+        // Multi-pin queue (diff-C #54 data face; official desktop keeps up to
+        // 3 pinned messages per conversation, `getPinnedMessagesLimit`). The
+        // primary key widens from (account, conversation) to the full target
+        // identity so distinct pins coexist; SQLite cannot ALTER a primary
+        // key, so the table is rebuilt (create-copy-drop-rename). Rows are
+        // copied verbatim — one row per conversation under the old shape is
+        // already a valid queue of one.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS conversation_pins_v28 (
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               target_author TEXT NOT NULL,
+               target_sent_at INTEGER NOT NULL,
+               pinned_at INTEGER NOT NULL,
+               expires_at INTEGER,
+               PRIMARY KEY(account_id, conversation_id, target_author, target_sent_at),
+               FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+               FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+             )",
+            [],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        conn.execute(
+            "INSERT INTO conversation_pins_v28
+               SELECT account_id, conversation_id, target_author, target_sent_at,
+                      pinned_at, expires_at
+             FROM conversation_pins",
+            [],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        conn.execute("DROP TABLE conversation_pins", [])
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        conn.execute(
+            "ALTER TABLE conversation_pins_v28 RENAME TO conversation_pins",
+            [],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -8978,58 +9055,68 @@ struct ConversationLastMessageMeta {
     reactions: Vec<String>,
 }
 
-/// Project one conversation's pinned state onto the summary wire shape
-/// (contract 1.33). Expired pins stop rendering (connector-clock comparison
-/// — a timed pin past its `expires_at` is no longer pinned); a pin whose
-/// target row is no longer in the local history (retention pruned it, or it
-/// never landed here) is not surfaced either, because the desktop can only
-/// render a pin bar for a message it holds. Read-time resolution keeps the
-/// stored state free of dangling row ids.
-fn pinned_message_for_conversation(
+/// Project one conversation's pinned queue onto the summary wire shape
+/// (contract 1.33; multi-pin queue, diff-C #54). Expired pins stop rendering
+/// (connector-clock comparison — a timed pin past its `expires_at` is no
+/// longer pinned); a pin whose target row is no longer in the local history
+/// (retention pruned it, or it never landed here) is not surfaced either,
+/// because the desktop can only render a pin bar for a message it holds.
+/// Read-time resolution keeps the stored state free of dangling row ids.
+/// Ordered `pinned_at` ASC — the official queue order (oldest first), the
+/// same order the desktop bar consumes.
+fn pinned_messages_for_conversation(
     conn: &Connection,
     account_id: &str,
     conversation_id: &str,
-) -> Result<Option<ConversationPinnedMessage>, StoreError> {
-    let stored = conn
-        .query_row(
-            "SELECT target_author, target_sent_at, pinned_at, expires_at
-             FROM conversation_pins
-             WHERE account_id=?1 AND conversation_id=?2",
-            params![account_id, conversation_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u64,
-                    row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
-                ))
-            },
+) -> Result<Vec<ConversationPinnedMessage>, StoreError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT p.target_author, p.target_sent_at, p.pinned_at, p.expires_at, m.id
+             FROM conversation_pins p
+             LEFT JOIN messages m
+               ON m.account_id = p.account_id
+              AND m.conversation_id = p.conversation_id
+              AND m.sent_at = p.target_sent_at
+             WHERE p.account_id=?1 AND p.conversation_id=?2
+             ORDER BY p.pinned_at ASC, m.id ASC",
         )
-        .optional()
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
-    let Some((target_author, target_sent_at, pinned_at, expires_at)) = stored else {
-        return Ok(None);
-    };
-    if expires_at.is_some_and(|expires_at| expires_at <= crate::link::now_ms()) {
-        return Ok(None);
+    let rows = statement
+        .query_map(params![account_id, conversation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let mut pins = Vec::new();
+    let mut seen_targets = std::collections::HashSet::new();
+    for row in rows {
+        let (target_author, target_sent_at, pinned_at, expires_at, message_id) =
+            row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if expires_at.is_some_and(|expires_at| expires_at <= crate::link::now_ms()) {
+            continue;
+        }
+        let Some(message_id) = message_id else {
+            continue;
+        };
+        // Rows sharing a sent_at would fan the join out — only the first
+        // (m.id ASC, the pre-multi-pin LIMIT 1 resolution) renders.
+        if !seen_targets.insert((target_author.clone(), target_sent_at)) {
+            continue;
+        }
+        pins.push(ConversationPinnedMessage {
+            message_id,
+            target_author,
+            target_sent_timestamp: target_sent_at,
+            pinned_at,
+            expires_at,
+        });
     }
-    let message_id: Option<String> = conn
-        .query_row(
-            "SELECT id FROM messages
-             WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
-             ORDER BY id ASC LIMIT 1",
-            params![account_id, conversation_id, target_sent_at as i64],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| StoreError::Unavailable(Some(error)))?;
-    Ok(message_id.map(|message_id| ConversationPinnedMessage {
-        message_id,
-        target_author,
-        target_sent_timestamp: target_sent_at,
-        pinned_at,
-        expires_at,
-    }))
+    Ok(pins)
 }
 
 fn conversation_last_message_meta(
@@ -12737,13 +12824,15 @@ mod tests {
         assert!(wire.get("sticker").is_none(), "{wire}");
     }
 
-    /// Conversation pin state (contract 1.33): a newer pin replaces the older
-    /// one, a mismatched clear leaves the pin alone, a matching clear removes
-    /// it, the summary projects the camelCase `pinnedMessage` with `expiresAt`
-    /// only on a live timed pin — an expired timed pin (`duration 0` = already
-    /// past) and a pin whose target row is gone stop rendering.
+    /// Conversation pin state (contract 1.33; multi-pin queue, diff-C #54):
+    /// distinct targets coexist as queue members ordered `pinned_at` ASC, the
+    /// legacy single face projects the newest, a targeted clear removes only
+    /// the named member, and the summary projects the camelCase
+    /// `pinnedMessages` array + `pinnedMessage` (newest) with `expiresAt`
+    /// only on a live timed pin — an expired timed pin (`duration 0` =
+    /// already past) and a pin whose target row is gone stop rendering.
     #[test]
-    fn conversation_pin_upsert_replaces_and_clears_with_expiry_projection() {
+    fn conversation_pin_queue_coexists_clears_targeted_and_projects_both_faces() {
         use serde_json::json;
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
@@ -12821,8 +12910,10 @@ mod tests {
         assert_eq!(wire["pinnedMessage"]["targetSentTimestamp"], json!(10));
         assert!(wire["pinnedMessage"].get("expiresAt").is_none());
 
-        // A newer pin replaces the older one in place (one row per
-        // conversation, new pin wins).
+        // A second pin on another row joins the queue (official
+        // getPinnedMessagesLimit = 3): both render, `pinned_at` ASC, and the
+        // legacy single face keeps projecting the newest so single-pin hosts
+        // read the same row they always did.
         store
             .upsert_conversation_pin(
                 &account.id,
@@ -12841,39 +12932,51 @@ mod tests {
         assert!(pinned.expires_at.is_some(), "a timed pin carries expiry");
         let wire = serde_json::to_value(&summary).unwrap();
         assert!(wire["pinnedMessage"]["expiresAt"].is_u64());
+        assert_eq!(
+            summary
+                .pinned_messages
+                .iter()
+                .map(|pin| pin.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2"],
+            "the queue renders oldest-first"
+        );
+        assert_eq!(wire["pinnedMessages"][0]["messageId"], json!("m1"));
+        assert_eq!(wire["pinnedMessages"][1]["messageId"], json!("m2"));
 
-        // A clear naming the replaced (author, timestamp) is a no-op.
+        // A targeted clear removes only the named member.
         assert!(
-            !store
+            store
                 .clear_conversation_pin(&account.id, &conversation.id, "+15555550101", 10)
                 .unwrap()
         );
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            store
-                .conversation_summary(&account.id, &conversation.id)
-                .unwrap()
-                .unwrap()
-                .pinned_message
-                .as_ref()
-                .unwrap()
-                .target_sent_timestamp,
-            20
+            summary
+                .pinned_messages
+                .iter()
+                .map(|pin| pin.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m2"]
         );
 
-        // The matching clear removes the state.
+        // The matching clear removes the last member and empties both faces.
         assert!(
             store
                 .clear_conversation_pin(&account.id, &conversation.id, "+15555550101", 20)
                 .unwrap()
         );
-        assert!(
-            store
-                .conversation_summary(&account.id, &conversation.id)
-                .unwrap()
-                .unwrap()
-                .pinned_message
-                .is_none()
-        );
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.pinned_message.is_none());
+        assert!(summary.pinned_messages.is_empty());
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert!(wire.get("pinnedMessages").is_none(), "{wire}");
 
         // An already-expired timed pin (duration 0) and a pin whose target
         // row is no longer in the history stop rendering.
@@ -12901,6 +13004,217 @@ mod tests {
                 .is_none(),
             "a pin without a local row must not render"
         );
+    }
+
+    /// Multi-pin queue cap (diff-C #54): the queue holds at most
+    /// `CONVERSATION_PIN_LIMIT` (official `getPinnedMessagesLimit` = 3)
+    /// members; a pin past the cap replaces the row with the oldest
+    /// `pinned_at`, and re-pinning an existing member refreshes its stamp
+    /// without growing the queue.
+    #[test]
+    fn conversation_pin_queue_caps_at_three_replacing_the_oldest() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let base = |id: &str, sent_at: u64| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        for (id, sent_at) in [("m1", 10), ("m2", 20), ("m3", 30), ("m4", 40)] {
+            assert!(
+                store
+                    .insert_message(&base(id, sent_at), None, Some("body"), true)
+                    .unwrap()
+            );
+        }
+
+        for (index, sent_at) in [10, 20, 30].into_iter().enumerate() {
+            store
+                .upsert_conversation_pin(
+                    &account.id,
+                    &conversation.id,
+                    "+15555550101",
+                    sent_at,
+                    None,
+                )
+                .unwrap();
+            // Deterministic ordering: back-to-back now_ms() stamps can tie,
+            // so each member's stamp is pinned to a distinct value.
+            store
+                .conn()
+                .execute(
+                    "UPDATE conversation_pins SET pinned_at=?1
+                     WHERE account_id=?2 AND conversation_id=?3 AND target_sent_at=?4",
+                    params![
+                        1_700_000_000_000i64 + index as i64,
+                        account.id,
+                        conversation.id,
+                        sent_at
+                    ],
+                )
+                .unwrap();
+        }
+        let queue = |store: &Store| {
+            store
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .pinned_messages
+                .iter()
+                .map(|pin| pin.message_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(queue(&store), vec!["m1", "m2", "m3"]);
+
+        // The fourth pin replaces the oldest (m1) — receiver-side enforcement
+        // of the official replace-earliest discipline keeps the queue bounded.
+        store
+            .upsert_conversation_pin(&account.id, &conversation.id, "+15555550101", 40, None)
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE conversation_pins SET pinned_at=1700000000003
+                 WHERE account_id=?1 AND conversation_id=?2 AND target_sent_at=40",
+                params![account.id, conversation.id],
+            )
+            .unwrap();
+        assert_eq!(queue(&store), vec!["m2", "m3", "m4"]);
+
+        // Re-pinning an existing member refreshes its stamp in place; the
+        // queue neither grows nor evicts (m2 moves to the newest slot).
+        store
+            .upsert_conversation_pin(&account.id, &conversation.id, "+15555550101", 20, None)
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE conversation_pins SET pinned_at=1700000000004
+                 WHERE account_id=?1 AND conversation_id=?2 AND target_sent_at=20",
+                params![account.id, conversation.id],
+            )
+            .unwrap();
+        assert_eq!(queue(&store), vec!["m3", "m4", "m2"]);
+        assert_eq!(queue(&store).len(), CONVERSATION_PIN_LIMIT);
+    }
+
+    /// Schema 28 (diff-C #54): a v27 database migrates in place — the
+    /// `conversation_pins` primary key widens to the full target identity,
+    /// the existing row survives verbatim, and the version stamp moves to 28.
+    #[test]
+    fn schema_v28_upgrade_rebuilds_conversation_pins_with_the_target_identity_key() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '27');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               state TEXT NOT NULL
+             );
+             CREATE TABLE conversations (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               peer_key TEXT NOT NULL,
+               title TEXT,
+               unread_count INTEGER NOT NULL DEFAULT 0,
+               muted INTEGER NOT NULL DEFAULT 0,
+               pinned INTEGER NOT NULL DEFAULT 0,
+               last_message_at INTEGER
+             );
+             INSERT INTO accounts VALUES('a1', '+15555550100', '+1555***00', 'ready');
+             INSERT INTO conversations
+               VALUES('c1', 'a1', 'direct', '+15555550101', NULL, 0, 0, 0, NULL);
+             CREATE TABLE conversation_pins (
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               target_author TEXT NOT NULL,
+               target_sent_at INTEGER NOT NULL,
+               pinned_at INTEGER NOT NULL,
+               expires_at INTEGER,
+               PRIMARY KEY(account_id, conversation_id)
+             );
+             INSERT INTO conversation_pins
+               VALUES('a1', 'c1', '+15555550101', 424, 1700000000000, NULL);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // The pre-upgrade row survives the rebuild verbatim.
+        let (author, sent_at, pinned_at): (String, i64, i64) = store
+            .conn()
+            .query_row(
+                "SELECT target_author, target_sent_at, pinned_at
+                 FROM conversation_pins
+                 WHERE account_id='a1' AND conversation_id='c1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(author, "+15555550101");
+        assert_eq!(sent_at, 424);
+        assert_eq!(pinned_at, 1_700_000_000_000);
+        // The widened key accepts a coexisting second member.
+        store
+            .conn()
+            .execute(
+                "INSERT INTO conversation_pins
+                   VALUES('a1', 'c1', '+15555550101', 425, 1700000001000, NULL)",
+                [],
+            )
+            .unwrap();
     }
 
     /// The admin-delete tombstone (contract 1.33): the flag flips exactly

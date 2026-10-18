@@ -5,6 +5,15 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.177 (2026-10-18; §4.177 the multi-pin queue
+  projection: `conversation_pins` widens from the per-conversation single
+  row to the official queue of up to 3 (desktop `getPinnedMessagesLimit`),
+  primary key widened to the full target identity (schema 28, rebuilt
+  in place), a pin past the cap replaces the row with the oldest
+  `pinned_at` receiver-side, and every summary row projects the full
+  queue as the additive `pinnedMessages` array (`pinned_at` ASC) beside
+  the legacy newest-pin `pinnedMessage` key. Wire additive; the desktop
+  half lands in desktop contract 1.186.)
 - Contract revision: 1.175 (2026-10-18; §4.175 the attachment-backfill
   loop: the engine's `syncMessage.attachmentBackfillResponse` projection
   gains a consume arm that merges the primary device's fresh transit
@@ -15083,6 +15092,67 @@ half (resolver last-tier arm + the three-source registration, desktop
 contract 1.177) lands in the kt-desktop worktree batch; no engine change
 — the engine's `listContacts` answer already exposes the field and the
 kt-engine read face legitimately omits it (the absent-key answer).
+
+### 4.177 The multi-pin queue projection: up to 3 pins per conversation with the replace-earliest discipline, projected as the additive `pinnedMessages` array (contract revision 1.177, 2026-10-18)
+
+Contract 1.33 pinned the official model as "one pinned message per
+conversation" because that was the shape the desktop rendered; the
+official client keeps a queue of up to `getPinnedMessagesLimit` = 3
+pinned messages per conversation and replaces the row with the oldest
+`pinned_at` when a member of a full queue pins past the cap. This
+revision moves the store and the summary wire onto the official queue
+model, all additive (pre-1.177 hosts read byte-identical summaries):
+
+- Store (schema 28): the `conversation_pins` primary key widens from
+  `(account_id, conversation_id)` to the full target identity
+  `(account_id, conversation_id, target_author, target_sent_at)` so
+  distinct pins coexist. SQLite cannot ALTER a primary key, so the
+  migration rebuilds the table (create-copy-drop-rename); rows are
+  copied verbatim — one row per conversation under the old shape is
+  already a valid queue of one.
+- Write side (`upsert_conversation_pin`): a distinct target identity
+  inserts as a queue member; re-pinning an existing member refreshes
+  its `pinned_at`/`expires_at` in place. After the write a receiver-side
+  cap keeps at most `CONVERSATION_PIN_LIMIT` = 3 rows per conversation,
+  dropping the rows with the oldest `pinned_at` (ties broken by the
+  older rowid) — the official replace-earliest discipline enforced on
+  the receiving side keeps the queue bounded no matter what a peer's
+  client sent.
+- Read side: `pinned_messages_for_conversation` resolves the whole
+  queue at read time with the same renderability gates the single face
+  always applied — expired timed pins stop rendering (connector clock),
+  pins whose target row is gone from the local history stop rendering,
+  and a `sent_at` shared by several rows fans the join out to exactly
+  one survivor (the pre-multi-pin `LIMIT 1` resolution, `m.id ASC`).
+  The result is ordered `pinned_at` ASC (the official queue order the
+  desktop bar consumes).
+- Wire: `ConversationSummary` gains `pinnedMessages`
+  (`skip_serializing_if Vec::is_empty`, camelCase `pinnedMessages` —
+  absent when the queue is empty so pre-multi-pin hosts read
+  byte-identical rows) and keeps the legacy `pinnedMessage` key, now
+  defined as the newest pin of the queue (`pinned_at` DESC, i.e. the
+  array's last element) — the two faces are always consistent by
+  construction. `clear_conversation_pin` stays the targeted clear it
+  already was: it removes exactly the named (author, sent_at) member;
+  the host's unpin flow names the pin it rendered.
+- The `messages.sendPinMessage` schema description drops the
+  "one pinned message per conversation" wording; the method shape,
+  addressing model, fail-closed rules, and the sent/unknown outcome
+  discipline are unchanged (contract 1.33 semantics preserved verbatim
+  — only the derived local queue model widened).
+
+Tests: the 1.33 suite (`conversation_pin_queue_coexists_clears_targeted_and_projects_both_faces`)
+rewritten onto the queue model — distinct targets coexist ordered
+`pinned_at` ASC, both wire faces project (array + newest single), a
+targeted clear removes only the named member, expiry and
+missing-target-row gates hold per member; plus
+`conversation_pin_queue_caps_at_three_replacing_the_oldest` (cap 3,
+fourth pin replaces the oldest, re-pin refreshes in place without
+growing) and `schema_v28_upgrade_rebuilds_conversation_pins_with_the_target_identity_key`
+(v27 → v28 in-place rebuild, row survives verbatim, the widened key
+accepts a coexisting member). The desktop half (the multi-pin bar with
+the official TabsList switcher, desktop contract 1.186) lands in the
+kt-desktop worktree batch.
 
 ## 5. signal-cli Boundary
 
