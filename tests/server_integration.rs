@@ -3324,9 +3324,11 @@ async fn incoming_mentions_project_author_aci_on_the_wire_row() {
 /// message row whose wire `poll` face is byte-identical to the §4.38
 /// history chain's (no `terminated`, no `votes`, no `voteCount` yet), the
 /// later `pollVote` folds the voter into that same row on
-/// `message.upserted`, and the `pollTerminate` flips `terminated` in place.
-/// The vote rides in the same emission as its create (the §4.91 buffer
-/// converges whatever order the stream picks).
+/// `message.upserted`, and the `pollTerminate` flips `terminated` in place
+/// — and, since §4.189, lands the standalone notice row beside the poll
+/// (the flattened `pollTerminate` rich face on a `system` row keyed to the
+/// terminate envelope's own stamp). The vote rides in the same emission as
+/// its create (the §4.91 buffer converges whatever order the stream picks).
 #[tokio::test]
 async fn live_poll_create_vote_terminate_land_the_history_shape() {
     let temp = TempDir::new().unwrap();
@@ -3528,7 +3530,7 @@ async fn live_poll_create_vote_terminate_land_the_history_shape() {
         }),
         "the converged face is the history chain's exact shape"
     );
-    let items_count = {
+    let final_items = {
         let listed = request(
             &mut client,
             "list-final",
@@ -3540,9 +3542,36 @@ async fn live_poll_create_vote_terminate_land_the_history_shape() {
             }),
         )
         .await;
-        listed["result"]["items"].as_array().unwrap().len()
+        listed["result"]["items"].as_array().unwrap().clone()
     };
-    assert_eq!(items_count, 1, "poll controls never mint rows of their own");
+    // §4.189: the vote never mints a row, but the terminate's first flip
+    // lands the official standalone notice row beside the poll — the
+    // host wire sees exactly two rows, and the notice's rich face rides
+    // flattened camelCase like every rich key.
+    assert_eq!(
+        final_items.len(),
+        2,
+        "the poll row plus its terminate notice row"
+    );
+    let notice = final_items
+        .iter()
+        .find(|row| row.get("pollTerminate").is_some())
+        .expect("the notice row carries the flattened pollTerminate face");
+    assert_eq!(notice["direction"], "system");
+    assert_eq!(notice["status"], "system");
+    assert_eq!(notice["sentAt"], 602, "the terminate envelope's own stamp");
+    assert_eq!(
+        notice["pollTerminate"],
+        json!({
+            "pollQuestion": "Lunch?",
+            "pollSentAt": 600,
+        }),
+        "a peer terminate carries no selfTerminated key (skip-when-false)"
+    );
+    assert!(
+        notice.get("poll").is_none(),
+        "the notice row is not the poll bubble"
+    );
 
     drop(client);
     wait_for_process_exit(engine_pid).await;

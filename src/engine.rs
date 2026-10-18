@@ -761,6 +761,16 @@ pub struct NormalizedRich {
     /// and pre-1.81 rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<NormalizedPoll>,
+    /// Poll-terminate notice face (contract 1.189, §4.189): the material of
+    /// the standalone system row a live termination lands beside the poll
+    /// row it folded — the official `poll-terminate` message's
+    /// `pollTerminateNotification {question, pollTimestamp}` projection, with
+    /// the terminator's self flag so the desktop picks the official
+    /// you/other copy without guessing identities. Rides only the notice
+    /// row the fold mints; absent everywhere else (the poll row keeps the
+    /// `poll` face, the vote fold mints no row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_terminate: Option<NormalizedPollTerminate>,
     /// Backfill payment face (contract 1.81, §4.38): the desktop's
     /// consumable slice of the archive's per-message `payment` item — the
     /// note alone; amounts, fees and the transaction blob have no desktop
@@ -989,6 +999,33 @@ pub struct NormalizedPollVote {
     pub option_indexes: Vec<u32>,
 }
 
+/// Poll-terminate notice face (contract 1.189, §4.189): the material the
+/// standalone notice row carries — the official timeline keeps the terminate
+/// as its own `poll-terminate` system row beside the poll bubble
+/// (`PollTerminateNotification.dom.tsx`, behavior reference, zero code
+/// copied), so the connector's live fold mints the same row with the poll's
+/// question, the poll row's own upstream timestamp (the desktop's scroll/
+/// pairing anchor), and the terminator's self flag (the official
+/// `isMeTerminating` read/unread split's KT projection: the desktop's
+/// you/other copy branch). Rides [`NormalizedRich`] on the notice row only.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedPollTerminate {
+    /// The ended poll's question, verbatim from the folded poll face (the
+    /// official notification row's `pollTerminateNotification.question`).
+    pub poll_question: String,
+    /// The ended poll row's own upstream timestamp (the official
+    /// `pollTimestamp` — the row the fold addressed, i.e. the desktop's
+    /// pairing key back to the poll bubble).
+    pub poll_sent_at: u64,
+    /// The terminator is the linked account itself (the official
+    /// `isMeTerminating` — the account's own sent echo); serialized only
+    /// when true. False/absent = a peer's terminate (the poll author — the
+    /// official invariant the fold's author-keyed addressing enforces).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub self_terminated: bool,
+}
+
 /// Backfill payment face (contract revision 1.81, §4.38): the desktop's
 /// consumable slice of the archive's `payment` item. The engine projects the
 /// official import face — `{amountMob?, feeMob?, note?,
@@ -1052,8 +1089,9 @@ impl ReceiptKind {
 /// Control-plane receive payloads that are not messages: reaction add/remove,
 /// remote delete of an earlier message, typing START/STOP, edit of an
 /// earlier message (new body rides `NormalizedReceive.text`), and the poll
-/// vote/terminate folds (§4.118 — they mutate the poll row they address,
-/// never a row of their own).
+/// vote/terminate folds (§4.118 — they mutate the poll row they address;
+/// a vote never mints a row, a termination's first flip mints the
+/// standalone notice row beside the poll, §4.189).
 #[derive(Clone, Debug)]
 pub enum ControlReceive {
     Reaction {
@@ -1117,7 +1155,9 @@ pub enum ControlReceive {
     },
     /// A poll termination (live poll chain, §4.118): the engine's
     /// `dataMessage.pollTerminate {targetSentTimestamp}` projection flips
-    /// the addressed poll row's `terminated` bit. The proto carries no
+    /// the addressed poll row's `terminated` bit — and, on the first flip,
+    /// lands the standalone notice row beside the poll (§4.189, the
+    /// official `poll-terminate` timeline row). The proto carries no
     /// author — the official terminate send is the poll author's own
     /// dataMessage, so the service layer addresses the row through the
     /// envelope's own sender identity (or the account on the sent echo).
