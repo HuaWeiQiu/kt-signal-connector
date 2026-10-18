@@ -138,6 +138,7 @@
             "history.importCancel",
             "history.attachmentDownload",
             "attachments.download",
+            "attachments.requestBackfill",
             "backups.export",
             "backups.exportPlaintext",
             "backups.exportStatus",
@@ -1265,6 +1266,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/attachmentDownloadParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "attachments.requestBackfill" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/attachmentBackfillRequestParams" }
             }
           }
         },
@@ -4093,6 +4105,21 @@
           "maximum": 31,
           "description": "The zero-based position of the attachment in the message's received metadata — the descriptor list order the wire row already carries."
         }
+      }
+    },
+    "attachmentBackfillRequestParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accountId",
+        "conversationId",
+        "messageId"
+      ],
+      "description": "Request the primary device's fresh transit pointers for one message's attachments (contract revision 1.175, \u00a74.175, capability attachment-download — no new capability bit, the 1.61 gate widened in place): the request half of the official attachment-backfill loop (Signal-Desktop AttachmentBackfill.request — the local media miss asks the primary to re-upload). The caller names the message with the same addressing attachments.download rides; the official request asks for every attachment of the message at once, so no positional index. The connector resolves the row, derives the official target triple (author = the row's sender, the account's own number for outgoing rows; the upstream sent stamp; the conversation identity as the direct peer key or the group master key), and fires the engine's requestAttachmentBackfill (SyncMessage.content oneof attachmentBackfillRequest=24 self-send). A zero upstream stamp answers INVALID_REQUEST before any engine traffic (a stamp-0 row never went upstream and cannot be backfilled). Result {status: sent|unknown} — the receipt-class posture: sent = the engine confirmed the protocol write, unknown = the engine is unreachable or refused (the write may have landed upstream; the primary's de-duplicated answer to a duplicate request is protocol-built-in, so a retry is safe). The response itself arrives asynchronously: the primary's attachmentBackfillResponse sync merges the fresh pointer faces into the row's live_attachment_locators column (empty slots only — the first face wins, the official keep-as-is posture for status/error entries), and the caller's bounded retry of attachments.download then walks the \u00a74.54 transit chain. Send lane, account-scoped mutating.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "backupsImportSnapshotParams": {
