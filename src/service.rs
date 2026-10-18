@@ -7649,9 +7649,10 @@ impl ConnectorService {
     }
 
     /// sendPinMessage 上行确认后的本地落库（reaction 先例的 complete 段）：
-    /// 本机置顶以发送方口径写入每会话 pinned 状态（新 pin 替换旧 pin，
-    /// 过期时间用 connector 时钟计算），并返回会话摘要供调用方推
-    /// conversation.changed——重载窗口由此免重放即可渲染置顶条。
+    /// 本机置顶以发送方口径写入会话 pin 队列（多 pin 队列 diff-C #54——
+    /// 至多 3 条、满员替换 pinnedAt 最早，过期时间用 connector 时钟计算），
+    /// 并返回会话摘要供调用方推 conversation.changed——重载窗口由此免
+    /// 重放即可渲染置顶条。
     pub fn complete_send_pin_message(
         &self,
         account_id: &str,
@@ -10484,11 +10485,12 @@ impl ConnectorService {
                 target_timestamp,
                 duration_seconds,
             } => {
-                // Contract 1.33: the derived per-conversation pinned state —
-                // a newer pin replaces the older one, the expiry is connector
-                // clock computed, and the host refreshes the pin bar through
-                // the summary that rides conversation.changed (the reaction
-                // notification precedent).
+                // Contract 1.33 + the multi-pin queue face (diff-C #54): the
+                // derived per-conversation pin queue — distinct targets
+                // coexist (up to 3, replace-earliest at the cap), the expiry
+                // is connector clock computed, and the host refreshes the
+                // pin bar through the summary that rides
+                // conversation.changed (the reaction notification precedent).
                 self.store.upsert_conversation_pin(
                     &account.id,
                     &conversation.id,
@@ -23196,7 +23198,7 @@ mod tests {
     /// expiresAt），摘要以 camelCase `pinnedMessage` 投影；不匹配的 unpin
     /// 不动新 pin（返回 None），匹配的 unpin 清除并返回刷新摘要。
     #[test]
-    fn complete_pin_unpin_write_replace_and_clear_the_pinned_state() {
+    fn complete_pin_unpin_write_queue_and_clear_the_pinned_state() {
         let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(
@@ -23262,8 +23264,9 @@ mod tests {
             888
         );
 
-        // A newer pin replaces the older one: pin the peer row (forever) and
-        // the summary follows.
+        // Multi-pin queue (diff-C #54): pinning the peer row (forever) JOINS
+        // the own-row pin instead of replacing it — the queue projects both
+        // faces (`pinned_at` ASC array + the newest legacy single).
         let events = service
             .ingest_receive(
                 NormalizedReceive {
@@ -23309,31 +23312,38 @@ mod tests {
         assert_eq!(pinned.expires_at, None, "a forever pin carries no expiry");
         let wire = serde_json::to_value(&summary).unwrap();
         assert!(wire["pinnedMessage"].get("expiresAt").is_none());
-
-        // A stale unpin naming the replaced (author, timestamp) stays
-        // silent: complete answers None and the newer pin survives.
-        assert!(
-            service
-                .complete_send_unpin_message(&account.id, &conversation.id, "+15555550100", 888)
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            summary
+                .pinned_messages
+                .iter()
+                .map(|pin| pin.target_sent_timestamp)
+                .collect::<Vec<_>>(),
+            vec![888, 50],
+            "the queue renders oldest-first, both members coexist"
         );
-        let pinned = service
-            .store_ref()
-            .conversation_summary(&account.id, &conversation.id)
+        assert_eq!(wire["pinnedMessages"][0]["messageId"], json!(own_row));
+        assert_eq!(wire["pinnedMessages"][1]["messageId"], json!(incoming_id));
+
+        // A targeted unpin removes only the named member: complete answers the
+        // refreshed summary and the surviving member carries on.
+        let summary = service
+            .complete_send_unpin_message(&account.id, &conversation.id, "+15555550100", 888)
             .unwrap()
-            .unwrap()
-            .pinned_message
             .unwrap();
+        assert_eq!(summary.pinned_messages.len(), 1);
+        let pinned = summary.pinned_message.as_ref().unwrap();
         assert_eq!(pinned.target_sent_timestamp, 50);
 
-        // The matching unpin clears the state and returns the refreshed
-        // summary (pinnedMessage absent again).
+        // The matching unpin clears the last member and returns the refreshed
+        // summary (both faces absent again).
         let summary = service
             .complete_send_unpin_message(&account.id, &conversation.id, "+15555550101", 50)
             .unwrap()
             .unwrap();
         assert!(summary.pinned_message.is_none());
+        assert!(summary.pinned_messages.is_empty());
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert!(wire.get("pinnedMessages").is_none(), "{wire}");
     }
 
     /// 收件面（contract 1.33）：peer 的 pinMessage 更新每会话 pinned 状态并
