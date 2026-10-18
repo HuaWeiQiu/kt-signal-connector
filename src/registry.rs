@@ -647,6 +647,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.attachment_download(params).await
     }
 
+    /// attachments.requestBackfill (contract revision 1.175, §4.175): the
+    /// backfill request addresses the account's own engine, so the call
+    /// routes through the owning supervisor like every other mutating face.
+    pub async fn request_attachment_backfill(
+        &self,
+        params: crate::service::AttachmentBackfillRequestParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.request_attachment_backfill(params).await
+    }
+
     /// stories.downloadAttachment (contract revision 1.86, §4.71): the
     /// caller-supplied pointer face and the destination directory live with
     /// the account's group, so the chain routes through the owning

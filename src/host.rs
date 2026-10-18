@@ -1755,6 +1755,31 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        // Attachment backfill request (contract revision 1.175, §4.175):
+        // the request half of the official backfill loop — same row
+        // addressing as attachments.download, success is {"status":
+        // "sent"|"unknown"} (receipt-class posture; the response arrives
+        // asynchronously and merges fresh transit pointers into the row's
+        // live-locator column). Shape errors answer INVALID_REQUEST before
+        // any engine traffic.
+        "attachments.requestBackfill" => {
+            match serde_json::from_value::<crate::service::AttachmentBackfillRequestParams>(
+                request.params,
+            ) {
+                Ok(params) => match runtime.request_attachment_backfill(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "attachments.requestBackfill",
+                        "params",
+                        "invalid attachments.requestBackfill params",
+                    ),
+                ),
+            }
+        }
         // Story-anchored attachment download (contract revision 1.86,
         // §4.71): the params-gate arm — a caller-supplied pointer with a
         // missing or wrong-typed required field answers INVALID_REQUEST at

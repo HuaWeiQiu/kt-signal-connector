@@ -5,6 +5,12 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.176 (2026-10-18; §4.176 the peer-username projection: the
+  raw upstream `JsonContact.username` rides the contacts cache `extra` JSON and
+  projects on `contacts.list` contact rows plus the roster / requesting /
+  pending member views — additive absent-key wire, the desktop's official
+  getTitleNoDefault last-tier material, desktop contract 1.177. Group rows
+  never carry the face; over-budget values drop whole at capture and read.)
 - Contract revision: 1.174 (2026-10-18; §4.174 the sweep probe's not-found face
   stays clean end to end: the desktop's 2026-10-18 false-failure-flicker
   evidence convicted the probe chain and the connector-side review acquitted
@@ -14923,6 +14929,56 @@ Tests: `retry_replay_answers_the_terminal_projection_and_the_probe_face_agrees`
 gains the `into_api` code assertion (`MESSAGE_NOT_FOUND`); the admission
 and scheduler-lane halves are pinned in the desktop boundary/scheduler
 specs (desktop contract 1.177).
+
+### 4.176 The peer-username projection: the raw `JsonContact.username` rides the contacts cache and the member views (contract revision 1.176, 2026-10-18)
+
+The desktop's 2026-10-18 user evidence ("a group member who has only a
+Signal username shows as Unknown contact; official getTitle falls through
+profileName → number → username") convicted a wire gap: the pinned
+`JsonContact` has always carried `username` and the contact-title
+composition already falls back to it, but the raw value never rode any
+read face on its own — the desktop's official getTitleNoDefault last tier
+had no first-class material, and any display surface that discards a
+masked/composed title (the resolver's masked-title guard) had nothing
+left to resolve.
+
+This revision is the minimal projection chain, all additive absent-key
+wire (pre-1.176 hosts and rows read byte-identical shapes):
+
+- Capture: the contacts sync stores the upstream `JsonContact.username`
+  under the `kind='contact'` row's `extra` JSON
+  (`contact_extra_json`) — verbatim-trimmed, 64-char whole-value budget,
+  over-budget keys dropped at capture and re-checked at read (a clipped
+  username would resolve the wrong account). Engines without the face
+  and peers without a username leave the extra empty, the same
+  informative-keys discipline as the group markers.
+- `contacts.list`: `ContactSummary` gains the optional `username` key,
+  projected from the row's extra at read time. Group rows never carry
+  the face — `JsonGroup` has no username projection, and the projection
+  gates on `kind == 'contact'`.
+- Member views: `GroupMemberView` / `GroupRequestingMemberView` /
+  `GroupPendingMemberView` gain the optional `username` key, resolved at
+  read time from the new `contact_username_map` — id-first with the uuid
+  tail, the same ladder the existing `contact_title_map` name resolution
+  runs (`member_name_username` is the shared pair resolver). Members the
+  cache has no username for keep the absent key; the desktop answers its
+  localized unknown-contact placeholder, never invents one.
+- Conversation summaries are deliberately untouched: the direct-row
+  title composition already falls back to the composed username, and a
+  contact row the sync admitted already keys the resolver's contacts
+  tier by peer key / service id. Adding a second username face there
+  would be redundant projection surface.
+
+Tests: `contact_extra_json_captures_bounded_username` (verbatim /
+trim / absent / blank / 64-in-65-out), `list_contacts_projects_captured_username`
+(wire projection, over-budget drop, absent stays absent, the group-row
+never-carries guard, the username map), `get_group_projects_member_usernames_from_contacts_cache`
+(roster + requesting + pending faces, id-first/uuid-tail resolution, the
+no-username absent key, the over-budget read-side drop). The desktop
+half (resolver last-tier arm + the three-source registration, desktop
+contract 1.177) lands in the kt-desktop worktree batch; no engine change
+— the engine's `listContacts` answer already exposes the field and the
+kt-engine read face legitimately omits it (the absent-key answer).
 
 ## 5. signal-cli Boundary
 

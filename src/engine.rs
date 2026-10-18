@@ -1274,6 +1274,26 @@ pub enum ControlReceive {
     SyncDeleteForMe {
         deletes: Vec<SyncDeleteGroup>,
     },
+    /// The engine's `syncMessage.attachmentBackfillResponse` projection
+    /// (contract revision 1.175, §4.175): the primary device answered our
+    /// backfill request (engine `requestAttachmentBackfill`, the official
+    /// `AttachmentBackfill.request` chain) — it re-uploaded the attachment
+    /// and returned fresh transit pointers for the target message. The
+    /// connector consumes the pointer faces into the row's schema-19 live
+    /// locator column (empty slots only; `status` entries and the error arm
+    /// change nothing, the official `handleResponse` keep-as-is posture),
+    /// so a later `attachments.download` walks the §4.54 transit CDN chain.
+    /// The target names the conversation in the official three-form shape
+    /// (exactly one leg survives the parse) and the message by author +
+    /// upstream sent stamp. A face whose target or conversation fails the
+    /// shape gates never reaches this variant — the projection parser
+    /// dropped it, and an envelope with nothing usable left keeps the plain
+    /// syncMessage skip. The `longText` entry is parsed and dropped: KT
+    /// long-text bodies ride the row's text column, so no locator column
+    /// exists for them (recorded §4.175).
+    SyncAttachmentBackfillResponse {
+        response: SyncAttachmentBackfillResponse,
+    },
     /// The engine's `syncMessage.verified` projection (contract 1.103,
     /// §4.84): the account's own linked device settled one peer's safety-number
     /// trust state — the official SyncMessage.verified face, the engine's B4
@@ -1605,6 +1625,28 @@ pub struct SyncBlocked {
     pub numbers: Vec<String>,
     pub acis: Vec<String>,
     pub group_ids: Vec<String>,
+}
+
+/// The engine's `syncMessage.attachmentBackfillResponse` face (contract
+/// revision 1.175, §4.175): the official
+/// `SyncMessage.AttachmentBackfillResponse` projection, normalized. The
+/// target message rides author + upstream sent stamp; the conversation in
+/// the official three-form identity (exactly one leg set after the parse).
+/// The data face is either the error word (`MESSAGE_NOT_FOUND`/`UNKNOWN`)
+/// or the index-aligned locator entries — `Some(face)` where the primary
+/// returned a pointer with locator material, `None` where it returned a
+/// status entry (`PENDING`/`TERMINAL_ERROR`) or an unparseable entry, so
+/// the merge keeps the official index alignment (a status entry means
+/// "keep the attachment as is", never "shift the row").
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncAttachmentBackfillResponse {
+    pub author: String,
+    pub sent_timestamp: u64,
+    pub conversation_service_id: Option<String>,
+    pub conversation_group_id: Option<String>,
+    pub conversation_e164: Option<String>,
+    pub error: Option<String>,
+    pub locators: Vec<Option<crate::store::HistoryAttachmentLocator>>,
 }
 
 /// Protocol-side bounds for inbound control-plane data (§4.13).
@@ -1946,6 +1988,31 @@ impl NormalizedReceive {
                 Some(ControlReceive::SyncPniChangeNumber { change }) => {
                     std::mem::size_of::<SyncPniChangeNumber>()
                         + change.new_e164.as_ref().map_or(0, String::len)
+                }
+                // The backfill response carries the bounded target identities
+                // plus one locator face per entry (each face bounded by the
+                // 1.56 caps family) — counted entry-wise so the queue budget
+                // stays honest (§4.13, §4.175).
+                Some(ControlReceive::SyncAttachmentBackfillResponse { response }) => {
+                    std::mem::size_of::<SyncAttachmentBackfillResponse>()
+                        + response.author.len()
+                        + response.conversation_service_id.as_ref().map_or(0, String::len)
+                        + response.conversation_group_id.as_ref().map_or(0, String::len)
+                        + response.conversation_e164.as_ref().map_or(0, String::len)
+                        + response
+                            .locators
+                            .iter()
+                            .flatten()
+                            .map(|face| {
+                                face.key.as_ref().map_or(0, String::len)
+                                    + face.cdn_key.as_ref().map_or(0, String::len)
+                                    + face.digest.as_ref().map_or(0, String::len)
+                                    + face
+                                        .plaintext_hash
+                                        .as_ref()
+                                        .map_or(0, String::len)
+                            })
+                            .sum::<usize>()
                 }
                 // The contacts sync carries heap record Vecs like the read
                 // lists — counted entry-wise so the queue budget stays
@@ -3546,6 +3613,94 @@ fn normalized_sync_read_entries(value: Option<&Value>) -> Vec<SyncReadEntry> {
         .collect()
 }
 
+/// Bounded `syncMessage.attachmentBackfillResponse` face (contract revision
+/// 1.175, §4.175): the engine's projection of the official backfill
+/// response. The parse is all-or-nothing on the target (author + positive
+/// sent stamp + exactly one conversation leg — the official
+/// strictAssert-drop posture; a malformed target answers None so the
+/// envelope keeps the plain syncMessage skip, 宁缺勿错). The data face
+/// parses leniently per entry: the error arm rides its bounded word; the
+/// attachments arm keeps index alignment — a pointer entry contributes its
+/// locator face (`None` when the pointer carried no locator material), a
+/// status entry contributes `None` (keep-as-is), an unparseable entry
+/// contributes `None` too (never a shifted row). The `longText` entry is
+/// dropped on the floor deliberately: KT long-text bodies ride the row's
+/// text column, so no locator column exists to merge into (recorded
+/// §4.175).
+fn normalized_sync_attachment_backfill_response(
+    value: Option<&Value>,
+) -> Option<SyncAttachmentBackfillResponse> {
+    const MAX_BACKFILL_ERROR_WORD_CHARS: usize = 64;
+    let face = value?.as_object()?;
+    let target_message = face.get("targetMessage")?.as_object()?;
+    let author = target_message
+        .get("author")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+    let sent_timestamp = target_message
+        .get("sentTimestamp")
+        .and_then(Value::as_u64)
+        .filter(|timestamp| *timestamp > 0)?;
+    let conversation = face.get("targetConversation")?.as_object()?;
+    let bounded_identity = |key: &str| {
+        conversation
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())
+    };
+    let conversation_service_id = bounded_identity("serviceId");
+    let conversation_group_id = bounded_identity("groupId");
+    let conversation_e164 = bounded_identity("e164");
+    if conversation_service_id.is_none()
+        && conversation_group_id.is_none()
+        && conversation_e164.is_none()
+    {
+        return None;
+    }
+    if let Some(error) = face.get("error").and_then(Value::as_str) {
+        return Some(SyncAttachmentBackfillResponse {
+            author,
+            sent_timestamp,
+            conversation_service_id,
+            conversation_group_id,
+            conversation_e164,
+            error: Some(
+                error
+                    .chars()
+                    .take(MAX_BACKFILL_ERROR_WORD_CHARS)
+                    .collect::<String>(),
+            ),
+            locators: Vec::new(),
+        });
+    }
+    let locators = face
+        .get("attachments")
+        .and_then(Value::as_array)?
+        .iter()
+        .take(MAX_INBOUND_ATTACHMENTS)
+        .map(|entry| {
+            entry
+                .as_object()?
+                .get("attachment")
+                .and_then(|attachment| attachment.get("locator"))
+                .and_then(normalized_locator_face)
+        })
+        .collect();
+    Some(SyncAttachmentBackfillResponse {
+        author,
+        sent_timestamp,
+        conversation_service_id,
+        conversation_group_id,
+        conversation_e164,
+        error: None,
+        locators,
+    })
+}
+
 /// Bounded `syncMessage.deleteForMe` group family (contract 1.102, §4.83):
 /// the wire shape is `{messageDeletes: [{conversationId?, messages:
 /// [{author, timestamp}]}]}` — the engine projects the official
@@ -4157,7 +4312,6 @@ fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
 /// invariant, not a connector gate: the connector forwards what is stated).
 fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<NormalizedAttachment> {
     const MAX_LOCATOR_BASE64_CHARS: usize = 512;
-    const MAX_LOCATOR_HEX_CHARS: usize = 128;
     let id = object
         .get("id")
         .and_then(Value::as_str)
@@ -4209,40 +4363,7 @@ fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<Norm
         (Some(mac), Some(chunk_size)) => (Some(mac.to_string()), Some(chunk_size)),
         _ => (None, None),
     };
-    let locator = object.get("locator").and_then(|raw| {
-        let raw = raw.as_object()?;
-        let bounded_b64 = |name: &str| {
-            raw.get(name)
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty() && text.len() <= MAX_LOCATOR_BASE64_CHARS)
-                .map(str::to_string)
-        };
-        let plaintext_hash = raw
-            .get("plaintextHash")
-            .and_then(Value::as_str)
-            .filter(|text| {
-                !text.is_empty()
-                    && text.len() <= MAX_LOCATOR_HEX_CHARS
-                    && text.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-            .map(|text| text.to_ascii_lowercase());
-        let face = crate::store::HistoryAttachmentLocator {
-            key: bounded_b64("key"),
-            cdn_key: bounded_b64("cdnKey"),
-            cdn_number: raw
-                .get("cdnNumber")
-                .and_then(Value::as_u64)
-                .filter(|number| *number <= u32::MAX as u64)
-                .map(|number| number as u32),
-            upload_timestamp: raw
-                .get("uploadTimestamp")
-                .and_then(Value::as_u64)
-                .filter(|timestamp| *timestamp > 0),
-            digest: bounded_b64("digest"),
-            plaintext_hash,
-        };
-        (face != crate::store::HistoryAttachmentLocator::default()).then_some(face)
-    });
+    let locator = object.get("locator").and_then(normalized_locator_face);
     Some(NormalizedAttachment {
         id,
         content_type,
@@ -4283,6 +4404,50 @@ fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<Norm
             .filter(|seconds| *seconds > 0.0),
         locator,
     })
+}
+
+/// One transit locator face off an attachment-shaped object (contract
+/// revision 1.61): the 1.56 import caps, per-key fail-closed — wrong-shaped
+/// keys drop, never guess (the §4.38 ingest discipline). An all-default face
+/// answers None (no locator material at all, indistinguishable on the read
+/// face from a metadata-only pointer). Single source of truth for both the
+/// live-receive descriptor parse ([`normalized_attachment`]) and the
+/// backfill-response entry parse (contract 1.175, §4.175).
+fn normalized_locator_face(raw: &Value) -> Option<crate::store::HistoryAttachmentLocator> {
+    const MAX_LOCATOR_BASE64_CHARS: usize = 512;
+    const MAX_LOCATOR_HEX_CHARS: usize = 128;
+    let raw = raw.as_object()?;
+    let bounded_b64 = |name: &str| {
+        raw.get(name)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty() && text.len() <= MAX_LOCATOR_BASE64_CHARS)
+            .map(str::to_string)
+    };
+    let plaintext_hash = raw
+        .get("plaintextHash")
+        .and_then(Value::as_str)
+        .filter(|text| {
+            !text.is_empty()
+                && text.len() <= MAX_LOCATOR_HEX_CHARS
+                && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map(|text| text.to_ascii_lowercase());
+    let face = crate::store::HistoryAttachmentLocator {
+        key: bounded_b64("key"),
+        cdn_key: bounded_b64("cdnKey"),
+        cdn_number: raw
+            .get("cdnNumber")
+            .and_then(Value::as_u64)
+            .filter(|number| *number <= u32::MAX as u64)
+            .map(|number| number as u32),
+        upload_timestamp: raw
+            .get("uploadTimestamp")
+            .and_then(Value::as_u64)
+            .filter(|timestamp| *timestamp > 0),
+        digest: bounded_b64("digest"),
+        plaintext_hash,
+    };
+    (face != crate::store::HistoryAttachmentLocator::default()).then_some(face)
 }
 
 /// One inbound sticker (contract revision 1.35): bounded pack identity beside
@@ -5479,6 +5644,26 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             source: None,
             group_id: None,
             control: ControlReceive::SyncUsernameChange,
+        });
+    }
+    // The engine's `syncMessage.attachmentBackfillResponse` projection
+    // (contract revision 1.175, §4.175): the primary device answered our
+    // backfill request with fresh transit pointers — the official
+    // #handleAttachmentBackfillResponse face. Intercepted before the plain
+    // syncMessage skip like its read/viewed/delete-for-me siblings; a face
+    // whose target or conversation failed the shape gates falls through to
+    // that skip. The routing source stays None — the envelope is our own
+    // account and the target names its own conversation (the read/viewed
+    // precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(response) =
+            normalized_sync_attachment_backfill_response(sync.get("attachmentBackfillResponse"))
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncAttachmentBackfillResponse { response },
         });
     }
     // The engine's `syncMessage.pniChangeNumber` projection (contract
@@ -9345,6 +9530,109 @@ mod tests {
                     .unwrap(),
             );
             assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// The engine's `syncMessage.attachmentBackfillResponse` projection
+    /// (contract revision 1.175, §4.175) routes as the backfill control with
+    /// the target identities and the index-aligned locator entries: pointer
+    /// entries contribute their locator face, status entries and unparseable
+    /// entries contribute None (never a shifted row), the error arm rides its
+    /// word with no locators, and a target missing its author/stamp/
+    /// conversation falls through to the plain skip.
+    #[test]
+    fn sync_attachment_backfill_response_routes_target_and_entries() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncAttachmentBackfillResponse { response }, source)) =
+            routing(json!({
+                "attachmentBackfillResponse": {
+                    "targetMessage": {
+                        "author": "22222222-2222-2222-2222-222222222222",
+                        "sentTimestamp": 1726999999000u64,
+                    },
+                    "targetConversation": { "groupId": "Z3JvdXA=" },
+                    "attachments": [
+                        { "status": "PENDING" },
+                        {
+                            "attachment": {
+                                "id": "att-a",
+                                "contentType": "image/png",
+                                "locator": {
+                                    "key": "a2F0LWtleQ==",
+                                    "cdnKey": "cdn-a",
+                                    "cdnNumber": 3,
+                                    "uploadTimestamp": 1700000000000u64,
+                                },
+                            },
+                        },
+                        { "attachment": { "id": "att-b", "contentType": "image/png" } },
+                    ],
+                },
+            }))
+        else {
+            panic!("expected a backfill-response control routing");
+        };
+        assert_eq!(response.author, "22222222-2222-2222-2222-222222222222");
+        assert_eq!(response.sent_timestamp, 1726999999000);
+        assert_eq!(response.conversation_group_id.as_deref(), Some("Z3JvdXA="));
+        assert!(response.conversation_service_id.is_none());
+        assert!(response.conversation_e164.is_none());
+        assert!(response.error.is_none());
+        // Index alignment: status → None, pointer → face, pointer without
+        // locator material → None.
+        assert_eq!(response.locators.len(), 3);
+        assert!(response.locators[0].is_none());
+        let face = response.locators[1].as_ref().expect("pointer face");
+        assert_eq!(face.key.as_deref(), Some("a2F0LWtleQ=="));
+        assert_eq!(face.cdn_key.as_deref(), Some("cdn-a"));
+        assert_eq!(face.cdn_number, Some(3));
+        assert!(response.locators[2].is_none());
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // The error arm: word rides, no locators.
+        let Some((ControlReceive::SyncAttachmentBackfillResponse { response }, _)) =
+            routing(json!({
+                "attachmentBackfillResponse": {
+                    "targetMessage": {
+                        "author": "+15555550101",
+                        "sentTimestamp": 1726999999000u64,
+                    },
+                    "targetConversation": { "serviceId": "11111111-1111-1111-1111-111111111111" },
+                    "error": "MESSAGE_NOT_FOUND",
+                },
+            }))
+        else {
+            panic!("expected an error-arm backfill routing");
+        };
+        assert_eq!(response.error.as_deref(), Some("MESSAGE_NOT_FOUND"));
+        assert!(response.locators.is_empty());
+        assert_eq!(
+            response.conversation_service_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+
+        // Malformed targets fall through to the plain skip: no author, no
+        // stamp, no conversation leg.
+        for face in [
+            json!({ "targetMessage": { "sentTimestamp": 1u64 }, "targetConversation": { "groupId": "Z3JvdXA=" }, "attachments": [] }),
+            json!({ "targetMessage": { "author": "a", "sentTimestamp": 0u64 }, "targetConversation": { "groupId": "Z3JvdXA=" }, "attachments": [] }),
+            json!({ "targetMessage": { "author": "a", "sentTimestamp": 1u64 }, "targetConversation": {}, "attachments": [] }),
+        ] {
+            assert!(
+                routing(json!({ "attachmentBackfillResponse": face })).is_none(),
+                "malformed target keeps the plain skip: {face}"
+            );
         }
     }
 

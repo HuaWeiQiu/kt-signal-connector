@@ -822,6 +822,21 @@ fn extra_is_terminated(extra: Option<&str>) -> bool {
         == Some(true)
 }
 
+/// Contract 1.176 (§4.176): the raw `JsonContact.username` marker the sync
+/// captured under the contact row's `extra` JSON — trimmed, non-empty, and
+/// only when whole-value within the §4.176 budget (a clipped username would
+/// resolve the wrong account, so over-budget values drop the key, the same
+/// read-side discipline the §4.60 labels run).
+fn extra_username(extra: Option<&str>) -> Option<String> {
+    let parsed = extra.and_then(|extra| serde_json::from_str::<Value>(extra).ok())?;
+    parsed
+        .get("username")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 64)
+        .map(str::to_owned)
+}
+
 /// The §4.171 outbound-quote projection only names an author for an outgoing
 /// quoted row whose send outcome has reached an addressable rung of the §4.6
 /// resolve ladder (`service.rs` resolve_recipient): sent/delivered/read mean
@@ -1558,6 +1573,15 @@ pub struct ContactSummary {
     /// pre-1.146 hosts read byte-identical rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_id: Option<String>,
+    /// Contract 1.176 (§4.176): the raw upstream `JsonContact.username` the
+    /// sync captured into the row's `extra` JSON — the desktop's official
+    /// getTitleNoDefault last-tier material (profileName → number →
+    /// username). Absent when the row carries none (pre-1.176 sync rows,
+    /// engines without the face, peers without a username) — the desktop
+    /// answers its localized unknown-contact placeholder, never invents one.
+    /// Group rows answer absent (JsonGroup has no username face).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 /// One recorded reaction (contract 1.15): the actor's emoji state on a target
@@ -5357,6 +5381,113 @@ impl Store {
         .unwrap_or_else(|| Ok(Vec::new()))
     }
 
+    /// Merge new live-receive locator faces into one row's schema-19 column,
+    /// filling only the slots that are still empty (contract revision 1.175,
+    /// §4.175): the optimistic outgoing row predates its sent-sync echo and
+    /// `INSERT OR IGNORE` drops the echo's faces, and a backfill response
+    /// arrives for a row whose live column the receive arm never filled —
+    /// both land their pointer faces through this primitive. An existing
+    /// non-default slot is authoritative and never overwritten (the first
+    /// face wins; a later echo cannot move a locator the receive arm
+    /// already stored); a new face longer than the stored column extends it
+    /// index-aligned (default-padded). Answers whether any slot changed.
+    /// Absent row answers `Ok(false)` (the caller treats a vanished row as
+    /// a quiet no-op, the same posture the receive arm's duplicate insert
+    /// takes).
+    pub fn merge_live_attachment_locators(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        new_faces: &[Option<HistoryAttachmentLocator>],
+    ) -> Result<bool, StoreError> {
+        if new_faces.iter().all(|face| {
+            face.as_ref()
+                .is_none_or(|face| face == &HistoryAttachmentLocator::default())
+        }) {
+            return Ok(false);
+        }
+        let conn = self.lock_conn()?;
+        let cell: Option<String> = conn
+            .query_row(
+                "SELECT live_attachment_locators FROM messages WHERE account_id=?1 AND id=?2",
+                params![account_id, message_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .flatten();
+        let Some(cell) = cell else {
+            return Ok(false);
+        };
+        let mut faces: Vec<HistoryAttachmentLocator> =
+            serde_json::from_str(&cell).map_err(|error| {
+                StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(error.into())))
+            })?;
+        let default = HistoryAttachmentLocator::default();
+        let mut changed = false;
+        for (index, face) in new_faces.iter().enumerate() {
+            let Some(face) = face.as_ref().filter(|face| face != &&default) else {
+                continue;
+            };
+            if faces.len() <= index {
+                faces.resize(index + 1, default.clone());
+            }
+            if faces[index] == default {
+                faces[index] = face.clone();
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(false);
+        }
+        let json = serde_json::to_string(&faces).map_err(|error| {
+            StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(error.into())))
+        })?;
+        conn.execute(
+            "UPDATE messages SET live_attachment_locators=?3 WHERE account_id=?1 AND id=?2",
+            params![account_id, message_id, json],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(true)
+    }
+
+    /// One row of any direction by conversation + upstream sent stamp
+    /// (contract revision 1.175, §4.175): the backfill response's target
+    /// lookup — `incoming_rows_by_sent_at` filters `direction='incoming'`,
+    /// but a backfill response can name the account's own outgoing row (the
+    /// phone mirrors the sent message back). Multiple rows sharing one stamp
+    /// are pathological (one sender, one stamp, one row); the newest wins
+    /// so a re-sent row answers over its predecessor.
+    pub fn rows_by_sent_at(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        sent_at: u64,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                 ORDER BY received_at DESC",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(
+                params![account_id, conversation_id, sent_at as i64],
+                message_record_from_row,
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(|error| StoreError::Unavailable(Some(error)))?);
+        }
+        Ok(records)
+    }
+
     /// Append one batch of pass-1 recipient staging rows (bounded: the caller
     /// streams the archive and flushes one batch at a time; nothing
     /// proportional to the archive is held in memory). The caller clears the
@@ -7434,6 +7565,39 @@ impl Store {
         Ok(map)
     }
 
+    /// Contract 1.176 (§4.176): the cached `kind='contact'` raw usernames of
+    /// one account, keyed by peer_key — the same read-time resolution the
+    /// [`contact_title_map`] names run, for the official getTitleNoDefault
+    /// last tier (profileName → number → username). Rows without a captured
+    /// username contribute nothing; the projection answers absent for those
+    /// members, never invents one.
+    pub fn contact_username_map(
+        &self,
+        account_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT peer_key, extra
+                 FROM contacts
+                 WHERE account_id=?1 AND kind='contact'",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (peer_key, extra) = row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if let Some(username) = extra_username(extra.as_deref()) {
+                map.insert(peer_key, username);
+            }
+        }
+        Ok(map)
+    }
+
     /// Read-only paged view of the contacts cache, ordered by (kind, peer_key).
     /// `query` is an optional case-insensitive substring filter over title/peer_key.
     pub fn list_contacts(
@@ -7520,6 +7684,17 @@ impl Store {
                         peer_key,
                         title: row.get(3)?,
                         service_id,
+                        // Contract 1.176 (§4.176): the username marker the
+                        // sync captured, verbatim-trimmed at capture and
+                        // re-checked whole-value here (a clipped username
+                        // would resolve the wrong account — over-budget
+                        // reads drop). Group rows never carry the face:
+                        // JsonGroup has no username projection.
+                        username: if kind == "contact" {
+                            extra_username(extra.as_deref())
+                        } else {
+                            None
+                        },
                     })
                 },
             )
@@ -9306,6 +9481,85 @@ mod tests {
 
     /// The window judgment: a queue entry whose `first_send_attempted_at +
     /// 24 h` has run out dies in the queue — the claim pass retires its
+    /// Contract 1.176 (§4.176): the raw `JsonContact.username` the sync
+    /// captured into the contact row's `extra` JSON projects on the
+    /// `contacts.list` wire and the read-time username map; absent,
+    /// blank, and over-budget markers all answer absent (the informative-
+    /// keys discipline — pre-1.176 rows read byte-identical).
+    #[test]
+    fn list_contacts_projects_captured_username() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .upsert_synced_contacts(
+                &account.id,
+                &[
+                    SyncedContact {
+                        kind: "contact",
+                        peer_key: "+15555550101",
+                        title: "Alice Contact",
+                        extra: Some(r#"{"username":"alice.01"}"#),
+                    },
+                    SyncedContact {
+                        kind: "contact",
+                        peer_key: "+15555550102",
+                        title: "Budget Peer",
+                        extra: Some(&format!(r#"{{"username":"{}"}}"#, "x".repeat(65))),
+                    },
+                    SyncedContact {
+                        kind: "contact",
+                        peer_key: "+15555550103",
+                        title: "No Username",
+                        extra: None,
+                    },
+                ],
+                1_725_300_000,
+            )
+            .unwrap();
+
+        let page = store.list_contacts(&account.id, None, 50, None).unwrap();
+        let wire = serde_json::to_value(&page.items).unwrap();
+        assert_eq!(wire[0]["username"], serde_json::json!("alice.01"));
+        assert!(wire[1].get("username").is_none(), "over-budget drops");
+        assert!(wire[2].get("username").is_none(), "absent stays absent");
+        // group rows never carry a username face
+        store
+            .upsert_synced_contacts(
+                &account.id,
+                &[SyncedContact {
+                    kind: "group",
+                    peer_key: "ZmFrZS1ncm91cC0x",
+                    title: "Fixture Group",
+                    extra: Some(r#"{"username":"group.01","memberCount":1}"#),
+                }],
+                1_725_300_000,
+            )
+            .unwrap();
+        let with_group = store.list_contacts(&account.id, None, 50, None).unwrap();
+        let group_wire = serde_json::to_value(&with_group.items).unwrap();
+        let group_row = group_wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "group")
+            .expect("the group row projects");
+        assert!(
+            group_row.get("username").is_none(),
+            "JsonGroup has no username face — the key never rides a group row"
+        );
+
+        let usernames = store.contact_username_map(&account.id).unwrap();
+        assert_eq!(
+            usernames.get("+15555550101").map(String::as_str),
+            Some("alice.01")
+        );
+        assert!(!usernames.contains_key("+15555550102"));
+        assert!(!usernames.contains_key("+15555550103"));
+    }
+
     /// schedule and claims nothing for it (the row stays `failed`,
     /// terminal), while a live-window control row in the same pass is
     /// claimed normally.
@@ -17482,6 +17736,116 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// merge_live_attachment_locators (contract revision 1.175, §4.175): the
+    /// merge fills only empty slots — the optimistic outgoing row / the
+    /// backfill response both land their pointer faces through this
+    /// primitive. First face wins (an existing non-default slot is never
+    /// overwritten); a longer new face extends the column index-aligned; an
+    /// all-default new face and an absent row both answer `Ok(false)`.
+    #[test]
+    fn merge_live_attachment_locators_fills_only_empty_slots() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550105", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550106", "Peer")
+            .unwrap();
+        let descriptor = |id: &str, locator: Option<crate::store::HistoryAttachmentLocator>| {
+            crate::engine::NormalizedAttachment {
+                id: id.into(),
+                content_type: Some("image/jpeg".into()),
+                filename: None,
+                size: Some(2048),
+                width: None,
+                height: None,
+                is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
+                locator,
+                waveform: None,
+                duration: None,
+            }
+        };
+        let face = |cdn: &str| crate::store::HistoryAttachmentLocator {
+            key: Some("a2F0LWtleQ==".into()),
+            cdn_key: Some(cdn.into()),
+            cdn_number: Some(3),
+            upload_timestamp: Some(1700000000000),
+            digest: Some("ZGl-nonsense".into()),
+            plaintext_hash: None,
+        };
+        // The pre-echo outgoing row: descriptors without locators.
+        let mut row = expire_record("m-merge", &account.id, &conversation.id);
+        row.direction = "outgoing";
+        row.attachments = vec![descriptor("att-a", None), descriptor("att-b", None)];
+        store
+            .insert_message(&row, None, Some("merge"), false)
+            .unwrap();
+        // The insert stored the all-default faces index-aligned (the 1.61
+        // write discipline) — every slot is an empty hole waiting to fill.
+        let initial = store
+            .live_attachment_locators(&account.id, "m-merge")
+            .unwrap();
+        assert_eq!(initial.len(), 2);
+        assert!(
+            initial
+                .iter()
+                .all(|face| face == &crate::store::HistoryAttachmentLocator::default())
+        );
+
+        // The echo/backfill merge: index 0 lands, index 1 stays a hole for
+        // now; a longer face extends the column.
+        let changed = store
+            .merge_live_attachment_locators(
+                &account.id,
+                "m-merge",
+                &[Some(face("cdn-a")), None, Some(face("cdn-c"))],
+            )
+            .unwrap();
+        assert!(changed);
+        let faces = store
+            .live_attachment_locators(&account.id, "m-merge")
+            .unwrap();
+        assert_eq!(faces.len(), 3);
+        assert_eq!(faces[0], face("cdn-a"));
+        assert_eq!(faces[1], crate::store::HistoryAttachmentLocator::default());
+        assert_eq!(faces[2], face("cdn-c"));
+
+        // First face wins: a second merge with a different face for index 0
+        // changes nothing.
+        let changed = store
+            .merge_live_attachment_locators(
+                &account.id,
+                "m-merge",
+                &[Some(face("cdn-OTHER")), Some(face("cdn-b"))],
+            )
+            .unwrap();
+        assert!(changed, "index 1's empty slot still fills");
+        let faces = store
+            .live_attachment_locators(&account.id, "m-merge")
+            .unwrap();
+        assert_eq!(faces[0], face("cdn-a"), "existing slot never moves");
+        assert_eq!(faces[1], face("cdn-b"));
+
+        // All-default new face: quiet no-op.
+        let changed = store
+            .merge_live_attachment_locators(&account.id, "m-merge", &[None, None])
+            .unwrap();
+        assert!(!changed);
+
+        // Absent row: quiet no-op.
+        let changed = store
+            .merge_live_attachment_locators(&account.id, "m-absent", &[Some(face("cdn-x"))])
+            .unwrap();
+        assert!(!changed);
     }
 
     /// serverGuid round-trip (contract revision 1.49, §4.48): a live receive
