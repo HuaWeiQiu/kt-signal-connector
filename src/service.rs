@@ -1719,6 +1719,47 @@ impl MediaIngest {
         std::fs::create_dir_all(&dir).map_err(|_| ServiceError::Io)?;
         Ok(dir)
     }
+
+    /// Stash one just-sent attachment's plaintext bytes into the governed
+    /// attachments directory (contract revision 1.183, §4.183) — the
+    /// official outgoing-attachment local-retention semantics: the sender's
+    /// own bubble reads its own bytes back from the local store without any
+    /// transit pointer or backfill round. The bytes land under the
+    /// descriptor's own sanitized id — the same addressing the download and
+    /// open faces already resolve — so the stash is per-account per-message
+    /// by construction (the id is the §4.12 stable hash of
+    /// account+clientRequestId+index) and stays inside the existing
+    /// retention machine: the governor's 7-day TTL and 2 GiB LRU passes
+    /// evict it like any other file in these directories, the view-once
+    /// burn erases it by the same id, and the per-file 100 MiB send budget
+    /// bounds one write. Best-effort by design: any failure is reported as
+    /// a class string (never ids or paths) and the send proceeds without
+    /// local bytes — the wire never depends on the filesystem answering.
+    pub fn stash_outbound_attachment(
+        &self,
+        descriptor_id: &str,
+        data_uri: &str,
+    ) -> Result<(), &'static str> {
+        let Some(payload) = data_uri
+            .strip_prefix("data:")
+            .and_then(|rest| rest.rsplit_once(','))
+            .map(|(_, payload)| payload)
+        else {
+            return Err("not-a-data-uri");
+        };
+        let mut bytes = Vec::with_capacity(payload.len() / 4 * 3);
+        base64_decode_to_vec(payload, &mut bytes).map_err(|_| "base64")?;
+        if bytes.is_empty() {
+            return Err("empty-payload");
+        }
+        let sanitized = sanitize_attachment_id(descriptor_id).map_err(|_| "id-shape")?;
+        let dir = self.write_dir().map_err(|_| "write-dir")?;
+        let target = dir.join(&sanitized);
+        let temp = dir.join(format!(".{sanitized}.{}.tmp", random_id()));
+        std::fs::write(&temp, &bytes).map_err(|_| "write")?;
+        std::fs::rename(&temp, &target).map_err(|_| "rename")?;
+        Ok(())
+    }
 }
 
 /// KT (send latency probe): service 层校验拒绝归因单点——host.rs
@@ -2672,8 +2713,13 @@ impl ConnectorService {
     /// stays a fresh request. The base64 payload is size-verified against the
     /// declared `sizeBytes` and re-encoded as an RFC 2397 data URI: upstream
     /// decodes it itself (AttachmentHelper, pinned 0.14.7), uploads via CDN,
-    /// and owns any temp file lifetime — bytes never touch connector disk and
-    /// no caller-controlled path reaches upstream. The pending row carries the
+    /// and owns the transit temp file lifetime. Since contract revision
+    /// 1.183 (§4.183) the connector ALSO stashes the plaintext into its
+    /// governed attachments directory at dispatch time — the official
+    /// outgoing local-retention semantics — best-effort, keyed by the
+    /// descriptor's own id, evicted by the same governor passes as inbound
+    /// media; the wire and the send outcome never depend on the stash. No
+    /// caller-controlled path reaches upstream. The pending row carries the
     /// metadata-only descriptor (same wire shape as inbound, contract 1.15) so
     /// the host renders the outgoing attachment from its first tick.
     #[allow(clippy::too_many_arguments)]
@@ -2833,7 +2879,9 @@ impl ConnectorService {
     /// content type); the caption and quote are message-level and shared.
     /// Settlement is the §4.12 chain unchanged: one pending row carrying one
     /// descriptor per entry, then the shared `dispatch_send` completion, so
-    /// the desktop renders every outgoing attachment from the first tick.
+    /// the desktop renders every outgoing attachment from the first tick;
+    /// §4.183 stashes every entry's bytes the same way (one file per
+    /// descriptor id).
     pub fn prepare_send_attachment_multi(
         &self,
         account_id: &str,
@@ -3315,6 +3363,28 @@ impl ConnectorService {
                 .message_by_client_request(account_id, client_request_id)?
         {
             return Ok(PreparedSend::Existing(Box::new(existing)));
+        }
+        // §4.183: the official outgoing-attachment local retention — while
+        // the caller's bytes are still in hand as data URIs, stash them
+        // into the governed attachments directory under each descriptor's
+        // own id, so the sender's own bubble (and any later download/open
+        // of this outgoing row) reads local bytes without a transit
+        // pointer. Best-effort: a stash failure logs by class and changes
+        // nothing about the send; without the media ingest face there is
+        // no local reader, so nothing is written.
+        if let (Some(media), Some(attachments)) = (self.media.as_ref(), attachments.as_deref())
+            && !attachments.is_empty()
+        {
+            for (descriptor, data_uri) in pending.attachments.iter().zip(attachments.iter()) {
+                if let Some(data_uri) = data_uri.as_str()
+                    && let Err(kind) = media.stash_outbound_attachment(&descriptor.id, data_uri)
+                {
+                    tracing::warn!(
+                        kind = %kind,
+                        "outbound attachment stash failed; the send proceeds without local bytes"
+                    );
+                }
+            }
         }
 
         let params = Self::upstream_text_send_params(
@@ -8102,6 +8172,17 @@ impl ConnectorService {
     /// host.rs's dispatch-time probes cannot see these): the live cluster
     /// this face refused read as bare rejected counts with zero
     /// reject-detail rows, so each guard now names itself.
+    ///
+    /// Ordering (contract revision 1.183, §4.183): the local-bytes dedup
+    /// below runs BEFORE the pointer-face check — a file already in the
+    /// attachments directory answers the measured size without any
+    /// locator. That is the official outgoing-attachment local-cache
+    /// semantics (the sender's own bytes were stashed at send time, §4.183)
+    /// and it is equally honest for inbound rows: bytes on disk are bytes
+    /// on disk, and the CDN is never re-asked for them. An outgoing row
+    /// whose stash the governor evicted (TTL/LRU) or that predates 1.183
+    /// still falls through to the locator check and answers the same
+    /// no-pointer INVALID_REQUEST as before — the honest miss face.
     pub fn prepare_attachment_download(
         &self,
         account_id: &str,
@@ -8143,20 +8224,23 @@ impl ConnectorService {
         })?;
         let descriptor_size = descriptor.size;
         let attachment_id = descriptor.id.clone();
-        let locator = self.attachment_locator_for_index(account_id, &message, attachment_index)?;
         let sanitized_id = sanitize_attachment_id(&attachment_id)?;
         let write_dir = media.write_dir()?;
         let target = write_dir.join(&sanitized_id);
         if let Ok(metadata) = std::fs::metadata(&target)
             && metadata.is_file()
         {
-            // Idempotent dedup, same posture as the history face: the bytes
-            // already landed (an earlier call, or the engine's own live
-            // download of the same id). The measured size is the honest
-            // answer; the CDN is never re-asked.
+            // Idempotent dedup, same posture as the history face — and now
+            // the §4.183 local-hit arm too: the file may be an inbound
+            // download, an engine live download of the same id, or the
+            // outgoing row's own send-time stash. The measured size is the
+            // honest answer; the pointer face below is never consulted for
+            // bytes that are already local (an outgoing row has no pointer
+            // face at all — the stash IS its bytes face).
             let size_bytes = metadata.len();
             return Ok(PreparedHistoryDownload::AlreadyPresent { size_bytes });
         }
+        let locator = self.attachment_locator_for_index(account_id, &message, attachment_index)?;
         let temp_path = write_dir.join(format!(".{}.{}.tmp", sanitized_id, random_id()));
         let plaintext_path = write_dir.join(format!(".{}.{}.dec", sanitized_id, random_id()));
         Ok(PreparedHistoryDownload::Ready {
@@ -35633,6 +35717,342 @@ mod tests {
             .complete_send_success(&message_id, &account.id, &direct.id, 800, None)
             .unwrap();
         (account.id, direct.id, message_id)
+    }
+
+    /// §4.183 (contract revision 1.183): the send arm stashes the outgoing
+    /// plaintext under the descriptor's own id — the official
+    /// outgoing-attachment local-retention semantics — and the download arm
+    /// serves the stash before any pointer-face check: an outgoing row has
+    /// no locator at all, and after settlement its download answers the
+    /// measured size instead of the old no-pointer INVALID_REQUEST.
+    #[test]
+    fn outbound_send_stashes_bytes_and_download_serves_them_without_a_pointer() {
+        let (temp, service) = media_service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let bytes = b"outbound stash bytes".to_vec();
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&direct.id),
+                "req-stash-1",
+                &base64_encode(&bytes),
+                bytes.len() as u64,
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("caption"),
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { pending_id, .. } = prepared else {
+            panic!("new client request must dispatch");
+        };
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-stash-1")
+            .unwrap()
+            .unwrap();
+        let stashed = temp
+            .path()
+            .join("signal-data/attachments")
+            .join(&row.attachments[0].id);
+        assert_eq!(
+            std::fs::read(&stashed).unwrap(),
+            bytes,
+            "the send arm stashes the exact plaintext under the descriptor id"
+        );
+
+        service
+            .complete_send_success(&pending_id, &account.id, &direct.id, 900, None)
+            .unwrap();
+        let PreparedHistoryDownload::AlreadyPresent { size_bytes } = service
+            .prepare_attachment_download(&account.id, &direct.id, &pending_id, 0)
+            .unwrap()
+        else {
+            panic!("a stashed outgoing row answers the local-hit arm, never a network chain");
+        };
+        assert_eq!(size_bytes, bytes.len() as u64);
+    }
+
+    /// §4.183: a stash the governor evicted (the 7-day TTL arm is used
+    /// here, backdating the file's mtime) is gone for real — the download
+    /// arm falls through to the pointer-face check and answers the same
+    /// honest no-pointer INVALID_REQUEST an upload-only outgoing row always
+    /// did. Eviction never invents bytes, and the miss never invents a
+    /// pointer.
+    #[test]
+    fn outbound_download_after_stash_eviction_keeps_the_honest_no_pointer_face() {
+        let (temp, service) = media_service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let bytes = b"evict me".to_vec();
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&direct.id),
+                "req-stash-2",
+                &base64_encode(&bytes),
+                bytes.len() as u64,
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { pending_id, .. } = prepared else {
+            panic!("new client request must dispatch");
+        };
+        service
+            .complete_send_success(&pending_id, &account.id, &direct.id, 900, None)
+            .unwrap();
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-stash-2")
+            .unwrap()
+            .unwrap();
+        let stashed = temp
+            .path()
+            .join("signal-data/attachments")
+            .join(&row.attachments[0].id);
+        assert!(stashed.is_file());
+        // Backdate past the MEDIA_TTL and let one governor pass evict the
+        // stash — the same retention machine inbound media answers to.
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&stashed)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        let stats = service.media.as_ref().unwrap().governor().run_pass();
+        assert_eq!(stats.deleted, 1);
+        assert!(!stashed.exists());
+
+        let error = service
+            .prepare_attachment_download(&account.id, &direct.id, &pending_id, 0)
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "INVALID_REQUEST");
+        assert!(!error.retryable);
+    }
+
+    /// §4.183: the stash is best-effort — when the attachments directory
+    /// cannot be written (here a regular file occupies the
+    /// `<data>/attachments` name, so the fallback create fails), the send
+    /// still dispatches unchanged and leaves the row behind. The failure
+    /// class is logged, never the id or path.
+    #[test]
+    fn outbound_stash_failure_does_not_block_the_send() {
+        let (temp, service) = media_service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        // Occupy the write path: the probe skips a non-directory and the
+        // fresh-install fallback create_dir_all fails on the file.
+        let attachments = temp.path().join("signal-data/attachments");
+        std::fs::remove_dir(&attachments).unwrap();
+        std::fs::write(&attachments, b"occupied").unwrap();
+
+        let bytes = b"unsaved bytes".to_vec();
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&direct.id),
+                "req-stash-3",
+                &base64_encode(&bytes),
+                bytes.len() as u64,
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(
+            matches!(prepared, PreparedSend::Dispatch { .. }),
+            "a stash failure never changes the send outcome"
+        );
+        assert!(
+            service
+                .store_ref()
+                .message_by_client_request(&account.id, "req-stash-3")
+                .unwrap()
+                .is_some(),
+            "the pending row exists even though the stash failed"
+        );
+    }
+
+    /// §4.183: multi-attachment sends stash every entry under its own
+    /// descriptor id — one file per entry, exact bytes each, index-aligned
+    /// with the row's descriptor order.
+    #[test]
+    fn outbound_multi_send_stashes_every_entry_under_its_own_descriptor_id() {
+        let (temp, service) = media_service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let first = b"first entry".to_vec();
+        let second = b"second entry!".to_vec();
+        let entries = vec![
+            MessagesSendAttachmentEntry {
+                data_base64: base64_encode(&first),
+                size_bytes: first.len() as u64,
+                filename: Some("a.txt".into()),
+                content_type: Some("text/plain".into()),
+                blur_hash: None,
+                gif: false,
+            },
+            MessagesSendAttachmentEntry {
+                data_base64: base64_encode(&second),
+                size_bytes: second.len() as u64,
+                filename: Some("b.txt".into()),
+                content_type: Some("text/plain".into()),
+                blur_hash: None,
+                gif: false,
+            },
+        ];
+        let prepared = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&direct.id),
+                "req-stash-multi",
+                &entries,
+                None,
+                None,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { pending_id, .. } = prepared else {
+            panic!("new client request must dispatch");
+        };
+        service
+            .complete_send_success(&pending_id, &account.id, &direct.id, 900, None)
+            .unwrap();
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-stash-multi")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.attachments.len(), 2);
+        for (descriptor, want) in row.attachments.iter().zip([first, second]) {
+            let stashed = temp
+                .path()
+                .join("signal-data/attachments")
+                .join(&descriptor.id);
+            assert_eq!(
+                std::fs::read(&stashed).unwrap(),
+                want,
+                "every multi entry stashes its own bytes"
+            );
+            let PreparedHistoryDownload::AlreadyPresent { size_bytes } = service
+                .prepare_attachment_download(
+                    &account.id,
+                    &direct.id,
+                    &pending_id,
+                    row.attachments
+                        .iter()
+                        .position(|d| d.id == descriptor.id)
+                        .unwrap(),
+                )
+                .unwrap()
+            else {
+                panic!("each stashed entry answers the local-hit arm");
+            };
+            assert_eq!(size_bytes, want.len() as u64);
+        }
+    }
+
+    /// §4.183: view-once sends stash like any other send (the sender's own
+    /// bubble renders across restarts), and the §4.37 burn erases the stash
+    /// with the same id discipline as every other media channel.
+    #[test]
+    fn outbound_view_once_stash_is_burned_with_the_message() {
+        let (temp, service) = media_service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let bytes = b"view once bytes".to_vec();
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&direct.id),
+                "req-stash-vo",
+                &base64_encode(&bytes),
+                bytes.len() as u64,
+                None,
+                Some("image/png"),
+                None,
+                None,
+                false,
+                true,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { pending_id, .. } = prepared else {
+            panic!("new client request must dispatch");
+        };
+        service
+            .complete_send_success(&pending_id, &account.id, &direct.id, 900, None)
+            .unwrap();
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-stash-vo")
+            .unwrap()
+            .unwrap();
+        let stashed = temp
+            .path()
+            .join("signal-data/attachments")
+            .join(&row.attachments[0].id);
+        assert_eq!(std::fs::read(&stashed).unwrap(), bytes);
+
+        // The §4.37 burn face erases the stash exactly like the other media
+        // channels of the burned message.
+        service
+            .prepare_mark_view_once_opened(&MessagesMarkViewOnceOpenedParams {
+                account_id: account.id.clone(),
+                conversation_id: direct.id.clone(),
+                message_id: pending_id,
+            })
+            .unwrap();
+        assert!(!stashed.exists(), "the burn erases the stashed bytes too");
     }
 
     /// Without the launcher opt-in (`ConnectorService::new`), all three

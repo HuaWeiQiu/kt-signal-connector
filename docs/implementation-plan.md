@@ -5,6 +5,16 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.183 (2026-10-19; §4.183 the outbound-attachment
+  local-retention stash: the send arm persists the outgoing plaintext into
+  the governed attachments directory while the caller's bytes are still in
+  hand — the official outgoing-attachment local-cache semantics (upstream
+  `app/attachments.node.ts:320-345` `writeNewAttachmentData`, read-only) —
+  and the `attachments.download` arm serves a local hit before any
+  pointer-face check, so the sender's own bubble reads its own bytes back
+  with zero transit traffic; an evicted (governor TTL/LRU) or pre-1.183
+  row keeps the honest no-pointer INVALID_REQUEST. Best-effort, bounded by
+  the existing governor, burned with view-once, wire-unchanged.)
 - Contract revision: 1.181 (2026-10-18; §4.181 the supply-batch contract for
   the desktop's auxiliary batch B (ledger §10): four connector-side landings —
   the receive-path mention self-match now also folds the account ACI (the
@@ -15648,6 +15658,87 @@ account total repaired), `local_only_conversation_delete_keeps_the_server_side_s
 false, store unchanged), and
 `conversation_delete_sync_ignores_unresolvable_identities` (an unknown
 identity drops nothing and forwards unenriched).
+
+### 4.183 The outbound-attachment local-retention stash: `dispatch_send` stashes the sent bytes, `attachments.download` serves the local hit first (contract revision 1.183, 2026-10-19)
+
+The S-4 decision made outgoing attachment bytes upload-only transit: the
+connector handed the data URI to the engine and kept nothing, so an
+outgoing row carried no byte source of its own — the desktop's own bubble
+could only "download" its own send, and the download arm answered the
+honest no-pointer `INVALID_REQUEST` (`attachment_locator_for_index`'s
+all-empty face) because an outgoing row has no transit pointer by
+construction. Backfill (§4.175) cannot fix that: the primary device is
+asked for pointers to bytes the sender itself never persisted, and the
+user-evidenced loop was 34 backfill requests, zero recoveries.
+
+The official semantics are the opposite: Signal-Desktop persists the
+outgoing attachment's bytes into its local attachments directory at send
+time and renders the sender's own bubble from the local copy — no CDN
+round, no backfill. Official anchors (upstream Signal-Desktop abe80d3,
+read-only, AGPL — semantics only): `app/attachments.node.ts:320-345`
+(`writeNewAttachmentData` — the outgoing plaintext is written to disk
+under the attachments directory at send, returning the version-2 local
+pointer `{version, plaintextHash, size, path, localKey}`), and
+`ts/util/migrations.preload.ts:112-136` (`readAttachmentData` /
+`writeNewAttachmentData = createEncryptedWriterForNew(ATTACHMENTS_PATH)`
+— the local reader/writer pair over the same directory; upstream v8
+encrypts at rest, the KT engine's store already sits inside the
+connector-managed state, so the KT half keeps the ADR 0004 plaintext
+posture identical to inbound media).
+
+Two arms land, both wire-neutral (no method, shape, or capability
+change):
+
+- **Send arm** — `dispatch_send` stashes each attachment's decoded
+  plaintext into the governed attachments directory
+  (`MediaIngest::stash_outbound_attachment`) after the pending row exists
+  and before the dispatch frame returns. Keying is the descriptor's own
+  sanitized id — the §4.12 stable hash of account+clientRequestId+index —
+  which is the same locator/handle family semantics the open and download
+  faces already resolve, so addressing is per-account per-message by
+  construction and no new naming surface appears. Bounded by the existing
+  retention machine: one file per descriptor inside the engine's
+  `attachments/` directories means the governor's 7-day TTL and 2 GiB
+  LRU passes (ADR 0004) evict stashes exactly like inbound media, the
+  per-file 100 MiB send budget (§4.12) bounds one write, and the
+  view-once burn (§4.37) erases the stash by the same id together with
+  every other media channel of the burned row. Best-effort by design: a
+  stash failure logs one class-level warning (never ids or paths) and
+  changes nothing about the send — the wire and the send outcome never
+  depend on the filesystem. Without `--media-ingest` there is no local
+  reader at all, so nothing is written. Idempotent replays (the
+  `PreparedSend::Existing` path) do not re-stash — the first call did.
+- **Download arm** — `prepare_attachment_download` moves the local-bytes
+  dedup above the pointer-face check: bytes already on disk under the
+  sanitized id answer `AlreadyPresent` with the measured size and the
+  locator ladder is never consulted. This is the stash-hit path for
+  outgoing rows (which have no locator at all) and stays exactly as honest
+  for inbound rows (bytes on disk are bytes on disk; the CDN is never
+  re-asked). An outgoing row whose stash was evicted, burned, or never
+  existed (pre-1.183 rows) falls through to the unchanged
+  `attachment_locator_for_index` check and answers the same no-pointer
+  `INVALID_REQUEST` as before — the honest miss face, never a fabricated
+  pointer. The history face (`history.attachmentDownload`) keeps its
+  locator-first ordering unchanged: its domain is imported archives, and
+  no outgoing row is addressed there. Scope bound: the stash covers the
+  message attachment sends (§4.12 singular and §4.59 plural) whose
+  descriptors ride the shared `dispatch_send`; sticker sends keep their
+  pack-CDN byte face and story media keeps its own pointer leg — neither
+  is addressed by row descriptors, so neither stakes a claim on the
+  stash.
+
+Tests (additive, service level): `outbound_send_stashes_bytes_and_download_serves_them_without_a_pointer`
+(send stashes the exact plaintext under the descriptor id; the settled
+row's download answers `AlreadyPresent` with the measured size),
+`outbound_download_after_stash_eviction_keeps_the_honest_no_pointer_face`
+(a governor-TTL-evicted stash falls through to the unchanged no-pointer
+INVALID_REQUEST), `outbound_stash_failure_does_not_block_the_send` (an
+unwritable attachments directory leaves the dispatch and the row
+untouched), `outbound_multi_send_stashes_every_entry_under_its_own_descriptor_id`
+(the plural form stashes every entry, index-aligned, each served by the
+local-hit arm), and `outbound_view_once_stash_is_burned_with_the_message`
+(the §4.37 burn erases the stash by descriptor id with the rest of the
+row's media channels).
 
 ## 5. signal-cli Boundary
 
