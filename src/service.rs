@@ -8883,7 +8883,7 @@ impl ConnectorService {
             self.store
                 .set_conversation_title(&conversation.id, group_name)?;
         }
-        let message = MessageRecord {
+        let mut message = MessageRecord {
             id: message_id,
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -8987,6 +8987,15 @@ impl ConnectorService {
             sent_at,
             &flush_sender_id,
         )?;
+        // Read-time quote deep link on the live face too (official
+        // `doubleCheckMissingQuoteReference` parity): the just-landed row's
+        // quote snapshot resolves against the store before the upsert event
+        // mints, so the desktop's jump and warning strip see the same answer
+        // a later `messages.list` read would give.
+        if message.quote_message_id.is_none() && message.quote_snapshot.is_some() {
+            self.store
+                .attach_quote_snapshot_ids(&account.id, std::slice::from_mut(&mut message))?;
+        }
         let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
             message,
         ))];
@@ -34149,6 +34158,96 @@ mod tests {
         let stored_rich = row.rich.as_ref().expect("rich round-trips");
         assert_eq!(stored_rich.expire_timer_version, Some(3));
         assert_eq!(stored_rich.previews[0].date, Some(1_600_000_000_000));
+    }
+
+    /// §4.178 live face: the receive arm resolves the just-landed row's
+    /// quote snapshot against the store BEFORE the upsert event mints, so
+    /// the desktop's jump and warning strip see the same answer a later
+    /// `messages.list` read would give. An unresolvable snapshot stays
+    /// honestly absent on the event face too — the official
+    /// `referencedMessageNotFound` posture the desktop renders as the
+    /// quote warning strip.
+    #[test]
+    fn live_receive_resolves_quote_snapshot_before_the_upsert_event() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        // The peer's original at t=300, stored with the peer's envelope hash.
+        let peer_sender_id = crate::ids::stable_hash_id(&[&account.id, "direct", "+15555550101"]);
+        let mut original = expire_record_fixture(&account.id, &conversation.id, "m-original");
+        original.sender_id = peer_sender_id;
+        original.sent_at = 300;
+        service
+            .store_ref()
+            .insert_message(&original, None, None, false)
+            .unwrap();
+
+        let mut receive = NormalizedReceive {
+            timestamp: Some(500),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: None,
+            text: Some("quoting you".into()),
+            text_bytes: Some(11),
+            text_truncated: false,
+            quote: Some(NormalizedQuote {
+                id: 300,
+                author: "+15555550101".into(),
+                text: "the original".into(),
+                attachments: Vec::new(),
+            }),
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            server_timestamp: None,
+        };
+        let events = service
+            .ingest_receive(receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) => Some(record),
+                _ => None,
+            })
+            .expect("one message.upserted event");
+        assert_eq!(
+            upserted.quote_message_id.as_deref(),
+            Some("m-original"),
+            "the live event carries the resolved deep link"
+        );
+
+        // A quote naming a timestamp nobody holds stays unresolved on the
+        // event face — the honest absent face, never a guessed pointer.
+        receive.timestamp = Some(600);
+        receive.quote = Some(NormalizedQuote {
+            id: 9_999,
+            author: "+15555550101".into(),
+            text: "into the void".into(),
+            attachments: Vec::new(),
+        });
+        let events = service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) => Some(record),
+                _ => None,
+            })
+            .expect("one message.upserted event");
+        assert_eq!(
+            upserted.quote_message_id, None,
+            "an unresolvable snapshot stays honestly absent"
+        );
     }
 
     /// The sent mirror's transcript faces (contract 1.107, §4.88) persist on

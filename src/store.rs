@@ -3209,6 +3209,7 @@ impl Store {
         self.attach_reactions(account_id, &mut items)?;
         self.attach_edits(account_id, &mut items)?;
         self.attach_outgoing_quotes(account_id, &mut items)?;
+        self.attach_quote_snapshot_ids(account_id, &mut items)?;
         Ok(Page { items, next_cursor })
     }
 
@@ -3311,6 +3312,7 @@ impl Store {
         self.attach_reactions(account_id, &mut matches)?;
         self.attach_edits(account_id, &mut matches)?;
         self.attach_outgoing_quotes(account_id, &mut matches)?;
+        self.attach_quote_snapshot_ids(account_id, &mut matches)?;
         Ok(matches)
     }
 
@@ -3400,6 +3402,7 @@ impl Store {
         self.attach_reactions(account_id, &mut items)?;
         self.attach_edits(account_id, &mut items)?;
         self.attach_outgoing_quotes(account_id, &mut items)?;
+        self.attach_quote_snapshot_ids(account_id, &mut items)?;
         Ok(Page { items, next_cursor })
     }
 
@@ -3443,6 +3446,7 @@ impl Store {
             self.attach_reactions(account_id, std::slice::from_mut(record))?;
             self.attach_edits(account_id, std::slice::from_mut(record))?;
             self.attach_outgoing_quotes(account_id, std::slice::from_mut(record))?;
+            self.attach_quote_snapshot_ids(account_id, std::slice::from_mut(record))?;
         }
         Ok(record)
     }
@@ -6917,6 +6921,149 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Read-time inbound quote deep link — the official
+    /// `doubleCheckMissingQuoteReference` / `isQuoteAMatch` posture projected
+    /// onto the wire: resolve each row's stored `quote_snapshot` to the local
+    /// row it references and surface that row's id through `quote_message_id`
+    /// (never stored — the same read-side discipline as
+    /// `attach_outgoing_quotes`). A snapshot resolves when the conversation
+    /// holds a row with `sent_at == snapshot.id` whose stored identity matches
+    /// the snapshot's stated author: the linked account itself for an
+    /// outgoing target (the quoter names our own address), or the
+    /// envelope-source sender hash derived from the stated author for an
+    /// incoming one (in a direct chat the peer-key derivation is the same
+    /// string, so legacy pre-§4.91 rows match too). A retracted target still
+    /// resolves — official `copyQuoteContentFromOriginal` answers the lookup
+    /// for a `deletedForEveryone` row, so the desktop jumps to the tombstone
+    /// rather than claiming the reference was never seen. An unresolved
+    /// snapshot stays `None`, which is the honest official
+    /// `referencedMessageNotFound` face the desktop renders as the quote
+    /// warning strip. Re-running on every read self-heals an out-of-order
+    /// target landing after its quoting row, exactly like the official
+    /// render-time re-check.
+    pub fn attach_quote_snapshot_ids(
+        &self,
+        account_id: &str,
+        records: &mut [MessageRecord],
+    ) -> Result<(), StoreError> {
+        let mut conversation_groups: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, record) in records.iter().enumerate() {
+            if record.quote_message_id.is_some() || record.quote_snapshot.is_none() {
+                continue;
+            }
+            conversation_groups
+                .entry(record.conversation_id.clone())
+                .or_default()
+                .push(index);
+        }
+        if conversation_groups.is_empty() {
+            return Ok(());
+        }
+        let Some(account) = self.account_by_id(account_id)? else {
+            return Ok(());
+        };
+        for (conversation_id, indexes) in conversation_groups {
+            let Some(conversation) =
+                self.conversation_by_id(account_id, conversation_id.as_str())?
+            else {
+                continue;
+            };
+            // The cache key is (timestamp, author): two quotes may share an
+            // upstream timestamp while naming different authors, and each
+            // author face resolves independently.
+            let mut resolved: std::collections::HashMap<(u64, String), Option<String>> =
+                std::collections::HashMap::new();
+            for index in &indexes {
+                let Some(snapshot) = records[*index].quote_snapshot.as_ref() else {
+                    continue;
+                };
+                let cache_key = (snapshot.id, snapshot.author.clone());
+                if resolved.contains_key(&cache_key) {
+                    continue;
+                }
+                let target = self.resolve_quote_snapshot_target(
+                    account_id,
+                    &account,
+                    &conversation,
+                    snapshot,
+                )?;
+                resolved.insert(cache_key, target);
+            }
+            for index in indexes {
+                let Some(snapshot) = records[index].quote_snapshot.as_ref() else {
+                    continue;
+                };
+                if let Some(Some(target)) = resolved.get(&(snapshot.id, snapshot.author.clone())) {
+                    records[index].quote_message_id = Some(target.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The single-snapshot lookup behind `attach_quote_snapshot_ids`: the
+    /// candidate rows sharing the snapshot's upstream timestamp, first by row
+    /// id (the `pinned_message_for_conversation` ordering precedent), checked
+    /// against the snapshot's stated author through the identity derivations
+    /// the store itself wrote.
+    fn resolve_quote_snapshot_target(
+        &self,
+        account_id: &str,
+        account: &AccountRow,
+        conversation: &ConversationRow,
+        snapshot: &crate::engine::NormalizedQuote,
+    ) -> Result<Option<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, direction, sender_id FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                 ORDER BY id ASC",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let candidates = stmt
+            .query_map(
+                params![account_id, conversation.id, snapshot.id as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        drop(stmt);
+        for (id, direction, sender_id) in candidates {
+            let author_matches = match direction.as_str() {
+                // The quoter names the linked account's own address for a
+                // self-authored target — the same author face
+                // `resolve_quote` projects onto outbound quotes.
+                "outgoing" => snapshot.author == account.signal_account,
+                // A peer-authored target hashed its envelope source at
+                // receive; re-deriving from the snapshot's stated author
+                // reproduces that hash whenever the two agree (and, in a
+                // direct chat, the peer-key form legacy rows stored).
+                "incoming" => sender_id.is_some_and(|stored| {
+                    stored
+                        == crate::ids::stable_hash_id(&[
+                            account_id,
+                            conversation.kind.as_str(),
+                            snapshot.author.as_str(),
+                        ])
+                }),
+                _ => false,
+            };
+            if author_matches {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     /// Snapshot the prior body of one message row (contract 1.32) inside the
@@ -20360,5 +20507,202 @@ mod tests {
         // Retry Send path, never the automatic queue.
         let (_, first, count, next) = retry_face(&store, "m-group-all-failed");
         assert_eq!((first, count, next), (None, 0, None));
+    }
+
+    // ------------------------------------------------------------------
+    // Read-time inbound quote deep link (official isQuoteAMatch /
+    // doubleCheckMissingQuoteReference posture)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn quote_snapshot_deep_link_resolves_by_sent_at_and_author() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let peer_sender_id = crate::ids::stable_hash_id(&[&account.id, "direct", "+15555550101"]);
+
+        let row =
+            |id: &str, direction: &'static str, sender_id: &str, sent_at: u64| MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction,
+                sender_id: sender_id.into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: None,
+                text_truncated: false,
+                text_retrievable: true,
+                status: "sent",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                quote: None,
+                attachments: Vec::new(),
+                edited_at: None,
+                rich: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                send_outcomes: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+                server_timestamp: None,
+                is_story: false,
+                story_message: None,
+            };
+        let snapshot = |author: &str, id: u64| crate::engine::NormalizedQuote {
+            id,
+            author: author.into(),
+            text: "quoted".into(),
+            attachments: Vec::new(),
+        };
+
+        // The peer's original at t=100, our own at t=200.
+        store
+            .insert_message(
+                &row("peer-original", "incoming", &peer_sender_id, 100),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        store
+            .insert_message(
+                &row("self-original", "outgoing", &account.id, 200),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+        // A peer quote of their own earlier message resolves to that row.
+        let mut quoting_peer = row("quoting-peer", "incoming", &peer_sender_id, 300);
+        quoting_peer.quote_snapshot = Some(snapshot("+15555550101", 100));
+        store
+            .insert_message(&quoting_peer, None, None, false)
+            .unwrap();
+
+        // A peer quote naming our own address resolves to the outgoing row.
+        let mut quoting_self = row("quoting-self", "incoming", &peer_sender_id, 400);
+        quoting_self.quote_snapshot = Some(snapshot("+15555550100", 200));
+        store
+            .insert_message(&quoting_self, None, None, false)
+            .unwrap();
+
+        // A quote whose stated author matches no stored identity stays
+        // unresolved — the honest official referencedMessageNotFound face.
+        let mut quoting_stranger = row("quoting-stranger", "incoming", &peer_sender_id, 500);
+        quoting_stranger.quote_snapshot = Some(snapshot("+15555559999", 100));
+        store
+            .insert_message(&quoting_stranger, None, None, false)
+            .unwrap();
+
+        // A quote of a timestamp nobody holds stays unresolved.
+        let mut quoting_void = row("quoting-void", "incoming", &peer_sender_id, 600);
+        quoting_void.quote_snapshot = Some(snapshot("+15555550101", 9_999));
+        store
+            .insert_message(&quoting_void, None, None, false)
+            .unwrap();
+
+        let mut page = store
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap();
+        // Newest-first; the ids must come back attached only where the
+        // author-checked sent_at lookup found the target.
+        for record in &mut page.items {
+            match record.id.as_str() {
+                "quoting-peer" => {
+                    assert_eq!(record.quote_message_id.as_deref(), Some("peer-original"))
+                }
+                "quoting-self" => {
+                    assert_eq!(record.quote_message_id.as_deref(), Some("self-original"))
+                }
+                "quoting-stranger" | "quoting-void" => {
+                    assert_eq!(record.quote_message_id, None)
+                }
+                _ => {}
+            }
+        }
+
+        // Self-heal parity: a quote that arrives before its target stays
+        // unresolved on the first read and resolves once the target lands
+        // (official doubleCheckMissingQuoteReference re-run).
+        let mut early_quote = row("early-quote", "incoming", &peer_sender_id, 700);
+        early_quote.quote_snapshot = Some(snapshot("+15555550101", 800));
+        store
+            .insert_message(&early_quote, None, None, false)
+            .unwrap();
+        let fresh = store
+            .list_messages(&account.id, &conversation.id, 1, None)
+            .unwrap();
+        assert_eq!(fresh.items[0].quote_message_id, None);
+        store
+            .insert_message(
+                &row("late-target", "incoming", &peer_sender_id, 800),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let healed = store
+            .list_messages(&account.id, &conversation.id, 2, None)
+            .unwrap();
+        // Newest-first: the late target lands at [0], the quoting row at [1].
+        assert_eq!(healed.items[0].id, "late-target");
+        assert_eq!(
+            healed.items[1].quote_message_id.as_deref(),
+            Some("late-target")
+        );
+        // The resolution never persists — the stored column stays the
+        // send-face-only face it was.
+        let stored = store
+            .message_by_id(&account.id, &conversation.id, "early-quote")
+            .unwrap();
+        // message_by_id also attaches the deep link on its read face, so the
+        // assertion goes to the raw column through the store connection.
+        let raw: Option<String> = store
+            .conn()
+            .query_row(
+                "SELECT quote_message_id FROM messages WHERE id='early-quote'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.is_some());
+        assert_eq!(raw, None);
+
+        // A retracted target still resolves: official
+        // copyQuoteContentFromOriginal answers the lookup for a deleted
+        // row, so the desktop jumps to the tombstone.
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET status='remote-deleted' WHERE id='peer-original'",
+                [],
+            )
+            .unwrap();
+        let mut retracted = store
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap();
+        let quoting = retracted
+            .items
+            .iter_mut()
+            .find(|record| record.id == "quoting-peer")
+            .unwrap();
+        assert_eq!(quoting.quote_message_id.as_deref(), Some("peer-original"));
     }
 }

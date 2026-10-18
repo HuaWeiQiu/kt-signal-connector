@@ -5,6 +5,21 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.178 (2026-10-18; §4.178 the inbound quote deep link:
+  a stored `quote_snapshot` resolves to the local row it names — same
+  `sent_at`, author checked through the store's own identity derivations —
+  on every read face and on the live `message.upserted` event, surfacing
+  the target's id through the read-time `quoteMessageId` (never stored,
+  the §4.171 discipline; the stored column keeps its send-face-only
+  meaning). An unresolved snapshot stays honestly absent: the official
+  `referencedMessageNotFound` face (copyQuote.preload.ts:70-80, no
+  network backfill — `doubleCheckMissingQuoteReference` re-runs the same
+  local by-sentAt lookup, quotes.preload.ts:12-33) the desktop renders as
+  the quote warning strip in desktop contract 1.186. A retracted target
+  still resolves (jump to the tombstone, the official
+  copyQuoteContentFromOriginal posture); out-of-order targets self-heal
+  on the next read. Revision 1.177 is the parallel admin-write batch's;
+  this batch continues the merge sequence, no gap.)
 - Contract revision: 1.175 (2026-10-18; §4.175 the attachment-backfill
   loop: the engine's `syncMessage.attachmentBackfillResponse` projection
   gains a consume arm that merges the primary device's fresh transit
@@ -15083,6 +15098,88 @@ half (resolver last-tier arm + the three-source registration, desktop
 contract 1.177) lands in the kt-desktop worktree batch; no engine change
 — the engine's `listContacts` answer already exposes the field and the
 kt-engine read face legitimately omits it (the absent-key answer).
+
+### 4.178 The inbound quote deep link: a stored `quote_snapshot` resolves to the local row it names on every read and on the live event face (contract revision 1.178, 2026-10-18)
+
+Desktop construction sheet B-18 (addendum row 256, diff-D #68 + F1-11).
+Official forensics (upstream Signal-Desktop abe80d3, read-only): an
+inbound quoted message resolves its reference at PROCESS time —
+`copyFromQuotedMessage` queries the local cache by the quote's upstream
+timestamp (`MessageCache.findBySentAt(id)`) under the `isQuoteAMatch`
+predicate (ts/messages/quotes.preload.ts:12-33: same `sent_at` (or an
+edit-history timestamp) ∧ same conversation ∧ author service-id match)
+and a miss sets `referencedMessageNotFound = true`
+(ts/messages/copyQuote.preload.ts:70-80), the state the Quote component
+renders as the bottom-attached warning strip
+(ts/components/conversation/Quote.dom.tsx:511-543,
+`icu:originalMessageNotFound` — zh-CN 「找不到原始消息」). There is NO
+network backfill for the original: the strip self-heals through
+`doubleCheckMissingQuoteReference` (ts/util/doubleCheckMissingQuoteReference.preload.ts:16-75),
+re-running the SAME local by-sentAt lookup from a render-time effect
+(Quote.dom.tsx:184-198) — an out-of-order target that landed after its
+quoting row clears the flag on the next render. The click face shares
+the lookup: every quote click dispatches `scrollToQuotedMessage`
+(ts/state/ducks/composer.preload.ts:371-405), and a miss shows the
+`OriginalMessageNotFound` toast (ToastManager.dom.tsx:711-714).
+
+The KT gap (wire-recorded at diff-D #68): an inbound row carried only
+the bounded `quote_snapshot` (author + upstream timestamp + preview,
+contract 1.15) with NO resolvable local id — the desktop's
+`canLocateQuote` face had nothing to map, so an unresolvable quote was a
+silent no-jump with no warning strip. This revision closes the mapping
+half inside the connector, the single place that can reproduce the
+official identity derivations:
+
+**Read-time resolution, never stored.** `Store::attach_quote_snapshot_ids`
+walks a record batch the way `attach_outgoing_quotes` (§4.171) does:
+rows with a `quote_snapshot` and no `quote_message_id` group by
+conversation, and each snapshot resolves through
+`resolve_quote_snapshot_target` — the conversation's candidate rows
+sharing `sent_at == snapshot.id` (ordered by row id), checked against
+the snapshot's stated author through the identity derivations the store
+itself wrote: the linked account's own address for an outgoing target
+(the quoter names our number), the envelope-source sender hash
+re-derived from the stated author for an incoming one (in a direct chat
+the peer-key derivation is the same string, so legacy pre-§4.91 rows
+match too). First matching candidate wins; the pair (timestamp, author)
+caches per batch so two quotes naming the same target resolve once.
+
+**The official posture, projected.** A retracted target still resolves —
+official `copyQuoteContentFromOriginal` answers the lookup for a
+`deletedForEveryone` row (copyQuote.preload.ts:117-119 keeps the
+retraction return), so the desktop jumps to the tombstone rather than
+claiming the reference was never seen. An unresolved snapshot stays
+`None` — the honest `referencedMessageNotFound` face the desktop
+renders as the quote warning strip (desktop contract 1.186). Re-running
+on every read self-heals an out-of-order target landing after its
+quoting row, exactly like the official render-time re-check: nothing
+backfills, the next read answers. The stored `quote_message_id` column
+keeps its send-face-only meaning (the row the upstream send quoted,
+§4.6) — the deep link is a read-side derivation, never persisted, so
+the plaintext export and audit faces stay byte-identical.
+
+**Attach faces.** Read side: `messages.list`, the adjacent-media probe,
+`messages.search`, and the single-message face. Live side: the receive
+arm resolves the just-landed row's snapshot BEFORE the
+`message.upserted` event mints (the desktop's jump and warning strip
+see the same answer a later read would give). The sent-sync echo's
+early-return arm (the optimistic-row locator merge, §4.175) needs no
+hook of its own: an optimistic row already carries its
+`quote_message_id` from the send face.
+
+Version note: revision 1.177 is occupied by the parallel admin-write
+batch (B-24); this batch continues the merge sequence as 1.178, no gap.
+
+Tests (+2): the store face
+(`quote_snapshot_deep_link_resolves_by_sent_at_and_author` — peer and
+self-target resolution, stranger-author and void-timestamp honesty, the
+self-heal read-after-late-target, the never-persisted column, the
+retracted-target resolve) and the live event face
+(`live_receive_resolves_quote_snapshot_before_the_upsert_event` — the
+upsert event carries the resolved id, an unresolvable snapshot stays
+absent). No schema-key change: `quoteMessageId` rides the shared
+MessageRecord face the schema already names on the send side; reads and
+events gain the key additively where it resolves.
 
 ## 5. signal-cli Boundary
 
