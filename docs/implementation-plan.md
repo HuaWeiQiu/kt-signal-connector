@@ -5,6 +5,18 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.174 (2026-10-18; §4.174 the sweep probe's not-found face
+  stays clean end to end: the desktop's 2026-10-18 false-failure-flicker
+  evidence convicted the probe chain and the connector-side review acquitted
+  the wire — `messages.getByClientRequestId`'s store miss already answers
+  `ServiceError::Store(StoreError::MessageNotFound)` and `into_api` maps it
+  one-to-one onto `MESSAGE_NOT_FOUND` (never the `INTERNAL_ERROR` catch-all);
+  the real break was the desktop method admission list refusing the probe
+  locally (plain Error, zero round-trips, logged as `internal_error` — the
+  probe never fired since 1.172), fixed desktop-side (desktop contract 1.177:
+  allowlist + Read-lane mirror + the sweep's in-flight gate). This revision
+  records the review and pins the mapping with one added assertion. Zero
+  wire change, zero behavior change.)
 - Contract revision: 1.173 (2026-10-18; §4.173 the per-recipient group send
   settlement face: the engine `send` reply's `results` array is counted into
   success/failure entry totals and persisted on the OUTGOING row at
@@ -14876,6 +14888,41 @@ rows), `all_failed_group_settlement_persists_the_outcome_counts` (failed
 settlement with counts, queue face retired),
 `send_outcomes_from_reply_counts_group_results_entries` (reply counting;
 shapeless/empty replies degrade to `None`).
+
+### 4.174 The sweep probe's not-found face stays clean end to end: `MessageNotFound` maps to `MESSAGE_NOT_FOUND`, and the desktop's admission gate is the reviewed fix (contract revision 1.174, 2026-10-18)
+
+The desktop's 2026-10-18 user evidence ("shows send failed, then send
+succeeds moments later") first convicted the sweep probe chain, and the
+connector-side review acquitted the wire: `messages.getByClientRequestId`
+already answers a store miss with `ServiceError::Store(StoreError::
+MessageNotFound)`, and `ServiceError::into_api` maps that variant
+one-to-one onto the `MESSAGE_NOT_FOUND` host code (not the `INTERNAL_ERROR`
+store catch-all) — the host.rs §4.172 comment's claim holds on the real
+code path, and the desktop probe's catch arm now logs the distinction
+(`not-found` vs `unreachable`) instead of reading both as failure.
+
+The actual break was one layer up, entirely on the desktop side of the
+socket: the probe's seven-file IPC chain was complete except for the
+method admission list, so `assertAllowed` refused the call locally — a
+plain `Error`, zero connector round-trips, folded by the desktop's
+structured log into `internal_error` in 0 ms. The probe had never actually
+fired since its 1.172 introduction. The desktop batch (desktop contract
+1.177) admits `messages.getByClientRequestId` into
+`SIGNAL_ALLOWED_CONNECTOR_METHODS`, mirrors it into the Read lane of the
+request scheduler (connector `methods.rs` already classifies it
+`Lane::Read`; §5.2 B2 same-change discipline), and gates the sweep arm
+itself on in-flight tracking so a live send is never probed at all.
+
+This connector revision records the review and pins the mapping: no wire
+change, no behavior change, one added assertion — the probe face's miss
+answer crosses `into_api` as `MESSAGE_NOT_FOUND` (a regression folding it
+into `INTERNAL_ERROR` would resurrect the desktop's false-failure
+flicker even with the admission gate open).
+
+Tests: `retry_replay_answers_the_terminal_projection_and_the_probe_face_agrees`
+gains the `into_api` code assertion (`MESSAGE_NOT_FOUND`); the admission
+and scheduler-lane halves are pinned in the desktop boundary/scheduler
+specs (desktop contract 1.177).
 
 ## 5. signal-cli Boundary
 

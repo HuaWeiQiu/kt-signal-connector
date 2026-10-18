@@ -19385,9 +19385,15 @@ mod tests {
             .get_message_by_client_request(&account.id, &conversation.id, "req-absent")
             .unwrap_err();
         assert!(matches!(
-            absent,
+            &absent,
             ServiceError::Store(StoreError::MessageNotFound)
         ));
+        // §4.174 (contract 1.174): the miss crosses into_api as
+        // MESSAGE_NOT_FOUND verbatim — the desktop sweep probe distinguishes
+        // not-found from transport failure, and folding this into
+        // INTERNAL_ERROR would resurrect the false-failure flicker even
+        // with the desktop admission gate open.
+        assert_eq!(absent.into_api().code, "MESSAGE_NOT_FOUND");
         let other = service
             .store_ref()
             .ensure_conversation(&account.id, "direct", "+15555550103", "Peer2")
