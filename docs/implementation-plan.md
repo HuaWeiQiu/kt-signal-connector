@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.177 (2026-10-18; §4.177 the multi-pin queue
+- Contract revision: 1.187 (2026-10-18; §4.187 the multi-pin queue
   projection: `conversation_pins` widens from the per-conversation single
   row to the official queue of up to 3 (desktop `getPinnedMessagesLimit`),
   primary key widened to the full target identity (schema 28, rebuilt
@@ -28,7 +28,7 @@
   raw upstream `JsonContact.username` rides the contacts cache `extra` JSON and
   projects on `contacts.list` contact rows plus the roster / requesting /
   pending member views — additive absent-key wire, the desktop's official
-  getTitleNoDefault last-tier material, desktop contract 1.177. Group rows
+  getTitleNoDefault last-tier material, desktop contract 1.187. Group rows
   never carry the face; over-budget values drop whole at capture and read.)
 - Contract revision: 1.174 (2026-10-18; §4.174 the sweep probe's not-found face
   stays clean end to end: the desktop's 2026-10-18 false-failure-flicker
@@ -38,7 +38,7 @@
   one-to-one onto `MESSAGE_NOT_FOUND` (never the `INTERNAL_ERROR` catch-all);
   the real break was the desktop method admission list refusing the probe
   locally (plain Error, zero round-trips, logged as `internal_error` — the
-  probe never fired since 1.172), fixed desktop-side (desktop contract 1.177:
+  probe never fired since 1.172), fixed desktop-side (desktop contract 1.187:
   allowlist + Read-lane mirror + the sweep's in-flight gate). This revision
   records the review and pins the mapping with one added assertion. Zero
   wire change, zero behavior change.)
@@ -15026,7 +15026,7 @@ method admission list, so `assertAllowed` refused the call locally — a
 plain `Error`, zero connector round-trips, folded by the desktop's
 structured log into `internal_error` in 0 ms. The probe had never actually
 fired since its 1.172 introduction. The desktop batch (desktop contract
-1.177) admits `messages.getByClientRequestId` into
+1.187) admits `messages.getByClientRequestId` into
 `SIGNAL_ALLOWED_CONNECTOR_METHODS`, mirrors it into the Read lane of the
 request scheduler (connector `methods.rs` already classifies it
 `Lane::Read`; §5.2 B2 same-change discipline), and gates the sweep arm
@@ -15041,7 +15041,7 @@ flicker even with the admission gate open).
 Tests: `retry_replay_answers_the_terminal_projection_and_the_probe_face_agrees`
 gains the `into_api` code assertion (`MESSAGE_NOT_FOUND`); the admission
 and scheduler-lane halves are pinned in the desktop boundary/scheduler
-specs (desktop contract 1.177).
+specs (desktop contract 1.187).
 
 ### 4.176 The peer-username projection: the raw `JsonContact.username` rides the contacts cache and the member views (contract revision 1.176, 2026-10-18)
 
@@ -15089,11 +15089,11 @@ never-carries guard, the username map), `get_group_projects_member_usernames_fro
 (roster + requesting + pending faces, id-first/uuid-tail resolution, the
 no-username absent key, the over-budget read-side drop). The desktop
 half (resolver last-tier arm + the three-source registration, desktop
-contract 1.177) lands in the kt-desktop worktree batch; no engine change
+contract 1.187) lands in the kt-desktop worktree batch; no engine change
 — the engine's `listContacts` answer already exposes the field and the
 kt-engine read face legitimately omits it (the absent-key answer).
 
-### 4.177 The multi-pin queue projection: up to 3 pins per conversation with the replace-earliest discipline, projected as the additive `pinnedMessages` array (contract revision 1.177, 2026-10-18)
+### 4.187 The multi-pin queue projection: up to 3 pins per conversation with the replace-earliest discipline, projected as the additive `pinnedMessages` array (contract revision 1.187, 2026-10-18)
 
 Contract 1.33 pinned the official model as "one pinned message per
 conversation" because that was the shape the desktop rendered; the
@@ -15101,7 +15101,7 @@ official client keeps a queue of up to `getPinnedMessagesLimit` = 3
 pinned messages per conversation and replaces the row with the oldest
 `pinned_at` when a member of a full queue pins past the cap. This
 revision moves the store and the summary wire onto the official queue
-model, all additive (pre-1.177 hosts read byte-identical summaries):
+model, all additive (pre-1.187 hosts read byte-identical summaries):
 
 - Store (schema 28): the `conversation_pins` primary key widens from
   `(account_id, conversation_id)` to the full target identity
