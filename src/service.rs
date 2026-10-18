@@ -3560,10 +3560,12 @@ impl ConnectorService {
     /// empty set would commit a no-delta group change broadcast. The
     /// conversation id must resolve to a kind='group' row (direct answers
     /// INVALID_REQUEST before any upstream call). The engine carries the
-    /// title/member/avatar/link-access subset; a change set naming anything
-    /// outside it (description, admin/ban families, resetLink, permission
-    /// trio, member label pair) answers CAPABILITY_UNAVAILABLE naming the
-    /// keys (retryable=false) after the local validation completed — the
+    /// title/member/avatar/link-access subset plus the 1.180 resetLink fold
+    /// and the 1.188 send-messages fold; a change set naming anything
+    /// outside it (description, admin/ban families, the remaining
+    /// permission pair, the member label pair) answers
+    /// CAPABILITY_UNAVAILABLE naming the keys (retryable=false) after the
+    /// local validation completed — the
     /// honest whole-call refusal, never a partial application. Zero local
     /// writes: group state converges through the receive projection.
     pub fn prepare_groups_update(
@@ -3770,11 +3772,13 @@ impl ConnectorService {
         // The engine face (contract 1.115, §4.96): the change set folds onto
         // the engine's updateGroup vocabulary — groupName→title, the member
         // arrays verbatim, the avatar tri-state verbatim, the link access
-        // word above, and (contract 1.180, §4.180) resetLink→a freshly
-        // minted `inviteLinkPassword` (the official refreshGroupLink fold).
-        // A change set carrying any key outside that subset
-        // (groupDescription, the admin and ban families, the permission
-        // trio, the member label pair) answers
+        // word above, (contract 1.180, §4.180) resetLink→a freshly
+        // minted `inviteLinkPassword` (the official refreshGroupLink fold),
+        // and (contract 1.188, §4.188) setPermissionSendMessages→the
+        // engine's `announcementsOnly` bool. A change set carrying any key
+        // outside that subset (groupDescription, the admin and ban
+        // families, the remaining permission pair, the member label pair)
+        // answers
         // CAPABILITY_UNAVAILABLE naming the keys — the honest whole-call
         // refusal, never a partial application: the engine commits the set
         // as one change broadcast and the official client applies it
@@ -3804,6 +3808,22 @@ impl ConnectorService {
                 "inviteLinkPassword" => {
                     payload.insert("inviteLinkPassword".to_owned(), value);
                 }
+                // Contract 1.188 (§4.188): the announcements-only write rides
+                // the engine's own `announcementsOnly` bool (its updateGroup
+                // arm, engine `8ea56f6` — the official
+                // modifyAnnouncementsOnly group change action,
+                // groups.preload.ts:895-904). The connector's host
+                // vocabulary stays the official permission word pair; the
+                // value was validated at the params layer, so only the fold
+                // maps it: only-admins is the announcements-only group,
+                // every-member lifts it — both real write intents, never
+                // an absent key.
+                "setPermissionSendMessages" => {
+                    payload.insert(
+                        "announcementsOnly".to_owned(),
+                        json!(value.as_str() == Some("only-admins")),
+                    );
+                }
                 // The refusal names the caller's schema vocabulary, not the
                 // internal upstream keys the change vec carries.
                 _ => {
@@ -3815,7 +3835,6 @@ impl ConnectorService {
                         "unbans" => "unbanMembers",
                         "setPermissionAddMember" => "permissionAddMember",
                         "setPermissionEditDetails" => "permissionEditDetails",
-                        "setPermissionSendMessages" => "permissionSendMessages",
                         other => other,
                     };
                     unsupported.push(host);
@@ -12317,6 +12336,18 @@ pub(crate) fn store_get_group_with_requesting(
     let announcements_only = extra
         .as_ref()
         .and_then(|extra| extra.get("announcementsOnly").and_then(Value::as_bool));
+    // Contract 1.188 (§4.188): the description the sync captured — the
+    // whole-value budget re-checked at read (a row written by a future
+    // wider budget must not smuggle an over-budget value past the face);
+    // absent stays absent (pre-1.188 rows, engines without the face,
+    // groups with no description — the honest unsynced placeholder, never
+    // an invented empty-known state).
+    let description = extra
+        .as_ref()
+        .and_then(|extra| extra.get("description").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= GROUP_DESCRIPTION_MAX_BYTES)
+        .map(str::to_owned);
     // Contract 1.62 (§4.53 appendix): the live requesting-members projection —
     // resolved against the same read-time contacts-cache name map the roster
     // uses, bounded to the roster cap. `None` (store-only callers, pre-1.62
@@ -12342,6 +12373,7 @@ pub(crate) fn store_get_group_with_requesting(
         is_terminated,
         link_access,
         announcements_only,
+        description,
         requesting_members,
         pending_members,
         synced_at,
@@ -13007,6 +13039,13 @@ pub struct GroupDetails {
     /// next sync like every other captured flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub announcements_only: Option<bool>,
+    /// Contract 1.188 (§4.188): the group description the sync captured
+    /// from the engine's decrypted group state, under the write face's own
+    /// whole-value budget (re-checked at read). Absent = pre-1.188 row /
+    /// engine without the face / no description — the desktop keeps its
+    /// honest unsynced placeholder, never invents an empty-known state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requesting_members: Option<Vec<GroupRequestingMemberView>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30708,6 +30747,73 @@ mod tests {
             .get_group(&account.id, "YmFkLWZsYWctZ3JvdXA")
             .unwrap();
         assert_eq!(malformed.announcements_only, None);
+
+        // Contract 1.188 (§4.188): the captured description projects as the
+        // optional wire key under the read-side budget re-check — pre-1.188
+        // rows, over-budget smuggles, and malformed stored values all answer
+        // an absent key, never a failed read.
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "ZGVzY3JpLWdyb3Vw",
+                "Described Group",
+                Some(r#"{"memberCount":1,"description":"周五晚上聚餐，地点老地方"}"#),
+                1725300005,
+            )
+            .unwrap();
+        let described = service.get_group(&account.id, "ZGVzY3JpLWdyb3Vw").unwrap();
+        assert_eq!(
+            described.description.as_deref(),
+            Some("周五晚上聚餐，地点老地方")
+        );
+        let wire = serde_json::to_value(&described).unwrap();
+        assert_eq!(wire["description"], json!("周五晚上聚餐，地点老地方"));
+        // A pre-1.188 row stays absent — the honest unsynced placeholder.
+        let legacy = service.get_group(&account.id, "ZmFrZS1ncm91cC0x").unwrap();
+        assert_eq!(legacy.description, None);
+        // An over-budget stored value drops at the read re-check (a row a
+        // future wider budget might write must not smuggle past the face).
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "b3Zlci1kZXNjLWdyb3Vw",
+                "Over-Budget Group",
+                Some(
+                    json!({
+                        "memberCount": 1,
+                        "description": "d".repeat(GROUP_DESCRIPTION_MAX_BYTES + 1),
+                    })
+                    .to_string()
+                    .as_str(),
+                ),
+                1725300006,
+            )
+            .unwrap();
+        let over = service
+            .get_group(&account.id, "b3Zlci1kZXNjLWdyb3Vw")
+            .unwrap();
+        assert_eq!(over.description, None);
+        // A malformed stored value drops the same way — a hostile row can
+        // never fail the read.
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "YmFkLWRlc2MtZ3JvdXA",
+                "Bad Description Group",
+                Some(r#"{"memberCount":1,"description":7}"#),
+                1725300007,
+            )
+            .unwrap();
+        let bad = service
+            .get_group(&account.id, "YmFkLWRlc2MtZ3JvdXA")
+            .unwrap();
+        assert_eq!(bad.description, None);
         // The number-keyed self member of the earlier roster still marks
         // self after the ACI landed (both ladder rungs live side by side).
         let roster = service.get_group(&account.id, "cm9zdGVyLWdyb3Vw").unwrap();
@@ -37286,6 +37392,117 @@ mod tests {
         // the empty-set refusal.
         let error = service
             .prepare_groups_update(&params(Some(false), None))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+    }
+
+    /// The announcements-only write fold (contract 1.188, §4.188): the host
+    /// vocabulary keeps the official permission word pair, the engine fold
+    /// maps it onto the engine's own `announcementsOnly` bool (its
+    /// updateGroup arm, engine `8ea56f6` — the official
+    /// modifyAnnouncementsOnly group change action). Both values are real
+    /// write intents: only-admins is the announcements-only group,
+    /// every-member lifts it. The other refused keys keep their whole-call
+    /// CAPABILITY_UNAVAILABLE — the engine face still does not carry them.
+    #[test]
+    fn groups_update_announcements_only_folds_onto_engine_face() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let params = |permission: Option<String>| GroupsUpdateParams {
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            group_name: None,
+            group_description: None,
+            add_members: None,
+            remove_members: None,
+            promote_admins: None,
+            demote_admins: None,
+            ban_members: None,
+            unban_members: None,
+            link_state: None,
+            reset_link: None,
+            permission_add_member: None,
+            permission_edit_details: None,
+            permission_send_messages: permission,
+            member_label: None,
+            member_label_emoji: None,
+            avatar: AvatarUpdate::Keep,
+            operation_id: None,
+        };
+        // only-admins → announcementsOnly true.
+        let payload = service
+            .prepare_groups_update(&params(Some("only-admins".into())))
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "announcementsOnly": true
+            })
+        );
+        // every-member → announcementsOnly false (lifting is a real write,
+        // not an absent key).
+        let payload = service
+            .prepare_groups_update(&params(Some("every-member".into())))
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "announcementsOnly": false
+            })
+        );
+        // The fold composes with the other carried keys in one atomic
+        // engine change set.
+        let mixed = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                group_name: Some("Renamed".into()),
+                ..params(Some("only-admins".into()))
+            })
+            .unwrap();
+        assert_eq!(mixed["title"], json!("Renamed"));
+        assert_eq!(mixed["announcementsOnly"], json!(true));
+        // The remaining permission arms keep the whole-call refusal, naming
+        // the host vocabulary.
+        let error = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                permission_add_member: Some("only-admins".into()),
+                ..params(None)
+            })
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE"
+                    && !api.retryable
+                    && api.message.contains("permissionAddMember")));
+        // The description write key keeps its refusal too — the engine's
+        // updateGroup carries no description arm (the §4.188 recorded gap;
+        // the local validation ladder still runs ahead of the seam).
+        let error = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                group_description: Some("no engine arm yet".into()),
+                ..params(None)
+            })
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE"
+                    && !api.retryable
+                    && api.message.contains("groupDescription")));
+        // An invalid send-messages word keeps its INVALID_REQUEST (the
+        // params ladder outranks the fold).
+        let error = service
+            .prepare_groups_update(&params(Some("nobody".into())))
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
     }
