@@ -1281,7 +1281,7 @@ pub enum ControlReceive {
     /// reach this variant — the projection parser dropped them, and an
     /// envelope with nothing usable left keeps the plain syncMessage skip.
     SyncDeleteForMe {
-        deletes: Vec<SyncDeleteGroup>,
+        deletes: SyncDeleteForMeProjection,
     },
     /// The engine's `syncMessage.attachmentBackfillResponse` projection
     /// (contract revision 1.175, §4.175): the primary device answered our
@@ -1513,6 +1513,101 @@ pub struct SyncDeleteGroup {
     pub messages: Vec<SyncDeleteEntry>,
 }
 
+/// One whole-conversation delete off the engine's `syncMessage.deleteForMe`
+/// projection (contract 1.182, §4.182): the `conversationDeletes` arm — the
+/// account cleared a whole chat on another linked device. `is_full_delete`
+/// is the official `Boolean(item.isFullDelete)` verbatim (the engine
+/// projects `false` for an unstated flag, the same default the official
+/// consumer applies); `most_recent_messages` and
+/// `most_recent_non_expiring_messages` are the official
+/// `getMostRecentAddressableMessages` anchors — the upstream sends the
+/// newest addressable rows so the receiver can bound the delete to
+/// everything at or below the newest one it still holds. The engine
+/// projection drops a group whose `mostRecentMessages` is empty (the
+/// official warn-drop), so what reaches here always carries at least one
+/// anchor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncDeleteConversation {
+    pub conversation_id: String,
+    pub is_full_delete: bool,
+    pub most_recent_messages: Vec<SyncDeleteEntry>,
+    pub most_recent_non_expiring_messages: Vec<SyncDeleteEntry>,
+}
+
+/// One local-only conversation delete off the engine's
+/// `syncMessage.deleteForMe` projection (contract 1.182, §4.182): the
+/// `localOnlyConversationDeletes` arm — the account cleared a chat that had
+/// no addressable rows left, so the upstream sends only the conversation
+/// identity and the other devices clear their local copies without
+/// pretending to bound the delete by a message position.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncLocalOnlyConversationDelete {
+    pub conversation_id: String,
+}
+
+/// The engine's whole `syncMessage.deleteForMe` projection (contract
+/// 1.182, §4.182): all three consumer-facing arms in one record. The arms
+/// never mix per proto shape (`messageDeletes` names rows,
+/// `conversationDeletes` names a conversation with its newest-row anchors,
+/// `localOnlyConversationDeletes` names a conversation alone), but one
+/// envelope may carry several of them, so the routing decision is "any arm
+/// survived the bounds" — the same any-entry-survives rule the message arm
+/// already followed in 1.102.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncDeleteForMeProjection {
+    pub groups: Vec<SyncDeleteGroup>,
+    pub conversations: Vec<SyncDeleteConversation>,
+    pub local_only_conversations: Vec<SyncLocalOnlyConversationDelete>,
+}
+
+impl SyncDeleteForMeProjection {
+    /// Whether no arm survived the projection bounds — the plain
+    /// `syncMessage` skip.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+            && self.conversations.is_empty()
+            && self.local_only_conversations.is_empty()
+    }
+
+    /// The entry-count budget the queue charges this face (contract 1.182):
+    /// the §4.13 accounting counts heap strings entry-wise, and the
+    /// conversation arms carry their anchors the same way the message
+    /// groups carry their entries.
+    pub fn budget_bytes(&self) -> usize {
+        let groups = self
+            .groups
+            .iter()
+            .map(|group| {
+                std::mem::size_of::<SyncDeleteGroup>()
+                    + group.conversation_id.as_ref().map_or(0, String::len)
+                    + group.messages.len()
+                        * (2 * MAX_RECEIVE_ID_CHARS + std::mem::size_of::<SyncDeleteEntry>())
+            })
+            .sum::<usize>();
+        let conversations = self
+            .conversations
+            .iter()
+            .map(|conversation| {
+                std::mem::size_of::<SyncDeleteConversation>()
+                    + conversation.conversation_id.len()
+                    + (conversation.most_recent_messages.len()
+                        + conversation.most_recent_non_expiring_messages.len())
+                        * (2 * MAX_RECEIVE_ID_CHARS + std::mem::size_of::<SyncDeleteEntry>())
+            })
+            .sum::<usize>();
+        let local_only = self
+            .local_only_conversations
+            .iter()
+            .map(|conversation| {
+                std::mem::size_of::<SyncLocalOnlyConversationDelete>()
+                    + conversation.conversation_id.len()
+            })
+            .sum::<usize>();
+        groups + conversations + local_only
+    }
+}
+
 /// One safety-number trust sync off the engine's `syncMessage.verified`
 /// projection (contract 1.103, §4.84): the destination peer's ServiceId UUID
 /// string, the settled trust state as the engine's lowercase word
@@ -1710,6 +1805,27 @@ pub const MAX_SYNC_DELETE_GROUPS: usize = 64;
 /// (the same truncate discipline). `pub` since the §4.83 host-event data
 /// shape mirrors the bound (the schema-pairing test pins the two together).
 pub const MAX_SYNC_DELETE_GROUP_MESSAGES: usize = 256;
+/// One delete-for-me sync carries at most this many whole-conversation
+/// deletes (`conversationDeletes`) (contract 1.182, §4.182): the same coarse
+/// batch guard as the message groups — the upstream fires one
+/// `delete-conversation` per user action, so a real batch is one entry
+/// (a device sweeping several chats stays in the low tens); entries past
+/// the cap drop whole. `pub` since the §4.182 host-event data shape mirrors
+/// the bound (the schema-pairing test pins the two together).
+pub const MAX_SYNC_DELETE_CONVERSATIONS: usize = 32;
+/// One `conversationDeletes` entry carries at most this many newest-row
+/// anchors per list (contract 1.182, §4.182): the official sending side
+/// slices both lists to `5` (`getMostRecentAddressableMessages(...).slice(0,
+/// 5)` in conversations.preload.ts `destroyMessagesInner`), so the receiver
+/// never needs more — the bound is generous on purpose (the official
+/// receiver itself keeps whatever the peer sent) while still capping a
+/// hostile face. Anchors past the cap drop (the truncate discipline).
+pub const MAX_SYNC_DELETE_CONVERSATION_ANCHORS: usize = 16;
+/// One delete-for-me sync carries at most this many local-only conversation
+/// deletes (contract 1.182, §4.182): same batch guard as the
+/// `conversationDeletes` arm. `pub` since the §4.182 host-event data shape
+/// mirrors the bound.
+pub const MAX_SYNC_LOCAL_ONLY_DELETE_CONVERSATIONS: usize = 32;
 /// One verified sync's hex identity key carries at most this many characters
 /// (contract 1.103, §4.84): the modern EC key projects 66 hex chars, so the
 /// bound only ever bites on a hostile face — and it bites by dropping the
@@ -1933,18 +2049,11 @@ impl NormalizedReceive {
                     (read.len() + viewed.len())
                         * (2 * MAX_RECEIVE_ID_CHARS + std::mem::size_of::<SyncReadEntry>())
                 }
-                // The delete groups carry heap Vecs like the read lists —
-                // counted entry-wise so the queue budget stays honest (§4.13).
-                Some(ControlReceive::SyncDeleteForMe { deletes }) => deletes
-                    .iter()
-                    .map(|group| {
-                        std::mem::size_of::<SyncDeleteGroup>()
-                            + group.conversation_id.as_ref().map_or(0, String::len)
-                            + group.messages.len()
-                                * (2 * MAX_RECEIVE_ID_CHARS
-                                    + std::mem::size_of::<SyncDeleteEntry>())
-                    })
-                    .sum(),
+                // The delete arms carry heap Vecs like the read lists —
+                // counted entry-wise so the queue budget stays honest (§4.13;
+                // contract 1.182 charges the two conversation arms through
+                // the same projection method).
+                Some(ControlReceive::SyncDeleteForMe { deletes }) => deletes.budget_bytes(),
                 // The verified sync carries one bounded record — the heap
                 // strings count here so the queue budget stays honest (§4.13).
                 Some(ControlReceive::SyncVerified { verified }) => {
@@ -3710,20 +3819,161 @@ fn normalized_sync_attachment_backfill_response(
     })
 }
 
-/// Bounded `syncMessage.deleteForMe` group family (contract 1.102, §4.83):
-/// the wire shape is `{messageDeletes: [{conversationId?, messages:
-/// [{author, timestamp}]}]}` — the engine projects the official
-/// DeleteForMe.messageDeletes arm, each group optionally naming its
-/// conversation (key absent when the proto carried none) and every entry
-/// naming one message by its author identity plus upstream timestamp. The
-/// identity caps mirror the receive id family, the group/message caps the
-/// read-face batch guard; an entry without an author or a positive
-/// timestamp drops (the engine projects 0 for an unstated stamp — the read
-/// face's unknown-marker discipline), a group whose entries all drop drops
-/// whole, and an envelope with no usable group at all answers empty (the
-/// plain syncMessage skip — 宁缺勿错; the engine already dropped its own
-/// unparseable entries, so what survives here is the bounds family's own
-/// guard).
+/// Bounded `syncMessage.deleteForMe` projection family (contract 1.102,
+/// §4.83; extended 1.182, §4.182): the wire shape mirrors the official
+/// DeleteForMe face —
+/// `{messageDeletes: [{conversationId?, messages: [{author, timestamp}]}],
+/// conversationDeletes: [{conversationId, isFullDelete,
+/// mostRecentMessages, mostRecentNonExpiringMessages}],
+/// localOnlyConversationDeletes: [{conversationId}]}` — and the engine
+/// projects all three consumer-facing arms. The identity caps mirror the
+/// receive id family, the group/message caps the read-face batch guard; an
+/// entry without an author or a positive timestamp drops (the engine
+/// projects 0 for an unstated stamp — the read face's unknown-marker
+/// discipline), a group whose entries all drop drops whole, and a face with
+/// no usable arm at all answers empty (the plain syncMessage skip —
+/// 宁缺勿错; the engine already dropped its own unparseable entries, so
+/// what survives here is the bounds family's own guard).
+///
+/// The two conversation arms (1.182) carry the official sending-side
+/// gates: a `conversationDeletes` entry without a conversation identity or
+/// with every `mostRecentMessages` anchor failing the entry bounds drops
+/// (the official MessageReceiver.preload.ts:3662-3681 warn-drop pair —
+/// "No target conversation" / "No target messages"), while the
+/// `mostRecentNonExpiringMessages` companion is optional and may honestly
+/// be empty (the official consumer falls back to it only when the primary
+/// anchor set matched nothing). A `localOnlyConversationDeletes` entry only
+/// needs its conversation identity (:3703-3711 — "No target conversation"
+/// is the official whole-entry drop).
+fn normalized_sync_delete_for_me(value: Option<&Value>) -> SyncDeleteForMeProjection {
+    SyncDeleteForMeProjection {
+        groups: normalized_sync_delete_groups(value),
+        conversations: normalized_sync_delete_conversations(value),
+        local_only_conversations: normalized_sync_local_only_conversations(value),
+    }
+}
+
+/// One bounded delete-for-me [`SyncDeleteEntry`] list (contract 1.182):
+/// the shared per-entry gate of all three arms — the identity caps mirror
+/// the receive id family, and an entry without an author or a positive
+/// stamp drops (the engine projects 0 for an unstated stamp).
+fn normalized_sync_delete_entries(entries: Option<&Value>, cap: usize) -> Vec<SyncDeleteEntry> {
+    entries
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .take(cap)
+                .filter_map(|entry| {
+                    let object = entry.as_object()?;
+                    let author = object
+                        .get("author")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|author| !author.is_empty())
+                        .map(|author| {
+                            author
+                                .chars()
+                                .take(MAX_RECEIVE_ID_CHARS)
+                                .collect::<String>()
+                        })?;
+                    let timestamp = object
+                        .get("timestamp")
+                        .and_then(Value::as_u64)
+                        .filter(|timestamp| *timestamp > 0)?;
+                    Some(SyncDeleteEntry { author, timestamp })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The bounded `conversationDeletes` arm (contract 1.182, §4.182): each
+/// entry names one conversation and its newest-row anchors. A group with no
+/// conversation identity, or with every primary anchor failing the entry
+/// bounds, drops whole — the official two warn-drops
+/// (MessageReceiver.preload.ts:3662-3681) that make a delete-with-no-
+/// position unrepresentable. The non-expiring companion is optional: an
+/// absent key and an all-junk key both answer the empty list, which is the
+/// official "no fallback position" state (the consumer only consults it
+/// when the primary anchors matched nothing).
+fn normalized_sync_delete_conversations(value: Option<&Value>) -> Vec<SyncDeleteConversation> {
+    let Some(conversations) = value
+        .and_then(|face| face.get("conversationDeletes"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    conversations
+        .iter()
+        .take(MAX_SYNC_DELETE_CONVERSATIONS)
+        .filter_map(|group| {
+            let object = group.as_object()?;
+            let conversation_id = object
+                .get("conversationId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(|id| id.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+            let most_recent_messages = normalized_sync_delete_entries(
+                object.get("mostRecentMessages"),
+                MAX_SYNC_DELETE_CONVERSATION_ANCHORS,
+            );
+            if most_recent_messages.is_empty() {
+                return None;
+            }
+            let most_recent_non_expiring_messages = normalized_sync_delete_entries(
+                object.get("mostRecentNonExpiringMessages"),
+                MAX_SYNC_DELETE_CONVERSATION_ANCHORS,
+            );
+            Some(SyncDeleteConversation {
+                conversation_id,
+                // The official `Boolean(item.isFullDelete)`: anything but a
+                // literal `true` reads false, so an absent or hostile flag
+                // degrades to the bounded-clear arm (the safe direction —
+                // the full-delete arm deletes more).
+                is_full_delete: object.get("isFullDelete").and_then(Value::as_bool) == Some(true),
+                most_recent_messages,
+                most_recent_non_expiring_messages,
+            })
+        })
+        .collect()
+}
+
+/// The bounded `localOnlyConversationDeletes` arm (contract 1.182,
+/// §4.182): the conversation identity alone. An entry without one drops
+/// whole (the official "No target conversation" warn-drop at
+/// MessageReceiver.preload.ts:3703-3711).
+fn normalized_sync_local_only_conversations(
+    value: Option<&Value>,
+) -> Vec<SyncLocalOnlyConversationDelete> {
+    let Some(conversations) = value
+        .and_then(|face| face.get("localOnlyConversationDeletes"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    conversations
+        .iter()
+        .take(MAX_SYNC_LOCAL_ONLY_DELETE_CONVERSATIONS)
+        .filter_map(|group| {
+            let object = group.as_object()?;
+            let conversation_id = object
+                .get("conversationId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(|id| id.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+            Some(SyncLocalOnlyConversationDelete { conversation_id })
+        })
+        .collect()
+}
+
+/// Bounded `syncMessage.deleteForMe` message group family (contract 1.102,
+/// §4.83): kept as its own reader for the arm's own semantics — the group
+/// optionally naming its conversation (key absent when the proto carried
+/// none) and every entry naming one message by its author identity plus
+/// upstream timestamp.
 fn normalized_sync_delete_groups(value: Option<&Value>) -> Vec<SyncDeleteGroup> {
     let Some(groups) = value
         .and_then(|face| face.get("messageDeletes"))
@@ -5542,15 +5792,16 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
         }
     }
     // The engine's `syncMessage.deleteForMe` projection (contract 1.102,
-    // §4.83): the account's own linked device deleted messages for itself —
-    // the official #handleDeleteForMeSync face. Intercepted before the plain
-    // syncMessage skip like its read/viewed sibling; an envelope whose groups
-    // all failed the bounds falls through to that skip. The routing source
-    // stays None — the envelope is our own account; the groups name their own
-    // conversations and the entries their own authors (the read/viewed
-    // precedent).
+    // §4.83; the two conversation arms added by contract 1.182, §4.182):
+    // the account's own linked device deleted messages for itself — the
+    // official #handleDeleteForMeSync face. Intercepted before the plain
+    // syncMessage skip like its read/viewed sibling; an envelope whose
+    // every arm failed the bounds falls through to that skip. The routing
+    // source stays None — the envelope is our own account; the groups name
+    // their own conversations and the entries their own authors (the
+    // read/viewed precedent).
     if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object) {
-        let deletes = normalized_sync_delete_groups(sync.get("deleteForMe"));
+        let deletes = normalized_sync_delete_for_me(sync.get("deleteForMe"));
         if !deletes.is_empty() {
             return Some(ControlRouting {
                 direction: "incoming",
@@ -9641,20 +9892,22 @@ mod tests {
         })) else {
             panic!("expected a sync delete control routing");
         };
-        assert_eq!(deletes.len(), 2, "{deletes:?}");
+        assert_eq!(deletes.groups.len(), 2, "{deletes:?}");
         assert_eq!(
-            deletes[0].conversation_id.as_deref(),
+            deletes.groups[0].conversation_id.as_deref(),
             Some("11111111-1111-1111-1111-111111111111")
         );
-        assert_eq!(deletes[0].messages.len(), 1);
+        assert_eq!(deletes.groups[0].messages.len(), 1);
         assert_eq!(
-            deletes[0].messages[0].author,
+            deletes.groups[0].messages[0].author,
             "22222222-2222-2222-2222-222222222222"
         );
-        assert_eq!(deletes[0].messages[0].timestamp, 1726999999000);
-        assert!(deletes[1].conversation_id.is_none());
-        assert_eq!(deletes[1].messages[0].author, "+15555550102");
-        assert_eq!(deletes[1].messages[0].timestamp, 1726999997000);
+        assert_eq!(deletes.groups[0].messages[0].timestamp, 1726999999000);
+        assert!(deletes.groups[1].conversation_id.is_none());
+        assert_eq!(deletes.groups[1].messages[0].author, "+15555550102");
+        assert_eq!(deletes.groups[1].messages[0].timestamp, 1726999997000);
+        assert!(deletes.conversations.is_empty(), "no conversation arm");
+        assert!(deletes.local_only_conversations.is_empty());
         assert!(source.is_none(), "the envelope is our own account");
 
         // No usable group at all → the plain syncMessage skip.
@@ -9674,6 +9927,181 @@ mod tests {
             );
             assert!(routing.is_none(), "expected the plain skip: {sync}");
         }
+    }
+
+    /// Contract 1.182 (§4.182): the two whole-conversation arms route on
+    /// their own (a conversation arm alone is not the plain skip), carry the
+    /// official gates — a `conversationDeletes` entry without an identity or
+    /// with every primary anchor dropped drops whole, its non-expiring
+    /// companion is optional and may be empty, and `isFullDelete` folds to
+    /// the official `Boolean()` (only a literal true reads true) — while a
+    /// `localOnlyConversationDeletes` entry needs only its identity.
+    #[test]
+    fn sync_delete_for_me_conversation_arms_route_and_gate() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncDeleteForMe { deletes }, source)) = routing(json!({
+            "deleteForMe": {
+                "conversationDeletes": [
+                    {
+                        "conversationId": "11111111-1111-1111-1111-111111111111",
+                        "isFullDelete": true,
+                        "mostRecentMessages": [
+                            { "author": "+15555550101", "timestamp": 1726999999000u64 },
+                        ],
+                        "mostRecentNonExpiringMessages": [
+                            { "author": "+15555550102", "timestamp": 1726999998000u64 },
+                            // Unusable anchors drop like message-delete entries.
+                            { "author": "+15555550103", "timestamp": 0u64 },
+                            { "timestamp": 1726999997000u64 },
+                        ],
+                    },
+                    {
+                        // The flag is absent: the official Boolean() reads false.
+                        "conversationId": "22222222-2222-2222-2222-222222222222",
+                        "mostRecentMessages": [
+                            { "author": "+15555550104", "timestamp": 1726999996000u64 },
+                        ],
+                    },
+                    {
+                        // Companion absent: the empty list is honest.
+                        "conversationId": "33333333-3333-3333-3333-333333333333",
+                        "isFullDelete": false,
+                        "mostRecentMessages": [
+                            { "author": "+15555550105", "timestamp": 1726999995000u64 },
+                        ],
+                    },
+                    // No conversation identity → drop whole.
+                    {
+                        "isFullDelete": true,
+                        "mostRecentMessages": [
+                            { "author": "+15555550106", "timestamp": 1726999994000u64 },
+                        ],
+                    },
+                    // Every primary anchor drops → drop whole (the official
+                    // "No target messages" gate).
+                    {
+                        "conversationId": "44444444-4444-4444-4444-444444444444",
+                        "mostRecentMessages": [{ "author": "+15555550107" }],
+                    },
+                    {
+                        "conversationId": "   ",
+                        "mostRecentMessages": [
+                            { "author": "+15555550108", "timestamp": 1726999993000u64 },
+                        ],
+                    },
+                ],
+                "localOnlyConversationDeletes": [
+                    { "conversationId": "55555555-5555-5555-5555-555555555555" },
+                    // No identity → drop whole.
+                    {},
+                    { "conversationId": "" },
+                ],
+            },
+        })) else {
+            panic!("expected a sync delete control routing");
+        };
+        assert!(source.is_none(), "the envelope is our own account");
+        assert!(deletes.groups.is_empty(), "no message arm");
+
+        assert_eq!(deletes.conversations.len(), 3, "{deletes:?}");
+        assert!(deletes.conversations[0].is_full_delete);
+        assert_eq!(
+            deletes.conversations[0].conversation_id,
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(deletes.conversations[0].most_recent_messages.len(), 1);
+        assert_eq!(
+            deletes.conversations[0].most_recent_messages[0].timestamp,
+            1726999999000
+        );
+        // The junk anchors dropped; the usable one survived.
+        assert_eq!(
+            deletes.conversations[0]
+                .most_recent_non_expiring_messages
+                .len(),
+            1
+        );
+        assert_eq!(
+            deletes.conversations[0].most_recent_non_expiring_messages[0].author,
+            "+15555550102"
+        );
+        assert!(!deletes.conversations[1].is_full_delete, "absent flag");
+        assert!(
+            deletes.conversations[1]
+                .most_recent_non_expiring_messages
+                .is_empty()
+        );
+        assert!(
+            deletes.conversations[2]
+                .most_recent_non_expiring_messages
+                .is_empty()
+        );
+
+        assert_eq!(deletes.local_only_conversations.len(), 1, "{deletes:?}");
+        assert_eq!(
+            deletes.local_only_conversations[0].conversation_id,
+            "55555555-5555-5555-5555-555555555555"
+        );
+
+        // A conversation arm alone routes; every arm failing falls through to
+        // the plain skip.
+        assert!(
+            routing(json!({
+                "deleteForMe": {
+                    "localOnlyConversationDeletes": [{ "conversationId": "c" }],
+                },
+            }))
+            .is_some()
+        );
+        for sync in [
+            json!({ "deleteForMe": { "conversationDeletes": [] } }),
+            json!({ "deleteForMe": { "conversationDeletes": [{}] } }),
+            json!({ "deleteForMe": { "conversationDeletes": [
+                { "conversationId": "c", "mostRecentMessages": [] },
+            ] } }),
+            json!({ "deleteForMe": { "localOnlyConversationDeletes": [{}] } }),
+            json!({ "deleteForMe": { "localOnlyConversationDeletes": [] } }),
+        ] {
+            assert!(
+                routing(sync.clone()).is_none(),
+                "expected the plain skip: {sync}"
+            );
+        }
+
+        // The caps bite by dropping the tail, never by truncating an entry.
+        let too_many_anchors = (0..(MAX_SYNC_DELETE_CONVERSATION_ANCHORS + 4))
+            .map(|index| {
+                json!({
+                    "author": "+15555550110",
+                    "timestamp": 1726999990000u64 + index as u64,
+                })
+            })
+            .collect::<Vec<_>>();
+        let Some((ControlReceive::SyncDeleteForMe { deletes }, _)) = routing(json!({
+            "deleteForMe": {
+                "conversationDeletes": [{
+                    "conversationId": "c",
+                    "mostRecentMessages": too_many_anchors,
+                }],
+            },
+        })) else {
+            panic!("expected a sync delete control routing");
+        };
+        assert_eq!(
+            deletes.conversations[0].most_recent_messages.len(),
+            MAX_SYNC_DELETE_CONVERSATION_ANCHORS
+        );
     }
 
     /// The engine's `syncMessage.attachmentBackfillResponse` projection

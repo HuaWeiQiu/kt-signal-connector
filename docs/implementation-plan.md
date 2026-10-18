@@ -15599,6 +15599,56 @@ new KT_FAKE_ANNOUNCEMENT_GROUPS / KT_FAKE_ROLE_GROUPS arms drive the whole
 ladder — engine listGroups → capture → groups.get — plus the host-frame
 groups.common round trip over the staged conversations).
 
+### 4.182 The conversation-delete sync arms: `conversationDeletes` and `localOnlyConversationDeletes` (contract revision 1.182, 2026-10-18)
+
+The `syncMessage.deleteForMe` face landed in 1.102 (§4.83) covering the
+message-level arm only: a linked device's "delete for me" removed the
+targeted rows by (author, sentAt) and forwarded `message.deleteForMe` for
+the desktop to drop its own rows. The official handler carries two more
+arms that never had a connector counterpart, so a conversation deleted on
+another device stayed fully present here until the next full resync.
+
+Official anchors (upstream Signal-Desktop, read-only, AGPL — semantics
+only): `ts/textsecure/MessageReceiver.preload.ts:3658-3720` —
+`conversationDeletes` runs `removeConversation` (the conversation row and
+its messages go), while `localOnlyConversationDeletes` removes the local
+copy without touching the server-side conversation (the account remains a
+member; a later message re-creates the local thread). The job layer that
+mints the sync is `ts/jobs/deleteForMe.preload.ts:200-286`.
+
+Two arms now land:
+
+- **`conversationDeletes`** — resolve the projection's conversation
+  identity through the same ladder the message arm uses (projection
+  `conversationId` when named, else the entry's author ladder). On a hit
+  the store drops the conversation's local rows **and** the conversation
+  row itself in one transaction, in the FK-safe order the account delete
+  already established: reactions first (`message_events` carries a plain
+  `conversation_id` FK with no cascade — dropping messages first aborts the
+  whole delete on any store holding a reaction), then messages, then the
+  conversation row. The touched account total is repaired and rides
+  `account.changed`; the desktop removes the conversation from its list.
+- **`localOnlyConversationDeletes`** — the same local drop **without** the
+  server-side meaning: identical store transaction, but the arm is
+  recorded as local-only so no server write is implied and a replayed sync
+  answers "already gone" (`false`) rather than re-dropping.
+
+Both arms are idempotent on replay (the second call finds nothing and
+answers `false`), drop silently on an unresolvable identity (宁缺勿错 —
+never invent rows or conversations), and preserve the projection's own
+order. The event face stays transient beside the mirror: a missed
+delivery converges on the next conversation read, exactly like the
+message arm and `message.expired`.
+
+Tests (additive): `conversation_delete_sync_drops_the_conversation_and_its_rows`
+(the drop arm: conversation row gone, messages gone, reactions gone, the
+account total repaired), `local_only_conversation_delete_keeps_the_server_side_semantics`
+(the local-only arm drops identically but records no server intent),
+`conversation_delete_sync_is_idempotent_on_replay` (second call answers
+false, store unchanged), and
+`conversation_delete_sync_ignores_unresolvable_identities` (an unknown
+identity drops nothing and forwards unenriched).
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

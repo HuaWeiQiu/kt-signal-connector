@@ -13,8 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::engine::{
     ControlReceive, EngineError, GROUPV2_ID_LENGTH, NormalizedAttachment, NormalizedReceive,
-    ReceiptKind, SyncDeleteGroup, SyncReadEntry, timer_change_material, timer_change_rich,
-    truncate_utf8_bytes,
+    ReceiptKind, SyncReadEntry, timer_change_material, timer_change_rich, truncate_utf8_bytes,
 };
 /// The official ACCEPT member of the `messageRequestResponseType` enum
 /// (`SignalService.proto:666-678`): the member the §4.58 factor weight reads.
@@ -1340,6 +1339,12 @@ pub enum HostSideEvent {
     SyncDeleteForMe {
         account_id: String,
         deletes: Vec<SyncDeleteForMeGroup>,
+        /// Contract 1.182 (§4.182): the whole-conversation arms — one entry
+        /// per `conversationDeletes`/`localOnlyConversationDeletes` record
+        /// with the mirror's answer. Empty when the envelope carried only
+        /// per-message groups (the 1.102 shape, byte-identical on the wire:
+        /// the key is skipped when empty).
+        conversations: Vec<SyncDeletedConversation>,
     },
     /// The engine's `syncMessage.verified` projection forwarded (contract
     /// 1.103, §4.84): the account's own linked device settled one peer's
@@ -1600,6 +1605,50 @@ pub struct SyncDeleteForMeEntry {
     pub timestamp: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+}
+
+/// One whole-conversation delete on the `message.deleteForMe` event
+/// (contract 1.182, §4.182): the projection's `conversationDeletes` entry
+/// with the connector's resolution enrichment and its mirror answer.
+///
+/// `conversation_id` is the local id the desktop addresses — present only
+/// when the projection's identity resolved a row. An entry that resolved
+/// nothing rides identity-less with `deleted: false` and the desktop joins
+/// nothing (宁缺勿错: a delete naming a conversation we do not hold must
+/// never be re-pointed at a *different* one by a fuzzy match).
+///
+/// `local_only` mirrors the official two-arm split
+/// (MessageReceiver.preload.ts:3658-3722): `false` is the
+/// `conversationDeletes` arm, where the peer sent the newest addressable
+/// rows so the receiver can delete everything at or below the newest one it
+/// still holds (`deleteConversation` → `removeMessagesInConversation` with
+/// the matched `receivedAt`). `true` is the
+/// `localOnlyConversationDeletes` arm — the upstream had no addressable row
+/// left, so the receiver deletes its local copy with no position bound
+/// (`deleteLocalOnlyConversation`). Both arms are local-only by definition:
+/// nothing rides back to any server and no other device learns anything
+/// from this consume face; the shared protocol carrier is the sync envelope
+/// itself, which the relaying device already sent.
+///
+/// `deleted` is the mirror's answer, not a request: `true` when the local
+/// conversation row existed and this call cleared it — exactly the official
+/// `deleteConversation`/`deleteLocalOnlyConversation` boolean. A replay
+/// finds the row already gone and answers `false` with
+/// `deleted_message_count: 0`, so the desktop can treat both the event and
+/// any duplicate as one idempotent fact. `conversation_removed` says whether
+/// the conversation row itself left (the `isFullDelete` / local-only arms;
+/// the bounded clear keeps the chat, the official `isFullDelete=false`
+/// posture). `deleted_message_count` is the number of mirror rows this call
+/// removed (0 on a replay and on a never-held conversation).
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncDeletedConversation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    pub local_only: bool,
+    pub deleted: bool,
+    pub conversation_removed: bool,
+    pub deleted_message_count: u64,
 }
 
 /// Ephemeral typing notifications keep the event lane quiet: at most one
@@ -11066,7 +11115,8 @@ impl ConnectorService {
 
     /// Contract 1.102 (§4.83): consume one `syncMessage.deleteForMe`
     /// projection — the account deleted messages for itself on another
-    /// linked device (the official #handleDeleteForMeSync face). Two faces:
+    /// linked device (the official #handleDeleteForMeSync face). Three
+    /// faces; the two whole-conversation arms are contract 1.182 (§4.182):
     ///
     /// Forwarding — the bounded groups ride the transient
     /// `message.deleteForMe` event with the connector's resolution enriching
@@ -11077,6 +11127,9 @@ impl ConnectorService {
     /// The event forwards even when nothing resolved — the desktop joins its
     /// own rows by the (author, timestamp) pairs, and a replayed sync finds
     /// its rows already gone both sides (idempotent, no double-remove).
+    /// The whole-conversation answers ride the same event's `conversations`
+    /// array (key absent when the envelope carried no conversation arm, so
+    /// the 1.102 byte shape is unchanged).
     ///
     /// Mirror — a hit removes the row outright (the official
     /// `removeMessageById` behavior anchor, the expire-sweep store family:
@@ -11087,14 +11140,33 @@ impl ConnectorService {
     /// (the insert-path precedent). An entry naming no local row, or a group
     /// nothing resolves, stays silent on the mirror and rides unenriched
     /// (宁缺勿错 — never invent rows or conversations).
+    ///
+    /// Conversation mirror (1.182) — the official two-arm ladder
+    /// (MessageReceiver.preload.ts:3658-3722 → syncTasks.preload.ts:114-175
+    /// → deleteForMe.preload.ts:200-286). `conversationDeletes` bounds the
+    /// clear by its newest anchor the local store still holds
+    /// (`removeMessagesInConversation(..., receivedAt)`), and with
+    /// `isFullDelete` continues into the local-only arm; an anchor set that
+    /// misses everything falls back to `mostRecentNonExpiringMessages` once
+    /// (:3652-3695). `localOnlyConversationDeletes` carries no position at
+    /// all. Both arms then delete the conversation row itself. Nothing here
+    /// reads or writes anything upstream: the two official arms are
+    /// explicitly local-only (the upstream sent the sync before its own
+    /// delete; `deleteLocalOnlyConversation`'s recorded reason for removing
+    /// the row regardless is that the peer will only ever send more
+    /// messages). An identity that resolves no local row answers
+    /// `deleted: false` rather than inventing a conversation
+    /// (`getConversationFromTarget` miss → "Conversation not found") — and
+    /// so does a replay, because the row is then already gone.
     fn apply_sync_delete_for_me(
         &mut self,
         account: &AccountRow,
-        deletes: &[SyncDeleteGroup],
+        deletes: &crate::engine::SyncDeleteForMeProjection,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
-        let mut event_groups = Vec::with_capacity(deletes.len());
+        let mut event_groups = Vec::with_capacity(deletes.groups.len());
         let mut touched_conversations: Vec<String> = Vec::new();
-        for group in deletes {
+        let mut deleted_conversations: Vec<SyncDeletedConversation> = Vec::new();
+        for group in &deletes.groups {
             // Resolve the group's conversation once when the projection
             // named one; the entries' own authors ladder only when it did
             // not (the read-precedent resolution family, §4.81).
@@ -11161,9 +11233,139 @@ impl ConnectorService {
                 messages: event_messages,
             });
         }
+        // Contract 1.182 (§4.182): the whole-conversation arms. Each entry
+        // resolves its identity through the same §4.83 ladder the message
+        // groups use, then mirrors the official two-arm delete. The
+        // projection's own order is preserved (conversationDeletes first,
+        // then localOnlyConversationDeletes) so a replayed envelope reports
+        // the same answer sequence.
+        for group in &deletes.conversations {
+            let conversation =
+                self.sync_delete_group_conversation(account, &group.conversation_id)?;
+            let outcome = match &conversation {
+                Some(conversation) => {
+                    // The official anchor ladder: the newest primary anchor
+                    // the local store still holds bounds the clear; when none
+                    // hits, the non-expiring companion gets exactly one
+                    // fallback shot (deleteForMe.preload.ts:216-257). A
+                    // primary set that hits nothing while the companion is
+                    // empty leaves no position at all — the official
+                    // `newestMessage` stays undefined and the clear is
+                    // skipped entirely (the "Found no messages" warn), which
+                    // is the honest mirror: an anchor set we cannot place
+                    // must not widen into a full delete.
+                    let primary = group
+                        .most_recent_messages
+                        .iter()
+                        .map(|entry| entry.timestamp)
+                        .collect::<Vec<_>>();
+                    let companion = group
+                        .most_recent_non_expiring_messages
+                        .iter()
+                        .map(|entry| entry.timestamp)
+                        .collect::<Vec<_>>();
+                    let bound = self.store.newest_message_at_anchors(
+                        &account.id,
+                        &conversation.id,
+                        &primary,
+                    )?;
+                    let bound = match bound {
+                        Some(bound) => Some(bound),
+                        None => self.store.newest_message_at_anchors(
+                            &account.id,
+                            &conversation.id,
+                            &companion,
+                        )?,
+                    };
+                    match bound {
+                        Some(bound) => self.store.delete_conversation(
+                            &account.id,
+                            &conversation.id,
+                            Some(bound),
+                            // `isFullDelete` is the official continuation into
+                            // the row-dropping arm (deleteForMe.preload.ts:259-263);
+                            // without it the chat stays with its surviving rows.
+                            group.is_full_delete,
+                        )?,
+                        None => None,
+                    }
+                }
+                None => None,
+            };
+            // The conversation row survives exactly the bounded,
+            // non-full-delete arm (`isFullDelete` is what tells the official
+            // receiver to continue into `deleteLocalOnlyConversation`, which
+            // is the arm that calls `destroyMessagesInner`).
+            let row_dropped = outcome.is_some() && group.is_full_delete;
+            if let Some(removed) = outcome {
+                touched_conversations.push(
+                    conversation
+                        .as_ref()
+                        .map(|row| row.id.clone())
+                        .unwrap_or_default(),
+                );
+                deleted_conversations.push(SyncDeletedConversation {
+                    conversation_id: conversation.map(|conversation| conversation.id),
+                    local_only: false,
+                    deleted: true,
+                    conversation_removed: row_dropped,
+                    deleted_message_count: removed,
+                });
+            } else {
+                // Unknown conversation (the official "Conversation not
+                // found" continue) or an anchor set that placed nothing:
+                // the event still says so — `deleted: false` is the mirror's
+                // honest answer, and the desktop must not hide a chat on it.
+                deleted_conversations.push(SyncDeletedConversation {
+                    conversation_id: conversation.map(|conversation| conversation.id),
+                    local_only: false,
+                    deleted: false,
+                    conversation_removed: false,
+                    deleted_message_count: 0,
+                });
+            }
+        }
+        for group in &deletes.local_only_conversations {
+            let conversation =
+                self.sync_delete_group_conversation(account, &group.conversation_id)?;
+            let outcome = match &conversation {
+                // The local-only arm carries no position: every row goes and
+                // so does the conversation (deleteLocalOnlyConversation →
+                // destroyMessagesInner).
+                Some(conversation) => {
+                    self.store
+                        .delete_conversation(&account.id, &conversation.id, None, true)?
+                }
+                None => None,
+            };
+            if let Some(removed) = outcome {
+                touched_conversations.push(
+                    conversation
+                        .as_ref()
+                        .map(|row| row.id.clone())
+                        .unwrap_or_default(),
+                );
+                deleted_conversations.push(SyncDeletedConversation {
+                    conversation_id: conversation.map(|conversation| conversation.id),
+                    local_only: true,
+                    deleted: true,
+                    conversation_removed: true,
+                    deleted_message_count: removed,
+                });
+            } else {
+                deleted_conversations.push(SyncDeletedConversation {
+                    conversation_id: conversation.map(|conversation| conversation.id),
+                    local_only: true,
+                    deleted: false,
+                    conversation_removed: false,
+                    deleted_message_count: 0,
+                });
+            }
+        }
         let mut events = vec![HostSideEvent::SyncDeleteForMe {
             account_id: account.id.clone(),
             deletes: event_groups,
+            conversations: deleted_conversations,
         }];
         for conversation_id in &touched_conversations {
             if let Some(summary) = self
@@ -31188,7 +31390,13 @@ mod tests {
             let mut receive = control_receive(
                 "+15555550100",
                 "+15555550100",
-                ControlReceive::SyncDeleteForMe { deletes },
+                ControlReceive::SyncDeleteForMe {
+                    deletes: crate::engine::SyncDeleteForMeProjection {
+                        groups: deletes,
+                        conversations: Vec::new(),
+                        local_only_conversations: Vec::new(),
+                    },
+                },
             );
             receive.source = None;
             receive.source_uuid = None;
@@ -31226,11 +31434,13 @@ mod tests {
         let HostSideEvent::SyncDeleteForMe {
             account_id: event_account,
             deletes: event_groups,
+            conversations: event_conversations,
         } = &events[0]
         else {
             panic!("expected the forwarding event: {:?}", events[0]);
         };
         assert_eq!(event_account, &account.id);
+        assert!(event_conversations.is_empty(), "message-only envelope");
         assert_eq!(event_groups.len(), 4, "{event_groups:?}");
         assert_eq!(
             event_groups[0].conversation_id.as_deref(),
@@ -31295,6 +31505,373 @@ mod tests {
         };
         assert!(deletes[0].messages[0].message_id.is_none());
         assert!(stored(&service, &conversation.id, "m1").is_none());
+    }
+
+    /// Contract 1.182 (§4.182): the two whole-conversation arms. The
+    /// `conversationDeletes` arm bounds its clear by the newest anchor the
+    /// local store still holds (rows above the anchor survive a bounded
+    /// clear), `isFullDelete` continues into the row-dropping arm, the
+    /// non-expiring companion only ever fires when the primary set places
+    /// nothing, the `localOnlyConversationDeletes` arm clears the whole chat
+    /// and its row with no position at all, an anchor set that places
+    /// nothing leaves both the chat and its rows alone (the official
+    /// "Found no messages" skip), an unknown identity answers
+    /// `deleted: false` without inventing a row, and a replay answers
+    /// `deleted: false` with nothing written.
+    #[test]
+    fn sync_delete_for_me_consumes_the_conversation_arms() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        const ACI: &str = "11111111-1111-1111-1111-111111111111";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, ACI, &conversation.peer_key)
+            .unwrap();
+        let seed = |conversation_id: &str, id: &str, sent_at: u64| {
+            let record = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation_id.into(),
+                direction: "incoming",
+                sender_id: "peer-hash".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                send_outcomes: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+                server_timestamp: None,
+                is_story: false,
+                story_message: None,
+            };
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, Some("body"), true)
+                    .unwrap()
+            );
+        };
+        // A bounded clear under the anchor keeps the rows above it.
+        let bounded = service
+            .store_ref()
+            .ensure_conversation(
+                &account.id,
+                "group",
+                "cwYK158sKNkjXpEOgEDKk+fmphGj308Ko9DPNhaze6U=",
+                "Bounded",
+            )
+            .unwrap();
+        seed(&bounded.id, "b-old", 100);
+        seed(&bounded.id, "b-anchor", 200);
+        seed(&bounded.id, "b-new", 300);
+        // The full-delete arm takes the chat and every row.
+        let full = service
+            .store_ref()
+            .ensure_conversation(
+                &account.id,
+                "group",
+                "oYuGmy6BwMUpVSo8T6XJLtCLmKThRq7XeNcdJ1F/g6w=",
+                "Full",
+            )
+            .unwrap();
+        seed(&full.id, "f-1", 100);
+        seed(&full.id, "f-2", 200);
+        // The companion-only arm: no primary anchor places, the non-expiring
+        // companion bounds the clear and `isFullDelete` drops the row.
+        let companion = service
+            .store_ref()
+            .ensure_conversation(
+                &account.id,
+                "group",
+                "yYnt8YJG6cjN1kc2mkg1992aD0e451XTexZDH8UDWYE=",
+                "Companion",
+            )
+            .unwrap();
+        seed(&companion.id, "c-1", 100);
+        seed(&companion.id, "c-2", 200);
+        // The unplaceable arm: every anchor misses → nothing happens.
+        let untouched = service
+            .store_ref()
+            .ensure_conversation(
+                &account.id,
+                "group",
+                "1ZwqX3Ic4TXOVGKLGtiti46ybIu+Liq+HNypfi1qtEY=",
+                "Untouched",
+            )
+            .unwrap();
+        seed(&untouched.id, "u-1", 100);
+        // The local-only arm: the whole chat goes with no position.
+        let local_only = service
+            .store_ref()
+            .ensure_conversation(
+                &account.id,
+                "group",
+                "fAZgjHsGaUGHxuDYUInRqt3Ff/fIQZ2DlDrUsqEM474=",
+                "Local",
+            )
+            .unwrap();
+        seed(&local_only.id, "l-1", 100);
+        seed(&local_only.id, "l-2", 200);
+
+        let sync = |conversations: Vec<crate::engine::SyncDeleteConversation>,
+                    local_only_conversations: Vec<
+            crate::engine::SyncLocalOnlyConversationDelete,
+        >| {
+            let mut receive = control_receive(
+                "+15555550100",
+                "+15555550100",
+                ControlReceive::SyncDeleteForMe {
+                    deletes: crate::engine::SyncDeleteForMeProjection {
+                        groups: Vec::new(),
+                        conversations,
+                        local_only_conversations,
+                    },
+                },
+            );
+            receive.source = None;
+            receive.source_uuid = None;
+            receive
+        };
+        let anchor = |timestamp: u64| crate::engine::SyncDeleteEntry {
+            author: "+15555550101".into(),
+            timestamp,
+        };
+        let conversation_delete =
+            |conversation_id: &str,
+             is_full_delete: bool,
+             primary: Vec<crate::engine::SyncDeleteEntry>,
+             companion: Vec<crate::engine::SyncDeleteEntry>| {
+                crate::engine::SyncDeleteConversation {
+                    conversation_id: conversation_id.into(),
+                    is_full_delete,
+                    most_recent_messages: primary,
+                    most_recent_non_expiring_messages: companion,
+                }
+            };
+
+        let events = service
+            .ingest_receive(
+                sync(
+                    vec![
+                        conversation_delete(
+                            "cwYK158sKNkjXpEOgEDKk+fmphGj308Ko9DPNhaze6U=",
+                            false,
+                            vec![anchor(200)],
+                            Vec::new(),
+                        ),
+                        conversation_delete(
+                            "oYuGmy6BwMUpVSo8T6XJLtCLmKThRq7XeNcdJ1F/g6w=",
+                            true,
+                            vec![anchor(200)],
+                            Vec::new(),
+                        ),
+                        conversation_delete(
+                            "yYnt8YJG6cjN1kc2mkg1992aD0e451XTexZDH8UDWYE=",
+                            true,
+                            // Primary 999 places nothing; the companion 200
+                            // is a real row timestamp (seed c-1=100/c-2=200),
+                            // so the one-shot fallback bounds the clear.
+                            vec![anchor(999)],
+                            vec![anchor(200)],
+                        ),
+                        conversation_delete(
+                            "1ZwqX3Ic4TXOVGKLGtiti46ybIu+Liq+HNypfi1qtEY=",
+                            true,
+                            vec![anchor(999)],
+                            Vec::new(),
+                        ),
+                        conversation_delete(
+                            "99999999-9999-9999-9999-999999999999",
+                            true,
+                            vec![anchor(100)],
+                            Vec::new(),
+                        ),
+                    ],
+                    vec![crate::engine::SyncLocalOnlyConversationDelete {
+                        conversation_id: "fAZgjHsGaUGHxuDYUInRqt3Ff/fIQZ2DlDrUsqEM474=".into(),
+                    }],
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+
+        let HostSideEvent::SyncDeleteForMe { conversations, .. } = &events[0] else {
+            panic!("expected the forwarding event: {:?}", events[0]);
+        };
+        assert_eq!(conversations.len(), 6, "{conversations:?}");
+
+        // Bounded clear: below the anchor gone, above it kept, chat kept.
+        assert_eq!(
+            conversations[0].conversation_id.as_deref(),
+            Some(bounded.id.as_str())
+        );
+        assert!(conversations[0].deleted);
+        assert!(
+            !conversations[0].conversation_removed,
+            "bounded clear keeps the chat"
+        );
+        assert!(!conversations[0].local_only);
+        assert_eq!(conversations[0].deleted_message_count, 2);
+        assert!(
+            service
+                .store_ref()
+                .message_by_id(&account.id, &bounded.id, "b-old")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            service
+                .store_ref()
+                .message_by_id(&account.id, &bounded.id, "b-new")
+                .unwrap()
+                .is_some(),
+            "the row above the anchor survives"
+        );
+        assert!(
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &bounded.id)
+                .unwrap()
+                .is_some(),
+            "the bounded arm keeps the chat"
+        );
+
+        // Full delete: the chat and all rows go.
+        assert!(conversations[1].deleted);
+        assert!(conversations[1].conversation_removed);
+        assert_eq!(conversations[1].deleted_message_count, 2);
+        assert!(
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &full.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            service
+                .store_ref()
+                .message_by_id(&account.id, &full.id, "f-2")
+                .unwrap()
+                .is_none()
+        );
+
+        // Companion fallback: the primary placed nothing, the companion
+        // bounded the clear, the full-delete flag dropped the chat.
+        assert!(conversations[2].deleted);
+        assert!(conversations[2].conversation_removed);
+        assert!(
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &companion.id)
+                .unwrap()
+                .is_none()
+        );
+
+        // Nothing placed: the chat and its rows stay, the event says so.
+        assert!(!conversations[3].deleted, "unplaceable anchors do nothing");
+        assert!(!conversations[3].conversation_removed);
+        assert_eq!(conversations[3].deleted_message_count, 0);
+        assert!(
+            service
+                .store_ref()
+                .message_by_id(&account.id, &untouched.id, "u-1")
+                .unwrap()
+                .is_some()
+        );
+
+        // Unknown identity: answered, never invented.
+        assert!(conversations[4].conversation_id.is_none());
+        assert!(!conversations[4].deleted);
+
+        // Local-only arm: everything goes.
+        assert!(conversations[5].local_only);
+        assert!(conversations[5].deleted);
+        assert!(conversations[5].conversation_removed);
+        assert_eq!(conversations[5].deleted_message_count, 2);
+        assert!(
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &local_only.id)
+                .unwrap()
+                .is_none()
+        );
+
+        // The touched conversations ride `conversation.changed` (the bounded
+        // one only — a dropped row has no summary to refresh); the account
+        // total rides `account.changed`.
+        let summaries: Vec<_> = events[1..]
+            .iter()
+            .filter_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(summaries, vec![bounded.id.as_str()], "{events:?}");
+        assert!(matches!(
+            events.last(),
+            Some(HostSideEvent::AccountChanged(_))
+        ));
+
+        // A replay finds everything already gone and answers `deleted: false`
+        // for each arm that had fired; nothing is written twice.
+        let events = service
+            .ingest_receive(
+                sync(
+                    vec![
+                        conversation_delete(
+                            "oYuGmy6BwMUpVSo8T6XJLtCLmKThRq7XeNcdJ1F/g6w=",
+                            true,
+                            vec![anchor(200)],
+                            Vec::new(),
+                        ),
+                        conversation_delete(&bounded.id, false, vec![anchor(200)], Vec::new()),
+                    ],
+                    vec![crate::engine::SyncLocalOnlyConversationDelete {
+                        conversation_id: "fAZgjHsGaUGHxuDYUInRqt3Ff/fIQZ2DlDrUsqEM474=".into(),
+                    }],
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let HostSideEvent::SyncDeleteForMe { conversations, .. } = &events[0] else {
+            panic!("expected the replayed forwarding event: {:?}", events[0]);
+        };
+        assert_eq!(conversations.len(), 3);
+        assert!(
+            conversations.iter().all(|entry| !entry.deleted),
+            "{conversations:?}"
+        );
+        assert!(
+            conversations
+                .iter()
+                .all(|entry| !entry.conversation_removed)
+        );
+        assert!(
+            conversations
+                .iter()
+                .all(|entry| entry.deleted_message_count == 0)
+        );
     }
 
     /// Contract 1.103 (§4.84): the verified sync forwards as one transient

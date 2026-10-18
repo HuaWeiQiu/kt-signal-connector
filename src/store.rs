@@ -6502,6 +6502,236 @@ impl Store {
         Ok(removed)
     }
 
+    /// Delete a whole conversation's local rows, and its summary row when
+    /// the official arm says so (contract 1.182, §4.182): the mirror of the
+    /// official `deleteConversation`/`deleteLocalOnlyConversation` pair
+    /// (deleteForMe.preload.ts:200-286), which answers "did the local copy
+    /// go away" and is idempotent on replay (the second call finds nothing
+    /// and answers `false`).
+    ///
+    /// One transaction, in the FK-safe order the account delete already
+    /// established: reactions first (`message_events` carries a plain
+    /// `conversation_id` FK with no cascade — dropping the messages first
+    /// aborts the whole delete on any store holding a reaction), then the
+    /// messages, then — for the drop arm — the conversation row itself.
+    /// Pins and drafts have `ON DELETE CASCADE` on the conversation FK and
+    /// leave with it; `message_edits` cascades off the message FK;
+    /// `peer_identities` is account-scoped (the peer still exists as a
+    /// contact) and stays.
+    ///
+    /// `bound_at` is the optional newest-anchor bound the official receiver
+    /// derives from its `mostRecentMessages` match (`removeMessagesInConversation`
+    /// walks older rows up to `receivedAt`). The connector applies it to a
+    /// row's `stored_at`/`received_at`/`sent_at` triple rather than the
+    /// official `received_at` alone: the three coincide for live rows, and
+    /// a history-imported row carries only `sent_at` — keying off the
+    /// official column alone would resurrect imported rows under a delete
+    /// the peer meant to cover. `None` removes every row.
+    ///
+    /// `drop_conversation` mirrors the official arm split: the
+    /// `conversationDeletes` arm with `isFullDelete=false` clears messages
+    /// and keeps the chat (the official bounded clear — the flag exists
+    /// precisely to separate "clear" from "clear and remove");
+    /// `isFullDelete=true` continues into `deleteLocalOnlyConversation`,
+    /// which calls `destroyMessagesInner` and takes the row; the
+    /// `localOnlyConversationDeletes` arm always takes the row.
+    ///
+    /// Returns `Some(removed_row_count)` when the conversation existed,
+    /// `None` when it did not (unknown conversation — the official
+    /// "Conversation not found" continue). An idempotent replay answers
+    /// `None` with nothing written.
+    pub fn delete_conversation(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        bound_at: Option<u64>,
+        drop_conversation: bool,
+    ) -> Result<Option<u64>, StoreError> {
+        let mut conn = self.lock_conn()?;
+        let transaction = conn
+            .transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM conversations WHERE id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .is_some();
+        if !exists {
+            transaction
+                .commit()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            return Ok(None);
+        }
+        // The bound compares the row's own sent stamp, not its storage
+        // stamp: `insert_message` always stamps `stored_at = now()`, so
+        // COALESCE(stored_at, ...) would compare every row against the
+        // insertion wall clock and make any anchor look "below the bound"
+        // (the whole chat would clear). The official arm passes
+        // `receivedAt` from the sync's own message timestamps
+        // (deleteForMe.preload.ts:216-257), which are send-time stamps.
+        let removed: usize = match bound_at {
+            Some(bound) => transaction
+                .execute(
+                    "DELETE FROM messages
+                     WHERE account_id=?1 AND conversation_id=?2
+                       AND sent_at <= ?3",
+                    params![account_id, conversation_id, bound as i64],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?,
+            None => transaction
+                .execute(
+                    "DELETE FROM messages WHERE account_id=?1 AND conversation_id=?2",
+                    params![account_id, conversation_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?,
+        };
+        let removed = u64::try_from(removed).unwrap_or(0);
+        // The official bounded arm only clears rows: the conversation stays
+        // (that is what `isFullDelete` exists to distinguish). Reactions
+        // whose target rows just went drop with them — the official
+        // `removeMessages` cascade — but a reaction on a surviving row must
+        // not take the whole thread's events down, so the delete is scoped
+        // to the rows that actually left.
+        transaction
+            .execute(
+                "DELETE FROM message_events
+                 WHERE account_id=?1 AND conversation_id=?2
+                   AND NOT EXISTS (SELECT 1 FROM messages
+                                    WHERE messages.account_id=message_events.account_id
+                                      AND messages.conversation_id=message_events.conversation_id
+                                      AND messages.sent_at=message_events.target_timestamp)",
+                params![account_id, conversation_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if drop_conversation {
+            // The row-dropping arms take everything: `isFullDelete` deletes
+            // the chat on the official side after the bounded clear, and the
+            // local-only arm is called only once the conversation has no
+            // addressable row left. A kill-the-thread delete must not leave
+            // orphaned rows behind a row that no longer exists — the
+            // official `destroyMessagesInner` clears the whole conversation.
+            transaction
+                .execute(
+                    "DELETE FROM message_events WHERE account_id=?1 AND conversation_id=?2",
+                    params![account_id, conversation_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            transaction
+                .execute(
+                    "DELETE FROM messages WHERE account_id=?1 AND conversation_id=?2",
+                    params![account_id, conversation_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            transaction
+                .execute(
+                    "DELETE FROM conversations WHERE id=?1 AND account_id=?2",
+                    params![conversation_id, account_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        } else {
+            // Bounded arm: the surviving rows keep the conversation, so the
+            // summary must be recomputed from them (the
+            // `delete_messages_by_sent_at` repair, verbatim). Reactions on
+            // those rows stay; reactions whose target rows just left go with
+            // them (the official `removeMessages` cascade), and the scoped
+            // delete above already did exactly that.
+            transaction
+                .execute(
+                    "UPDATE conversations
+                        SET last_message_at = (
+                              SELECT MAX(sent_at) FROM messages WHERE conversation_id=?1
+                            ),
+                            last_message_preview = (
+                              SELECT substr(body, 1, ?2) FROM messages
+                               WHERE conversation_id=?1
+                               ORDER BY sent_at DESC, id DESC
+                               LIMIT 1
+                            ),
+                            unread_count = MIN(unread_count, (
+                              SELECT COUNT(*) FROM messages
+                               WHERE conversation_id=?1 AND direction='incoming'
+                            ))
+                      WHERE id=?1",
+                    params![conversation_id, PREVIEW_CHARS],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        transaction
+            .execute(
+                "UPDATE accounts
+                    SET unread_count = COALESCE((
+                          SELECT SUM(unread_count) FROM conversations
+                           WHERE conversations.account_id = accounts.id
+                        ), 0),
+                        last_message_at = (
+                          SELECT MAX(last_message_at) FROM conversations
+                           WHERE conversations.account_id = accounts.id
+                        )",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(Some(removed))
+    }
+
+    /// The newest stored message at or below one anchor set (contract 1.182,
+    /// §4.182): the official `getMostRecentMatchingMessage` —
+    /// `findMatchingMessage` per anchor, then the newest by `received_at` —
+    /// projected onto the connector's row store. Anchors match on
+    /// `sent_at`; the author half is deliberately not a join key (the
+    /// official `getMessageQueryFromTarget` compares the source service id,
+    /// but the connector's incoming rows carry a projected sender hash, so
+    /// matching on it would silently miss exactly the rows a delete needs to
+    /// cover — §4.83's recorded asymmetry, applied here for the same
+    /// reason). `None` when no anchor hits a local row, which is the
+    /// official "Found no messages from mostRecentMessages set" warn and the
+    /// `mostRecentNonExpiringMessages` fallback trigger.
+    pub fn newest_message_at_anchors(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        anchors: &[u64],
+    ) -> Result<Option<u64>, StoreError> {
+        if anchors.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.lock_conn()?;
+        let mut statement = conn
+            .prepare(
+                // The arm answers the placed anchor's own sent stamp, not a
+                // storage stamp: `insert_message` stamps `stored_at = now()`,
+                // so MAX(COALESCE(stored_at, ...)) would return the wall
+                // clock and the delete bound would clear the whole chat
+                // (deleteForMe.preload.ts:216-257 passes the message's own
+                // timestamps through as `receivedAt`).
+                "SELECT MAX(sent_at)
+                   FROM messages
+                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut newest: Option<u64> = None;
+        for anchor in anchors.iter().take(256) {
+            let hit: Option<i64> = statement
+                .query_row(
+                    params![account_id, conversation_id, *anchor as i64],
+                    |row| row.get(0),
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if let Some(at) = hit.and_then(|at| u64::try_from(at).ok())
+                && newest.is_none_or(|current| at > current)
+            {
+                newest = Some(at);
+            }
+        }
+        Ok(newest)
+    }
+
     /// The incoming rows of one conversation in receipt order (`sent_at ASC,
     /// id ASC`), bounded — the absent-`messageIds` mode of
     /// `messages.markRead` / `messages.markViewed` (contract 1.34). Only

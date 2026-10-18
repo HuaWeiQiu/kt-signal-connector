@@ -4399,18 +4399,25 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
         HostSideEvent::SyncDeleteForMe {
             account_id,
             deletes,
+            conversations,
         } => {
             // Contract 1.102, §4.83: the delete groups ride with the
             // absent-optional discipline — a group nothing resolved stays
             // conversation-less, an unmatched entry stays messageId-less (the
             // serde skip keeps the keys absent).
-            Ok(HostEvent::new(
-                "message.deleteForMe",
-                json!({
-                    "accountId": account_id,
-                    "deletes": deletes,
-                }),
-            ))
+            let mut payload = json!({
+                "accountId": account_id,
+                "deletes": deletes,
+            });
+            // Contract 1.182, §4.182: the whole-conversation answers ride the
+            // same event (one transient lane, one desktop consumer). The key
+            // is skipped when empty so a message-only envelope keeps the 1.102
+            // byte shape exactly.
+            if !conversations.is_empty() {
+                payload["conversations"] =
+                    serde_json::to_value(&conversations).unwrap_or(serde_json::Value::Null);
+            }
+            Ok(HostEvent::new("message.deleteForMe", payload))
         }
         HostSideEvent::IdentityVerifiedChanged {
             account_id,
@@ -6051,6 +6058,7 @@ mod tests {
                         }],
                     },
                 ],
+                conversations: Vec::new(),
             })
             .unwrap(),
         )
