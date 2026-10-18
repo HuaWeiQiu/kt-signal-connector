@@ -5,23 +5,25 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.184 (2026-10-19; §4.184 the inbound attachment filename
-  rides verbatim: the audit convicted the connector's inbound arm for rewriting
-  the sender's filename to a 128-byte budget — a real-name truncation (255
-  UTF-16-unit filesystem names reach 1020 UTF-8 bytes) that broke the official
-  passthrough semantics. The receive face now carries the name verbatim
-  (long names, Unicode, spaces, multi-extensions) through the official's own
-  filter family only: path components flatten (basename, both separators,
-  official `attachments.preload.ts:257` save-layer posture pulled to the
-  connector face) with `.`/`..`/flatten-to-nothing answering key absence, and
-  the official schema-v9 bidi-control set maps to U+FFFD
-  (`Attachment.std.ts:123-143` `replaceUnicodeV2`; the official ingest itself
-  is verbatim, `processDataMessage.preload.ts:128`) — no C0 sweep, no
-  extension verdict, and the length rewrite retired in favor of a
-  filesystem-scale 1024-byte clamp that only hostile oversized faces can
-  reach. The quote face and the §4.38 import arm share the one posture.
-  Revision 1.182 is the conversation-delete-sync batch's; this batch continues
-  the merge sequence, no gap.)
+- Contract revision: 1.185 (2026-10-19; §4.185 the media-story caption leg
+  on `messages.sendStory`: the connector half of the engine's sendStory
+  caption batch (engine `48e69a2`, already on the engine mainline) — the
+  official `AttachmentPointer.caption=11` alignment
+  (`uploadAttachment.preload.ts:99/:134`, the caption riding the upload's
+  returned pointer in-cap-out — the 1.161 pointer answer faces already
+  forward that half verbatim). The optional host `caption` key rides the
+  engine `sendStory` frame verbatim on the 1.156 attachment transit class:
+  no connector leg gate, no byte gate — the engine's documented parse owns
+  the whole value domain (an empty caption, a caption over the official
+  MAX_BODY_ATTACHMENT_BYTE_LENGTH 64 KiB budget, and a caption riding
+  without the attachment leg answer its plain -32603, degrading through
+  the structured ladder to UPSTREAM_ERROR retryable), and a JSON null
+  folds to absence at the serde option layer. Version-numbering note:
+  1.182 (§4.182) is this line's own newest merged revision (its header
+  bump was missed by that batch's docs pass — corrected here by record);
+  1.183/1.184 and 1.186/1.187 are in-flight parallel branches
+  (outbound-attachment-stash, inbound-filename-passthrough, panel-data),
+  so this batch takes the free sequential 1.185.)
 - Contract revision: 1.181 (2026-10-18; §4.181 the supply-batch contract for
   the desktop's auxiliary batch B (ledger §10): four connector-side landings —
   the receive-path mention self-match now also folds the account ACI (the
@@ -15818,6 +15820,63 @@ ASCII and CJK clamp on a char boundary; the quote face sharing the parser)
 and `imported_filename_shares_the_inbound_posture` (the archive arm: the
 long name verbatim, the traversal name flattened, the bidi name replaced,
 the pure-traversal name absent).
+
+### 4.185 The media-story caption leg on `messages.sendStory` (contract revision 1.185, 2026-10-19)
+
+The engine's sendStory caption batch (engine `48e69a2`, on the engine
+mainline since 2026-10-15) opened the media story's caption wire — the
+official `AttachmentPointer.caption=11` alignment: the official sender's
+caption rides the upload's returned pointer
+(`ts/util/uploadAttachment.preload.ts:99/:134` `caption || null`, the same
+pointer the official story send then carries as `fileAttachment`,
+`StoryMessage.attachment` oneof `protos/SignalService.proto:476-479`), with
+the official input budget `MAX_BODY_ATTACHMENT_BYTE_LENGTH = 64 KiB`
+(`ts/util/longAttachment.std.ts:8`, the byte face
+`ts/components/CompositionInput.dom.tsx:686-692`). The engine's caption
+commit recorded the connector transit as already in place ("connector
+1.160 透传前置就位") — a misread this batch corrects by record: the
+`messages.sendStory` params carry `deny_unknown_fields`, so a host `caption`
+key answered a local INVALID_REQUEST at the serde layer and the engine's
+caption face was unreachable through this connector. The answer-side half
+was already true transit (the 1.161 pointer faces are raw `Value` arms, the
+caption riding the pointer in-cap-out with no connector follow-up) — only
+the request param was missing.
+
+The landing follows the 1.156 attachment transit class exactly:
+
+- `MessagesSendStoryParams` gains `caption: Option<String>` — the same
+  posture as `attachment`: verbatim transit material, no connector leg
+  gate (a caption riding without the attachment leg is the engine's
+  plain -32603, never silently dropped), no byte gate (the 64 KiB budget
+  is the engine's documented parse), and a JSON null folding to `None`
+  at the serde option layer (the §4.154 with_nulls precedent).
+- `prepare_send_story` rides `frame["caption"]` only when the caller sent
+  it; absence never becomes a key, so every pre-1.185 frame reads
+  byte-identically.
+- The engine's own gates stay authoritative end to end: non-string or
+  empty caption, over-budget caption, and the media-leg-only rule
+  (attachment absent + caption present = nowhere to hang it,
+  `kt-signal-engine src/methods.rs` caption parse) all answer the plain
+  -32603 through the structured ladder to UPSTREAM_ERROR retryable.
+
+Wire additive: one optional key on one existing method, zero new
+methods/events/error codes/store moves/capability bits (the `stories` tag
+widened in place, the 1.82 precedent). Schema: `messagesSendStoryParams`
+gains the `caption` property plus the description-chain sentence (no new
+def, the consistency pointers stay put). The desktop's same-batch publish
+face (kt-desktop `fix/stories-publish`, desktop contract 1.231) consumes
+this key for the story composer's caption input; the answer-side pointer
+faces it reads for its own-media read-back are the already-landed 1.161
+arms (zero connector change there).
+
+Tests (additive): `send_story_caption_leg_rides_the_frame_verbatim` (lib —
+the caption riding the attachment leg byte-for-byte, absent staying absent,
+null folding to the no-key frame, and the caption-without-attachment frame
+forwarding ungated) and the integration arm
+`story_send_caption_rides_and_echoes_through_the_pointer` (the fake
+engine's sendStory arm echoing the caption in-cap-out through the 1.161
+pointer stub — the frame-level forward and the answer-level ride proving
+both directions of the caption chain through the connector).
 
 ## 5. signal-cli Boundary
 

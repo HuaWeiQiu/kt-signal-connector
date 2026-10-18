@@ -98,6 +98,7 @@ fn params(account_id: &str, recipients: Vec<&str>, group: Option<&str>) -> Messa
         preview_url: None,
         preview_title: None,
         attachment: None,
+        caption: None,
         group: group.map(str::to_string).map(Value::String),
     }
 }

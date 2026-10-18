@@ -12629,6 +12629,9 @@ mod tests {
             // Contract 1.156 (§4.154): the media story leg — the text-face
             // tests stay on the text leg, the attachment face has its own.
             attachment: None,
+            // Contract 1.185 (§4.185): the media story's caption — the
+            // dispatch tests stay caption-free, the caption face has its own.
+            caption: None,
             // Contract 1.157 (§4.155): the group audience leg — the
             // dispatch tests stay on the list leg, the group face has its
             // own.

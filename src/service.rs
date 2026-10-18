@@ -5277,6 +5277,16 @@ impl ConnectorService {
     /// forwards as-is — the mixed-domain orchestration is the engine's,
     /// never re-gated here). The group key itself rides raw and ungated:
     /// the whole value domain is the engine's fail-closed parse.
+    ///
+    /// Contract 1.185 (§4.185): `caption` is the media story's caption (the
+    /// engine caption face, engine `48e69a2` — the official
+    /// `AttachmentPointer.caption=11` riding the upload's returned pointer,
+    /// `uploadAttachment.preload.ts:99/:134`), forwarded verbatim on the
+    /// attachment leg's transit class (the 1.156 posture): no connector
+    /// leg gate, no byte gate — the engine's parse owns the whole value
+    /// domain (empty, over the official 64 KiB budget, or riding without
+    /// the attachment leg answer its plain -32603), and absence never
+    /// becomes a key.
     pub fn prepare_send_story(
         &self,
         params: &MessagesSendStoryParams,
@@ -5384,6 +5394,15 @@ impl ConnectorService {
         }
         if let Some(attachment) = params.attachment.as_deref() {
             frame["attachment"] = json!(attachment);
+        }
+        // §4.185 (contract 1.185): the caption rides only when the caller
+        // sent it, the attachment leg's verbatim-transit class — the engine's
+        // documented parse owns the whole value domain (empty, over the
+        // official 64 KiB MAX_BODY_ATTACHMENT_BYTE_LENGTH budget, or riding
+        // without the attachment leg are all its plain -32603), never a
+        // connector gate.
+        if let Some(caption) = params.caption.as_deref() {
+            frame["caption"] = json!(caption);
         }
         // §4.155 (contract 1.157): the group audience leg rides verbatim —
         // the raw value forwarded as the caller shaped it, the engine's
@@ -14480,6 +14499,20 @@ pub struct MessagesSendStoryParams {
     /// and never gates the value domain (empty string included; the
     /// engine's parse owns the refusal).
     pub attachment: Option<String>,
+    /// Contract 1.185 (§4.185): the media story's caption — the engine
+    /// caption face (engine `48e69a2`, the official `AttachmentPointer.caption`
+    /// alignment, the caption riding the upload's returned pointer) riding
+    /// the engine `sendStory` frame verbatim on the attachment leg's class
+    /// (the 1.156 attachment posture): the connector performs no leg gate and
+    /// no byte gate — the caption is verbatim transit material, the engine's
+    /// documented parse owning the whole value domain (a non-string or empty
+    /// caption, a caption over the official MAX_BODY_ATTACHMENT_BYTE_LENGTH
+    /// 64 KiB budget, and a caption riding without the attachment leg are all
+    /// its plain -32603, degrading through the structured ladder to
+    /// UPSTREAM_ERROR retryable). A JSON null folds to None at the serde
+    /// option layer (the §4.154 with_nulls precedent): neither absent nor
+    /// null ever reaches the frame.
+    pub caption: Option<String>,
     /// Contract 1.157 (§4.155): the group audience leg — the engine groupId
     /// (the group master key standard base64, the `sendTextGroup` group-id
     /// caliber) riding the engine `sendStory` frame verbatim. The key stays
@@ -27884,6 +27917,7 @@ mod tests {
             preview_url: None,
             preview_title: None,
             attachment: None,
+            caption: None,
             group: None,
         };
         let gate = |params: &MessagesSendStoryParams| {
@@ -28044,6 +28078,7 @@ mod tests {
             preview_url: None,
             preview_title: None,
             attachment: attachment.map(str::to_string),
+            caption: None,
             group: None,
         };
 
@@ -28116,6 +28151,98 @@ mod tests {
         ));
     }
 
+    /// messages.sendStory caption leg (contract 1.185, §4.185): the media
+    /// story's caption rides the engine frame verbatim on the attachment
+    /// leg's transit class — no leg gate (a caption without the attachment
+    /// leg forwards as-is, the engine's plain -32603 owns the refusal), no
+    /// byte gate (the official 64 KiB budget is the engine's parse), and
+    /// absence never becoming a key.
+    #[test]
+    fn send_story_caption_leg_rides_the_frame_verbatim() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let params = |attachment: Option<&str>, caption: Option<&str>| MessagesSendStoryParams {
+            account_id: account.id.clone(),
+            message: None,
+            recipients: vec!["+15555550101".into()],
+            distribution_list_id: None,
+            allows_replies: false,
+            text_style: None,
+            body_ranges: None,
+            preview_image: None,
+            preview_url: None,
+            preview_title: None,
+            attachment: attachment.map(str::to_string),
+            caption: caption.map(str::to_string),
+            group: None,
+        };
+
+        // The caption beside the attachment leg: byte-verbatim, the same
+        // frame shape the engine's caption parse documents.
+        let media_uri = "data:image/jpeg;base64,QUJDREVGRw==";
+        assert_eq!(
+            service
+                .prepare_send_story(&params(Some(media_uri), Some("a sunset")))
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "recipients": ["+15555550101"],
+                "allowsReplies": false,
+                "attachment": media_uri,
+                "caption": "a sunset",
+            })
+        );
+
+        // The pre-1.185 media frame: no caption key (absence never serializes).
+        assert_eq!(
+            service
+                .prepare_send_story(&params(Some(media_uri), None))
+                .unwrap()
+                .get("caption"),
+            None
+        );
+
+        // A caption riding without the attachment leg forwards ungated —
+        // the media-leg-only rule is the engine's face, never a connector
+        // gate (the 1.156 zero-local-gate posture).
+        let orphan = service
+            .prepare_send_story(&params(None, Some("orphan")))
+            .unwrap();
+        assert_eq!(orphan.get("attachment"), None);
+        assert_eq!(orphan["caption"], json!("orphan"));
+
+        // The empty caption forwards as-is too (the engine's parse owns the
+        // refusal); a null folds to None at the serde option layer, so the
+        // no-key frame stays byte-identical (the §4.154 with_nulls posture).
+        assert_eq!(
+            service
+                .prepare_send_story(&params(Some(media_uri), Some("")))
+                .unwrap()["caption"],
+            json!("")
+        );
+        let null_folded: MessagesSendStoryParams = serde_json::from_value(json!({
+            "accountId": account.id,
+            "recipients": ["+15555550101"],
+            "attachment": media_uri,
+            "caption": null,
+        }))
+        .unwrap();
+        assert!(null_folded.caption.is_none());
+        assert_eq!(
+            service
+                .prepare_send_story(&null_folded)
+                .unwrap()
+                .get("caption"),
+            None
+        );
+    }
+
     /// messages.sendStory link-preview metadata (contract 1.91, §4.74): the
     /// two optional keys gate independently ahead of the account ladder —
     /// non-https/empty/over-cap `previewUrl` and empty/over-cap
@@ -28146,6 +28273,7 @@ mod tests {
             preview_url,
             preview_title,
             attachment: None,
+            caption: None,
             group: None,
         };
         let gate = |params: &MessagesSendStoryParams| {
@@ -28294,6 +28422,7 @@ mod tests {
             preview_url: None,
             preview_title: None,
             attachment: None,
+            caption: None,
             group,
         };
 
