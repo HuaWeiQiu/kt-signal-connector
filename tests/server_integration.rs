@@ -6623,11 +6623,66 @@ async fn groups_update_quit_round_trip_and_guards() {
         "{wired_calls:?}"
     );
 
+    // Contract 1.180 §4.180: resetLink folds onto the engine's
+    // inviteLinkPassword arm — a freshly minted 24-char standard-base64
+    // password (16 official bytes), never a resetLink key, and two calls
+    // never mint the same password (the official refreshGroupLink: the old
+    // link dies with the old password).
+    let reset_once = request(
+        &mut client,
+        "update-reset-1",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "resetLink": true,
+            "operationId": "group-mgmt-op-reset-1"
+        }),
+    )
+    .await;
+    assert_eq!(reset_once["result"]["status"], "sent", "{reset_once}");
+    let reset_dispatches: Vec<Value> = group_dispatches()
+        .into_iter()
+        .filter(|params| params.get("inviteLinkPassword").is_some())
+        .collect();
+    assert_eq!(reset_dispatches.len(), 1, "{reset_dispatches:?}");
+    let first_password = reset_dispatches[0]["inviteLinkPassword"].as_str().unwrap();
+    assert_eq!(first_password.len(), 24);
+    assert!(first_password.ends_with("=="));
+    assert!(reset_dispatches[0].get("resetLink").is_none());
+    assert_eq!(reset_dispatches[0]["groupId"], "ZmFrZS1ncm91cC0x");
+    let reset_twice = request(
+        &mut client,
+        "update-reset-2",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "resetLink": true,
+            "operationId": "group-mgmt-op-reset-2"
+        }),
+    )
+    .await;
+    assert_eq!(reset_twice["result"]["status"], "sent", "{reset_twice}");
+    let second_passwords: Vec<String> = group_dispatches()
+        .into_iter()
+        .filter_map(|params| {
+            params
+                .get("inviteLinkPassword")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(second_passwords.len(), 2);
+    assert_ne!(second_passwords[0], second_passwords[1]);
+
     // Any change key outside the engine subset (description, the admin and
-    // ban families, resetLink, the permission trio, the member label pair)
-    // still answers the honest whole-call refusal — naming the offending
-    // keys, retryable=false — and dispatches nothing: never a partial
-    // application of the change set.
+    // ban families, the permission trio, the member label pair — resetLink
+    // left this family in 1.180 §4.180) still answers the honest whole-call
+    // refusal — naming the offending keys, retryable=false — and dispatches
+    // nothing: never a partial application of the change set. (The set below
+    // also carries resetLink, which now folds — but the other offenders
+    // still refuse the whole call.)
     let dispatches_before = group_dispatches().len();
     let refused_update = request(
         &mut client,
@@ -6754,6 +6809,9 @@ async fn groups_update_quit_round_trip_and_guards() {
                 && params.get("addMembers").is_none()
                 && params.get("removeMembers").is_none()
                 && params.get("addFromInviteLinkAccess").is_none()
+                // 1.180 §4.180: the reset-link dispatches carry
+                // inviteLinkPassword — not the quit face.
+                && params.get("inviteLinkPassword").is_none()
         })
         .collect();
     assert_eq!(quit_calls.len(), 1, "{quit_calls:?}");

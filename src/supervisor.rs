@@ -7908,6 +7908,18 @@ fn group_extra_json(members: &[Value], group: &Value) -> String {
     if group.get("isTerminated").and_then(Value::as_bool) == Some(true) {
         extra.insert("isTerminated".to_string(), json!(true));
     }
+    // Contract 1.180 (§4.180): the official link-access word the upstream
+    // JsonGroup carries (`addFromInviteLink` — the official
+    // buildAccessControlAddFromInviteLinkChange vocabulary the desktop's
+    // group-link face derives hasGroupLink/approval from). MEMBER is not a
+    // link-join state and UNKNOWN is the engine's unparsed fallback —
+    // neither is a display state the official client knows, so both (and
+    // every malformed value) collapse to absent: unknown, never a lie.
+    if let Some(word) = group.get("addFromInviteLink").and_then(Value::as_str)
+        && matches!(word, "ANY" | "ADMINISTRATOR" | "UNSATISFIABLE")
+    {
+        extra.insert("linkAccess".to_string(), json!(word));
+    }
     Value::Object(extra).to_string()
 }
 
@@ -10762,6 +10774,36 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(terminated["isTerminated"], serde_json::json!(true));
+
+        // Contract 1.180 (§4.180): the upstream JsonGroup.addFromInviteLink
+        // word is captured as `linkAccess` — only the official vocabulary
+        // (ANY/ADMINISTRATOR/UNSATISFIABLE, the official
+        // buildAccessControlAddFromInviteLinkChange enum); MEMBER/UNKNOWN/
+        // malformed and absent all collapse to an absent key (unknown,
+        // never a lie — the engines-without-the-face and pre-1.180 rows
+        // answer the same absent key).
+        for word in ["ANY", "ADMINISTRATOR", "UNSATISFIABLE"] {
+            let extra = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+                members.as_array().unwrap(),
+                &json!({"id": "aWQ", "isMember": true, "addFromInviteLink": word}),
+            ))
+            .unwrap();
+            assert_eq!(extra["linkAccess"], serde_json::json!(word));
+        }
+        for word in ["MEMBER", "UNKNOWN", "not-a-word"] {
+            let extra = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+                members.as_array().unwrap(),
+                &json!({"id": "aWQ", "isMember": true, "addFromInviteLink": word}),
+            ))
+            .unwrap();
+            assert!(extra.get("linkAccess").is_none(), "word {word} collapses");
+        }
+        let no_word = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true}),
+        ))
+        .unwrap();
+        assert!(no_word.get("linkAccess").is_none());
     }
 
     #[test]

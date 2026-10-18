@@ -5,6 +5,22 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.180 (2026-10-18; §4.180 the group-link read face and
+  the reset-link write arm: the sync capture keeps the upstream JsonGroup's
+  `addFromInviteLink` word — only the official vocabulary ANY /
+  ADMINISTRATOR / UNSATISFIABLE, MEMBER/UNKNOWN collapse to absent — and
+  `groups.get` projects it as the optional `linkAccess` key (absent on
+  pre-1.180 rows = unknown, never a lie), the desktop's B-04 group-link
+  face deriving the official `hasGroupLink`/approval states
+  (GroupLinkManagement.dom.tsx:46-53) from it. The write side flips the
+  long-refused `groups.update resetLink` into the engine's
+  `inviteLinkPassword` arm: the connector mints the official 16-byte CSPRNG
+  password locally — exactly the official client's own refreshGroupLink
+  posture (conversations.preload.ts:4793-4795) — and rides it standard
+  base64 onto the engine payload; the old link dies with the old password.
+  Revision 1.177 is the parallel admin-write batch's and 1.178/1.179 the
+  quote-deep-link and unknown-reconcile batches'; this batch continues the
+  merge sequence, no gap.)
 - Contract revision: 1.179 (2026-10-18; §4.179 the unknown-outcome reconciliation arm:
   a startup pass over unsettled outgoing rows (ledger `status='unknown'` — the §4.172
   anti-double-delivery residue) asks the engine, row by row, whether it ever
@@ -15282,6 +15298,72 @@ dispatched=true arm settles sent with `sent_at` preserved; the
 dispatched=false arm settles failed and a retryText rearm is granted; the
 engine-error arm leaves the row unknown and the pass continues; a
 cap-exceeding backlog drains across batches; a re-run converges to no-ops).
+
+### 4.180 The group-link read face and the reset-link write arm: `groups.get linkAccess` + `groups.update resetLink`→engine `inviteLinkPassword` (contract revision 1.180, 2026-10-18)
+
+The desktop's B-04 batch (desktop contract 1.195) rebuilds the official
+GroupLinkManagement face and needs two things the connector did not yet
+give it: the group's link-access truth, and an honest reset write.
+
+**The read face.** The engine's `listGroups` JsonGroup has carried the
+`addFromInviteLink` word since the P13 group-link batch (the official
+`buildAccessControlAddFromInviteLinkChange` vocabulary), but the sync
+capture dropped it — the desktop's official `hasGroupLink` /
+`membersNeedAdminApproval` derivations
+(GroupLinkManagement.dom.tsx:46-53: `groupLink != null &&
+accessControlAddFromInviteLink !== UNSATISFIABLE` /
+`accessControlAddFromInviteLink === ADMINISTRATOR`) had no local truth to
+derive from. The capture now keeps the word in `group_extra_json` under
+`linkAccess` — **only the official vocabulary** ANY (link on, joins
+without approval), ADMINISTRATOR (link on, admin approval gate),
+UNSATISFIABLE (link off; the official toggle-off keeps the password, so
+this word alone carries the off state). MEMBER is not a link-join state
+and UNKNOWN is the engine's unparsed fallback — neither is a display
+state the official client knows, so both (and every malformed value)
+collapse to an absent key: unknown, never a lie. `groups.get` projects
+the captured word as the optional `linkAccess` key — absent on pre-1.180
+rows and every capture outside the vocabulary; the row converges through
+the next sync exactly like `isTerminated`/`announcementsOnly` (a
+malformed stored value drops, never fails the read). The official
+`groupLink != null` half of the hasGroupLink condition rides the same
+word: an enabled link implies materialized password material upstream, so
+`linkAccess ∈ {ANY, ADMINISTRATOR}` is the honest projection of the whole
+official condition onto the word the engine exposes.
+
+**The write face.** `groups.update resetLink: true` has answered
+CAPABILITY_UNAVAILABLE since 1.115 named the key — the engine's
+`updateGroup` actually carries the `inviteLinkPassword` arm (raw bytes
+into `modify_invite_link_password`, the official
+`buildInviteLinkPasswordChange`; the engine's own param gate takes
+standard base64, 1..N bytes, shape failures -32603). The fold now maps
+`resetLink: true` to that arm: the connector mints a fresh 16-byte CSPRNG
+password — **exactly the official client's own posture**
+(conversations.preload.ts:4788-4805 `refreshGroupLink`:
+`Bytes.toBase64(generateGroupInviteLinkPassword())` minted client-side
+then committed as the invite-link-password change; the §4.98
+`generateInviteLinkPassword` engine face stays the engine-side mint for
+tooling, not a dependency of this path) — and rides it onto the engine
+payload as standard base64 via the connector's own `base64_encode`. The
+password is single-pass material: never logged, never persisted, one
+dispatch. The old link dies with the old password (the official reset
+semantics — "People will no longer be able to join the group using the
+current link"). `resetLink: false` keeps its absent semantics (1.45); the
+rest of the refusal family (groupDescription, the admin and ban families,
+the permission trio, the member label pair) answers
+CAPABILITY_UNAVAILABLE exactly as before — resetLink simply leaves that
+family. The fold is atomic with any other change in the same set (the
+engine commits one change broadcast), and a 409 revision race keeps the
+1.115 discipline: re-read then re-compose, never blind replay.
+
+Tests (only additions): `groups_update_reset_link_folds_a_fresh_password`
+(the dispatch payload carries a 24-char standard-base64
+`inviteLinkPassword` — 16 bytes exactly, never `resetLink`, and two calls
+never mint the same password; the mixed set with `linkState` folds both
+keys), `group_extra_json_captures_the_bounded_roster` extended (the three
+official words captured verbatim; MEMBER/UNKNOWN/malformed collapse to an
+absent key), and `get_group_projects_the_cached_group_row` extended (the
+captured word projects as `linkAccess`; pre-1.180 rows and malformed
+stored values answer an absent key — byte-identical to the 1.177 shape).
 
 ## 5. signal-cli Boundary
 

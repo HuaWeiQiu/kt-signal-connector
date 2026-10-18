@@ -5,6 +5,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
 
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -3531,7 +3532,22 @@ impl ConnectorService {
             changes.push(("addFromInviteLinkAccess", json!(access)));
         }
         if params.reset_link == Some(true) {
-            changes.push(("resetLink", json!(true)));
+            // Contract 1.180 (§4.180): the official refreshGroupLink — the
+            // client mints a fresh 16-byte CSPRNG password locally
+            // (conversations.preload.ts:4793-4795
+            // generateGroupInviteLinkPassword, the official
+            // GROUP_INVITE_LINK_PASSWORD_LENGTH) and commits it as the
+            // invite-link-password change; the old link dies with the old
+            // password. The connector is the engine's client, so the mint
+            // lives here (the §4.98 password face stays the engine-side
+            // mint for tooling): the password is single-pass material,
+            // never logged or persisted, riding the engine payload as
+            // standard base64 exactly the way the engine's updateGroup arm
+            // reads it (modify_invite_link_password — the official
+            // buildInviteLinkPasswordChange).
+            let mut password = [0u8; 16];
+            rand::rng().fill_bytes(&mut password);
+            changes.push(("inviteLinkPassword", json!(base64_encode(&password))));
         }
         for (value, key) in [
             (
@@ -3619,9 +3635,11 @@ impl ConnectorService {
         // The engine face (contract 1.115, §4.96): the change set folds onto
         // the engine's updateGroup vocabulary — groupName→title, the member
         // arrays verbatim, the avatar tri-state verbatim, the link access
-        // word above. A change set carrying any key outside that subset
-        // (groupDescription, the admin and ban families, resetLink, the
-        // permission trio, the member label pair) answers
+        // word above, and (contract 1.180, §4.180) resetLink→a freshly
+        // minted `inviteLinkPassword` (the official refreshGroupLink fold).
+        // A change set carrying any key outside that subset
+        // (groupDescription, the admin and ban families, the permission
+        // trio, the member label pair) answers
         // CAPABILITY_UNAVAILABLE naming the keys — the honest whole-call
         // refusal, never a partial application: the engine commits the set
         // as one change broadcast and the official client applies it
@@ -3647,6 +3665,9 @@ impl ConnectorService {
                 }
                 "addFromInviteLinkAccess" => {
                     payload.insert("addFromInviteLinkAccess".to_owned(), value);
+                }
+                "inviteLinkPassword" => {
+                    payload.insert("inviteLinkPassword".to_owned(), value);
                 }
                 // The refusal names the caller's schema vocabulary, not the
                 // internal upstream keys the change vec carries.
@@ -11847,6 +11868,18 @@ pub(crate) fn store_get_group_with_requesting(
         .as_ref()
         .and_then(|extra| extra.get("isTerminated").and_then(Value::as_bool))
         == Some(true);
+    // Contract 1.180 (§4.180): the link-access word the sync captured — the
+    // official vocabulary only (ANY / ADMINISTRATOR / UNSATISFIABLE);
+    // MEMBER/UNKNOWN and every pre-1.180 row collapse to an absent key
+    // (unknown, never a lie). A malformed stored value drops, not fails —
+    // a hostile row can never fail the read (the isTerminated discipline).
+    let link_access = extra
+        .as_ref()
+        .and_then(|extra| extra.get("linkAccess").and_then(Value::as_str))
+        .and_then(|word| match word {
+            "ANY" | "ADMINISTRATOR" | "UNSATISFIABLE" => Some(word.to_string()),
+            _ => None,
+        });
     // Contract 1.62 (§4.53 appendix): the live requesting-members projection —
     // resolved against the same read-time contacts-cache name map the roster
     // uses, bounded to the roster cap. `None` (store-only callers, pre-1.62
@@ -11870,6 +11903,7 @@ pub(crate) fn store_get_group_with_requesting(
         member_count,
         members: members?,
         is_terminated,
+        link_access,
         requesting_members,
         pending_members,
         synced_at,
@@ -12496,7 +12530,15 @@ pub struct MediaCloseView {
 /// 1.62, §4.53 appendix) is the live read, not the cached row — see the
 /// supervisor projection. `pending_members` (contract revision 1.64, §4.57)
 /// is the same-shaped live read of the invited-but-not-yet-joined set — see
-/// the supervisor projection.
+/// the supervisor projection. `link_access` (contract revision 1.180,
+/// §4.180) is the upstream `JsonGroup.addFromInviteLink` word the sync
+/// captured — the official link-access vocabulary (ANY / ADMINISTRATOR /
+/// UNSATISFIABLE; MEMBER is not a link-join state and UNKNOWN is the
+/// engine's unparsed fallback, both collapse to absent) the desktop's
+/// group-link face derives `hasGroupLink`/approval from
+/// (GroupLinkManagement.dom.tsx:46-53). Absent on pre-1.180 rows and every
+/// capture outside the vocabulary — unknown, never a lie; the row converges
+/// through the next sync like every other captured flag.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupDetails {
@@ -12506,6 +12548,8 @@ pub struct GroupDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub members: Option<Vec<GroupMemberView>>,
     pub is_terminated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_access: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requesting_members: Option<Vec<GroupRequestingMemberView>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -29751,6 +29795,64 @@ mod tests {
         let plain = serde_json::to_value(&group).unwrap();
         assert_eq!(plain["isTerminated"], json!(false));
 
+        // Contract 1.180 (§4.180): the captured link-access word projects
+        // as the optional `linkAccess` key — only the official vocabulary.
+        // A pre-1.180 row (the plain fixture above) answers an absent key,
+        // byte-identical to the 1.177 shape.
+        assert_eq!(group.link_access, None);
+        assert!(plain.get("linkAccess").is_none());
+        for (word, expected) in [
+            ("ANY", "ANY"),
+            ("ADMINISTRATOR", "ADMINISTRATOR"),
+            ("UNSATISFIABLE", "UNSATISFIABLE"),
+        ] {
+            service
+                .store_ref()
+                .upsert_contact(
+                    &account.id,
+                    "group",
+                    &format!("bGluay17d29yZH0t{word}"),
+                    "Link Word Group",
+                    Some(
+                        json!({"memberCount": 3, "linkAccess": word})
+                            .to_string()
+                            .as_str(),
+                    ),
+                    1725300004,
+                )
+                .unwrap();
+            let projected = service
+                .get_group(&account.id, &format!("bGluay17d29yZH0t{word}"))
+                .unwrap();
+            assert_eq!(projected.link_access.as_deref(), Some(expected));
+        }
+        // MEMBER/UNKNOWN/malformed stored values collapse to absent —
+        // unknown, never a lie.
+        let off_words = [
+            ("bGluay1vZmYtbWVtYmVy", "MEMBER"),
+            ("bGluay1vZmYtdW5rbm93bg", "UNKNOWN"),
+            ("bGluay1vZmYtbWFsZm9ybWVk", "not-a-word"),
+        ];
+        for (key, word) in off_words {
+            service
+                .store_ref()
+                .upsert_contact(
+                    &account.id,
+                    "group",
+                    key,
+                    "Off-Word Group",
+                    Some(
+                        json!({"memberCount": 3, "linkAccess": word})
+                            .to_string()
+                            .as_str(),
+                    ),
+                    1725300005,
+                )
+                .unwrap();
+            let projected = service.get_group(&account.id, key).unwrap();
+            assert_eq!(projected.link_access, None, "word {word} collapses");
+        }
+
         // Contract 1.62 (§4.53 appendix): the live requesting-members
         // projection. None (the pre-1.62 face, engine stopped / refused)
         // keeps the key absent — byte-identical to the cached row face.
@@ -35064,6 +35166,92 @@ mod tests {
                 "groupId": "group-id-1"
             })
         );
+    }
+
+    /// The groups.update resetLink fold (contract 1.180, §4.180): the
+    /// official refreshGroupLink — a fresh 16-byte CSPRNG password minted
+    /// connector-side (the official client's own posture,
+    /// conversations.preload.ts:4793-4795) riding the engine's
+    /// inviteLinkPassword arm as standard base64. Two calls never mint the
+    /// same password; the payload never carries a `resetLink` key (the
+    /// engine face has none); the fold composes with the link-access word
+    /// in the same atomic change set.
+    #[test]
+    fn groups_update_reset_link_folds_a_fresh_password() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let params = |reset_link: Option<bool>, link_state: Option<String>| GroupsUpdateParams {
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            group_name: None,
+            group_description: None,
+            add_members: None,
+            remove_members: None,
+            promote_admins: None,
+            demote_admins: None,
+            ban_members: None,
+            unban_members: None,
+            link_state,
+            reset_link,
+            permission_add_member: None,
+            permission_edit_details: None,
+            permission_send_messages: None,
+            member_label: None,
+            member_label_emoji: None,
+            avatar: AvatarUpdate::Keep,
+            operation_id: None,
+        };
+        let first = service
+            .prepare_groups_update(&params(Some(true), None))
+            .unwrap();
+        let second = service
+            .prepare_groups_update(&params(Some(true), None))
+            .unwrap();
+        let password_of = |payload: &Value| -> String {
+            let password = payload.get("inviteLinkPassword").and_then(Value::as_str);
+            assert!(password.is_some(), "payload carries inviteLinkPassword");
+            let password = password.expect("checked above");
+            // Standard base64 of exactly 16 bytes: 24 chars, ending in the
+            // two-char padding of the 16-byte tail block (the official
+            // GROUP_INVITE_LINK_PASSWORD_LENGTH material).
+            assert_eq!(password.len(), 24);
+            assert!(password.ends_with("=="));
+            assert!(password.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                || byte == b'+'
+                || byte == b'/'
+                || byte == b'='));
+            password.to_string()
+        };
+        let first_password = password_of(&first);
+        let second_password = password_of(&second);
+        assert_ne!(first_password, second_password, "each mint is fresh");
+        assert!(
+            first.get("resetLink").is_none(),
+            "the engine face carries no resetLink key"
+        );
+        // The fold composes with the link-access word in one atomic set.
+        let mixed = service
+            .prepare_groups_update(&params(Some(true), Some("enabled-without-approval".into())))
+            .unwrap();
+        assert_eq!(mixed.get("addFromInviteLinkAccess"), Some(&json!("ANY")));
+        let mixed_password = password_of(&mixed);
+        assert_ne!(mixed_password, first_password);
+        // resetLink: false keeps its absent semantics (1.45) — no change,
+        // the empty-set refusal.
+        let error = service
+            .prepare_groups_update(&params(Some(false), None))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
     }
 
     /// The groups.update avatar tri-state (contract 1.89; the engine face
