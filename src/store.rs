@@ -1256,6 +1256,22 @@ pub struct MessageSendOutcomes {
     pub failed: u32,
 }
 
+/// §4.179 unknown-outcome reconciliation batch entry: one unsettled outgoing
+/// row joined with everything the engine lookup needs — the signal account
+/// (the engine's `account` key), the conversation's addressing (kind +
+/// peer_key, the `set_upstream_target` semantics the original send used), and
+/// the row's own prepare-time `sent_at` (the lookup's sentTimestamp).
+#[derive(Clone, Debug)]
+pub struct UnknownSendRow {
+    pub id: String,
+    pub account_id: String,
+    pub conversation_id: String,
+    pub signal_account: String,
+    pub conversation_kind: String,
+    pub peer_key: String,
+    pub sent_at: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageRecord {
@@ -7107,6 +7123,144 @@ impl Store {
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(())
+    }
+
+    /// §4.179 unknown-outcome reconciliation: the unsettled backlog of one
+    /// proxy group — outgoing rows still `status='unknown'` (the §4.172
+    /// anti-double-delivery residue the engine restart window leaves behind).
+    /// Oldest first (a head-of-line dead row heals first), bounded by the
+    /// caller's batch cap; the reconciliation pass loops cap-sized batches
+    /// until the query answers short, so the bound is per-round, not a cap
+    /// on the whole backlog.
+    pub fn unsettled_unknown_outgoing_sends(
+        &self,
+        proxy_group: &str,
+        limit: u32,
+    ) -> Result<Vec<UnknownSendRow>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id, m.account_id, m.conversation_id, a.signal_account,
+                        c.kind, c.peer_key, m.sent_at
+                 FROM messages m
+                 JOIN accounts a ON a.id = m.account_id
+                 JOIN conversations c ON c.id = m.conversation_id
+                 WHERE m.status='unknown' AND m.direction='outgoing'
+                   AND a.proxy_group=?1
+                 ORDER BY m.sent_at ASC, m.id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![proxy_group, limit as i64], |row| {
+                Ok(UnknownSendRow {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    conversation_id: row.get(2)?,
+                    signal_account: row.get(3)?,
+                    conversation_kind: row.get(4)?,
+                    peer_key: row.get(5)?,
+                    sent_at: row.get::<_, i64>(6)?.max(0) as u64,
+                })
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// §4.179 unknown-outcome reconciliation: the guarded settle. The engine
+    /// answered the reconciliation lookup, so the row leaves `unknown` for a
+    /// terminal state the engine's own ledger vouches for:
+    /// `dispatched=true` → `sent`, KEEPING the row's original `sent_at` (the
+    /// prepare-time stamp — the engine's matched-row timestamp stays on the
+    /// engine side; the summaries bump monotonically off the kept stamp, the
+    /// §4.93 never-regress discipline); `dispatched=false` → plain `failed`
+    /// (provably never sent — the §4.172 gate re-opens with zero
+    /// double-delivery risk). The `WHERE status='unknown'` guard is the whole
+    /// point: a row that moved on (a concurrent retry rearm to `pending`, a
+    /// settled terminal state, a swept row) is never stomped, which is also
+    /// what makes the whole pass idempotent — a re-run's settles report
+    /// `None`/`false` and emit nothing. The failed arm retires any retry
+    /// schedule face in the same breath (the §4.123 store-layer red line,
+    /// belt-and-braces with `complete_send_unknown`'s own retire).
+    pub fn settle_unknown_send(
+        &self,
+        message_id: &str,
+        dispatched: bool,
+    ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let status: &str = if dispatched { "sent" } else { "failed" };
+        let changed = transaction
+            .execute(
+                "UPDATE messages SET status=?2,
+                        first_send_attempted_at=NULL, retry_attempt_count=0, next_attempt_at=NULL
+                 WHERE id=?1 AND status='unknown'",
+                params![message_id, status],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if changed != 1 {
+            return Ok(None);
+        }
+        if !dispatched {
+            // The failed arm retires the scheduling face in the same
+            // transaction (unknown rows should never carry one — the §4.123
+            // red line — but the settle is the one guaranteed pass point).
+            transaction
+                .execute(
+                    "UPDATE messages SET next_attempt_at=NULL
+                     WHERE id=?1 AND next_attempt_at IS NOT NULL",
+                    params![message_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        } else {
+            // The sent arm bumps the summaries monotonically off the kept
+            // sent_at (the complete_outgoing_send CASE guard verbatim — the
+            // prepare-time stamp can sit below a newer row the guard must
+            // leave alone).
+            transaction
+                .execute(
+                    "UPDATE conversations
+                     SET last_message_at=CASE
+                           WHEN last_message_at IS NULL OR last_message_at < (
+                             SELECT sent_at FROM messages WHERE id=?1
+                           ) THEN (SELECT sent_at FROM messages WHERE id=?1)
+                           ELSE last_message_at END
+                     WHERE id=(SELECT conversation_id FROM messages WHERE id=?1)
+                       AND account_id=(SELECT account_id FROM messages WHERE id=?1)",
+                    params![message_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            transaction
+                .execute(
+                    "UPDATE accounts
+                     SET last_message_at=CASE
+                           WHEN last_message_at IS NULL OR last_message_at < (
+                             SELECT sent_at FROM messages WHERE id=?1
+                           ) THEN (SELECT sent_at FROM messages WHERE id=?1)
+                           ELSE last_message_at END
+                     WHERE id=(SELECT account_id FROM messages WHERE id=?1)",
+                    params![message_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        let record = transaction
+            .query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                 FROM messages WHERE id=?1",
+                params![message_id],
+                message_record_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(record.map(|record| (record, changed == 1)))
     }
 
     /// Mark a pending outgoing row sent. Returns the updated row and whether
@@ -16316,6 +16470,285 @@ mod tests {
                 .map(|row| row.id),
             Some("outcome-unknown".to_string())
         );
+    }
+
+    /// §4.179 unknown-outcome reconciliation: the backlog query answers
+    /// exactly this proxy group's unsettled outgoing rows — status='unknown'
+    /// AND direction='outgoing' — joined with the engine lookup's addressing
+    /// (signal account, conversation kind + peer_key), oldest first, bounded
+    /// by the batch cap. Other groups' rows, settled rows, and incoming rows
+    /// never enter the batch.
+    #[test]
+    fn unsettled_unknown_query_scopes_group_direction_and_bounds_batch() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let other_group = store
+            .upsert_account_from_signal("+15555550200", Some(1), "other-group")
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let group_conversation = store
+            .ensure_conversation(&account.id, "group", "GROUPKEY==", "Group")
+            .unwrap();
+        let other_conversation = store
+            .ensure_conversation(&other_group.id, "direct", "+15555550201", "Other")
+            .unwrap();
+
+        let base = now_ms() - 10_000;
+        let seed = |id: &str,
+                    account_id: &str,
+                    conversation_id: &str,
+                    status: &'static str,
+                    direction: &'static str,
+                    sent_at: u64| {
+            let record = MessageRecord {
+                id: id.into(),
+                account_id: account_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                direction,
+                sender_id: account_id.to_string(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status,
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                quote: None,
+                attachments: Vec::new(),
+                edited_at: None,
+                rich: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                send_outcomes: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+                server_timestamp: None,
+                is_story: false,
+                story_message: None,
+            };
+            store
+                .insert_message(&record, None, Some("body"), false)
+                .unwrap();
+        };
+        seed(
+            "unknown-1",
+            &account.id,
+            &conversation.id,
+            "unknown",
+            "outgoing",
+            base,
+        );
+        seed(
+            "unknown-2",
+            &account.id,
+            &group_conversation.id,
+            "unknown",
+            "outgoing",
+            base + 1,
+        );
+        seed(
+            "unknown-3",
+            &account.id,
+            &conversation.id,
+            "unknown",
+            "outgoing",
+            base + 2,
+        );
+        // Distractors: settled, in-flight, incoming, and another group's row.
+        seed(
+            "settled",
+            &account.id,
+            &conversation.id,
+            "sent",
+            "outgoing",
+            base + 3,
+        );
+        seed(
+            "pending",
+            &account.id,
+            &conversation.id,
+            "pending",
+            "outgoing",
+            base + 4,
+        );
+        seed(
+            "incoming-unknown",
+            &account.id,
+            &conversation.id,
+            "unknown",
+            "incoming",
+            base + 5,
+        );
+        seed(
+            "other-group-unknown",
+            &other_group.id,
+            &other_conversation.id,
+            "unknown",
+            "outgoing",
+            base + 6,
+        );
+
+        // Full backlog: exactly this group's three unsettled outgoing rows,
+        // oldest first, with the engine lookup's addressing joined in.
+        let rows = store
+            .unsettled_unknown_outgoing_sends(DEFAULT_PROXY_GROUP_ID, 16)
+            .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["unknown-1", "unknown-2", "unknown-3"]);
+        assert_eq!(rows[0].signal_account, "+15555550100");
+        assert_eq!(rows[0].conversation_kind, "direct");
+        assert_eq!(rows[0].peer_key, "+15555550101");
+        assert_eq!(rows[0].sent_at, base);
+        assert_eq!(rows[1].conversation_kind, "group");
+        assert_eq!(rows[1].peer_key, "GROUPKEY==");
+
+        // Batch cap bounds the round: a short batch is the drained signal,
+        // a full batch means another round follows (the pass loops).
+        let bounded = store
+            .unsettled_unknown_outgoing_sends(DEFAULT_PROXY_GROUP_ID, 2)
+            .unwrap();
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0].id, "unknown-1");
+
+        // A different group's backlog answers its own rows — and only those.
+        let other_rows = store
+            .unsettled_unknown_outgoing_sends("other-group", 16)
+            .unwrap();
+        assert_eq!(other_rows.len(), 1);
+        assert_eq!(other_rows[0].id, "other-group-unknown");
+        assert_eq!(other_rows[0].signal_account, "+15555550200");
+    }
+
+    /// §4.179 unknown-outcome reconciliation: the guarded settle. The sent
+    /// arm keeps the row's original sent_at (the engine's matched-row
+    /// timestamp stays engine-side) and bumps the conversation summary
+    /// monotonically; the failed arm settles plain. The `status='unknown'`
+    /// guard is the idempotency face: a second settle, and a settle aimed at
+    /// a row that moved on (pending/sent), report None and change nothing.
+    #[test]
+    fn settle_unknown_send_is_guarded_and_keeps_sent_at() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let sent_at = now_ms() - 60_000;
+        let record = MessageRecord {
+            id: "reconcile-row".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "outgoing",
+            sender_id: account.id.clone(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "unknown",
+            client_request_id: Some("request-unknown".into()),
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            edited_at: None,
+            rich: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        store
+            .insert_message(&record, Some("request-unknown"), Some("body"), false)
+            .unwrap();
+
+        // dispatched=true: settled sent, sent_at preserved verbatim, real
+        // transition reported, schedule faces clear, summary bumped to the
+        // kept stamp.
+        let (settled, transitioned) = store
+            .settle_unknown_send("reconcile-row", true)
+            .unwrap()
+            .expect("unknown row settles");
+        assert!(transitioned);
+        assert_eq!(settled.status, "sent");
+        assert_eq!(settled.sent_at, sent_at);
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .expect("summary");
+        assert_eq!(summary.last_message_at, Some(sent_at));
+
+        // Idempotency: the row left unknown — a re-run reports None.
+        assert!(
+            store
+                .settle_unknown_send("reconcile-row", false)
+                .unwrap()
+                .is_none()
+        );
+        let after = store
+            .message_by_client_request(&account.id, "request-unknown")
+            .unwrap()
+            .expect("row");
+        assert_eq!(after.status, "sent");
+
+        // Guard: a settle aimed at a row that moved on changes nothing.
+        store
+            .update_message_status("reconcile-row", "pending", None)
+            .unwrap();
+        assert!(
+            store
+                .settle_unknown_send("reconcile-row", true)
+                .unwrap()
+                .is_none()
+        );
+        let pending = store
+            .message_by_client_request(&account.id, "request-unknown")
+            .unwrap()
+            .expect("row");
+        assert_eq!(pending.status, "pending");
+
+        // dispatched=false arm: unknown -> failed, plain settle.
+        store
+            .update_message_status("reconcile-row", "unknown", None)
+            .unwrap();
+        let (failed, transitioned) = store
+            .settle_unknown_send("reconcile-row", false)
+            .unwrap()
+            .expect("unknown row settles");
+        assert!(transitioned);
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.sent_at, sent_at);
     }
 
     #[test]

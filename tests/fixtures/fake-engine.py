@@ -366,6 +366,11 @@ LINKED_ACCOUNT = (
     else "+15555550100"
 )
 DELETED_MARKER = SIGNAL_DATA_DIR / ".fixture-account-deleted"
+# §4.179 unknown-outcome reconciliation probe markers: the answer-shape marker
+# (.fixture-lookup-dispatch.json, a verbatim lookupOutgoingDispatch result
+# object) and the error marker (.fixture-lookup-error, -32603 face).
+LOOKUP_DISPATCH_MARKER = SIGNAL_DATA_DIR / ".fixture-lookup-dispatch.json"
+LOOKUP_ERROR_MARKER = SIGNAL_DATA_DIR / ".fixture-lookup-error"
 STDERR_MARKER = SIGNAL_DATA_DIR / ".fixture-stderr-websocket-error"
 FAIL_USER_STATUS_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status"
 FAIL_USER_STATUS_COUNT_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status-count"
@@ -917,6 +922,28 @@ for line in sys.stdin:
         if DELETE_MODE == "crash_after_delete_once":
             os._exit(19)
         result = {}
+    elif method == "lookupOutgoingDispatch":
+        # §4.179 unknown-outcome reconciliation probe: the connector's startup
+        # pass asks whether the engine's own ledger holds the dispatched row.
+        # Record the exact params (asserting the row's addressing — account /
+        # recipient|groupId / sentTimestamp / toleranceMs); answer shape is
+        # marker-driven so a test can arm dispatched=true / dispatched=false /
+        # error faces per row set. Default = the honest never-dispatched face.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if LOOKUP_ERROR_MARKER.exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        if LOOKUP_DISPATCH_MARKER.exists():
+            result = json.loads(LOOKUP_DISPATCH_MARKER.read_text())
+        else:
+            result = {"dispatched": False}
     elif method == "send":
         # Record the exact JSON-RPC params so tests can assert what the
         # connector dispatched upstream (e.g. quoteTimestamp/quoteAuthor).

@@ -114,6 +114,27 @@ const OUTBOX_DUE_WAKE_MIN: Duration = Duration::from_millis(50);
 /// monopolize the store lock or the engine's send queue.
 const OUTBOX_CLAIM_BATCH: u32 = 16;
 
+/// §4.179 unknown-outcome reconciliation: settle beat before the first probe
+/// round — the fresh engine's own startup work (and the link-time inline
+/// sync) lands first, same discipline as the contacts-resync settle delay.
+const UNKNOWN_RECONCILE_SETTLE_DELAY: Duration = Duration::from_secs(2);
+/// §4.179 unknown-outcome reconciliation: rows per probe round. A full batch
+/// loops straight into the next (the query is drained oldest-first and the
+/// settles are guarded), so this bounds the per-round engine probe series,
+/// not the backlog (the batch ceiling below bounds the pass).
+const UNKNOWN_RECONCILE_BATCH: u32 = 64;
+/// §4.179 unknown-outcome reconciliation: hard pass ceiling in batches
+/// (4096 rows — a backlog beyond this is a runaway somewhere else; the pass
+/// exits warn-only and the next engine landing continues).
+const UNKNOWN_RECONCILE_MAX_BATCHES: u32 = 64;
+/// §4.179 unknown-outcome reconciliation: the engine lookup tolerance, pinned
+/// to the engine face's hard cap (`lookupOutgoingDispatch` 1..=60000). Recall
+/// over precision: the unknown row's sent_at is the PREPARE-time stamp while
+/// the engine row's ts is the dispatch envelope timestamp (per-account
+/// queueing + any attachment upload in between); a tight window would
+/// re-strand genuinely dispatched rows — the exact dead state §4.179 heals.
+const UNKNOWN_RECONCILE_TOLERANCE_MS: u64 = 60_000;
+
 /// §4.119 receipt-failure debounce: after one conversation's receipt face
 /// records a failure, another trigger of the same (account, conversation,
 /// face) key inside this window answers `unknown` without touching the
@@ -892,6 +913,152 @@ impl RuntimeSupervisor {
         });
     }
 
+    // -------------------------------------------------------------------------
+    // Unknown-outcome reconciliation (contract revision 1.179, §4.179): the
+    // engine's own thread_messages store is the local truth of "the engine
+    // really dispatched this" (its outgoing rows land only AFTER a dispatch
+    // call returns success), exposed through the read-only engine
+    // `lookupOutgoingDispatch` face. When an engine lands Running, this pass
+    // asks it, row by row, about this group's unsettled outgoing rows
+    // (status='unknown' — the §4.172 anti-double-delivery residue an engine
+    // restart window leaves behind) and settles each with a guarded store
+    // write: dispatched → sent (sent_at kept), not-found → failed (provably
+    // never sent, so the §4.172 retryText gate re-opens with zero
+    // double-delivery risk). Warn-only everywhere: an engine error leaves
+    // the row unknown (without the engine's truth nothing is claimed) and
+    // never blocks startup.
+    // -------------------------------------------------------------------------
+
+    /// Arm the startup reconciliation pass. Best-effort and idempotent: the
+    /// settles are guarded (`WHERE status='unknown'`), so a re-run — a
+    /// watchdog-recovered engine, a later start — converges to no-ops over
+    /// already-settled rows and never stomps a concurrently rearmed retry.
+    fn spawn_unknown_outcome_reconcile(&self) {
+        let Ok(engine_slot) = self.engine.try_lock() else {
+            return;
+        };
+        let Some(engine) = engine_slot
+            .as_ref()
+            .filter(|engine| !engine.is_terminal())
+            .cloned()
+        else {
+            return;
+        };
+        drop(engine_slot);
+        let service = Arc::clone(&self.service);
+        let store = Arc::clone(&self.store);
+        let group_id = self.group_id.clone();
+        let host_events = self.host_events.clone();
+        tokio::spawn(async move {
+            // Let the fresh engine settle first (its own startup work and the
+            // link-time inline sync land; the contacts-resync settle beat).
+            sleep(UNKNOWN_RECONCILE_SETTLE_DELAY).await;
+            for _ in 0..UNKNOWN_RECONCILE_MAX_BATCHES {
+                let batch = match blocking_service({
+                    let store = Arc::clone(&store);
+                    let group_id = group_id.clone();
+                    move || {
+                        store
+                            .unsettled_unknown_outgoing_sends(&group_id, UNKNOWN_RECONCILE_BATCH)
+                            .map_err(ServiceError::Store)
+                    }
+                })
+                .await
+                {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        tracing::warn!(
+                            error_class = error.class(),
+                            "unknown-outcome reconciliation backlog query failed"
+                        );
+                        return;
+                    }
+                };
+                if batch.is_empty() {
+                    return;
+                }
+                let drained = (batch.len() as u32) < UNKNOWN_RECONCILE_BATCH;
+                for row in batch {
+                    // The row's own conversation addressing, the same
+                    // `set_upstream_target` semantics the original send used:
+                    // direct = recipient peer_key, group = groupId master key.
+                    let mut params = json!({
+                        "account": row.signal_account,
+                        "sentTimestamp": row.sent_at,
+                        // The engine's hard tolerance cap: recall over
+                        // precision — the unknown row's sent_at is the
+                        // prepare-time stamp while the engine row's ts is the
+                        // dispatch envelope timestamp (queueing + any
+                        // attachment upload in between); §4.179 records the
+                        // trade-off.
+                        "toleranceMs": UNKNOWN_RECONCILE_TOLERANCE_MS,
+                    });
+                    if row.conversation_kind == "group" {
+                        params["groupId"] = json!(row.peer_key);
+                    } else {
+                        params["recipient"] = json!(row.peer_key);
+                    }
+                    let answer = engine
+                        .call("lookupOutgoingDispatch", params, CallClass::ReadOnly)
+                        .await;
+                    let dispatched = match answer {
+                        Ok(result) => match result.get("dispatched").and_then(Value::as_bool) {
+                            Some(dispatched) => dispatched,
+                            None => {
+                                tracing::warn!(
+                                    "unknown-outcome reconciliation answer lost its dispatched face; row stays unknown"
+                                );
+                                continue;
+                            }
+                        },
+                        // The engine died or the call never landed: without
+                        // the engine's truth nothing is claimed — the row
+                        // stays unknown and the next engine landing re-runs.
+                        Err(EngineError::NotRunning | EngineError::Exited) => {
+                            tracing::warn!(
+                                "engine left before the unknown-outcome reconciliation drained; the next landing re-runs"
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            // Per-row failure (unregistered account,
+                            // unresolvable peer, transport): warn and keep
+                            // draining the rest of the batch.
+                            tracing::warn!(
+                                error_class = ServiceError::from(error).class(),
+                                "unknown-outcome reconciliation probe failed; row stays unknown"
+                            );
+                            continue;
+                        }
+                    };
+                    let events = {
+                        let service = service.lock().await;
+                        service.settle_reconciled_unknown(&row.id, dispatched)
+                    };
+                    match events {
+                        Ok(events) => {
+                            for event in events {
+                                let _ = host_events.send(event);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error_class = error.class(),
+                                "unknown-outcome reconciliation settle failed; row stays unknown"
+                            );
+                        }
+                    }
+                }
+                if drained {
+                    return;
+                }
+            }
+            tracing::warn!(
+                "unknown-outcome reconciliation pass hit its batch ceiling; the next engine landing continues"
+            );
+        });
+    }
+
     /// After a `link.finish`, watch for the archive the engine is
     /// downloading in the background (§4.38): poll every few seconds for at
     /// most [`crate::history_import::LINK_WAIT_MS`], import when the file
@@ -1506,6 +1673,10 @@ impl RuntimeSupervisor {
         if status.state == EngineState::Running {
             self.spawn_contacts_resync();
             self.spawn_history_import_pass();
+            // §4.179: the engine landed — reconcile this group's unsettled
+            // unknown-outcome rows against the engine's own dispatch ledger
+            // (best-effort, idempotent, warn-only).
+            self.spawn_unknown_outcome_reconcile();
             // §4.123: engine landed — the offline queue drains now instead of
             // waiting out the tick (the official online-event re-dispatch).
             self.notify_outbox_drain();

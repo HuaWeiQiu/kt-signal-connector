@@ -5,6 +5,23 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.179 (2026-10-18; §4.179 the unknown-outcome reconciliation arm:
+  a startup pass over unsettled outgoing rows (ledger `status='unknown'` — the §4.172
+  anti-double-delivery residue) asks the engine, row by row, whether it ever
+  dispatched that send — the engine's own `thread_messages` store is the local
+  truth of "the engine really sent this" (its rows land only AFTER a dispatch
+  call returns success), exposed through the new read-only engine method
+  `lookupOutgoingDispatch` (engine compat §3/§5, engine-compat batch).
+  `dispatched: true` settles the row `sent` keeping its original `sent_at`;
+  `dispatched: false` settles it `failed` — provably never sent, so the §4.172
+  retryText gate re-opens with zero double-delivery risk and the dead-state row
+  (unknown forever, resend refused by design) becomes recoverable. The pass is
+  bounded (batch cap, one pass per engine landing), failure-warned (an engine
+  error leaves the row unknown — without the engine's truth nothing is
+  claimed), and idempotent (guarded `unknown ->` settles; a re-run converges).
+  §4.172's refusal semantics are untouched: once the stock of unknown rows is
+  reconciled away, `RETRY_OUTCOME_UNKNOWN` refuses exactly the genuinely
+  in-flight unknowns, which is its correct domain.)
 - Contract revision: 1.178 (2026-10-18; §4.178 the inbound quote deep link:
   a stored `quote_snapshot` resolves to the local row it names — same
   `sent_at`, author checked through the store's own identity derivations —
@@ -15180,6 +15197,91 @@ upsert event carries the resolved id, an unresolvable snapshot stays
 absent). No schema-key change: `quoteMessageId` rides the shared
 MessageRecord face the schema already names on the send side; reads and
 events gain the key additively where it resolves.
+
+### 4.179 The unknown-outcome reconciliation arm: a startup pass asks the engine's own ledger whether each unsettled outgoing row was really dispatched (contract revision 1.179, 2026-10-18)
+
+The 2026-10-18 user evidence convicted a dead state, not a wrong refusal. A
+send was interrupted in an engine-restart window; the mutating call's
+outcome was lost in transport, so the connector settled the row
+`status='unknown'` (the §4.172 anti-double-delivery layer, correct at that
+moment). But the row then stayed unknown forever: `retryText` refuses it
+(`RETRY_OUTCOME_UNKNOWN`, by design — a blind resend could
+double-deliver), and nothing ever revisits the question. Meanwhile the
+engine's own database held the answer: `thread_messages` had ZERO outgoing
+rows at that timestamp — the message was never sent at all. The engine's
+store is the local truth of "the engine really dispatched this"; the
+connector just never asked.
+
+**Why the engine's row is trustworthy in both directions** (forensics in
+engine compat §5, the same-batch engine-compat entry): the vendored send
+paths write `thread_messages` only AFTER the dispatch call returns
+success — the direct leg saves after the server ack
+(`sender.send_message(...).await?` then `save_message`), the group leg
+saves the transcript after the per-member dispatch attempts (even with
+partial failures). So: a row exists ⇒ the engine completed a dispatch
+call; no row ⇒ the dispatch call never succeeded. The residual window —
+server accepted the send but the process died before the row landed — is
+recorded, not asserted away: there, reconciliation answers not-found while
+the message WAS dispatched, a `failed` settle plus resend would
+double-deliver, and the mitigation is the receiver-side
+(destination,timestamp) duplicate folding (presage's receive-side
+`Received::Duplicate` face) — a mitigation, not a guarantee (a connector
+retry mints a fresh timestamp). The window is milliseconds wide (between
+ack and the store write) and strictly narrower than the status quo, where
+EVERY unknown row is a dead state.
+
+**The engine face is read-only and content-free** (engine compat §3
+`lookupOutgoingDispatch`): params `{account, recipient|groupId
+(the row's own conversation addressing — `set_upstream_target` semantics:
+direct peer_key / group master key), sentTimestamp, toleranceMs}`, answer
+`{dispatched, serverTimestamp?}` — never body, numbers, or names (the
+engine's zero-content red line). The tolerance window exists because the
+unknown row's `sent_at` is the PREPARE-time stamp (connector clock) while
+the engine row's ts is the dispatch envelope timestamp (engine clock,
+after per-account queueing and any attachment upload). The arm passes the
+engine's hard cap `toleranceMs=60000` explicitly — recall over precision:
+a too-tight window re-strands genuinely dispatched rows (the bug being
+fixed), while the timestamp-only pairing ambiguity inside a wide window is
+the same grain the official retry-receipt pairing works at. The trade-off
+is recorded, not hidden.
+
+**The arm is a startup pass, not a retry queue.** When the engine lands
+Running (boot start or watchdog recovery — the `spawn_contacts_resync`
+hook point), the pass lists this group's unsettled rows
+(`status='unknown'`, direction outgoing, joined with their conversation
+addressing and signal account), bounded to a batch cap with batched
+iteration (a cap-sized batch loops until drained, hard-capped passes), and
+reconciles each: `dispatched:true` → guarded settle
+`unknown -> sent` KEEPING the original `sent_at` (the row's own prepare
+stamp; the summary bumps stay monotonic — §4.93 discipline);
+`dispatched:false` → guarded settle `unknown -> failed` (provably never
+sent: the §4.172 gate now correctly refuses nothing here and a resend
+carries zero double-delivery risk — `RETRY_NOT_ALLOWED`/`RETRY_IN_FLIGHT`
+keep their own guards). Every settle emits the settlement event set
+(message upsert + status change + conversation + account), the same faces
+`complete_send_success` serves. An engine error on a row (transport,
+unregistered account, unresolvable peer) is warn-only and leaves the row
+`unknown` — without the engine's truth nothing is claimed, and the next
+engine landing re-runs the pass (idempotent: settled rows drop out of the
+query; the settles are guarded `WHERE status='unknown'` so a concurrent
+retry rearm is never stomped). The pass never blocks startup: it sleeps a
+settle beat first (the fresh engine's own startup work lands) and every
+failure is a warn.
+
+**§4.172 itself is untouched.** The refusal semantics stay exactly as
+written: once the stock of unknown rows is reconciled away,
+`RETRY_OUTCOME_UNKNOWN` answers only genuinely in-flight unknowns — which
+is its correct domain. No new host method, no wire change: the arm rides
+store faces + one new engine read.
+
+Tests (+6, only additions: store unit +2, integration +4): store unit (the unsettled query — group
+scoping, batch bound, direction/status filters; the guarded settles —
+sent keeps `sent_at`, failed retires schedules, non-unknown rows are
+never touched) and integration against the fixture engine (the
+dispatched=true arm settles sent with `sent_at` preserved; the
+dispatched=false arm settles failed and a retryText rearm is granted; the
+engine-error arm leaves the row unknown and the pass continues; a
+cap-exceeding backlog drains across batches; a re-run converges to no-ops).
 
 ## 5. signal-cli Boundary
 

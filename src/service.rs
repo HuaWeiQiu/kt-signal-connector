@@ -8452,6 +8452,51 @@ impl ConnectorService {
         ))
     }
 
+    /// §4.179 unknown-outcome reconciliation: settle one unsettled row with
+    /// the engine's own answer. `dispatched=true` → the guarded
+    /// `unknown -> sent` settle keeping the row's original `sent_at` (the
+    /// engine's matched-row timestamp stays on the engine side; summaries
+    /// bump monotonically off the kept stamp); `dispatched=false` → the
+    /// guarded `unknown -> failed` settle (provably never sent — the §4.172
+    /// retryText gate re-opens with zero double-delivery risk). The store
+    /// guard (`WHERE status='unknown'`) is the idempotency/concurrency face:
+    /// a row that moved on (retry rearm, terminal settle, sweep) reports
+    /// `None` and emits nothing. The event set mirrors
+    /// `complete_send_success`: message upsert + status change (real
+    /// transitions only) + conversation + account summaries.
+    pub fn settle_reconciled_unknown(
+        &self,
+        message_id: &str,
+        dispatched: bool,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some((mut updated, status_transitioned)) =
+            self.store.settle_unknown_send(message_id, dispatched)?
+        else {
+            return Ok(Vec::new());
+        };
+        let account_id = updated.account_id.clone();
+        self.store
+            .attach_reactions(&account_id, std::slice::from_mut(&mut updated))?;
+        self.store
+            .attach_outgoing_quotes(&account_id, std::slice::from_mut(&mut updated))?;
+        let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
+            updated.clone(),
+        ))];
+        if status_transitioned {
+            events.push(status_changed_event(&updated));
+        }
+        if let Some(conversation) = self
+            .store
+            .conversation_summary(&updated.account_id, &updated.conversation_id)?
+        {
+            events.push(HostSideEvent::ConversationChanged(conversation));
+        }
+        if let Some(account) = self.store.account_summary(&updated.account_id)? {
+            events.push(HostSideEvent::AccountChanged(account));
+        }
+        Ok(events)
+    }
+
     /// Contract 1.21: the engine classified an upstream authorization failure
     /// for `signal_account` — the account holder unlinked this device. Persist
     /// the dead state and surface it as an `account.changed` event so the
