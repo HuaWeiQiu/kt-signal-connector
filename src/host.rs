@@ -4611,6 +4611,7 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
             account_id,
             deletes,
             conversations,
+            attachments,
         } => {
             // Contract 1.102, §4.83: the delete groups ride with the
             // absent-optional discipline — a group nothing resolved stays
@@ -4627,6 +4628,15 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
             if !conversations.is_empty() {
                 payload["conversations"] =
                     serde_json::to_value(&conversations).unwrap_or(serde_json::Value::Null);
+            }
+            // Contract 1.196, §4.196: the single-attachment entries ride the
+            // same additive lane. The key is skipped when empty so every
+            // pre-1.196 envelope (and every envelope without the fourth arm)
+            // keeps its previous frame byte-for-byte; within an entry the
+            // serde skips keep an unresolved id or an absent leg out.
+            if !attachments.is_empty() {
+                payload["attachmentDeletes"] =
+                    serde_json::to_value(&attachments).unwrap_or(serde_json::Value::Null);
             }
             Ok(HostEvent::new("message.deleteForMe", payload))
         }
@@ -6743,12 +6753,21 @@ mod tests {
                     },
                 ],
                 conversations: Vec::new(),
+                attachments: Vec::new(),
             })
             .unwrap(),
         )
         .unwrap();
         assert_eq!(frame["event"], "message.deleteForMe");
         assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert!(
+            frame["data"].get("conversations").is_none(),
+            "the empty arm keeps the 1.102 frame"
+        );
+        assert!(
+            frame["data"].get("attachmentDeletes").is_none(),
+            "the empty arm keeps the pre-1.196 frame"
+        );
         assert_eq!(frame["data"]["deletes"].as_array().unwrap().len(), 2);
         let first = &frame["data"]["deletes"][0];
         assert_eq!(first["conversationId"], "conv-1");
@@ -6762,6 +6781,76 @@ mod tests {
         // messageId-less, an unresolved group stays conversation-less.
         assert!(first["messages"][1].get("messageId").is_none());
         assert!(frame["data"]["deletes"][1].get("conversationId").is_none());
+    }
+
+    /// Contract 1.196 (§4.196): the fourth `message.deleteForMe` arm. Each
+    /// entry carries the raw one-of legs the projection stated plus the ids
+    /// the connector resolved; an unresolved id or an absent leg stays out
+    /// (the absent-optional discipline), and an envelope without the arm
+    /// keeps the pre-1.196 frame exactly.
+    #[tokio::test]
+    async fn delete_for_me_event_rides_attachment_deletes() {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::SyncDeleteForMe {
+                account_id: "acct-1".into(),
+                deletes: Vec::new(),
+                conversations: Vec::new(),
+                attachments: vec![
+                    crate::service::SyncDeletedAttachment {
+                        conversation_id: Some("conv-1".into()),
+                        message_id: Some("msg-1".into()),
+                        attachment_id: Some("att-1".into()),
+                        client_uuid: Some("11111111-2222-4333-8444-555555555555".into()),
+                        fallback_digest: None,
+                        fallback_plaintext_hash: None,
+                    },
+                    crate::service::SyncDeletedAttachment {
+                        conversation_id: Some("conv-1".into()),
+                        message_id: Some("msg-1".into()),
+                        attachment_id: None,
+                        client_uuid: None,
+                        fallback_digest: Some("ZGlnZXN0".into()),
+                        fallback_plaintext_hash: Some("deadbeef".into()),
+                    },
+                    crate::service::SyncDeletedAttachment {
+                        conversation_id: None,
+                        message_id: None,
+                        attachment_id: None,
+                        client_uuid: None,
+                        fallback_digest: None,
+                        fallback_plaintext_hash: Some("cafebabe".into()),
+                    },
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["event"], "message.deleteForMe");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert!(frame["data"].get("conversations").is_none());
+        let entries = frame["data"]["attachmentDeletes"]
+            .as_array()
+            .expect("the fourth arm rides its own key");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[0],
+            json!({
+                "conversationId": "conv-1",
+                "messageId": "msg-1",
+                "attachmentId": "att-1",
+                "clientUuid": "11111111-2222-4333-8444-555555555555",
+            })
+        );
+        assert_eq!(
+            entries[1],
+            json!({
+                "conversationId": "conv-1",
+                "messageId": "msg-1",
+                "fallbackDigest": "ZGlnZXN0",
+                "fallbackPlaintextHash": "deadbeef",
+            })
+        );
+        assert_eq!(entries[2], json!({ "fallbackPlaintextHash": "cafebabe" }));
     }
 
     /// Contract 1.103 (§4.84): the `identity.verifiedChanged` wire frame —

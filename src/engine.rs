@@ -18,6 +18,7 @@ use tokio::time::timeout;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
+use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::resource::{
     DEFAULT_RSS_PRESSURE_BYTES, DEFAULT_RSS_PRESSURE_SAMPLES, DEFAULT_RSS_RECOVERY_BYTES,
     DEFAULT_RSS_RECOVERY_SAMPLES, ResourcePressureState, ResourcePressureTracker, sample_rss,
@@ -49,11 +50,24 @@ enum PumpedLine {
 const EVENT_QUEUE_CAPACITY: usize = 1024;
 const RECEIVE_QUEUE_CAPACITY: usize = 256;
 const RECEIVE_QUEUE_BYTE_CAPACITY: usize = 2 * 1024 * 1024;
-/// How long receive admission may wait on queue capacity before the receive
-/// is dropped instead of parking the engine actor. Healthy persistence drains
-/// the queue in milliseconds; a queue that stays full for this long means
-/// storage is not draining, and the actor must stay responsive to its command
-/// lane (including shutdown) instead of backpressuring forever.
+/// Per-account receive share (packet 1.196, internal): the global queue
+/// bounds stay the outer contract, but a single account's flood must not
+/// consume them all and crowd out a second account. 64 slots / 512 KiB is
+/// the account's own in-flight ceiling; a burst past it drops under the
+/// existing drop/warn semantics instead of parking the engine actor (the
+/// per-account permits are tried without waiting, so the flooding account
+/// cannot stall the line loop for everyone else). Four accounts can fill
+/// the global 256/2 MiB caps, which remain unchanged.
+const RECEIVE_QUEUE_PER_ACCOUNT_CAPACITY: usize = 64;
+const RECEIVE_QUEUE_PER_ACCOUNT_BYTE_CAPACITY: usize = 512 * 1024;
+/// How long receive admission may wait on the global queue capacity before
+/// the receive is dropped instead of parking the engine actor. Healthy
+/// persistence drains the queue in milliseconds; a queue that stays full for
+/// this long means storage is not draining, and the actor must stay
+/// responsive to its command lane (including shutdown) instead of
+/// backpressuring forever. The per-account share does not wait: its permits
+/// are tried once, so a flooded account drops immediately and never parks the
+/// loop another account's receives need.
 const RECEIVE_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Slack over the child graceful-exit budget after which an unanswered
 /// shutdown request is considered stuck and the child is killed directly.
@@ -1336,18 +1350,22 @@ pub enum ControlReceive {
         viewed: Vec<SyncReadEntry>,
     },
     /// The engine's `syncMessage.deleteForMe` projection (contract 1.102,
-    /// §4.83): the account's own linked device deleted messages for itself
-    /// ("delete for me") — the official #handleDeleteForMeSync face, the
-    /// `SyncContent.deleteForMe=22` content arm. Each group carries one
-    /// conversation's deletes: the proto ConversationIdentifier as the
-    /// engine's conversation string (ACI/PNI ServiceId UUID, group master
-    /// key standard base64, or e164 — absent when the proto carried none),
-    /// and the (author, timestamp) entries naming the messages (the author
-    /// an ACI/PNI string or e164, the timestamp the message's upstream
-    /// sent stamp; the engine projects 0 for an unstated stamp and the
-    /// parser drops it). Groups whose entries all failed the bounds never
-    /// reach this variant — the projection parser dropped them, and an
-    /// envelope with nothing usable left keeps the plain syncMessage skip.
+    /// §4.83; the attachment arm 1.196, §4.196): the account's own linked
+    /// device deleted messages for itself ("delete for me") — the official
+    /// #handleDeleteForMeSync face, the `SyncContent.deleteForMe=22` content
+    /// arm. Each group carries one conversation's deletes: the proto
+    /// ConversationIdentifier as the engine's conversation string (ACI/PNI
+    /// ServiceId UUID, group master key standard base64, or e164 — absent
+    /// when the proto carried none), and the (author, timestamp) entries
+    /// naming the messages (the author an ACI/PNI string or e164, the
+    /// timestamp the message's upstream sent stamp; the engine projects 0
+    /// for an unstated stamp and the parser drops it). The fourth arm
+    /// (`attachmentDeletes`, official MessageReceiver.preload.ts:3724-3790)
+    /// names one attachment on one target message by its client UUID and/or
+    /// its two fallback integrity faces. Groups whose entries all failed the
+    /// bounds never reach this variant — the projection parser dropped them,
+    /// and an envelope with nothing usable left keeps the plain syncMessage
+    /// skip.
     SyncDeleteForMe {
         deletes: SyncDeleteForMeProjection,
     },
@@ -1619,19 +1637,42 @@ pub struct SyncLocalOnlyConversationDelete {
     pub conversation_id: String,
 }
 
+/// One single-attachment delete off the engine's `syncMessage.deleteForMe`
+/// projection (contract 1.196, §4.196): the `attachmentDeletes` arm — the
+/// official `handleDeleteForMeSync` fourth face
+/// (MessageReceiver.preload.ts:3724-3790). The target message keeps the
+/// official `AddressableMessage` address (author + upstream sent stamp, both
+/// hard gates: the official target resolution at :3739-3755 calls
+/// `processAddressableMessage` (:4415-4429), which refuses an author-less
+/// or stamp-less target), and the attachment is
+/// named one-of-or-more by its client UUID and the two integrity fallbacks
+/// (:3754-3770): `client_uuid` a hyphenated UUID string, `fallback_digest`
+/// standard base64, `fallback_plaintext_hash` lowercase hex. At least one
+/// leg survives the parse; an entry with none drops whole.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncDeleteAttachment {
+    pub conversation_id: String,
+    pub target: SyncDeleteEntry,
+    pub client_uuid: Option<String>,
+    pub fallback_digest: Option<String>,
+    pub fallback_plaintext_hash: Option<String>,
+}
+
 /// The engine's whole `syncMessage.deleteForMe` projection (contract
-/// 1.182, §4.182): all three consumer-facing arms in one record. The arms
-/// never mix per proto shape (`messageDeletes` names rows,
-/// `conversationDeletes` names a conversation with its newest-row anchors,
-/// `localOnlyConversationDeletes` names a conversation alone), but one
-/// envelope may carry several of them, so the routing decision is "any arm
-/// survived the bounds" — the same any-entry-survives rule the message arm
-/// already followed in 1.102.
+/// 1.182, §4.182; the attachment arm 1.196, §4.196): all four
+/// consumer-facing arms in one record. The arms never mix per proto shape
+/// (`messageDeletes` names rows, `conversationDeletes` names a conversation
+/// with its newest-row anchors, `localOnlyConversationDeletes` names a
+/// conversation alone, `attachmentDeletes` names one attachment on one
+/// target row), but one envelope may carry several of them, so the routing
+/// decision is "any arm survived the bounds" — the same any-entry-survives
+/// rule the message arm already followed in 1.102.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SyncDeleteForMeProjection {
     pub groups: Vec<SyncDeleteGroup>,
     pub conversations: Vec<SyncDeleteConversation>,
     pub local_only_conversations: Vec<SyncLocalOnlyConversationDelete>,
+    pub attachments: Vec<SyncDeleteAttachment>,
 }
 
 impl SyncDeleteForMeProjection {
@@ -1642,6 +1683,7 @@ impl SyncDeleteForMeProjection {
         self.groups.is_empty()
             && self.conversations.is_empty()
             && self.local_only_conversations.is_empty()
+            && self.attachments.is_empty()
     }
 
     /// The entry-count budget the queue charges this face (contract 1.182):
@@ -1678,7 +1720,22 @@ impl SyncDeleteForMeProjection {
                     + conversation.conversation_id.len()
             })
             .sum::<usize>();
-        groups + conversations + local_only
+        let attachments = self
+            .attachments
+            .iter()
+            .map(|attachment| {
+                std::mem::size_of::<SyncDeleteAttachment>()
+                    + attachment.conversation_id.len()
+                    + attachment.target.author.len()
+                    + attachment.client_uuid.as_ref().map_or(0, String::len)
+                    + attachment.fallback_digest.as_ref().map_or(0, String::len)
+                    + attachment
+                        .fallback_plaintext_hash
+                        .as_ref()
+                        .map_or(0, String::len)
+            })
+            .sum::<usize>();
+        groups + conversations + local_only + attachments
     }
 }
 
@@ -2075,6 +2132,11 @@ const MRR_RESPONSE_TYPE_MAX: u8 = 6;
 pub struct QueuedReceive {
     receive: NormalizedReceive,
     _byte_permit: OwnedSemaphorePermit,
+    /// The account's own slot and byte permits, released when the receive is
+    /// drained or dropped (packet 1.196: per-account isolation beside the
+    /// global caps).
+    _account_slot: OwnedSemaphorePermit,
+    _account_byte_permit: OwnedSemaphorePermit,
 }
 
 impl QueuedReceive {
@@ -2094,10 +2156,24 @@ pub(crate) enum EnqueueOutcome {
     Dropped,
 }
 
+/// One account's receive share (packet 1.196): a slot semaphore (one permit
+/// per in-flight receive) and a byte semaphore (the sum of their weights).
+/// Both are process-local budgets; the permits ride [`QueuedReceive`], so
+/// drainage and drop release them identically.
+#[derive(Clone)]
+struct AccountReceiveBudget {
+    slots: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+}
+
 #[derive(Clone)]
 pub struct ReceiveIngress {
     sender: mpsc::Sender<QueuedReceive>,
     byte_budget: Arc<Semaphore>,
+    /// Per-account shares, bounded to the engine's account ceiling plus one
+    /// anonymous overflow bucket (an unknown account string can never grow
+    /// this map). Mutex-guarded briefly to fetch or create one share.
+    account_budgets: Arc<Mutex<HashMap<String, AccountReceiveBudget>>>,
     enqueue_timeout: Duration,
 }
 
@@ -2110,12 +2186,32 @@ impl ReceiveIngress {
         if weight > RECEIVE_QUEUE_BYTE_CAPACITY {
             return Err(EngineError::Protocol);
         }
-        // Both waits are bounded. While storage is down the persistence loop
-        // keeps retrying the head of the queue, so an unbounded wait here
-        // would park the engine actor and starve its command lane (including
-        // shutdown). Both futures are cancel-safe, so a timeout cannot lose a
-        // half-acquired permit; the permit taken by a timed-out send drops
-        // with it and releases its budget.
+        // A single receive heavier than one account's whole share can never
+        // be admitted; waiting the full enqueue timeout would park the actor
+        // (and with it every other account) for nothing. Drop at once under
+        // the normal overflow semantics.
+        if weight > RECEIVE_QUEUE_PER_ACCOUNT_BYTE_CAPACITY {
+            return Ok(EnqueueOutcome::Dropped);
+        }
+        let budget = self
+            .account_budget(receive.account.as_deref().unwrap_or(""))
+            .await;
+        // The account's own permits are tried without waiting: a flooded
+        // account drops its overflow immediately instead of stalling the
+        // line loop, so another account's receive is never behind it.
+        let Ok(slot_permit) = budget.slots.clone().try_acquire_owned() else {
+            return Ok(EnqueueOutcome::Dropped);
+        };
+        let Ok(account_byte_permit) = budget.bytes.clone().try_acquire_many_owned(weight as u32)
+        else {
+            return Ok(EnqueueOutcome::Dropped);
+        };
+        // The global waits are bounded. While storage is down the
+        // persistence loop keeps retrying the head of the queue, so an
+        // unbounded wait here would park the engine actor and starve its
+        // command lane (including shutdown). Both futures are cancel-safe,
+        // so a timeout cannot lose a half-acquired permit; the permits taken
+        // by a timed-out send drop with it and release their budgets.
         let acquire = self.byte_budget.clone().acquire_many_owned(weight as u32);
         let permit = match timeout(self.enqueue_timeout, acquire).await {
             Ok(Ok(permit)) => permit,
@@ -2127,6 +2223,8 @@ impl ReceiveIngress {
             self.sender.send(QueuedReceive {
                 receive,
                 _byte_permit: permit,
+                _account_slot: slot_permit,
+                _account_byte_permit: account_byte_permit,
             }),
         )
         .await
@@ -2138,6 +2236,29 @@ impl ReceiveIngress {
             Ok(Err(_)) => Err(EngineError::Exited),
             Err(_) => Ok(EnqueueOutcome::Dropped),
         }
+    }
+
+    /// The share for one account key (the raw account string, empty for an
+    /// envelope without one). The map is capped at the per-engine account
+    /// ceiling plus the anonymous bucket; a key arriving past the cap joins
+    /// the anonymous bucket instead of growing the map.
+    async fn account_budget(&self, key: &str) -> AccountReceiveBudget {
+        let mut budgets = self.account_budgets.lock().await;
+        if let Some(budget) = budgets.get(key) {
+            return budget.clone();
+        }
+        let key = if budgets.len() < MAX_ACCOUNTS_PER_ENGINE + 1 {
+            key
+        } else {
+            ""
+        };
+        budgets
+            .entry(key.to_string())
+            .or_insert_with(|| AccountReceiveBudget {
+                slots: Arc::new(Semaphore::new(RECEIVE_QUEUE_PER_ACCOUNT_CAPACITY)),
+                bytes: Arc::new(Semaphore::new(RECEIVE_QUEUE_PER_ACCOUNT_BYTE_CAPACITY)),
+            })
+            .clone()
     }
 }
 
@@ -2396,6 +2517,7 @@ pub fn receive_channel() -> (ReceiveIngress, mpsc::Receiver<QueuedReceive>) {
         ReceiveIngress {
             sender,
             byte_budget: Arc::new(Semaphore::new(RECEIVE_QUEUE_BYTE_CAPACITY)),
+            account_budgets: Arc::new(Mutex::new(HashMap::new())),
             enqueue_timeout: RECEIVE_ENQUEUE_TIMEOUT,
         },
         receiver,
@@ -4021,13 +4143,16 @@ fn normalized_backfill_entry(entry: &Value) -> BackfillEntry {
 }
 
 /// Bounded `syncMessage.deleteForMe` projection family (contract 1.102,
-/// §4.83; extended 1.182, §4.182): the wire shape mirrors the official
-/// DeleteForMe face —
+/// §4.83; extended 1.182, §4.182; attachment arm 1.196, §4.196): the wire
+/// shape mirrors the official DeleteForMe face —
 /// `{messageDeletes: [{conversationId?, messages: [{author, timestamp}]}],
 /// conversationDeletes: [{conversationId, isFullDelete,
 /// mostRecentMessages, mostRecentNonExpiringMessages}],
-/// localOnlyConversationDeletes: [{conversationId}]}` — and the engine
-/// projects all three consumer-facing arms. The identity caps mirror the
+/// localOnlyConversationDeletes: [{conversationId}],
+/// attachmentDeletes: [{conversationId, targetMessage: {author,
+/// timestamp}, clientUuid?, fallbackDigest?, fallbackPlaintextHash?}]}` —
+/// and the engine projects all four consumer-facing arms. The identity caps
+/// mirror the
 /// receive id family, the group/message caps the read-face batch guard; an
 /// entry without an author or a positive timestamp drops (the engine
 /// projects 0 for an unstated stamp — the read face's unknown-marker
@@ -4051,6 +4176,7 @@ fn normalized_sync_delete_for_me(value: Option<&Value>) -> SyncDeleteForMeProjec
         groups: normalized_sync_delete_groups(value),
         conversations: normalized_sync_delete_conversations(value),
         local_only_conversations: normalized_sync_local_only_conversations(value),
+        attachments: normalized_sync_delete_attachments(value),
     }
 }
 
@@ -4166,6 +4292,95 @@ fn normalized_sync_local_only_conversations(
                 .filter(|id| !id.is_empty())
                 .map(|id| id.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
             Some(SyncLocalOnlyConversationDelete { conversation_id })
+        })
+        .collect()
+}
+
+/// The bounded `attachmentDeletes` arm (contract 1.196, §4.196): the
+/// official `handleDeleteForMeSync` fourth face (MessageReceiver.preload
+/// .ts:3724-3790). Each entry names its conversation (the engine projects
+/// the ConversationIdentifier as its conversation string), the target
+/// message (author + upstream stamp — both hard gates: the official
+/// `processAddressableMessage` refuses a target without either, :4415-4429,
+/// and this destructive single-attachment arm does not inherit the
+/// messageDeletes arm's zero-defaulted stamp tolerance), and at least one
+/// attachment leg: clientUuid, fallbackDigest, or fallbackPlaintextHash
+/// (:3754-3770). An entry with no conversation, no usable target, or all
+/// three legs absent drops whole (the official three warn-drops); the leg
+/// caps mirror the receive-id family and an over-bound leg drops rather
+/// than truncates (a shortened digest/hash is a wrong fingerprint).
+/// Entries are capped at the message-arm batch ceiling (the engine projects
+/// at most the same 256).
+fn normalized_sync_delete_attachments(value: Option<&Value>) -> Vec<SyncDeleteAttachment> {
+    let Some(attachments) = value
+        .and_then(|face| face.get("attachmentDeletes"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    // A leg is useful only verbatim: trim, bound, and drop anything that
+    // would have to be shortened or guesses a non-string shape.
+    let bounded_leg = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|leg| !leg.is_empty() && leg.chars().count() <= MAX_RECEIVE_ID_CHARS)
+            .map(str::to_string)
+    };
+    attachments
+        .iter()
+        .take(MAX_SYNC_DELETE_GROUP_MESSAGES)
+        .filter_map(|attachment| {
+            let object = attachment.as_object()?;
+            let conversation_id = object
+                .get("conversationId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(|id| id.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+            let target = object.get("targetMessage")?.as_object()?;
+            let author = target
+                .get("author")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|author| !author.is_empty())
+                .map(|author| {
+                    author
+                        .chars()
+                        .take(MAX_RECEIVE_ID_CHARS)
+                        .collect::<String>()
+                })?;
+            let timestamp = target
+                .get("timestamp")
+                .and_then(Value::as_u64)
+                .filter(|timestamp| *timestamp > 0)?;
+            let client_uuid = bounded_leg(object.get("clientUuid"));
+            let fallback_digest = bounded_leg(object.get("fallbackDigest"));
+            // The engine projects lowercase hex; normalize a hostile
+            // uppercase face instead of storing a non-matching spelling.
+            let fallback_plaintext_hash = object
+                .get("fallbackPlaintextHash")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|hash| {
+                    !hash.is_empty()
+                        && hash.chars().count() <= MAX_RECEIVE_ID_CHARS
+                        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .map(str::to_ascii_lowercase);
+            if client_uuid.is_none()
+                && fallback_digest.is_none()
+                && fallback_plaintext_hash.is_none()
+            {
+                return None;
+            }
+            Some(SyncDeleteAttachment {
+                conversation_id,
+                target: SyncDeleteEntry { author, timestamp },
+                client_uuid,
+                fallback_digest,
+                fallback_plaintext_hash,
+            })
         })
         .collect()
 }
@@ -7523,6 +7738,128 @@ mod tests {
             .unwrap();
     }
 
+    /// Packet 1.196: the per-account share. One account filling its own
+    /// 64-slot budget drops its next receive immediately (never parking the
+    /// actor), while a second account's share is untouched and its receive
+    /// still admits. Draining one queued receive frees exactly one slot.
+    #[tokio::test]
+    async fn receive_queue_per_account_budget_isolates_a_flooding_account() {
+        let (mut ingress, mut receives) = receive_channel();
+        ingress.enqueue_timeout = Duration::from_millis(50);
+        let receive = |account: &str| NormalizedReceive {
+            timestamp: Some(42),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some(account.into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            control: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+        };
+
+        let mut admitted = 0;
+        while matches!(
+            ingress.enqueue(receive("+15555550100")).await,
+            Ok(EnqueueOutcome::Enqueued)
+        ) {
+            admitted += 1;
+        }
+        assert_eq!(admitted, RECEIVE_QUEUE_PER_ACCOUNT_CAPACITY);
+        // The flooded account's overflow is an immediate drop, not a wait.
+        assert_eq!(
+            timeout(
+                Duration::from_millis(50),
+                ingress.enqueue(receive("+15555550100"))
+            )
+            .await
+            .expect("per-account overflow must not wait")
+            .unwrap(),
+            EnqueueOutcome::Dropped
+        );
+        // The second account's own share is untouched.
+        assert_eq!(
+            ingress.enqueue(receive("+15555550101")).await.unwrap(),
+            EnqueueOutcome::Enqueued
+        );
+        // One drained slot admits exactly one more receive for the flooded
+        // account.
+        drop(receives.recv().await.unwrap());
+        assert_eq!(
+            ingress.enqueue(receive("+15555550100")).await.unwrap(),
+            EnqueueOutcome::Enqueued
+        );
+    }
+
+    /// Packet 1.196: the global caps remain the outer bound. Four accounts
+    /// fill their own 512 KiB shares (five 100 KiB receives each) and the
+    /// 2 MiB global byte budget runs out; a fifth account, whose own share is
+    /// empty, is then dropped — proving the per-account split did not turn
+    /// the global ceiling into a per-account one.
+    #[tokio::test]
+    async fn receive_queue_global_budget_still_caps_the_sum_of_accounts() {
+        let (mut ingress, _receives) = receive_channel();
+        ingress.enqueue_timeout = Duration::from_millis(50);
+        let text = "a".repeat(100 * 1024);
+        let receive = |account: &str| NormalizedReceive {
+            timestamp: Some(42),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some(account.into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: None,
+            text: Some(text.clone()),
+            text_bytes: Some(text.len() as u32),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            control: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+        };
+
+        for account in [
+            "+15555550100",
+            "+15555550101",
+            "+15555550102",
+            "+15555550103",
+        ] {
+            for _ in 0..5 {
+                assert_eq!(
+                    ingress.enqueue(receive(account)).await.unwrap(),
+                    EnqueueOutcome::Enqueued
+                );
+            }
+        }
+        // The fifth account has its whole per-account share free, but the
+        // global byte budget has less than one receive left.
+        assert_eq!(
+            ingress.enqueue(receive("+15555550104")).await.unwrap(),
+            EnqueueOutcome::Dropped
+        );
+    }
+
     #[test]
     fn receive_normalization_accepts_source_uuid_and_result_wrapper() {
         let input = json!({
@@ -10542,6 +10879,193 @@ mod tests {
             deletes.conversations[0].most_recent_messages.len(),
             MAX_SYNC_DELETE_CONVERSATION_ANCHORS
         );
+    }
+
+    /// Contract 1.196 (§4.196): the `attachmentDeletes` arm routes on its
+    /// own — conversation identity plus the target's (author, positive stamp)
+    /// are hard gates (the official "No target conversation" / "No target
+    /// message" warn-drops), the target stamp is stricter than the message
+    /// arm (no zero default), at least one of clientUuid / fallbackDigest /
+    /// fallbackPlaintextHash must survive, empty and over-bound legs drop
+    /// individually, and the batch takes the message-arm 256 cap.
+    #[test]
+    fn sync_delete_for_me_attachment_arm_routes_and_gates() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+        let entry =
+            |conversation_id: &str, author: &str, timestamp: u64, legs: serde_json::Value| {
+                let mut value = json!({
+                    "conversationId": conversation_id,
+                    "targetMessage": { "author": author, "timestamp": timestamp },
+                });
+                for (key, leg) in legs.as_object().unwrap() {
+                    value[key.as_str()] = leg.clone();
+                }
+                value
+            };
+
+        let Some((ControlReceive::SyncDeleteForMe { deletes }, source)) = routing(json!({
+            "deleteForMe": {
+                "attachmentDeletes": [
+                    // Each of the three legs alone.
+                    entry(
+                        "11111111-1111-1111-1111-111111111111",
+                        "22222222-2222-2222-2222-222222222222",
+                        1726999999000,
+                        json!({ "clientUuid": "33333333-3333-3333-3333-333333333333" }),
+                    ),
+                    entry(
+                        "11111111-1111-1111-1111-111111111111",
+                        "22222222-2222-2222-2222-222222222222",
+                        1726999998000,
+                        json!({ "fallbackDigest": "ZGlnZXN0" }),
+                    ),
+                    entry(
+                        "11111111-1111-1111-1111-111111111111",
+                        "22222222-2222-2222-2222-222222222222",
+                        1726999997000,
+                        json!({ "fallbackPlaintextHash": "AABBCCDD" }),
+                    ),
+                    // All three legs.
+                    entry(
+                        "11111111-1111-1111-1111-111111111111",
+                        "22222222-2222-2222-2222-222222222222",
+                        1726999996000,
+                        json!({
+                            "clientUuid": "44444444-4444-4444-4444-444444444444",
+                            "fallbackDigest": "ZGlnZXN0",
+                            "fallbackPlaintextHash": "deadbeef",
+                        }),
+                    ),
+                    // No conversation identity → drop.
+                    {
+                        "targetMessage": {
+                            "author": "22222222-2222-2222-2222-222222222222",
+                            "timestamp": 1726999995000u64,
+                        },
+                        "clientUuid": "55555555-5555-5555-5555-555555555555",
+                    },
+                    // No target message → drop.
+                    {
+                        "conversationId": "11111111-1111-1111-1111-111111111111",
+                        "fallbackDigest": "ZGlnZXN0",
+                    },
+                    // Target author absent / stamp zero → drop (the
+                    // official processAddressableMessage double gate).
+                    {
+                        "conversationId": "11111111-1111-1111-1111-111111111111",
+                        "targetMessage": { "timestamp": 1726999994000u64 },
+                        "fallbackDigest": "ZGlnZXN0",
+                    },
+                    entry(
+                        "11111111-1111-1111-1111-111111111111",
+                        "22222222-2222-2222-2222-222222222222",
+                        0,
+                        json!({ "fallbackDigest": "ZGlnZXN0" }),
+                    ),
+                    // All legs absent or empty → drop.
+                    entry(
+                        "11111111-1111-1111-1111-111111111111",
+                        "22222222-2222-2222-2222-222222222222",
+                        1726999993000,
+                        json!({ "clientUuid": "  ", "fallbackDigest": "" }),
+                    ),
+                    // A non-hex plaintext hash drops that leg (the only
+                    // leg here), so the entry drops whole.
+                    entry(
+                        "11111111-1111-1111-1111-111111111111",
+                        "22222222-2222-2222-2222-222222222222",
+                        1726999992000,
+                        json!({ "fallbackPlaintextHash": "zzzz" }),
+                    ),
+                ],
+            },
+        })) else {
+            panic!("expected a sync delete control routing");
+        };
+        assert!(source.is_none(), "the envelope is our own account");
+        assert!(deletes.groups.is_empty(), "no message arm");
+        assert!(deletes.conversations.is_empty(), "no conversation arm");
+        assert!(deletes.local_only_conversations.is_empty());
+        assert_eq!(deletes.attachments.len(), 4, "{deletes:?}");
+        assert_eq!(
+            deletes.attachments[0].client_uuid.as_deref(),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
+        assert!(deletes.attachments[0].fallback_digest.is_none());
+        assert_eq!(
+            deletes.attachments[1].fallback_digest.as_deref(),
+            Some("ZGlnZXN0")
+        );
+        assert_eq!(
+            deletes.attachments[2].fallback_plaintext_hash.as_deref(),
+            Some("aabbccdd"),
+            "the hash is normalized lowercase"
+        );
+        assert_eq!(
+            deletes.attachments[3].target.author,
+            "22222222-2222-2222-2222-222222222222"
+        );
+        assert_eq!(deletes.attachments[3].target.timestamp, 1726999996000);
+        assert!(deletes.attachments[3].client_uuid.is_some());
+        assert!(deletes.attachments[3].fallback_digest.is_some());
+        assert!(deletes.attachments[3].fallback_plaintext_hash.is_some());
+
+        // The attachment arm alone routes; an empty/all-bad face falls back
+        // to the plain syncMessage skip.
+        assert!(
+            routing(json!({
+                "deleteForMe": {
+                    "attachmentDeletes": [entry(
+                        "c",
+                        "a",
+                        1,
+                        json!({ "clientUuid": "u" }),
+                    )],
+                },
+            }))
+            .is_some()
+        );
+        for sync in [
+            json!({ "deleteForMe": { "attachmentDeletes": [] } }),
+            json!({ "deleteForMe": { "attachmentDeletes": [{}] } }),
+            json!({ "deleteForMe": { "attachmentDeletes": [{
+                "conversationId": "c",
+                "targetMessage": { "author": "a", "timestamp": 1 },
+            }] } }),
+        ] {
+            assert!(
+                routing(sync.clone()).is_none(),
+                "expected the plain skip: {sync}"
+            );
+        }
+
+        // The batch cap mirrors the message arm: the tail drops.
+        let too_many = (0..(MAX_SYNC_DELETE_GROUP_MESSAGES + 4))
+            .map(|index| {
+                entry(
+                    "c",
+                    "a",
+                    1726999990000 + index as u64,
+                    json!({ "clientUuid": format!("uuid-{index}") }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let Some((ControlReceive::SyncDeleteForMe { deletes }, _)) = routing(json!({
+            "deleteForMe": { "attachmentDeletes": too_many },
+        })) else {
+            panic!("expected a sync delete control routing");
+        };
+        assert_eq!(deletes.attachments.len(), MAX_SYNC_DELETE_GROUP_MESSAGES);
     }
 
     /// The engine's `syncMessage.attachmentBackfillResponse` projection

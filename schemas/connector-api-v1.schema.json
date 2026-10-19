@@ -5334,12 +5334,12 @@
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["accountId", "deletes"],
-                "description": "One delete-for-me sync forwarded (contract 1.102, §4.83): the engine's syncMessage.deleteForMe projection — the account deleted messages for itself on another linked device, the official #handleDeleteForMeSync face. The connector mirrors first (matched store rows are removed outright and the conversation summary repaired, the removeMessageById anchor), then forwards each group with the local conversationId when the group's conversation identity resolved (the projection's conversation id — the 32-byte standard-base64 form — or, absent that, its entries' authors laddering through the same resolution the read state uses) and the removed rows' messageIds on their entries; absent optionals stay absent. The desktop removes its own local messages from these handles, joining by (author, sentAt) alone for the entries the connector held no row for. Transient beside the mirror: a missed delivery converges on the next conversation read exactly like message.expired.",
+                "description": "One delete-for-me sync forwarded (contract 1.102, §4.83; conversation arms 1.182, §4.182; attachment arm 1.196, §4.196): the engine's syncMessage.deleteForMe projection — the account deleted messages for itself on another linked device, the official #handleDeleteForMeSync face. The connector mirrors first (matched store rows are removed outright and the conversation summary repaired, the removeMessageById anchor), then forwards each group with the local conversationId when the group's conversation identity resolved (the projection's conversation id — the 32-byte standard-base64 form — or, absent that, its entries' authors laddering through the same resolution the read state uses) and the removed rows' messageIds on their entries; absent optionals stay absent. The desktop removes its own local messages from these handles, joining by (author, sentAt) alone for the entries the connector held no row for. The whole-conversation arms ride the optional conversations key and the single-attachment arm the optional attachmentDeletes key (both skipped when empty, so older envelopes keep their byte shape); deletes itself stays required for shape stability and is empty on an envelope carrying only those arms. Transient beside the mirror: a missed delivery converges on the next conversation read exactly like message.expired.",
                 "properties": {
                   "accountId": { "$ref": "#/$defs/opaqueId" },
                   "deletes": {
                     "type": "array",
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": 64,
                     "items": {
                       "type": "object",
@@ -5376,6 +5376,41 @@
                               }
                             }
                           }
+                        }
+                      }
+                    }
+                  },
+                  "attachmentDeletes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 256,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "conversationId": {
+                          "$ref": "#/$defs/opaqueId",
+                          "description": "The projection's conversation identity resolved through the §4.83 ladder; absent when it named no local conversation (the desktop joins by its own map and the raw legs)."
+                        },
+                        "messageId": {
+                          "$ref": "#/$defs/opaqueId",
+                          "description": "The target message's local row id — resolved by the projection's upstream sent stamp in either direction (a pathological multi-row stamp narrows by the target author and otherwise stays unresolved); absent when no row was addressed."
+                        },
+                        "attachmentId": {
+                          "$ref": "#/$defs/opaqueId",
+                          "description": "The removed local attachment descriptor's id — present only on a unique one-of-leg match (clientUuid / fallbackDigest / fallbackPlaintextHash); absent on a miss or an ambiguous match, in which case nothing was removed."
+                        },
+                        "clientUuid": {
+                          "$ref": "#/$defs/opaqueId",
+                          "description": "The projection's clientUuid leg (hyphenated UUID), forwarded verbatim when present (the official deleteForMe.preload.ts:162-165 first field)."
+                        },
+                        "fallbackDigest": {
+                          "$ref": "#/$defs/opaqueId",
+                          "description": "The projection's fallbackDigest leg (standard base64 encrypted digest), forwarded verbatim when present (deleteForMe.preload.ts:167-172)."
+                        },
+                        "fallbackPlaintextHash": {
+                          "$ref": "#/$defs/opaqueId",
+                          "description": "The projection's fallbackPlaintextHash leg (lowercase hex), forwarded when present (deleteForMe.preload.ts:176-181)."
                         }
                       }
                     }

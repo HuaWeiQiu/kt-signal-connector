@@ -6029,6 +6029,99 @@ impl Store {
         Ok(true)
     }
 
+    /// Remove one attachment slot from a row (contract 1.196, §4.196): the
+    /// official `applyDeleteAttachmentFromMessage` mirror
+    /// (deleteForMe.preload.ts:129-190) — the descriptor leaves
+    /// `attachments_json` and the same index leaves both index-aligned
+    /// locator columns (live-receive and history-import), so the surviving
+    /// slots never shift onto the wrong descriptor. The message row itself
+    /// stays (the official keeps the message and only filters the
+    /// attachment array). An absent row, a row without descriptors, a
+    /// malformed descriptor cell, or an out-of-range index answers `None`
+    /// with nothing written — the caller's fail-closed miss face. A
+    /// malformed locator column is `Unavailable` instead (storage
+    /// corruption of index-aligned key material: failing closed beats a
+    /// shifted delete). Returns the removed descriptor's id, which is the
+    /// local attachment handle the host event reports.
+    pub fn remove_message_attachment_at(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        index: usize,
+    ) -> Result<Option<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT attachments_json, attachment_locators, live_attachment_locators
+                   FROM messages WHERE account_id=?1 AND id=?2",
+                params![account_id, message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some((attachments_json, attachment_locators, live_attachment_locators)) = row else {
+            return Ok(None);
+        };
+        let Some(attachments_json) = attachments_json else {
+            return Ok(None);
+        };
+        let Ok(mut attachments) =
+            serde_json::from_str::<Vec<crate::engine::NormalizedAttachment>>(&attachments_json)
+        else {
+            return Ok(None);
+        };
+        if index >= attachments.len() {
+            return Ok(None);
+        }
+        // Both columns are internal, index-aligned state. A malformed cell
+        // means the row cannot be edited without risking a shifted delete —
+        // fail closed before touching anything.
+        let strip_locator = |cell: Option<String>| {
+            let Some(cell) = cell else {
+                return Ok(None);
+            };
+            let mut faces =
+                serde_json::from_str::<Vec<HistoryAttachmentLocator>>(&cell).map_err(|error| {
+                    StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(
+                        error.into(),
+                    )))
+                })?;
+            if index < faces.len() {
+                faces.remove(index);
+            }
+            if faces.is_empty() {
+                return Ok(None);
+            }
+            serde_json::to_string(&faces).map(Some).map_err(|error| {
+                StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(error.into())))
+            })
+        };
+        let attachment_locators = strip_locator(attachment_locators)?;
+        let live_attachment_locators = strip_locator(live_attachment_locators)?;
+        let removed = attachments.remove(index);
+        let attachments_json = if attachments.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&attachments).map_err(|error| {
+                StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(error.into())))
+            })?)
+        };
+        conn.execute(
+            "UPDATE messages
+                SET attachments_json=?3, attachment_locators=?4, live_attachment_locators=?5
+              WHERE account_id=?1 AND id=?2",
+            params![
+                account_id,
+                message_id,
+                attachments_json,
+                attachment_locators,
+                live_attachment_locators
+            ],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(Some(removed.id))
+    }
+
     /// One row of any direction by conversation + upstream sent stamp
     /// (contract revision 1.175, §4.175): the backfill response's target
     /// lookup — `incoming_rows_by_sent_at` filters `direction='incoming'`,
@@ -20117,6 +20210,137 @@ mod tests {
             .merge_live_attachment_locators(&account.id, "m-absent", &[Some(face("cdn-x"))])
             .unwrap();
         assert!(!changed);
+    }
+
+    /// `remove_message_attachment_at` (contract 1.196, §4.196): the
+    /// official single-attachment delete mirror — the descriptor leaves and
+    /// the same index leaves both locator columns, so surviving slots never
+    /// shift onto a neighbour. An absent row, an index past the end, and a
+    /// row with no descriptors answer `None` without writing.
+    #[test]
+    fn remove_message_attachment_at_strips_descriptor_and_aligned_locators() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550105", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550106", "Peer")
+            .unwrap();
+        let descriptor = |id: &str, locator: Option<HistoryAttachmentLocator>| {
+            crate::engine::NormalizedAttachment {
+                id: id.into(),
+                content_type: Some("image/jpeg".into()),
+                filename: None,
+                size: Some(2048),
+                width: None,
+                height: None,
+                is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
+                locator,
+                waveform: None,
+                duration: None,
+            }
+        };
+        let face = |digest: &str, hash: &str| HistoryAttachmentLocator {
+            key: Some("a2F0LWtleQ==".into()),
+            cdn_key: Some(format!("cdn-{digest}")),
+            cdn_number: Some(3),
+            upload_timestamp: Some(1700000000000),
+            digest: Some(digest.into()),
+            plaintext_hash: Some(hash.into()),
+        };
+        let mut row = expire_record("m-strip", &account.id, &conversation.id);
+        row.attachments = vec![
+            descriptor("att-a", Some(face("digest-a", "aa"))),
+            descriptor("att-b", Some(face("digest-b", "bb"))),
+            descriptor("att-c", Some(face("digest-c", "cc"))),
+        ];
+        store
+            .insert_message(&row, None, Some("strip"), true)
+            .unwrap();
+        // Seed the history-import column too: the removal must keep both
+        // index-aligned columns in step (they are separate columns because
+        // the history import and the live receive write different faces).
+        let history_faces = vec![
+            face("digest-a", "aa"),
+            face("digest-b", "bb"),
+            face("digest-c", "cc"),
+        ];
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET attachment_locators=?3 WHERE account_id=?1 AND id=?2",
+                params![
+                    account.id,
+                    "m-strip",
+                    serde_json::to_string(&history_faces).unwrap()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .remove_message_attachment_at(&account.id, "m-strip", 1)
+                .unwrap()
+                .as_deref(),
+            Some("att-b")
+        );
+        let record = store
+            .message_by_id(&account.id, &conversation.id, "m-strip")
+            .unwrap()
+            .expect("the message row survives an attachment delete");
+        assert_eq!(
+            record
+                .attachments
+                .iter()
+                .map(|attachment| attachment.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["att-a", "att-c"]
+        );
+        let live = store
+            .live_attachment_locators(&account.id, "m-strip")
+            .unwrap();
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].digest.as_deref(), Some("digest-a"));
+        assert_eq!(live[1].digest.as_deref(), Some("digest-c"));
+        let history = store
+            .history_attachment_locators(&account.id, "m-strip")
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].digest.as_deref(), Some("digest-a"));
+        assert_eq!(history[1].digest.as_deref(), Some("digest-c"));
+
+        // Out-of-range, absent row, and a descriptor-less row are quiet
+        // misses: nothing is written.
+        assert!(
+            store
+                .remove_message_attachment_at(&account.id, "m-strip", 9)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .remove_message_attachment_at(&account.id, "m-absent", 0)
+                .unwrap()
+                .is_none()
+        );
+        let mut plain = expire_record("m-plain-strip", &account.id, &conversation.id);
+        plain.attachments = Vec::new();
+        store
+            .insert_message(&plain, None, Some("plain"), true)
+            .unwrap();
+        assert!(
+            store
+                .remove_message_attachment_at(&account.id, "m-plain-strip", 0)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// serverGuid round-trip (contract revision 1.49, §4.48): a live receive

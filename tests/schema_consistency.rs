@@ -297,7 +297,8 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 ///
 /// Code-only bounds without a schema representation (internal capacity —
 /// gated by behavior tests per optimization-plan §6.4 M3.5, not by pairs):
-/// - receive queue budgets (256 items / 2 MiB) and internal channel
+/// - receive queue budgets (256 items / 2 MiB global, 64 items / 512 KiB per
+///   account since contract 1.196's internal companion) and internal channel
 ///   capacities: in-process queues, not wire contracts.
 /// - host admission (128 global / 32 per account / 8 MiB aggregate) and
 ///   per-method dispatch lanes: connection-local admission control.
@@ -661,6 +662,14 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/event/allOf/15/then/properties/data/properties/deletes/items/properties/messages/items/properties/author",
             "maxLength",
             MAX_RECEIVE_ID_CHARS as u64,
+        ),
+        // Contract 1.196 (§4.196): the attachment arm shares the message
+        // arm's 256-entry batch ceiling (the engine's projection cap is the
+        // same value).
+        (
+            "/$defs/event/allOf/15/then/properties/data/properties/attachmentDeletes",
+            "maxItems",
+            MAX_SYNC_DELETE_GROUP_MESSAGES as u64,
         ),
         // Verified sync (contract 1.103, §4.84): the destination mirrors the
         // receive-id bound (the parse gates the UUID shape verbatim) and the

@@ -33,8 +33,8 @@ use crate::media::{MEDIA_CHUNK_BYTES, MediaGovernor, MediaHandleError, MediaHand
 use crate::protocol::ApiError;
 use crate::store::{
     AccountDeletePlan, AccountRow, AccountSummary, AdjacentMediaDirection, CommonGroupRow,
-    ContactSummary, ConversationRow, ConversationSummary, MessageRecord, Page, ReceiptResupply,
-    RetryClaim, Store, StoreError, SyncedContact,
+    ContactSummary, ConversationRow, ConversationSummary, HistoryAttachmentLocator, MessageRecord,
+    Page, ReceiptResupply, RetryClaim, Store, StoreError, SyncedContact,
 };
 
 /// Bounds below are the code-side enforcement of the host-facing schema
@@ -1430,6 +1430,12 @@ pub enum HostSideEvent {
         /// per-message groups (the 1.102 shape, byte-identical on the wire:
         /// the key is skipped when empty).
         conversations: Vec<SyncDeletedConversation>,
+        /// Contract 1.196 (§4.196): the single-attachment arm — one entry
+        /// per `attachmentDeletes` record with the connector's resolution
+        /// and mirror answer. Empty when the envelope carried no attachment
+        /// arm (the pre-1.196 wire frame stays byte-identical: the key is
+        /// skipped when empty).
+        attachments: Vec<SyncDeletedAttachment>,
     },
     /// The engine's `syncMessage.verified` projection forwarded (contract
     /// 1.103, §4.84): the account's own linked device settled one peer's
@@ -1734,6 +1740,33 @@ pub struct SyncDeletedConversation {
     pub deleted: bool,
     pub conversation_removed: bool,
     pub deleted_message_count: u64,
+}
+
+/// One single-attachment delete on the `message.deleteForMe` event
+/// (contract 1.196, §4.196): the projection's `attachmentDeletes` entry
+/// with the connector's resolution enrichment and the raw one-of legs
+/// forwarded verbatim. `conversation_id` / `message_id` / `attachment_id`
+/// ride only when the respective ladder resolved a local object; the
+/// desktop joins by the raw legs where an id is absent (宁缺勿错 — an
+/// unresolved or ambiguous entry never invents a handle). The legs
+/// (`client_uuid` hyphenated UUID, `fallback_digest` standard base64,
+/// `fallback_plaintext_hash` lowercase hex) appear exactly as the
+/// projection stated them.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncDeletedAttachment {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_plaintext_hash: Option<String>,
 }
 
 /// Ephemeral typing notifications keep the event lane quiet: at most one
@@ -11998,8 +12031,9 @@ impl ConnectorService {
 
     /// Contract 1.102 (§4.83): consume one `syncMessage.deleteForMe`
     /// projection — the account deleted messages for itself on another
-    /// linked device (the official #handleDeleteForMeSync face). Three
-    /// faces; the two whole-conversation arms are contract 1.182 (§4.182):
+    /// linked device (the official #handleDeleteForMeSync face). Four
+    /// faces; the two whole-conversation arms are contract 1.182 (§4.182)
+    /// and the single-attachment arm is contract 1.196 (§4.196):
     ///
     /// Forwarding — the bounded groups ride the transient
     /// `message.deleteForMe` event with the connector's resolution enriching
@@ -12041,6 +12075,19 @@ impl ConnectorService {
     /// `deleted: false` rather than inventing a conversation
     /// (`getConversationFromTarget` miss → "Conversation not found") — and
     /// so does a replay, because the row is then already gone.
+    ///
+    /// Attachment mirror (1.196) — the official
+    /// `deleteAttachmentFromMessage` one-of ladder
+    /// (deleteForMe.preload.ts:64-190 via syncTasks.preload.ts:176-188):
+    /// the conversation walks the §4.83 ladder, the target row resolves by
+    /// its upstream sent stamp in either direction, and the attachment is
+    /// matched by clientUuid / fallbackDigest / fallbackPlaintextHash. Only
+    /// a unique match is removed (the official first-`find` tightened to
+    /// fail closed on ambiguity); the descriptor and its index-aligned
+    /// locator slots leave together, the message row stays, and the local
+    /// media file is erased best-effort (the §4.37 burn precedent). The
+    /// event entry still forwards the raw legs with no ids where nothing
+    /// resolved.
     fn apply_sync_delete_for_me(
         &mut self,
         account: &AccountRow,
@@ -12245,10 +12292,19 @@ impl ConnectorService {
                 });
             }
         }
+        // Contract 1.196 (§4.196): the single-attachment arm. Each entry
+        // resolves independently through the same conversation ladder and
+        // the official one-of attachment legs; the projection's own order
+        // is preserved so a replayed envelope answers the same sequence.
+        let mut event_attachments = Vec::with_capacity(deletes.attachments.len());
+        for entry in &deletes.attachments {
+            event_attachments.push(self.apply_sync_delete_attachment(account, entry)?);
+        }
         let mut events = vec![HostSideEvent::SyncDeleteForMe {
             account_id: account.id.clone(),
             deletes: event_groups,
             conversations: deleted_conversations,
+            attachments: event_attachments,
         }];
         for conversation_id in &touched_conversations {
             if let Some(summary) = self
@@ -12289,6 +12345,112 @@ impl ConnectorService {
                 .filter(|conversation| conversation.kind == "group"));
         }
         self.sync_sender_conversation(account, conversation_id, None)
+    }
+
+    /// Resolve and mirror one `attachmentDeletes` entry (contract 1.196,
+    /// §4.196): the official `deleteAttachmentFromMessage`
+    /// (deleteForMe.preload.ts:64-190, reached through
+    /// `delete-single-attachment` in syncTasks.preload.ts:176-188).
+    ///
+    /// The conversation walks the same §4.83 ladder the other delete arms
+    /// use. The target row resolves by its upstream sent stamp in either
+    /// direction (`rows_by_sent_at` — the phone mirrors our own outgoing
+    /// rows back, so an incoming-only reader cannot apply); a pathological
+    /// multi-row stamp narrows by the target author and otherwise stays
+    /// unresolved (fail closed). The attachment then matches by the official
+    /// one-of legs — clientUuid against the descriptor id (the engine's
+    /// `AttachmentPointer.client_uuid` projection), fallbackDigest and
+    /// fallbackPlaintextHash against the index-aligned locator columns —
+    /// and only a unique match is removed. The official first-`find` is
+    /// deliberately tightened to "unique or nothing": a destructive
+    /// attachment delete must never guess between two matches. The removed
+    /// descriptor's local bytes are erased best-effort (the view-once burn
+    /// precedent); the message row itself stays, as the official
+    /// `applyDeleteAttachmentFromMessage` keeps it.
+    ///
+    /// The event entry always forwards the raw legs; `conversationId` /
+    /// `messageId` / `attachmentId` ride only where each ladder resolved.
+    fn apply_sync_delete_attachment(
+        &mut self,
+        account: &AccountRow,
+        entry: &crate::engine::SyncDeleteAttachment,
+    ) -> Result<SyncDeletedAttachment, ServiceError> {
+        let conversation = self.sync_delete_group_conversation(account, &entry.conversation_id)?;
+        let mut event = SyncDeletedAttachment {
+            conversation_id: conversation.as_ref().map(|row| row.id.clone()),
+            message_id: None,
+            attachment_id: None,
+            client_uuid: entry.client_uuid.clone(),
+            fallback_digest: entry.fallback_digest.clone(),
+            fallback_plaintext_hash: entry.fallback_plaintext_hash.clone(),
+        };
+        let Some(conversation) = conversation else {
+            return Ok(event);
+        };
+        let rows =
+            self.store
+                .rows_by_sent_at(&account.id, &conversation.id, entry.target.timestamp)?;
+        let record = match rows.len() {
+            0 => None,
+            1 => rows.first(),
+            _ => {
+                // The §4.83 recorded asymmetry keeps the author out of the
+                // address; a stamp collision is the one place it earns a
+                // vote (the backfill-target precedent), and only to narrow
+                // to a single row — never to pick a favourite.
+                let matching = rows
+                    .iter()
+                    .filter(|row| {
+                        row.author_aci
+                            .as_deref()
+                            .is_some_and(|aci| aci.eq_ignore_ascii_case(&entry.target.author))
+                            || row.sender_id.eq_ignore_ascii_case(&entry.target.author)
+                            || (!address_digits(&entry.target.author).is_empty()
+                                && address_digits(&row.sender_id)
+                                    == address_digits(&entry.target.author))
+                    })
+                    .collect::<Vec<_>>();
+                (matching.len() == 1).then(|| matching[0])
+            }
+        };
+        let Some(record) = record else {
+            return Ok(event);
+        };
+        event.message_id = Some(record.id.clone());
+        let live = self
+            .store
+            .live_attachment_locators(&account.id, &record.id)?;
+        let history = self
+            .store
+            .history_attachment_locators(&account.id, &record.id)?;
+        let matches = record
+            .attachments
+            .iter()
+            .enumerate()
+            .filter(|(index, attachment)| {
+                attachment_delete_matches(entry, attachment, live.get(*index), history.get(*index))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            // No hit or more than one: the row address stands (when it was
+            // unique), the attachment handle is withheld, nothing is
+            // removed (宁缺勿错).
+            return Ok(event);
+        }
+        let Some(attachment_id) =
+            self.store
+                .remove_message_attachment_at(&account.id, &record.id, matches[0])?
+        else {
+            return Ok(event);
+        };
+        if let Some(media) = self.media.as_ref()
+            && let Ok(sanitized) = sanitize_attachment_id(&attachment_id)
+        {
+            media.governor().delete_attachment(&sanitized);
+        }
+        event.attachment_id = Some(attachment_id);
+        Ok(event)
     }
 
     /// Contract 1.103 (§4.84): forward one `syncMessage.verified` projection
@@ -16911,6 +17073,43 @@ fn is_uuid_shaped(value: &str) -> bool {
 /// key (numbers compare as digit-suffix, ignoring formatting).
 fn address_digits(value: &str) -> String {
     value.chars().filter(char::is_ascii_digit).collect()
+}
+
+/// Whether one descriptor matches a delete-for-me attachment entry
+/// (contract 1.196, §4.196): the official one-of legs
+/// (deleteForMe.preload.ts:162-185) — clientUuid against the descriptor id
+/// (the engine writes `AttachmentPointer.client_uuid` there), fallbackDigest
+/// against the encrypted digest, fallbackPlaintextHash against the plaintext
+/// hash. Integrity legs consult both index-aligned locator columns: the
+/// live-receive column and the history-import column, either of which may
+/// hold the face. Any one leg matching is enough; the caller owns the
+/// "unique or nothing" rule.
+fn attachment_delete_matches(
+    entry: &crate::engine::SyncDeleteAttachment,
+    attachment: &NormalizedAttachment,
+    live: Option<&HistoryAttachmentLocator>,
+    history: Option<&HistoryAttachmentLocator>,
+) -> bool {
+    let digest_matches = |digest: &str| {
+        live.and_then(|face| face.digest.as_deref()) == Some(digest)
+            || history.and_then(|face| face.digest.as_deref()) == Some(digest)
+    };
+    let plaintext_hash_matches = |hash: &str| {
+        live.and_then(|face| face.plaintext_hash.as_deref())
+            .is_some_and(|stored| stored.eq_ignore_ascii_case(hash))
+            || history
+                .and_then(|face| face.plaintext_hash.as_deref())
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(hash))
+    };
+    entry
+        .client_uuid
+        .as_deref()
+        .is_some_and(|uuid| attachment.id.eq_ignore_ascii_case(uuid))
+        || entry.fallback_digest.as_deref().is_some_and(digest_matches)
+        || entry
+            .fallback_plaintext_hash
+            .as_deref()
+            .is_some_and(plaintext_hash_matches)
 }
 
 /// Validate and normalize the caller-supplied link preview into the exact
@@ -33348,6 +33547,7 @@ mod tests {
                         groups: deletes,
                         conversations: Vec::new(),
                         local_only_conversations: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 },
             );
@@ -33388,12 +33588,14 @@ mod tests {
             account_id: event_account,
             deletes: event_groups,
             conversations: event_conversations,
+            attachments: event_attachments,
         } = &events[0]
         else {
             panic!("expected the forwarding event: {:?}", events[0]);
         };
         assert_eq!(event_account, &account.id);
         assert!(event_conversations.is_empty(), "message-only envelope");
+        assert!(event_attachments.is_empty(), "no attachment arm");
         assert_eq!(event_groups.len(), 4, "{event_groups:?}");
         assert_eq!(
             event_groups[0].conversation_id.as_deref(),
@@ -33458,6 +33660,387 @@ mod tests {
         };
         assert!(deletes[0].messages[0].message_id.is_none());
         assert!(stored(&service, &conversation.id, "m1").is_none());
+    }
+
+    /// One descriptor for the §4.196 tests: the id is the live clientUuid
+    /// face and the locator carries the two integrity fallbacks.
+    fn delete_attachment_descriptor(
+        id: &str,
+        digest: Option<&str>,
+        plaintext_hash: Option<&str>,
+    ) -> NormalizedAttachment {
+        let locator =
+            (digest.is_some() || plaintext_hash.is_some()).then(|| HistoryAttachmentLocator {
+                key: Some("a2V5".into()),
+                cdn_key: None,
+                cdn_number: None,
+                upload_timestamp: None,
+                digest: digest.map(str::to_string),
+                plaintext_hash: plaintext_hash.map(str::to_string),
+            });
+        NormalizedAttachment {
+            id: id.into(),
+            content_type: Some("image/jpeg".into()),
+            filename: None,
+            size: None,
+            width: None,
+            height: None,
+            is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
+            waveform: None,
+            duration: None,
+            locator,
+        }
+    }
+
+    /// Seed one incoming row carrying attachment descriptors (and their
+    /// index-aligned live locator faces, through `insert_message`).
+    #[allow(clippy::too_many_arguments)]
+    fn seed_delete_attachment_row(
+        service: &ConnectorService,
+        account_id: &str,
+        conversation_id: &str,
+        id: &str,
+        sent_at: u64,
+        sender_id: &str,
+        author_aci: Option<&str>,
+        attachments: Vec<NormalizedAttachment>,
+    ) {
+        let record = MessageRecord {
+            author_aci: author_aci.map(str::to_string),
+            id: id.into(),
+            account_id: account_id.into(),
+            conversation_id: conversation_id.into(),
+            direction: "incoming",
+            sender_id: sender_id.into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments,
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        assert!(
+            service
+                .store_ref()
+                .insert_message(&record, None, Some("body"), true)
+                .unwrap()
+        );
+    }
+
+    /// Contract 1.196 (§4.196): the `attachmentDeletes` arm. The
+    /// conversation walks the §4.83 ladder (the direct peer here), the target
+    /// row resolves by its upstream sent stamp in either direction, and the
+    /// attachment matches by any of the official one-of legs — clientUuid,
+    /// fallbackDigest, fallbackPlaintextHash. A unique match removes the
+    /// descriptor while keeping the message row; no match leaves it alone
+    /// with the raw legs forwarded; two matches fail closed (no
+    /// attachmentId, nothing removed); the conversation scoping keeps a
+    /// same-stamp row in another chat untouched; a pathological multi-row
+    /// stamp narrows by the target author and otherwise stays unresolved.
+    #[test]
+    fn sync_delete_for_me_attachment_arm_resolves_legs_and_mirrors() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        const ACI: &str = "11111111-1111-1111-1111-111111111111";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, ACI, &conversation.peer_key)
+            .unwrap();
+        let second = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Other")
+            .unwrap();
+
+        // The three legs on one row, one attachment each: the UUID leg, the
+        // digest leg, and the plaintext-hash leg.
+        seed_delete_attachment_row(
+            &service,
+            &account.id,
+            &conversation.id,
+            "m-attach",
+            100,
+            "peer-hash",
+            Some(ACI),
+            vec![
+                // All three legs point at this one attachment.
+                delete_attachment_descriptor(
+                    "11111111-2222-4333-8444-555555555555",
+                    Some("ZGlnZXN0MQ=="),
+                    Some("aa11"),
+                ),
+                delete_attachment_descriptor("att-digest", Some("ZGlnZXN0Mg=="), None),
+                delete_attachment_descriptor("att-hash", None, Some("bb22")),
+            ],
+        );
+        // Two attachments on one row share a digest: the entry is ambiguous
+        // and must delete neither.
+        seed_delete_attachment_row(
+            &service,
+            &account.id,
+            &conversation.id,
+            "m-amb",
+            200,
+            "peer-hash",
+            Some(ACI),
+            vec![
+                delete_attachment_descriptor("att-amb-a", Some("YW1iaWc="), None),
+                delete_attachment_descriptor("att-amb-b", Some("YW1iaWc="), None),
+            ],
+        );
+        // A same-digest row in another conversation proves the conversation
+        // scoping; a same-digest row in this one proves a miss stays local.
+        seed_delete_attachment_row(
+            &service,
+            &account.id,
+            &second.id,
+            "m-cross",
+            100,
+            "+15555550102",
+            None,
+            vec![delete_attachment_descriptor(
+                "att-cross",
+                Some("Y3Jvc3M="),
+                None,
+            )],
+        );
+        seed_delete_attachment_row(
+            &service,
+            &account.id,
+            &conversation.id,
+            "m-other",
+            300,
+            "peer-hash",
+            Some(ACI),
+            vec![delete_attachment_descriptor(
+                "att-other",
+                Some("Y3Jvc3M="),
+                None,
+            )],
+        );
+        // One stamp, two rows: the author narrowing picks the ACI-authored
+        // row, never the stamp alone.
+        seed_delete_attachment_row(
+            &service,
+            &account.id,
+            &conversation.id,
+            "m-collide-a",
+            400,
+            "peer-hash",
+            Some(ACI),
+            vec![delete_attachment_descriptor(
+                "att-collide-a",
+                Some("Y29sbGlkZQ=="),
+                None,
+            )],
+        );
+        seed_delete_attachment_row(
+            &service,
+            &account.id,
+            &conversation.id,
+            "m-collide-b",
+            400,
+            "other-hash",
+            None,
+            vec![delete_attachment_descriptor(
+                "att-collide-b",
+                Some("Y29sbGlkZQ=="),
+                None,
+            )],
+        );
+
+        let entry = |conversation_id: &str,
+                     author: &str,
+                     timestamp: u64,
+                     client_uuid: Option<&str>,
+                     digest: Option<&str>,
+                     hash: Option<&str>| crate::engine::SyncDeleteAttachment {
+            conversation_id: conversation_id.into(),
+            target: crate::engine::SyncDeleteEntry {
+                author: author.into(),
+                timestamp,
+            },
+            client_uuid: client_uuid.map(str::to_string),
+            fallback_digest: digest.map(str::to_string),
+            fallback_plaintext_hash: hash.map(str::to_string),
+        };
+        let sync = |attachments: Vec<crate::engine::SyncDeleteAttachment>| {
+            let mut receive = control_receive(
+                "+15555550100",
+                "+15555550100",
+                ControlReceive::SyncDeleteForMe {
+                    deletes: crate::engine::SyncDeleteForMeProjection {
+                        groups: Vec::new(),
+                        conversations: Vec::new(),
+                        local_only_conversations: Vec::new(),
+                        attachments,
+                    },
+                },
+            );
+            receive.source = None;
+            receive.source_uuid = None;
+            receive
+        };
+
+        let events = service
+            .ingest_receive(
+                sync(vec![
+                    // clientUuid leg.
+                    entry(
+                        ACI,
+                        ACI,
+                        100,
+                        Some("11111111-2222-4333-8444-555555555555"),
+                        None,
+                        None,
+                    ),
+                    // digest leg.
+                    entry(ACI, ACI, 100, None, Some("ZGlnZXN0Mg=="), None),
+                    // plaintext-hash leg.
+                    entry(ACI, ACI, 100, None, None, Some("bb22")),
+                    // No row at the stamp: raw legs only.
+                    entry(ACI, ACI, 999, Some("no-such-uuid"), None, None),
+                    // Two attachments share the digest: ambiguous, no delete.
+                    entry(ACI, ACI, 200, None, Some("YW1iaWc="), None),
+                    // The same digest in the other conversation deletes only
+                    // that conversation's copy.
+                    entry(
+                        "+15555550102",
+                        "+15555550102",
+                        100,
+                        None,
+                        Some("Y3Jvc3M="),
+                        None,
+                    ),
+                    // Unknown conversation: nothing resolves.
+                    entry(
+                        "no-such-conversation",
+                        ACI,
+                        100,
+                        None,
+                        Some("Y3Jvc3M="),
+                        None,
+                    ),
+                    // Stamp collision: the author narrows to the ACI row.
+                    entry(ACI, ACI, 400, None, Some("Y29sbGlkZQ=="), None),
+                ]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let HostSideEvent::SyncDeleteForMe { attachments, .. } = &events[0] else {
+            panic!("expected the forwarding event: {:?}", events[0]);
+        };
+        assert_eq!(attachments.len(), 8, "{attachments:?}");
+        assert_eq!(
+            attachments[0].conversation_id.as_deref(),
+            Some(conversation.id.as_str())
+        );
+        assert_eq!(attachments[0].message_id.as_deref(), Some("m-attach"));
+        assert_eq!(
+            attachments[0].attachment_id.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+        assert!(attachments[0].fallback_digest.is_none());
+        assert_eq!(attachments[1].attachment_id.as_deref(), Some("att-digest"));
+        assert_eq!(attachments[2].attachment_id.as_deref(), Some("att-hash"));
+        // The miss: conversation resolved, no row, no ids.
+        assert_eq!(
+            attachments[3].conversation_id.as_deref(),
+            Some(conversation.id.as_str())
+        );
+        assert!(attachments[3].message_id.is_none());
+        assert!(attachments[3].attachment_id.is_none());
+        assert_eq!(attachments[3].client_uuid.as_deref(), Some("no-such-uuid"));
+        // Ambiguity: the row address stands, the attachment handle is
+        // withheld, nothing was deleted.
+        assert_eq!(attachments[4].message_id.as_deref(), Some("m-amb"));
+        assert!(attachments[4].attachment_id.is_none());
+        // Cross-conversation: the other chat's copy resolves and goes.
+        assert_eq!(
+            attachments[5].conversation_id.as_deref(),
+            Some(second.id.as_str())
+        );
+        assert_eq!(attachments[5].attachment_id.as_deref(), Some("att-cross"));
+        // Unknown conversation: every id absent, the leg still rides.
+        assert!(attachments[6].conversation_id.is_none());
+        assert!(attachments[6].message_id.is_none());
+        assert!(attachments[6].attachment_id.is_none());
+        assert_eq!(attachments[6].fallback_digest.as_deref(), Some("Y3Jvc3M="));
+        // Author narrowing on a stamp collision.
+        assert_eq!(attachments[7].message_id.as_deref(), Some("m-collide-a"));
+        assert_eq!(
+            attachments[7].attachment_id.as_deref(),
+            Some("att-collide-a")
+        );
+
+        let stored = |conversation_id: &str, id: &str| {
+            service
+                .store_ref()
+                .message_by_id(&account.id, conversation_id, id)
+                .unwrap()
+        };
+        // The message row survives; its attachment array is empty.
+        let row = stored(&conversation.id, "m-attach").expect("row survives");
+        assert!(row.attachments.is_empty());
+        assert!(
+            service
+                .store_ref()
+                .live_attachment_locators(&account.id, "m-attach")
+                .unwrap()
+                .is_empty()
+        );
+        // The ambiguous row keeps both attachments.
+        let ambiguous = stored(&conversation.id, "m-amb").expect("ambiguous row survives");
+        assert_eq!(ambiguous.attachments.len(), 2);
+        // The other conversation's copy is gone; this conversation's
+        // same-digest row is untouched.
+        let cross = stored(&second.id, "m-cross").expect("cross row survives");
+        assert!(cross.attachments.is_empty());
+        let other = stored(&conversation.id, "m-other").expect("other row survives");
+        assert_eq!(other.attachments.len(), 1);
+        // The collision: the ACI row lost its attachment, the other kept it.
+        assert!(
+            stored(&conversation.id, "m-collide-a")
+                .unwrap()
+                .attachments
+                .is_empty()
+        );
+        assert_eq!(
+            stored(&conversation.id, "m-collide-b")
+                .unwrap()
+                .attachments
+                .len(),
+            1
+        );
     }
 
     /// Contract 1.182 (§4.182): the two whole-conversation arms. The
@@ -33600,6 +34183,7 @@ mod tests {
                         groups: Vec::new(),
                         conversations,
                         local_only_conversations,
+                        attachments: Vec::new(),
                     },
                 },
             );

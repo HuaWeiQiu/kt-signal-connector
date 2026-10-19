@@ -5,6 +5,27 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.196 (2026-10-20; §4.196 the delete-for-me
+  attachment arm: `syncMessage.deleteForMe.attachmentDeletes` — the
+  official `handleDeleteForMeSync` fourth face
+  (MessageReceiver.preload.ts:3724-3790, engine projection 1af73ed) — is
+  no longer dropped. Each entry keeps its conversation identity, target
+  (author, positive upstream stamp), and the one-of clientUuid /
+  fallbackDigest / fallbackPlaintextHash legs. The service resolves the
+  conversation through the §4.83 ladder, the target row by its upstream
+  sent stamp in either direction, and the attachment through the
+  index-aligned descriptor and locator columns; a unique match removes
+  the descriptor and its locator slot locally, and the event's new
+  optional `attachmentDeletes` key reports `conversationId?` /
+  `messageId?` / `attachmentId?` beside the raw legs. A miss or an
+  ambiguous match deletes nothing and withholds the ids; the key is
+  skipped when empty, so pre-1.196 frames are byte-identical. The schema
+  also relaxes the event's `deletes` array to `minItems: 0` so an
+  envelope carrying only the conversation or attachment arms validates.
+  This revision additionally lands the per-account receive-queue budget
+  (64 slots / 512 KiB per account beside the retained 256-slot / 2 MiB
+  global caps — internal, no wire face) so one account's flood cannot
+  crowd out another's receives.)
 - Contract revision: 1.195 (2026-10-20; §4.195 the long-text backfill
   state: the backfill response's sibling `longText` entry — officially the
   same `AttachmentData` oneof beside `attachments`
@@ -16876,6 +16897,115 @@ and absence → neither, all beside an empty attachment list) and
 `attachment_backfill_settled_frame_reports_long_text_state` (the whole
 wire frame verbatim for both keys; the 1.193 test pins the key-free
 pre-1.195 frame).
+
+### 4.196 The delete-for-me attachment arm: `attachmentDeletes` consume + mirror (contract revision 1.196, 2026-10-20)
+
+The delete-for-me family covered `messageDeletes` (1.102, §4.83) and the
+two whole-conversation arms (1.182, §4.182). The official
+`handleDeleteForMeSync` carries a fourth arm the connector had never
+consumed: `deleteSync.attachmentDeletes` — one attachment (not the whole
+message) deleted for this account on another linked device. The engine's
+projection landed first (kt-signal-engine `1af73ed`, 2026-10-20, the
+`attachmentDeletes` leg 1/3 batch): each entry is
+`{conversationId, targetMessage: {author, timestamp}, clientUuid?,
+fallbackDigest?, fallbackPlaintextHash?}` with the official byte
+conversions (UUID string, standard base64, lowercase hex).
+
+Official anchors (upstream Signal-Desktop, read-only, AGPL — semantics
+only): `ts/textsecure/MessageReceiver.preload.ts:3724-3790` (the arm's
+three warn-drops: no target conversation :3744, no target message at
+:3748-3755 with its `processAddressableMessage` author/stamp double gate
+:4415-4429, all three legs absent :3764-3770),
+`ts/util/syncTasks.preload.ts:176-188`
+(dispatch as `delete-single-attachment`), and
+`ts/util/deleteForMe.preload.ts:64-190` (find the message, then try
+clientUuid → fallbackDigest → fallbackPlaintextHash among attachments
+that carry a digest, filter the attachment out, save, and
+`cleanupAttachmentFiles`).
+
+**Parse.** `normalized_sync_delete_attachments` keeps at most 256 entries
+(the message-arm batch ceiling, the same value the engine caps at). Each
+entry hard-gates on a non-empty conversation identity and a target with a
+non-empty author and a strictly positive stamp — this destructive arm
+does not inherit `messageDeletes`' zero-defaulted stamp tolerance (the
+official `processAddressableMessage` refuses both). The three legs are
+per-key fail-closed: empty, wrong-shaped, or over-bound legs drop
+individually (the receive-id bound 128; a shortened digest/hash is a
+wrong fingerprint), the plaintext hash normalizes to lowercase, and an
+entry with no surviving leg drops whole. The queue budget charges the
+entry's heap strings like the other arms.
+
+**Mirror.** The service resolves the conversation through the same §4.83
+ladder the other arms use, then the target row by its upstream sent stamp
+in either direction (`Store::rows_by_sent_at` — the phone mirrors our own
+outgoing rows back, so the incoming-only reader cannot apply). A
+pathological multi-row stamp narrows by the target author (the
+attachment-backfill precedent) and otherwise stays unresolved. Inside
+the row, each descriptor matches when any leg hits: `clientUuid` against
+the descriptor id (the engine writes `AttachmentPointer.client_uuid`
+there), `fallbackDigest` and `fallbackPlaintextHash` against the
+index-aligned live-receive and history-import locator columns. Recorded
+boundary: history-import rows carry synthetic descriptor ids (the archive
+ingest does not persist the raw `clientUuid`), so the clientUuid leg only
+hits live-receive rows; the integrity legs cover imported rows through
+their locator columns.
+
+Exactly one matching attachment is removed through
+`Store::remove_message_attachment_at`: the descriptor leaves
+`attachments_json` and the same index leaves both locator columns, so
+the surviving slots never shift onto a neighbour. The message row itself
+stays — the official `applyDeleteAttachmentFromMessage` keeps it and
+only filters the attachment array — and the local media file is erased
+best-effort (the §4.37 view-once burn precedent; no ids or paths logged).
+No match removes nothing and withholds the ids; more than one match is
+ambiguous and fails closed the same way (宁缺勿错 — a wrong attachment
+deletion is not recoverable; the official first-`find` is deliberately
+tightened to "unique or nothing"). Replays find the descriptor already
+gone and converge. Deliberate divergence recorded: the conversation
+summary is not rewritten — the row, its timestamp, and its unread count
+stand, so only an attachment-only preview noun can linger until the next
+newer row updates the summary (recomputing that noun would duplicate the
+preview composition or, worse, flatten a richer group preview).
+
+**Forward.** The transient `message.deleteForMe` event gains the optional
+`attachmentDeletes` key (skipped when empty, so every pre-1.196 frame —
+and every envelope without the fourth arm — keeps its exact bytes). Each
+entry carries `conversationId?`, `messageId?`, `attachmentId?`, and the
+raw legs the projection stated (`clientUuid?`, `fallbackDigest?`,
+`fallbackPlaintextHash?`); absent stays absent, so the desktop joins by
+the raw legs where the connector held nothing. The schema event payload
+block declares the new array (max 256) and its six optional keys, and
+the branch's `deletes` array relaxes to `minItems: 0` (the required key
+stays for shape stability): an envelope carrying only the conversation
+or attachment arms legitimately reports an empty `deletes`, which the
+1.182 arms already did in practice.
+
+**Tests.** `sync_delete_for_me_attachment_arm_routes_and_gates` (the
+three legs, all three together, every official drop gate, hash
+normalization, batch cap, plain skip),
+`sync_delete_for_me_attachment_arm_resolves_legs_and_mirrors` (the three
+legs each removing their descriptor, the message row surviving, the miss,
+the ambiguous two-match fail-closed arm, the same-digest cross-
+conversation scoping, the unknown-conversation entry, and the author
+narrowing on a stamp collision),
+`remove_message_attachment_at_strips_descriptor_and_aligned_locators`
+(the store primitive, both locator columns, and the quiet misses), and
+`delete_for_me_event_rides_attachment_deletes` (the whole wire frame
+verbatim, including the skipped empty key on the pre-1.196 shape).
+
+**Internal stability companion (no wire face).** The receive queue keeps
+its global 256-slot / 2 MiB caps and gains a per-account budget of 64
+slots / 512 KiB (`RECEIVE_QUEUE_PER_ACCOUNT_CAPACITY` /
+`RECEIVE_QUEUE_PER_ACCOUNT_BYTE_CAPACITY`). An account's slot/byte
+permits are tried without waiting; a flood that fills its own share
+drops that account's overflow under the existing drop/warn semantics
+(no payload or identity logged) while another account still admits. The
+global semaphore and channel cap remain the outer bound, and the
+per-account map is capped at the per-engine account ceiling
+(`MAX_ACCOUNTS_PER_ENGINE`) with an anonymous overflow bucket so a
+malformed account string cannot grow it. Tests:
+`receive_queue_per_account_budget_isolates_a_flooding_account` and
+`receive_queue_global_budget_still_caps_the_sum_of_accounts`.
 
 ## 5. signal-cli Boundary
 
