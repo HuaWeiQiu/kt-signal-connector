@@ -67,6 +67,24 @@
   recorded in `docs/last-moments-redaction-audit.md`; the engine worktree is
   outside this repository and the fix lands there.)
 =======
+- Contract revision: 1.201 (2026-10-20; §6.5 amendment / §4.201 the
+  cross-account crosstalk fix: **a contacts sync never creates a
+  conversation.** The §6.5 skeleton materialization — added in 1.14 so a
+  linked account sees its existing chats right after a sync — has been
+  demoted to an UPDATE-only title refresh for both faces (the 60s pull
+  batch and the 1.136 passive batch). Root cause: a contacts entry is not
+  a chat. Signal shows a thread only after messages exist; a contact the
+  user never messaged belongs in "new chat", not in the chat list. With
+  one account the difference was invisible; with two it was fatal —
+  account B stored account A's number, A's profile sync delivered A's
+  identities into B's contacts cache, and B's chat list grew rows for
+  people B had never messaged, keyed by A's own ACIs (real device:
+  bx y / 菲菲 林 / y y). The fix is internal: no wire, method, event, key,
+  error code, capability, or schema change. A contacts batch may still
+  upgrade a masked/placeholder title on a conversation that already
+  exists, and still reports that conversation id in its change set.
+  Evidence and the excluded hypotheses are recorded in
+  `/Users/tanye/test/kt/SIGNAL-ACCOUNT-CROSSTALK-P0.md`.)
 - Contract revision: 1.200 (2026-10-20; §4.200 the pin backfill
   semantics: the archive's `PinDetails` clocks are authoritative. The
   engine history export emits `pinExpiry`
