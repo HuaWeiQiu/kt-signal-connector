@@ -15473,3 +15473,214 @@ async fn voice_waveform_pair_rides_the_live_row_verbatim() {
     wait_for_process_exit(engine_pid).await;
     assert_clean_exit(&mut connector).await;
 }
+
+/// Contract 1.190 (§4.190 ②+⑤) — the group dead-letter fix and the ledger
+/// faces, end to end through a real connector process and the fake engine:
+/// a real `messages.sendText` round trip creates the GROUP's outgoing row,
+/// a group member's DELIVERED receipt envelope (whose own direct
+/// conversation holds no such row — the exact pre-1.190 dead-letter shape)
+/// finds it through the account-level sentAt find, the host lane observes
+/// `message.statusChanged` plus the additive `message.receiptsChanged`, and
+/// the `messages.receipts` read face serves the stamped per-recipient
+/// ledger. The receipt rides the extra-receives marker with the typing send
+/// as the flush trigger.
+#[tokio::test]
+async fn group_receipt_finds_the_group_row_and_serves_the_ledger() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [77_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Group-Receipt" }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let mut account_id = String::new();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                account_id = frame["result"]["id"].as_str().unwrap().to_string();
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the link burst answers the account id");
+
+    // The fixture links with a group conversation; the listing answers its
+    // opaque id (the listing runs before the receipt marker exists, so no
+    // premature flush).
+    let listed = request(
+        &mut client,
+        "list-groups",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation_id = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with a group conversation");
+
+    // The group send whose receipt the member will return.
+    let sent = request(
+        &mut client,
+        "send-group",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "group",
+            "peerKey": "ZmFrZS1ncm91cC0x",
+            "text": "group receipt probe",
+            "clientRequestId": "grp-receipt-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let sent_at = sent["result"]["sentAt"].as_u64().expect("the row's stamp");
+    let message_id = sent["result"]["id"].as_str().unwrap().to_string();
+
+    // The roster member's DELIVERED receipt: the envelope's own timestamp is
+    // the arrival stamp (contract 1.32). The member's own direct
+    // conversation exists (the fixture peer materializes at link) but holds
+    // no row at the group's sentAt — the exact pre-1.190 dead-letter shape
+    // the account-level find fixes; the roster the link-time sync captured
+    // carries the member, so the qualification gate passes.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([{
+            "source": "+15555550101",
+            "timestamp": sent_at + 1000,
+            "receiptMessage": {
+                "isDelivery": true,
+                "timestamp": [sent_at]
+            }
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let mut interleaved = Vec::new();
+    send_request_frame(
+        &mut client,
+        "typing-flush",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "stop": true
+        }),
+    )
+    .await;
+    let typing_reply = timeout(Duration::from_secs(5), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("typing-flush") {
+                return frame;
+            }
+            interleaved.push(frame);
+        }
+    })
+    .await
+    .expect("the typing flush answers");
+    assert!(
+        typing_reply.get("result").is_some(),
+        "the typing flush must succeed: {typing_reply:?}"
+    );
+
+    // The receipt notification precedes the typing reply on the wire, but
+    // the connector ingests it asynchronously — the events may trail the
+    // reply. Keep collecting (bounded quiet window) until the fold's faces
+    // arrive.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").is_none() {
+                interleaved.push(frame);
+                let status = interleaved.iter().any(|frame| {
+                    frame.get("event").and_then(Value::as_str) == Some("message.statusChanged")
+                        && frame["data"]["messageId"] == json!(message_id)
+                        && frame["data"]["status"] == "delivered"
+                });
+                let ledger = interleaved.iter().any(|frame| {
+                    frame.get("event").and_then(Value::as_str) == Some("message.receiptsChanged")
+                        && frame["data"]["messageId"] == json!(message_id)
+                });
+                if status && ledger {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the receipt fold's events ride the host lane");
+
+    let status = interleaved
+        .iter()
+        .find(|frame| {
+            frame.get("event").and_then(Value::as_str) == Some("message.statusChanged")
+                && frame["data"]["messageId"] == json!(message_id)
+                && frame["data"]["status"] == "delivered"
+        })
+        .unwrap_or_else(|| panic!("no delivered transition; interleaved: {interleaved:?}"));
+    assert_eq!(status["data"]["deliveredAt"], json!(sent_at + 1000));
+
+    let ledger_event = interleaved
+        .iter()
+        .find(|frame| frame.get("event").and_then(Value::as_str) == Some("message.receiptsChanged"))
+        .expect("the per-recipient ledger event rides the host lane");
+    assert_eq!(ledger_event["data"]["messageId"], json!(message_id));
+    let receipts = ledger_event["data"]["receipts"].as_array().unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["recipient"], "+15555550101");
+    assert_eq!(receipts[0]["deliveredAt"], json!(sent_at + 1000));
+
+    // The read face serves the same ledger through the wire method.
+    let read = request(
+        &mut client,
+        "read-receipts",
+        "messages.receipts",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "messageId": message_id
+        }),
+    )
+    .await;
+    let items = read["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{read}");
+    assert_eq!(items[0]["recipient"], "+15555550101");
+    assert_eq!(items[0]["deliveredAt"], json!(sent_at + 1000));
+    assert!(items[0].get("readAt").is_none(), "absent tiers stay absent");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}

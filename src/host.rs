@@ -50,8 +50,9 @@ use crate::service::{
     GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
     HistoryAttachmentDownloadParams, HistoryImportCancelParams, HistoryImportRetryParams,
     HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
-    LinkSessionParams, LinkStartParams, MessageGetByClientRequestIdParams, MessageGetTextParams,
-    MessageRequestParams, MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
+    LinkSessionParams, LinkStartParams, MessageGetByClientRequestIdParams,
+    MessageGetReceiptsParams, MessageGetTextParams, MessageRequestParams,
+    MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesDeleteForMeParams,
     MessagesEditParams, MessagesListParams, MessagesMarkReadParams,
     MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams, MessagesRemoteDeleteParams,
@@ -2135,6 +2136,31 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        "messages.receipts" => {
+            match serde_json::from_value::<MessageGetReceiptsParams>(request.params) {
+                Ok(params) => match runtime
+                    .get_message_receipts(
+                        params.account_id,
+                        params.conversation_id,
+                        params.message_id,
+                    )
+                    .await
+                {
+                    Ok(items) => {
+                        HostResponse::success(request_id, serde_json::json!({ "items": items }))
+                    }
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "messages.receipts",
+                        "params",
+                        "invalid messages.receipts params",
+                    ),
+                ),
+            }
+        }
         "messages.search" => match serde_json::from_value::<MessagesSearchParams>(request.params) {
             Ok(params) if (1..=MAX_PAGE_LIMIT).contains(&params.limit) => {
                 match runtime
@@ -4098,6 +4124,22 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
             }
             Ok(HostEvent::new("message.statusChanged", payload))
         }
+        HostSideEvent::MessageReceiptsChanged {
+            account_id,
+            message_id,
+            receipts,
+        } => {
+            // Contract 1.190 (§4.190 ⑤): the per-recipient ledger face — the
+            // message's whole ledger rides the event (first stamps only,
+            // absent tiers absent), so the host merge is total; the empty
+            // array is always serialized so a merge never keeps stale rows.
+            let payload = json!({
+                "accountId": account_id,
+                "messageId": message_id,
+                "receipts": serde_json::to_value(&receipts).unwrap_or(json!([])),
+            });
+            Ok(HostEvent::new("message.receiptsChanged", payload))
+        }
         HostSideEvent::ConversationTyping {
             account_id,
             conversation_id,
@@ -5870,6 +5912,68 @@ mod tests {
         // The absent-optional discipline: a missing identity stays absent.
         assert!(frame["data"].get("senderName").is_none());
         assert_eq!(frame["data"]["timestamp"], 1727000002000u64);
+    }
+
+    /// Contract 1.190 (§4.190 ⑤): the per-recipient ledger event frame —
+    /// `message.receiptsChanged` carrying the message's whole ledger with
+    /// absent tiers absent (first stamps only), the empty array always
+    /// serialized so a host merge never keeps stale rows.
+    #[tokio::test]
+    async fn receipts_changed_event_carries_the_ledger_face() {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::MessageReceiptsChanged {
+                account_id: "acct-1".into(),
+                message_id: "msg-1".into(),
+                receipts: vec![
+                    crate::store::RecipientReceiptRow {
+                        recipient: "+15555550101".into(),
+                        sent_at: Some(1000),
+                        failed_at: None,
+                        delivered_at: Some(2000),
+                        read_at: None,
+                        viewed_at: None,
+                    },
+                    crate::store::RecipientReceiptRow {
+                        recipient: "+15555550102".into(),
+                        sent_at: None,
+                        failed_at: Some(1500),
+                        delivered_at: None,
+                        read_at: None,
+                        viewed_at: None,
+                    },
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["event"], "message.receiptsChanged");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["messageId"], "msg-1");
+        let receipts = frame["data"]["receipts"].as_array().unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0]["recipient"], "+15555550101");
+        assert_eq!(receipts[0]["sentAt"], 1000);
+        assert_eq!(receipts[0]["deliveredAt"], 2000);
+        assert!(
+            receipts[0].get("readAt").is_none(),
+            "absent tiers stay absent"
+        );
+        assert!(receipts[0].get("failedAt").is_none());
+        assert_eq!(receipts[1]["recipient"], "+15555550102");
+        assert_eq!(receipts[1]["failedAt"], 1500);
+        assert!(receipts[1].get("sentAt").is_none());
+
+        // The empty ledger still serializes the array (a total merge face).
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::MessageReceiptsChanged {
+                account_id: "acct-1".into(),
+                message_id: "msg-2".into(),
+                receipts: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["data"]["receipts"], json!([]));
     }
 
     /// Contract 1.134 (§4.117; the storage-pull face joins with 1.141,

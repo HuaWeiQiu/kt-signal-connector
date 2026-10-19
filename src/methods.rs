@@ -59,6 +59,10 @@ pub const METHODS: &[MethodRow] = &[
     // `message-adjacent-media`.
     ("messages.adjacentMedia", Lane::Read, false, "read"),
     ("messages.getText", Lane::Read, false, "read"),
+    // Per-recipient receipt ledger read (contract 1.190, §4.190): a bounded
+    // store-only read over one message's ledger rows — no upstream traffic,
+    // no mutation; the desktop's per-recipient checkmark face.
+    ("messages.receipts", Lane::Read, false, "read"),
     // Orphan-sweep probe (contract 1.172, §4.172): the single-row read-only
     // face behind the desktop's unsettled-row sweep — the same ledger row
     // the retry face addresses, answered with its settled state; no
@@ -1000,6 +1004,7 @@ mod tests {
             "messages.list",
             "messages.adjacentMedia",
             "messages.getText",
+            "messages.receipts",
             "messages.getByClientRequestId",
             "messages.search",
             "messages.attachments.open",

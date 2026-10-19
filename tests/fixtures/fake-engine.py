@@ -978,6 +978,21 @@ for line in sys.stdin:
             result = json.loads(LOOKUP_DISPATCH_MARKER.read_text())
         else:
             result = {"dispatched": False}
+    elif method == "getConfiguration":
+        # §4.190 receipt-gate fetch: the connector's startup pass mirrors the
+        # account's readReceipts flag. The real engine answers the six-key
+        # account-configuration face (AccountRecord truth, proto3 defaults
+        # when no storage state, phoneNumberSharingMode key-absent when
+        # unset); the fixture answers the gate's one consumed key off
+        # KT_FAKE_READ_RECEIPTS (default false — the proto default),
+        # key-verbatim, no marker file needed.
+        result = {
+            "readReceipts": os.environ.get("KT_FAKE_READ_RECEIPTS") == "1",
+            "typingIndicators": False,
+            "linkPreviews": False,
+            "unlistedPhoneNumber": False,
+            "storiesDisabled": False,
+        }
     elif method == "send":
         # Record the exact JSON-RPC params so tests can assert what the
         # connector dispatched upstream (e.g. quoteTimestamp/quoteAuthor).

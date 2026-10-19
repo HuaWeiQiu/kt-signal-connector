@@ -1112,11 +1112,22 @@ pub enum ControlReceive {
     /// Peer receipt confirming earlier outgoing rows (bounded batch). `when`
     /// is the receipt envelope's own timestamp (contract 1.32) — when the
     /// peer sent the receipt — falling back to connector wall-clock at the
-    /// service layer when the envelope carries none.
+    /// service layer when the envelope carries none. `recipient` is the
+    /// per-recipient identity (contract 1.190, §4.190): the ReceiptMessage
+    /// proto names no recipient (SignalService.proto:451-460 — type + a
+    /// repeated timestamp and nothing else), and the official receiver
+    /// attributes the receipt by the envelope source
+    /// (MessageReceiver.preload.ts:2849-2855). The routing copies the same
+    /// `source`/`sourceNumber`/`sourceUuid` ladder `envelope_peer_source`
+    /// answers, verbatim — the value rides inside the variant so every
+    /// consumer that matches `ControlReceive::Receipt` (the §4.91-style
+    /// early-receipt buffer included) holds the identity without reaching
+    /// back for the receive context.
     Receipt {
         kind: ReceiptKind,
         timestamps: Vec<u64>,
         when: Option<u64>,
+        recipient: Option<String>,
     },
     /// Pin of an earlier message (contract 1.33): the target identity plus
     /// the optional timed-pin duration — absent means the official forever
@@ -6215,6 +6226,11 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
         return Some(ControlRouting {
             direction: "incoming",
             source: envelope_peer_source(envelope),
+            // Contract 1.190 (§4.190): the proto carries no recipient — the
+            // envelope source IS the per-recipient identity (the official
+            // receiver's own attribution, MessageReceiver.preload.ts:2849-2855).
+            // The group key stays None: a receipt addresses our outgoing rows
+            // by timestamp, never a conversation (the account-level find).
             group_id: None,
             control: ControlReceive::Receipt {
                 kind,
@@ -6222,6 +6238,7 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
                 // Contract 1.32: the receipt's own envelope timestamp backs the
                 // desktop's delivered/read timeline.
                 when: envelope.get("timestamp").and_then(Value::as_u64),
+                recipient: envelope_peer_source(envelope),
             },
         });
     }
@@ -8942,12 +8959,16 @@ mod tests {
                 kind,
                 timestamps,
                 when,
+                recipient,
             } => {
                 assert!(matches!(kind, ReceiptKind::Delivered));
                 assert_eq!(timestamps, vec![1726999000000, 1726999001000]);
                 // Contract 1.32: the envelope's own timestamp backs the
                 // delivered/read timeline.
                 assert_eq!(when, Some(1727000000000));
+                // Contract 1.190 (§4.190): the per-recipient identity rides
+                // the variant — the envelope source verbatim.
+                assert_eq!(recipient.as_deref(), Some("+15555550101"));
             }
             other => panic!("unexpected control: {other:?}"),
         }

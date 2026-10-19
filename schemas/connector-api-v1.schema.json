@@ -75,6 +75,7 @@
             "messages.adjacentMedia",
             "messages.search",
             "messages.getText",
+            "messages.receipts",
             "messages.getByClientRequestId",
             "messages.sendText",
             "messages.retryText",
@@ -800,6 +801,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messageGetTextParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.receipts" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesReceiptsParams" }
             }
           }
         },
@@ -2140,6 +2152,17 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "conversationId", "messageId"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesReceiptsParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId"],
+      "description": "messages.receipts (contract 1.190, §4.190): the per-recipient receipt ledger of one message — the addressing triple mirrors messages.getText (the message must resolve in the named conversation), read-only, no upstream traffic. The answer's items array is always present: a message that predates the ledger (pre-1.190 rows), or one no qualifying peer receipt ever reached, answers the honest empty list — each recipient row carries only the tiers actually stamped (first stamps, absent keys absent).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -4653,6 +4676,7 @@
             "conversation.typing",
             "message.upserted",
             "message.statusChanged",
+            "message.receiptsChanged",
             "message.viewOnceOpened",
             "message.expired",
             "call.incoming",
@@ -5859,6 +5883,62 @@
                 "description": "One decryption-error envelope forwarded (contract 1.165, §4.163): the engine's structured report that an inbound envelope failed to decrypt (the receive notification whose envelope carries the decryptionError marker — no message row exists for it). Account-domain transient lane (the receive.emptied attribution discipline): the signal account resolves through the store to this accountId, an unmatchable account drops warn-only. The fact alone — nothing persists, and no reset action exists on this face (the engine's DERM retry protocol is the self-heal path); the connector's metrics snapshot counts the envelopes independently, so a missed event costs nothing.",
                 "properties": {
                   "accountId": { "$ref": "#/$defs/opaqueId" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "message.receiptsChanged" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "messageId", "receipts"],
+                "description": "Contract 1.190 (§4.190): a peer receipt changed a message's per-recipient ledger — additive beside message.statusChanged (which keeps firing for the row's own aggregate ladder transitions). The payload carries the message's whole ledger face so a host merge stays total: one entry per recipient (the receipt envelope's source as the engine projected it — E.164 preferred, the ACI string as the fallback spelling), each tier's FIRST stamp only, absent tiers absent keys. sentAt/failedAt are the send-settlement seeds (the group send reply's per-recipient results, contract 1.173's counts de-aggregated); deliveredAt/readAt/viewedAt are the first peer receipts of each tier (read/viewed gated by the account's readReceipts configuration, the official shouldDropReceipt privacy symmetry). A change that only re-confirms existing stamps emits nothing; a message whose ledger emptied cannot emit (rows cascade with their message).",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "messageId": { "$ref": "#/$defs/opaqueId" },
+                  "receipts": {
+                    "type": "array",
+                    "maxItems": 1001,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["recipient"],
+                      "properties": {
+                        "recipient": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "description": "The recipient's identity key as the receipt envelope named it (E.164 preferred, the ACI string as the fallback spelling — the receive lane's own identifier bound, never invented)."
+                        },
+                        "sentAt": {
+                          "type": "integer",
+                          "description": "The send-settlement success seed for this recipient (first stamp wins)."
+                        },
+                        "failedAt": {
+                          "type": "integer",
+                          "description": "The send-settlement failure seed for this recipient (first stamp wins)."
+                        },
+                        "deliveredAt": {
+                          "type": "integer",
+                          "description": "Receipt envelope timestamp of this recipient's first DELIVERY receipt."
+                        },
+                        "readAt": {
+                          "type": "integer",
+                          "description": "Receipt envelope timestamp of this recipient's first READ receipt."
+                        },
+                        "viewedAt": {
+                          "type": "integer",
+                          "description": "Receipt envelope timestamp of this recipient's first VIEWED receipt."
+                        }
+                      }
+                    }
+                  }
                 }
               }
             }
