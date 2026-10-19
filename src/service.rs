@@ -276,6 +276,15 @@ pub const MARK_RECEIPT_MESSAGE_IDS_LIMIT: usize = 512;
 /// projection cap mirrored — entries beyond 64 are dropped, mirroring the
 /// official bounded BodyRange list.
 pub const MAX_SEND_MENTIONS: usize = 64;
+/// One `messages.deleteForMeMessages` request carries at most this many
+/// local row ids (contract revision 1.197, §4.197): the engine's
+/// single-request `deleteForMeMessages` ceiling — the official sender
+/// chunks at `MAX_MESSAGE_COUNT` 500
+/// (`ts/state/ducks/conversations.preload.ts:1952-1965`), the engine
+/// refuses a batch past 256 outright, and this face mirrors that exact
+/// bound. A larger list answers INVALID_REQUEST; a destructive intent is
+/// never silently truncated (the §4.99 discipline).
+pub const MAX_DELETE_FOR_ME_MESSAGES: usize = 256;
 /// The multi-attachment send cap (contract revision 1.66, §4.59): the
 /// upstream engine's own per-message attachment ceiling (pinned signal-cli /
 /// kt-engine `ATTACHMENT_MAX_COUNT` = 32) mirrored — a `messages.attachments.
@@ -6316,6 +6325,131 @@ impl ConnectorService {
             }
         }
         Ok(upstream)
+    }
+
+    /// messages.deleteForMeMessages (contract revision 1.197, §4.197): the
+    /// message-level delete-for-me uplink — the official
+    /// `getDeleteForMeSyncMessage` messageDeletes arm
+    /// (`ts/textsecure/SendMessage.preload.ts:1840-1936`) built from the
+    /// desktop's local row ids. The desktop never holds the protocol author
+    /// identity (incoming rows carry a privacy hash), so the connector is the
+    /// resolver: every id must name a row of this conversation, and the
+    /// official `toAddressableMessage` author follows the row direction —
+    /// the account's own address for outgoing rows, the direct peer
+    /// (`peer_identities` ACI first, the peer key second) for incoming direct
+    /// rows, and the ingest-captured member ACI (`author_aci`) for incoming
+    /// group rows. A pre-1.191 group row carries no member identity and is
+    /// refused rather than fed to the engine's `resolve_author_aci` as the
+    /// row's local sender hash (the §4.191 backfill ladder precedent).
+    /// Whole-batch discipline: an unknown row, a zero upstream stamp, a
+    /// system row, or an unaddressable author refuses the entire request
+    /// before any engine call — never a silent half batch (the §4.99
+    /// destructive-intent rule). The conversation resolves through the
+    /// §4.83 ladder; `kind` derives from the local row (direct → contact,
+    /// group → group; a legacy/unknown kind refuses).
+    pub fn prepare_messages_delete_for_me_messages(
+        &self,
+        params: &MessagesDeleteForMeMessagesParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        if params.conversation_id.is_empty()
+            || params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        if params.message_ids.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "messageIds must carry at least one id",
+                false,
+            )));
+        }
+        if params.message_ids.len() > MAX_DELETE_FOR_ME_MESSAGES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "messageIds carries at most 256 ids",
+                false,
+            )));
+        }
+        for message_id in &params.message_ids {
+            validate_opaque_id(message_id, "messageId")?;
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        let kind = match conversation.kind.as_str() {
+            "direct" => "contact",
+            "group" => "group",
+            _ => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "this conversation kind cannot carry delete-for-me",
+                    false,
+                )));
+            }
+        };
+        if conversation.peer_key.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "this conversation has no upstream address",
+                false,
+            )));
+        }
+        // Resolve every row before building any entry: one bad row refuses
+        // the whole batch (the engine's own all-or-nothing parse).
+        let mut entries = Vec::with_capacity(params.message_ids.len());
+        for message_id in &params.message_ids {
+            let message =
+                self.resolve_message(&params.account_id, &params.conversation_id, message_id)?;
+            if message.sent_at == 0 {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "message has no upstream timestamp to delete",
+                    false,
+                )));
+            }
+            let author = match message.direction {
+                "outgoing" => account.signal_account.clone(),
+                "incoming" if conversation.kind == "group" => {
+                    match message.author_aci.as_deref().filter(|aci| !aci.is_empty()) {
+                        Some(aci) => aci.to_string(),
+                        None => {
+                            return Err(ServiceError::Api(ApiError::new(
+                                "INVALID_REQUEST",
+                                "message author has no resolvable protocol identity",
+                                false,
+                            )));
+                        }
+                    }
+                }
+                "incoming" => self
+                    .store
+                    .aci_for_peer_key(&account.id, &conversation.peer_key)?
+                    .filter(|aci| !aci.is_empty())
+                    .unwrap_or_else(|| conversation.peer_key.clone()),
+                _ => {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "system rows cannot be deleted for me",
+                        false,
+                    )));
+                }
+            };
+            entries.push(json!({
+                "author": author,
+                "timestamp": message.sent_at,
+            }));
+        }
+        Ok(json!({
+            "account": account.signal_account,
+            "kind": kind,
+            "conversationId": conversation.peer_key,
+            "entries": entries,
+        }))
     }
 
     /// The §4.98 link-addressed pre-ladder (contract revision 1.117): the
@@ -15783,6 +15917,21 @@ pub struct MessagesDeleteForMeParams {
     pub most_recent_messages: Option<Vec<MessagesDeleteForMeEntry>>,
     #[serde(default)]
     pub most_recent_non_expiring_messages: Option<Vec<MessagesDeleteForMeEntry>>,
+}
+
+/// `messages.deleteForMeMessages` params (contract revision 1.197, §4.197):
+/// the message-level delete-for-me uplink addresses local rows only — the
+/// desktop never holds the protocol author identity (its incoming
+/// `senderId` is a privacy hash), so the connector resolves each id to the
+/// official `(author, sentTimestamp)` pair from its own store. Same one
+/// conversation per request as the official `getDeleteForMeSyncMessage`
+/// messageDeletes arm; 1..=256 ids (the engine's single-request ceiling).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesDeleteForMeMessagesParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_ids: Vec<String>,
 }
 
 /// `conversations.acceptRequest` / `conversations.declineRequest` params
@@ -27880,6 +28029,166 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "CONVERSATION_NOT_FOUND");
+    }
+
+    /// Contract revision 1.197 (§4.197): the message-level delete-for-me
+    /// prepare ladder — every local row id resolves to the official
+    /// `toAddressableMessage` pair. The author follows the row direction and
+    /// the conversation family (outgoing → the account, direct incoming →
+    /// the peer/ACI ladder, group incoming → the captured member ACI); one
+    /// unknown, zero-stamp, system, or capture-less row refuses the whole
+    /// batch before any engine call, as do empty and over-cap lists.
+    #[test]
+    fn prepare_delete_for_me_messages_ladders_row_authors() {
+        let (_temp, mut service) = service();
+        let (account, direct) = linked_account_and_conversation(&mut service);
+        const PEER_ACI: &str = "11111111-1111-1111-1111-111111111111";
+        const MEMBER_ACI: &str = "22222222-2222-2222-2222-222222222222";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, PEER_ACI, &direct.peer_key)
+            .unwrap();
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let second = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Other")
+            .unwrap();
+
+        let seed = |service: &ConnectorService,
+                    conversation_id: &str,
+                    id: &str,
+                    direction: &'static str,
+                    sent_at: u64,
+                    author_aci: Option<&str>| {
+            let mut record = expire_record_fixture(&account.id, conversation_id, id);
+            record.direction = direction;
+            record.sent_at = sent_at;
+            record.status = if direction == "outgoing" {
+                "sent"
+            } else {
+                "delivered"
+            };
+            record.author_aci = author_aci.map(str::to_string);
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, Some("body"), true)
+                    .unwrap()
+            );
+        };
+        seed(&service, &direct.id, "in-direct", "incoming", 100, None);
+        seed(&service, &direct.id, "out-direct", "outgoing", 101, None);
+        seed(
+            &service,
+            &group.id,
+            "in-group",
+            "incoming",
+            200,
+            Some(MEMBER_ACI),
+        );
+        seed(&service, &group.id, "out-group", "outgoing", 201, None);
+        seed(&service, &direct.id, "system-row", "system", 102, None);
+        seed(&service, &direct.id, "zero-stamp", "incoming", 0, None);
+        seed(&service, &group.id, "no-author", "incoming", 202, None);
+        seed(&service, &second.id, "elsewhere", "incoming", 103, None);
+
+        let params = |conversation_id: &str, message_ids: Vec<&str>| {
+            serde_json::from_value::<MessagesDeleteForMeMessagesParams>(json!({
+                "accountId": account.id,
+                "conversationId": conversation_id,
+                "messageIds": message_ids,
+            }))
+            .unwrap()
+        };
+
+        // Direct: incoming resolves through the peer-identity ACI, outgoing
+        // through the account's own address; both entries ride one frame.
+        let upstream = service
+            .prepare_messages_delete_for_me_messages(&params(
+                &direct.id,
+                vec!["in-direct", "out-direct"],
+            ))
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["kind"], "contact");
+        assert_eq!(upstream["conversationId"], direct.peer_key);
+        assert_eq!(
+            upstream["entries"],
+            json!([
+                { "author": PEER_ACI, "timestamp": 100 },
+                { "author": "+15555550100", "timestamp": 101 }
+            ])
+        );
+
+        // Group: incoming carries the ingest-captured member ACI, outgoing
+        // the account's own address; the conversation is the master key.
+        let upstream = service
+            .prepare_messages_delete_for_me_messages(&params(
+                &group.id,
+                vec!["in-group", "out-group"],
+            ))
+            .unwrap();
+        assert_eq!(upstream["kind"], "group");
+        assert_eq!(upstream["conversationId"], group.peer_key);
+        assert_eq!(
+            upstream["entries"],
+            json!([
+                { "author": MEMBER_ACI, "timestamp": 200 },
+                { "author": "+15555550100", "timestamp": 201 }
+            ])
+        );
+
+        // The all-or-nothing refusals: nothing reaches the engine.
+        let unknown = service
+            .prepare_messages_delete_for_me_messages(&params(
+                &direct.id,
+                vec!["in-direct", "no-such-row"],
+            ))
+            .unwrap_err();
+        assert_eq!(unknown.into_api().code, "MESSAGE_NOT_FOUND");
+        let wrong_conversation = service
+            .prepare_messages_delete_for_me_messages(&params(&direct.id, vec!["elsewhere"]))
+            .unwrap_err();
+        assert_eq!(wrong_conversation.into_api().code, "MESSAGE_NOT_FOUND");
+        for (name, conversation_id, ids) in [
+            ("system row", direct.id.as_str(), vec!["system-row"]),
+            ("zero stamp", direct.id.as_str(), vec!["zero-stamp"]),
+            (
+                "capture-less group row",
+                group.id.as_str(),
+                vec!["no-author"],
+            ),
+        ] {
+            let error = service
+                .prepare_messages_delete_for_me_messages(&params(conversation_id, ids))
+                .unwrap_err();
+            assert_eq!(
+                error.into_api().code,
+                "INVALID_REQUEST",
+                "{name} must refuse"
+            );
+        }
+        let empty = service
+            .prepare_messages_delete_for_me_messages(&params(&direct.id, vec![]))
+            .unwrap_err();
+        assert_eq!(empty.into_api().code, "INVALID_REQUEST");
+        let over_cap: Vec<String> = (0..=MAX_DELETE_FOR_ME_MESSAGES)
+            .map(|index| format!("row-{index}"))
+            .collect();
+        let over_cap = service
+            .prepare_messages_delete_for_me_messages(
+                &serde_json::from_value(json!({
+                    "accountId": account.id,
+                    "conversationId": direct.id,
+                    "messageIds": over_cap,
+                }))
+                .unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(over_cap.into_api().code, "INVALID_REQUEST");
     }
 
     #[test]

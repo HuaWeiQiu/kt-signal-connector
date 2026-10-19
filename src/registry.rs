@@ -1546,6 +1546,18 @@ impl ProxyGroupRuntime {
         slot.supervisor.delete_for_me(params).await
     }
 
+    /// Message-level delete-for-me SELF-SYNC routing (contract revision
+    /// 1.197, §4.197): the same owning-group dispatch as the
+    /// conversation-level twin; the connector resolves the local row ids to
+    /// protocol entries in the service prepare ladder.
+    pub async fn delete_for_me_messages(
+        &self,
+        params: crate::service::MessagesDeleteForMeMessagesParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.delete_for_me_messages(params).await
+    }
+
     /// Story-anchored viewed receipt routing (contract revision 1.85,
     /// §4.70): the owning group's supervisor sends the single-author frame
     /// over its own engine, receipt-class semantics end to end.

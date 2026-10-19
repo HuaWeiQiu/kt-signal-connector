@@ -119,6 +119,12 @@ pub const METHODS: &[MethodRow] = &[
     // classification as the syncRead/syncViewed pair; advertised through
     // `delete-for-me`.
     ("messages.deleteForMe", Lane::Send, true, "send"),
+    // Message-level delete-for-me SELF-SYNC upstream leg (contract 1.197,
+    // §4.197): the official messageDeletes sender, one engine
+    // `deleteForMeMessages` call per batch — receipt-class, same lane and
+    // mutex classification as the conversation twin; advertised through
+    // `delete-for-me`.
+    ("messages.deleteForMeMessages", Lane::Send, true, "send"),
     // View-once faces (contract 1.38): the bare open-sync passthrough and
     // the burn trigger are both receipt-class — mutating, send-lane upstream
     // traffic under the reaction-class write-lane mutex and delete barrier;
@@ -1125,6 +1131,7 @@ mod tests {
             "storyDistributionLists.setRecords",
             "storage.setCallLink",
             "messages.deleteForMe",
+            "messages.deleteForMeMessages",
         ];
         let mutating = [
             "messages.sendText",
@@ -1202,6 +1209,7 @@ mod tests {
             "storyDistributionLists.setRecords",
             "storage.setCallLink",
             "messages.deleteForMe",
+            "messages.deleteForMeMessages",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

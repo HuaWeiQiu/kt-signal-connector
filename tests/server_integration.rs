@@ -8438,6 +8438,168 @@ async fn messages_delete_for_me_rides_the_engine_sync_face() {
     drop(client);
     assert_clean_exit(&mut connector).await;
 }
+
+/// Contract revision 1.197 (§4.197): the message-level delete-for-me
+/// upstream leg. The handshake advertises `messages.deleteForMeMessages`
+/// plus the existing `delete-for-me` tag; the desktop addresses local row
+/// ids, the connector resolves the row's official `(author, sentTimestamp)`
+/// pair (outgoing → the account's own address), and exactly one engine
+/// `deleteForMeMessages` dispatch lands. Batch refusals — an unknown row
+/// and an over-cap list — answer before any engine call.
+#[tokio::test]
+async fn messages_delete_for_me_messages_resolves_rows_and_rides_the_engine() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [61_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["messages.deleteForMeMessages", "delete-for-me"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-DeleteForMeMessages" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // One landed outgoing row: its id is the desktop handle, its upstream
+    // stamp is what the sync frame must address.
+    let sent = request(
+        &mut client,
+        "dfm-msg-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "text": "delete this message for me",
+            "clientRequestId": "dfm-msg-send-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let message_id = sent["result"]["id"].as_str().unwrap().to_string();
+    let sent_at = sent["result"]["sentAt"].as_u64().unwrap();
+
+    let synced = request(
+        &mut client,
+        "dfm-msg-sync",
+        "messages.deleteForMeMessages",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [message_id]
+        }),
+    )
+    .await;
+    assert_eq!(synced["result"]["status"], "sent", "{synced:?}");
+    assert!(
+        synced.get("error").is_none(),
+        "a confirmed sync must not carry an error: {synced:?}"
+    );
+
+    // The exact upstream dispatch: local ids resolved to the official pair,
+    // the conversation reference and the row family on the wire.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log deleteForMeMessages params");
+    let dispatches: Vec<Value> = send_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|params: &Value| params.get("entries").is_some())
+        .collect();
+    assert_eq!(
+        dispatches.len(),
+        1,
+        "one engine dispatch for the whole batch: {dispatches:?}"
+    );
+    assert_eq!(dispatches[0]["account"], "+15555550100");
+    assert_eq!(dispatches[0]["kind"], "contact");
+    assert_eq!(dispatches[0]["conversationId"], "+15555550101");
+    assert_eq!(
+        dispatches[0]["entries"],
+        json!([{ "author": "+15555550100", "timestamp": sent_at }])
+    );
+
+    // The all-or-nothing refusals never reach the engine: an unknown row
+    // and a list past the 256 ceiling.
+    let unknown = request(
+        &mut client,
+        "dfm-msg-unknown",
+        "messages.deleteForMeMessages",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [message_id, "no-such-row"]
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "MESSAGE_NOT_FOUND", "{unknown:?}");
+    let over_cap: Vec<String> = (0..=256).map(|index| format!("row-{index}")).collect();
+    let over_cap = request(
+        &mut client,
+        "dfm-msg-over-cap",
+        "messages.deleteForMeMessages",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": over_cap
+        }),
+    )
+    .await;
+    assert_eq!(over_cap["error"]["code"], "INVALID_REQUEST", "{over_cap:?}");
+    let refusals_logged = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+    .filter(|params: &Value| params.get("entries").is_some())
+    .count();
+    assert_eq!(
+        refusals_logged, 1,
+        "the refused batches must not reach the upstream"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
 /// through the fixture's `.fixture-extra-receives.json` carry `serverGuid`
 /// Contract 1.49 (§4.48): the reportSpam round trip. Envelopes staged
 /// through the fixture's `.fixture-extra-receives.json` carry `serverGuid`

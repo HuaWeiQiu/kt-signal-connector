@@ -1313,6 +1313,49 @@ for line in sys.stdin:
         ):
             os._exit(23)
         result = {"status": "sent"}
+    elif method == "deleteForMeMessages":
+        # Contract 1.197 §4.197 message-level delete-for-me upstream leg:
+        # same dispatch-recording discipline as its conversation twin, so
+        # tests can assert the {account, kind, conversationId, entries}
+        # contract. Fail-closed param gate mirrors the engine's -32603 face.
+        account = params.get("account")
+        kind = params.get("kind")
+        conversation_id = params.get("conversationId")
+        entries = params.get("entries")
+        shape_ok = (
+            isinstance(account, str)
+            and bool(account)
+            and kind in ("contact", "group")
+            and isinstance(conversation_id, str)
+            and bool(conversation_id)
+            and isinstance(entries, list)
+            and 1 <= len(entries) <= 256
+        )
+        if shape_ok:
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    shape_ok = False
+                    break
+                author = entry.get("author")
+                timestamp = entry.get("timestamp")
+                if not isinstance(author, str) or not author:
+                    shape_ok = False
+                    break
+                if not isinstance(timestamp, int) or timestamp <= 0:
+                    shape_ok = False
+                    break
+        if not shape_ok:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "invalid deleteForMeMessages params"},
+            }
+            emit_json(response)
+            continue
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        result = {"status": "sent"}
     elif method == "getStickerPackManifest":
         # Contract 1.36 browse face: deterministic manifest keyed by pack id.
         # Sentinel packId ffffffffffffffffffffffffffffffff answers a

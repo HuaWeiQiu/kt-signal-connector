@@ -5,6 +5,23 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.198 (2026-10-20; §4.198 the message-level
+  delete-for-me uplink `messages.deleteForMeMessages`: the official
+  `getDeleteForMeSyncMessage` messageDeletes sender
+  (`ts/state/ducks/conversations.preload.ts:1866-1965`, frame
+  `ts/textsecure/SendMessage.preload.ts:1840-1936`) is now reachable from
+  the desktop. [KT adaptation] The request carries local row ids only
+  (`{conversationId, messageIds}`), because the desktop's incoming rows
+  carry a privacy hash rather than the protocol author; the connector
+  resolves every id to the official `(author, sentTimestamp)` entry from
+  its own store (outgoing → the account's own address, incoming direct →
+  the peer/ACI ladder, incoming group → the ingest-captured `author_aci`)
+  and calls the engine `deleteForMeMessages` (engine 93bc5bf) once.
+  1..=256 ids, all-or-nothing: an unknown row, zero stamp, system row, or
+  unaddressable author refuses the whole batch before any engine call.
+  Receipt-class `{status: sent|unknown}`, never retried, zero local
+  writes. Schema + bounds pairing + fake-engine gate + integration tests
+  land with the revision.)
 - Contract revision: 1.196 (2026-10-20; §4.196 the delete-for-me
   attachment arm: `syncMessage.deleteForMe.attachmentDeletes` — the
   official `handleDeleteForMeSync` fourth face
@@ -17006,6 +17023,92 @@ per-account map is capped at the per-engine account ceiling
 malformed account string cannot grow it. Tests:
 `receive_queue_per_account_budget_isolates_a_flooding_account` and
 `receive_queue_global_budget_still_caps_the_sum_of_accounts`.
+
+### 4.198 The message-level delete-for-me uplink: `messages.deleteForMeMessages` (contract revision 1.198, 2026-10-20)
+
+The delete-for-me family had both directions for whole conversations
+(§4.99 outbound, §4.182 inbound) and both directions for single messages
+(§4.83 inbound), but no outbound message leg: the desktop could remove a
+row locally and the account's other linked devices kept their copy. The
+official client closes that gap in `deleteMessages`
+(`ts/state/ducks/conversations.preload.ts:1866-1965`): after
+`removeMessagesById`, it maps each selected row to
+`getAddressableMessage` (`{author: ACI|e164, sentAt}`,
+`ts/util/syncIdentifiers.preload.ts:175-199`), chunks at
+`MAX_MESSAGE_COUNT` 500, and queues one
+`getDeleteForMeSyncMessage` per chunk; the frame
+(`ts/textsecure/SendMessage.preload.ts:1840-1936`) carries
+`syncMessage.deleteForMe.messageDeletes[0]{conversation, messages[]}`,
+which the receiver replays as `delete-message`
+(`ts/textsecure/MessageReceiver.preload.ts:3609-3657` →
+`ts/util/syncTasks.preload.ts:104-113` →
+`ts/util/deleteForMe.preload.ts:33-59`). The engine `deleteForMeMessages`
+face (kt-signal-engine `93bc5bf`) owns the protocol half.
+
+**[KT adaptation] The addressing split.** The official sender holds the
+protocol author itself; the desktop does not. Its incoming rows carry the
+connector's privacy hash in `senderId` (the read face never exposes the
+protocol identity, by design), and the account address is an opaque id.
+So the wire request carries only what the desktop genuinely owns — one
+`conversationId` plus 1..=256 **local row ids** — and the connector
+resolves each id against its own store. This is the same division of
+labour as the attachment arm (§4.196): the connector already holds the
+addressable-message material, and the desktop must never invent an
+author.
+
+**The resolution ladder.** `prepare_messages_delete_for_me_messages`
+(the §4.97 shape gates, the empty/over-256 list refusal and the per-id
+opaque bound) resolves the account and the conversation row, derives
+`kind` from `conversation.kind` (`direct` → `contact`, `group` → `group`;
+anything else — a legacy/unknown row — refuses), and then resolves every
+row before building any entry. The official `toAddressableMessage` author
+follows the direction and the row faces:
+
+- outgoing rows: the account's own address (`account.signal_account`) —
+  the §4.99 backfill ladder's outgoing arm verbatim;
+- incoming direct rows: the peer — the `peer_identities` ACI capture
+  first, the peer key second (both E.164 and ACI-shaped keys are
+  resolvable engine faces);
+- incoming group rows: the ingest-captured `author_aci` (contract 1.191,
+  §4.191). A pre-1.191 group row carries no member identity; the local
+  `sender_id` hash is explicitly not a protocol identity, so the request
+  answers INVALID_REQUEST instead of feeding the engine a value its
+  `resolve_author_aci` must refuse.
+
+The timestamp is always the row's upstream `sent_at`; a zero stamp (the
+row never went upstream) refuses. System rows have no author and refuse.
+
+**All-or-nothing.** The engine's single-request parse rejects the whole
+batch on any malformed entry and does not chunk on the caller's behalf
+(a destructive intent is never split silently). The connector mirrors
+that posture before the call: one unknown/mismatched row
+(`MESSAGE_NOT_FOUND` through the shared store error mapping), one
+zero-stamp/system/unaddressable row (`INVALID_REQUEST`), or a list past
+256 refuses the entire request — no half batch ever reaches the engine.
+The 256 ceiling is the engine's single-request cap
+(`MAX_DELETE_FOR_ME_MESSAGES`), tighter than the official sender's 500
+chunk because the engine refuses to choose the chunking for a
+destructive operation.
+
+**Receipt class.** The supervisor locks, prepares, and calls the engine
+`deleteForMeMessages` face on the mutating class; success answers
+`{status: "sent"}`, any engine failure degrades to
+`{status: "unknown"}` and is never retried (the sync frame may already
+have ridden the self-send lane — the §4.99 discipline). Zero local
+writes: the §4.83 receive mirror remains the inbound channel; this face
+is the outbound leg only. The method is `Lane::Send`, account-scoped
+mutating, advertised by name (derived from the single method table) and
+through the existing `delete-for-me` tag; the schema declares the params
+with `messageIds` 1..=256 and the bounds test pairs the schema `maxItems`
+with `MAX_DELETE_FOR_ME_MESSAGES`.
+
+**Tests.** `prepare_delete_for_me_messages_ladders_row_authors` (direct
+outgoing/incoming, group incoming `author_aci`, group outgoing, the
+unknown row / zero stamp / system row / capture-less group row
+refusals, and the empty/over-cap list), and
+`messages_delete_for_me_messages_rides_the_engine_sync_face` (the
+handshake advertisement, the resolved entries on the fixture dispatch
+log, and the batch refusals never reaching the engine).
 
 ## 5. signal-cli Boundary
 
