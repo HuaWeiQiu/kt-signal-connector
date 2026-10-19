@@ -6658,7 +6658,10 @@ fn group_update_rich(group_name: Option<String>) -> NormalizedRich {
 }
 
 /// Our own multi-device control echo inside `syncMessage.sentMessage`: edit /
-/// remote delete / reaction of an earlier message we sent from the phone.
+/// remote delete / pin / unpin / admin delete / reaction of an earlier message
+/// we sent from the phone. The pin family rides the same normalized shapes the
+/// peer `dataMessage` faces use (engine projection
+/// `project_data_message`@`src/service/mod.rs:9204-9231`).
 fn sync_sent_control(sent: &serde_json::Map<String, Value>) -> Option<ControlReceive> {
     if let Some(edit) = sent.get("editMessage").and_then(Value::as_object)
         && let Some(target) = edit.get("targetSentTimestamp").and_then(Value::as_u64)
@@ -6676,6 +6679,15 @@ fn sync_sent_control(sent: &serde_json::Map<String, Value>) -> Option<ControlRec
         return Some(ControlReceive::RemoteDelete {
             target_timestamp: target,
         });
+    }
+    if let Some(pin) = sent.get("pinMessage").and_then(normalized_pin_message) {
+        return Some(pin);
+    }
+    if let Some(unpin) = sent.get("unpinMessage").and_then(normalized_unpin_message) {
+        return Some(unpin);
+    }
+    if let Some(admin_delete) = sent.get("adminDelete").and_then(normalized_admin_delete) {
+        return Some(admin_delete);
     }
     if let Some(target) = sent
         .get("pollTerminate")
@@ -9588,6 +9600,104 @@ mod tests {
         assert!(routing(json!({ "pinMessage": { "targetAuthor": "+15555550101" } })).is_none());
         assert!(routing(json!({ "unpinMessage": { "targetAuthor": "+15555550101" } })).is_none());
         assert!(routing(json!({ "adminDelete": { "targetSentTimestamp": 1 } })).is_none());
+    }
+
+    /// Our own multi-device pin / unpin / admin delete echoes ride
+    /// `syncMessage.sentMessage` (official `background.preload.ts:3281-3295`
+    /// pin, `:3468-3476` unpin, `:3373-3389` admin delete). The engine
+    /// projects the same DataMessage faces under `sentMessage`; they must
+    /// route as outgoing control receives, not fall through to the skip.
+    #[test]
+    fn sync_sent_pin_family_routes_to_pin_controls() {
+        let route = |family: serde_json::Value| {
+            let mut sent = json!({
+                "timestamp": 1726999997000u64,
+                "destinationNumber": "+15555550101",
+                "destinationDevice": 2,
+            });
+            let object = sent.as_object_mut().unwrap();
+            for (key, value) in family.as_object().unwrap() {
+                object.insert(key.clone(), value.clone());
+            }
+            normalize_receive_fields(&json!({
+                "account": "+15555550100",
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": { "sentMessage": sent }
+                }
+            }))
+            .unwrap()
+        };
+
+        let pin = route(json!({
+            "pinMessage": {
+                "targetAuthor": "+15555550101",
+                "targetSentTimestamp": 1726999000000u64,
+                "pinDurationSeconds": 604800u64,
+            }
+        }));
+        assert_eq!(pin.direction, "outgoing");
+        assert_eq!(pin.content_kind, "control");
+        assert_eq!(pin.timestamp, Some(1726999997000));
+        assert!(matches!(
+            pin.control,
+            Some(ControlReceive::PinMessage {
+                ref target_author,
+                target_timestamp: 1726999000000,
+                duration_seconds: Some(604800),
+            }) if target_author == "+15555550101"
+        ));
+
+        let forever = route(json!({
+            "pinMessage": {
+                "targetAuthor": "+15555550101",
+                "targetSentTimestamp": 1726999000000u64,
+            }
+        }));
+        assert!(matches!(
+            forever.control,
+            Some(ControlReceive::PinMessage {
+                duration_seconds: None,
+                ..
+            })
+        ));
+
+        let unpin = route(json!({
+            "unpinMessage": {
+                "targetAuthor": "+15555550101",
+                "targetSentTimestamp": 1726999000000u64,
+            }
+        }));
+        assert_eq!(unpin.content_kind, "control");
+        assert!(matches!(
+            unpin.control,
+            Some(ControlReceive::UnpinMessage {
+                target_timestamp: 1726999000000,
+                ..
+            })
+        ));
+
+        let admin_delete = route(json!({
+            "adminDelete": {
+                "targetAuthor": "+15555550101",
+                "targetSentTimestamp": 1726999000000u64,
+            }
+        }));
+        assert_eq!(admin_delete.content_kind, "control");
+        assert!(matches!(
+            admin_delete.control,
+            Some(ControlReceive::AdminDelete {
+                target_timestamp: 1726999000000,
+                ..
+            })
+        ));
+
+        // Malformed echoes fall through to the ordinary sent-message ladder
+        // (no text here → plain skip), never a fabricated pin control.
+        let malformed = route(json!({
+            "pinMessage": { "targetSentTimestamp": 1726999000000u64 }
+        }));
+        assert!(malformed.control.is_none());
     }
 
     /// The engine's `groupUpdated` projection (2026-10-06 engine batch,

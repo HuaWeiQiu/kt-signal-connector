@@ -395,11 +395,37 @@ struct ResolvedChat {
     peer_key: String,
 }
 
-/// One pending conversation pin, applied when its batch lands.
+/// One pending conversation pin, applied when its batch lands. The fields
+/// mirror the official `PinDetails` face (`protos/Backups.proto:494-500`):
+/// `pinned_at` is the backup's `pinnedAtTimestamp` and `expires_at` the
+/// `pinExpiry` arm's absolute deadline (`None` = `pinNeverExpires`).
 struct PendingPin {
     conversation_id: String,
     target_author: String,
     target_sent_at: u64,
+    pinned_at: u64,
+    expires_at: Option<u64>,
+}
+
+/// The official `PinDetails.pinExpiry` oneof as the local deadline
+/// (`Backups.proto:494-500`; import.preload.ts:1929-1938). `Some(Some(ts))`
+/// is a timed pin, `Some(None)` a forever pin, and `None` a malformed face —
+/// the official side `strictAssert`s one of the two arms, so the connector
+/// drops the pin instead of inventing a forever one. An absent key (an older
+/// engine face before contract 1.197) keeps the pre-1.197 forever reading,
+/// because there the oneof was simply never projected.
+fn backup_pin_expiry(value: &Value) -> Option<Option<u64>> {
+    let Some(expiry) = value.get("pinExpiry") else {
+        return Some(None);
+    };
+    let expiry = expiry.as_object()?;
+    if let Some(timestamp) = expiry.get("pinExpiresAtTimestamp").and_then(Value::as_u64) {
+        return Some(Some(timestamp));
+    }
+    if expiry.get("pinNeverExpires").and_then(Value::as_bool) == Some(true) {
+        return Some(None);
+    }
+    None
 }
 
 /// Pass-2 driver: streams the archive's message frames and writes them one
@@ -826,17 +852,27 @@ impl<'a> Importer<'a> {
             alt_sender_id,
             locators,
         });
-        if value
+        if let Some(pinned_at) = value
             .get("pinnedAtTimestamp")
             .and_then(Value::as_u64)
-            .is_some_and(|at| at > 0)
+            .filter(|at| *at > 0)
+            && let Some(expires_at) = backup_pin_expiry(value)
         {
+            // The official import reads pinDetails.pinnedAtTimestamp as the
+            // pin's own clock and pinExpiry as its absolute deadline
+            // (import.preload.ts:1922-1945); the expired/forever distinction
+            // is therefore the backup's, never the connector's clock. An
+            // older engine face without pinExpiry keeps the pre-1.197
+            // forever reading.
             // The pin resolves by (conversation, sent_at); the author rides
-            // the same identity form a live pin envelope carries.
+            // the same identity form a live pin envelope carries. The author
+            // is display metadata only — the queue key is the stamp.
             self.pins.push(PendingPin {
                 conversation_id: chat.conversation_id.clone(),
                 target_author: author_source.unwrap_or_else(|| self.signal_account.to_string()),
                 target_sent_at: sent_at,
+                pinned_at,
+                expires_at,
             });
         }
         if self.batch.len() >= BATCH_MESSAGES {
@@ -1422,12 +1458,13 @@ impl<'a> Importer<'a> {
         self.counters.imported += outcome.inserted;
         self.counters.skipped_messages += outcome.duplicates;
         for pin in self.pins.drain(..) {
-            self.store.upsert_conversation_pin(
+            self.store.append_conversation_pin(
                 self.account_id,
                 &pin.conversation_id,
                 &pin.target_author,
                 pin.target_sent_at,
-                None,
+                pin.pinned_at,
+                pin.expires_at,
             )?;
         }
         self.batch.clear();
@@ -2063,7 +2100,9 @@ mod tests {
             }),
             serde_json::json!({
                 "type": "message", "chatId": 10, "authorId": 1, "dateSent": 3000,
-                "direction": "incoming", "text": "pinned one", "pinnedAtTimestamp": 4000
+                "direction": "incoming", "text": "pinned one",
+                "pinnedAtTimestamp": 4000,
+                "pinExpiry": {"pinExpiresAtTimestamp": 4_000_000_000_000u64}
             }),
             serde_json::json!({
                 "type": "message", "chatId": 10, "authorId": 1, "dateSent": 5000,
@@ -2641,6 +2680,43 @@ mod tests {
         assert_eq!(stage_chat(&serde_json::json!({"id": 10})), None);
     }
 
+    /// Official `PinDetails.pinExpiry` mapping (Backups.proto:494-500): the
+    /// timed arm keeps its absolute deadline, the never-expires arm is
+    /// forever, an absent key keeps the older-engine forever reading, and a
+    /// present-but-armless face is malformed (`strictAssert` upstream) — the
+    /// pin is dropped, never invented into forever.
+    #[test]
+    fn backup_pin_expiry_reads_the_official_oneof_and_rejects_malformed_faces() {
+        assert_eq!(
+            backup_pin_expiry(&serde_json::json!({
+                "pinExpiry": {"pinExpiresAtTimestamp": 9000}
+            })),
+            Some(Some(9000))
+        );
+        assert_eq!(
+            backup_pin_expiry(&serde_json::json!({
+                "pinExpiry": {"pinNeverExpires": true}
+            })),
+            Some(None)
+        );
+        assert_eq!(
+            backup_pin_expiry(&serde_json::json!({})),
+            Some(None),
+            "an older engine face without the key reads forever"
+        );
+        assert_eq!(
+            backup_pin_expiry(&serde_json::json!({
+                "pinExpiry": {"pinNeverExpires": false}
+            })),
+            None,
+            "neither arm is the official malformed face"
+        );
+        assert_eq!(
+            backup_pin_expiry(&serde_json::json!({"pinExpiry": "bad"})),
+            None
+        );
+    }
+
     #[test]
     fn import_lands_rows_under_live_identity_and_counts_skips_honestly() {
         let temp = TempDir::new().unwrap();
@@ -2728,6 +2804,11 @@ mod tests {
         let pinned = summary.pinned_message.expect("imported pin");
         assert_eq!(pinned.target_sent_timestamp, 3000);
         assert_eq!(pinned.target_author, ALICE_E164);
+        // The backup's own PinDetails clocks ride through verbatim: the pin
+        // time is `pinnedAtTimestamp`, the deadline `pinExpiresAtTimestamp`
+        // (never the connector clock at import time).
+        assert_eq!(pinned.pinned_at, 4000);
+        assert_eq!(pinned.expires_at, Some(4_000_000_000_000));
 
         // Remote-deleted tombstone keeps the direction, drops the body.
         let tombstone = store

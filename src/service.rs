@@ -7901,12 +7901,16 @@ impl ConnectorService {
         target_sent_at: u64,
         pin_duration_seconds: Option<u32>,
     ) -> Result<Option<ConversationSummary>, ServiceError> {
-        self.store.upsert_conversation_pin(
+        let pinned_at = crate::link::now_ms();
+        let expires_at = pin_duration_seconds
+            .map(|seconds| pinned_at.saturating_add(u64::from(seconds) * 1_000));
+        self.store.append_conversation_pin(
             account_id,
             conversation_id,
             target_author,
             target_sent_at,
-            pin_duration_seconds,
+            pinned_at,
+            expires_at,
         )?;
         Ok(self
             .store
@@ -7914,21 +7918,20 @@ impl ConnectorService {
     }
 
     /// sendUnpinMessage 上行确认后的本地落库：仅当本地 pinned 状态仍指向
-    /// 被解 pin 的 (author, timestamp) 时清除；不匹配的 unpin 不动更新的
-    /// pin。清除发生时返回会话摘要供调用方推 conversation.changed。
+    /// 被解 pin 的目标时间戳时清除；作者拼写不参与身份判定，不匹配的
+    /// unpin 不动更新的 pin（`_target_author` 保留仅为调用面稳定）。
+    /// 清除发生时返回会话摘要供调用方推 conversation.changed。
     pub fn complete_send_unpin_message(
         &self,
         account_id: &str,
         conversation_id: &str,
-        target_author: &str,
+        _target_author: &str,
         target_sent_at: u64,
     ) -> Result<Option<ConversationSummary>, ServiceError> {
-        if !self.store.clear_conversation_pin(
-            account_id,
-            conversation_id,
-            target_author,
-            target_sent_at,
-        )? {
+        if !self
+            .store
+            .clear_conversation_pin(account_id, conversation_id, target_sent_at)?
+        {
             return Ok(None);
         }
         Ok(self
@@ -11151,12 +11154,16 @@ impl ConnectorService {
                 // is connector clock computed, and the host refreshes the
                 // pin bar through the summary that rides
                 // conversation.changed (the reaction notification precedent).
-                self.store.upsert_conversation_pin(
+                let pinned_at = crate::link::now_ms();
+                let expires_at = duration_seconds
+                    .map(|seconds| pinned_at.saturating_add(u64::from(seconds) * 1_000));
+                self.store.append_conversation_pin(
                     &account.id,
                     &conversation.id,
                     &target_author,
                     target_timestamp,
-                    duration_seconds,
+                    pinned_at,
+                    expires_at,
                 )?;
                 let mut events = Vec::new();
                 if let Some(summary) = self
@@ -11168,16 +11175,16 @@ impl ConnectorService {
                 Ok(events)
             }
             ControlReceive::UnpinMessage {
-                target_author,
+                target_author: _,
                 target_timestamp,
             } => {
-                // Only the pinned (author, timestamp) the unpin names clears;
-                // a stale or mismatched unpin leaves a newer pin alone and
+                // Only the pinned target stamp the unpin names clears; the
+                // author spelling a replay happened to carry is not identity.
+                // A stale or mismatched unpin leaves a newer pin alone and
                 // stays silent (replays never re-notify).
                 if !self.store.clear_conversation_pin(
                     &account.id,
                     &conversation.id,
-                    &target_author,
                     target_timestamp,
                 )? {
                     return Ok(Vec::new());
@@ -11192,7 +11199,7 @@ impl ConnectorService {
                 Ok(events)
             }
             ControlReceive::AdminDelete {
-                target_author,
+                target_author: _,
                 target_timestamp,
             } => {
                 // Contract 1.33: the official "deleted by admin" tombstone is
@@ -11218,7 +11225,6 @@ impl ConnectorService {
                 if self.store.clear_conversation_pin(
                     &account.id,
                     &conversation.id,
-                    &target_author,
                     target_timestamp,
                 )? && let Some(summary) = self
                     .store
