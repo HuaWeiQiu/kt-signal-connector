@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use std::collections::BTreeMap;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 31;
+const SCHEMA_VERSION: i64 = 32;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -27,6 +30,31 @@ pub const CONVERSATION_PIN_LIMIT: usize = 3;
 /// without ever holding the store lock long.
 pub const EXPIRE_SWEEP_BATCH: u32 = 256;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
+/// Contract 1.197 (§4.197, D4): deletion receipts are a bounded ring. Each
+/// row carries counts + a digest only (never content), so 256 receipts prove
+/// recent deletions without becoming an unbounded identity ledger.
+const MAX_ACCOUNT_DELETE_RECEIPTS: i64 = 256;
+/// Keep the WAL bounded between explicit post-delete checkpoints: 512 pages
+/// (~2 MiB at the default page size). This is a size bound, not a durability
+/// change — `synchronous` is untouched and every commit still fsyncs in WAL
+/// mode.
+const SQLITE_WAL_AUTOCHECKPOINT_PAGES: i64 = 512;
+/// Hard ceiling for the WAL file after a checkpoint; SQLite truncates/limits
+/// future growth at this size.
+const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 8 * 1024 * 1024;
+/// Writer page cache: 4 MiB (`PRAGMA cache_size` is KiB when negative). The
+/// store is one profile-wide file, so this is a process budget, not a
+/// per-account one; the two readers add 2 MiB each (ADR 0007).
+const SQLITE_WRITER_CACHE_KIB: i64 = 4 * 1024;
+/// Contract 1.197 (§4.197, ADR 0007): the bounded read pool. Two read-only
+/// connections beside the one writer let independent read dispatches proceed
+/// while a writer commit or another read holds the writer connection. The
+/// pool is deliberately small and fixed: every connection costs a page cache
+/// and a WAL reader slot, and the reader never becomes a writer
+/// (`PRAGMA query_only=ON` refuses any write at the SQL layer).
+const READ_POOL_CONNECTIONS: usize = 2;
+/// Per-reader page cache: 2 MiB (`PRAGMA cache_size` is KiB when negative).
+const READ_POOL_CACHE_KIB: i64 = 2 * 1024;
 /// Storage engine: SQLCipher (rusqlite `bundled-sqlcipher`), keyed per profile.
 const DATABASE_FILE_NAME: &str = "connector.sqlite3";
 /// Phase 3 migration remnant: one consistent plaintext copy, kept next to the
@@ -243,6 +271,15 @@ CREATE TABLE IF NOT EXISTS account_delete_operations (
 CREATE UNIQUE INDEX IF NOT EXISTS account_delete_one_pending_per_account
   ON account_delete_operations(account_id)
   WHERE state != 'completed';
+CREATE TABLE IF NOT EXISTS account_delete_receipts (
+  account_id TEXT PRIMARY KEY,
+  completed_at INTEGER NOT NULL,
+  rows_deleted INTEGER NOT NULL,
+  table_counts TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  plaintext_backup TEXT NOT NULL,
+  wal_checkpoint TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS contacts (
   id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL,
@@ -2051,9 +2088,101 @@ pub enum AccountDeletePlan {
     },
 }
 
+/// Contract 1.197 (§4.197, D4): what one local account deletion removed.
+///
+/// This is a deletion proof, not content: opaque account id, the completion
+/// stamp, per-table row counts, and a SHA-256 digest binding those counts to
+/// that account and moment. No phone number, message body, peer key, path, or
+/// key material is ever part of it. `plaintext_backup` reports what happened
+/// to the Phase 3 plaintext migration backup (it is row-scrubbed for this
+/// account, not deleted wholesale, so other accounts keep their rollback
+/// window) and `wal_checkpoint` reports whether the post-delete TRUNCATE
+/// checkpoint ran.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountDeleteReceipt {
+    pub account_id: String,
+    pub completed_at: u64,
+    pub rows_deleted: u64,
+    pub table_counts: BTreeMap<String, u64>,
+    pub digest: String,
+    pub plaintext_backup: String,
+    pub wal_checkpoint: String,
+}
+
+/// Rows one account deletion counts and removes. Every table carries
+/// `account_id`; `message_receipts` is counted through its message row
+/// because it is message-scoped rather than account-scoped.
+const ACCOUNT_DELETE_TABLES: [&str; 12] = [
+    "messages",
+    "conversations",
+    "contacts",
+    "message_events",
+    "message_edits",
+    "conversation_pins",
+    "conversation_drafts",
+    "memo_migrations",
+    "peer_identities",
+    "history_imports",
+    "history_import_stage_recipients",
+    "history_import_stage_chats",
+];
+
+/// Contract 1.197 (§4.197, ADR 0007): a fixed-size pool of read-only
+/// SQLCipher connections over the same store file.
+///
+/// The writer connection stays the single writer and the single statement
+/// serializer for every mutating method. Reads that only page stored rows use
+/// a pool connection, so a long read (or a writer commit) no longer blocks an
+/// unrelated read. `query_only=ON` is the hard safety rail: a method that
+/// accidentally writes through a pool connection fails instead of racing the
+/// writer.
+struct ReadPool {
+    connections: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
+}
+
+impl ReadPool {
+    fn open(path: &Path, key: &StoreKey) -> Result<Self, StoreError> {
+        let mut connections = Vec::with_capacity(READ_POOL_CONNECTIONS);
+        for _ in 0..READ_POOL_CONNECTIONS {
+            let conn = Connection::open(path).map_err(unavailable)?;
+            let key_spec = key.raw_key_spec();
+            let pragma = Zeroizing::new(format!(
+                "PRAGMA key = \"{}\";
+                 PRAGMA query_only = ON;
+                 PRAGMA foreign_keys = ON;
+                 PRAGMA busy_timeout = 250;
+                 PRAGMA cache_size = -{READ_POOL_CACHE_KIB};",
+                key_spec.as_str()
+            ));
+            drop(key_spec);
+            conn.execute_batch(pragma.as_str()).map_err(unavailable)?;
+            drop(pragma);
+            // Force the first page read here: a rejected key or a damaged file
+            // fails at open, never on the first host read.
+            conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+                .map_err(unavailable)?;
+            connections.push(Mutex::new(conn));
+        }
+        Ok(Self {
+            connections,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    fn connection(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.connections.len();
+        self.connections[index]
+            .lock()
+            .map_err(|_| StoreError::Unavailable(None))
+    }
+}
+
 pub struct Store {
     path: PathBuf,
     conn: Mutex<Connection>,
+    readers: ReadPool,
 }
 
 /// Contract 1.170 (§4.170): the number-keyed memo shell's mergeable state,
@@ -2098,8 +2227,19 @@ impl Store {
         let conn = open_encrypted(&path, &key, preexisting)?;
         conn.busy_timeout(Duration::from_millis(250))
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;\nPRAGMA foreign_keys=ON;")
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // §4.197 SQLite hygiene: `secure_delete` zeroes deleted row content
+        // inside its pages before the page returns to the freelist, so a
+        // later read of freed pages (or a plaintext backup scrub) cannot
+        // recover it. The WAL bounds are size-only; durability is unchanged.
+        conn.execute_batch(&format!(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA foreign_keys=ON;
+             PRAGMA secure_delete=ON;
+             PRAGMA wal_autocheckpoint={SQLITE_WAL_AUTOCHECKPOINT_PAGES};
+             PRAGMA journal_size_limit={SQLITE_JOURNAL_SIZE_LIMIT_BYTES};
+             PRAGMA cache_size=-{SQLITE_WRITER_CACHE_KIB};"
+        ))
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
         conn.execute_batch(SCHEMA_DDL)
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         migrate_schema(&conn)?;
@@ -2144,9 +2284,11 @@ impl Store {
                 "startup sweep migrated stale pending sends to failed"
             );
         }
+        let readers = ReadPool::open(&path, &key)?;
         Ok(Self {
             path,
             conn: Mutex::new(conn),
+            readers,
         })
     }
 
@@ -2169,6 +2311,13 @@ impl Store {
     /// storage failure.
     fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.conn.lock().map_err(|_| StoreError::Unavailable(None))
+    }
+
+    /// A read-pool connection (ADR 0007). Read-only by `query_only`; never
+    /// used by a mutating method or by a method that reads and writes in one
+    /// call.
+    fn read_conn(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        self.readers.connection()
     }
 
     /// Direct connection access for tests that install fault-injection
@@ -2879,13 +3028,36 @@ impl Store {
         Ok(())
     }
 
-    /// Remove account and dependent rows from the connector store (local exit).
+    /// Remove account and dependent rows from the connector store (local
+    /// exit). Kept as the boolean face for existing callers; the recorded
+    /// variant carries the §4.197 receipt.
     pub fn complete_account_delete(
         &self,
         account_id: &str,
         operation_id: Option<&str>,
         now_ms: u64,
     ) -> Result<bool, StoreError> {
+        Ok(self
+            .complete_account_delete_recorded(account_id, operation_id, now_ms)?
+            .is_some())
+    }
+
+    /// Contract 1.197 (§4.197, D4): delete the account's rows in one
+    /// transaction, write the deletion receipt (counts + digest only), then
+    /// run the post-delete WAL checkpoint. Returns `None` when the account
+    /// row was already gone (the operation-id ledger still settles).
+    ///
+    /// The transaction deletes in FK-safe order: `message_events` first
+    /// (plain `conversation_id` FK, no cascade), then messages (receipts and
+    /// edits cascade), conversations (pins and drafts cascade), contacts,
+    /// the contacts-sync marker, and finally the account row (memo ledger,
+    /// peer identities, and history-import scratch cascade).
+    pub fn complete_account_delete_recorded(
+        &self,
+        account_id: &str,
+        operation_id: Option<&str>,
+        now_ms: u64,
+    ) -> Result<Option<AccountDeleteReceipt>, StoreError> {
         let mut conn = self.lock_conn()?;
         let transaction = conn
             .transaction()
@@ -2899,7 +3071,63 @@ impl Store {
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))?
             .is_some();
+        let mut receipt = None;
         if exists {
+            let mut table_counts = BTreeMap::new();
+            for table in ACCOUNT_DELETE_TABLES {
+                let count: i64 = transaction
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE account_id=?1"),
+                        params![account_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                if count > 0 {
+                    table_counts.insert((*table).to_string(), count as u64);
+                }
+            }
+            // `message_receipts` is message-scoped rather than account-scoped;
+            // count it through the account's message rows before they go.
+            let receipts: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM message_receipts
+                      WHERE message_id IN (SELECT id FROM messages WHERE account_id=?1)",
+                    params![account_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if receipts > 0 {
+                table_counts.insert("message_receipts".to_string(), receipts as u64);
+            }
+            table_counts.insert("accounts".to_string(), 1);
+            let rows_deleted = table_counts.values().sum();
+            let digest = account_delete_digest(account_id, now_ms, rows_deleted, &table_counts);
+            let table_counts_json =
+                serde_json::to_string(&table_counts).map_err(|_| StoreError::Unavailable(None))?;
+            transaction
+                .execute(
+                    "INSERT INTO account_delete_receipts(
+                       account_id, completed_at, rows_deleted, table_counts, digest,
+                       plaintext_backup, wal_checkpoint
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, 'pending', 'deferred')
+                     ON CONFLICT(account_id) DO UPDATE SET
+                       completed_at=excluded.completed_at,
+                       rows_deleted=excluded.rows_deleted,
+                       table_counts=excluded.table_counts,
+                       digest=excluded.digest,
+                       plaintext_backup=excluded.plaintext_backup,
+                       wal_checkpoint=excluded.wal_checkpoint",
+                    params![
+                        account_id,
+                        now_ms as i64,
+                        rows_deleted as i64,
+                        table_counts_json,
+                        digest,
+                    ],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            prune_account_delete_receipts(&transaction)?;
+
             transaction
                 .execute(
                     // Reactions first: message_events carries a plain
@@ -2938,6 +3166,15 @@ impl Store {
             transaction
                 .execute("DELETE FROM accounts WHERE id=?1", params![account_id])
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            receipt = Some(AccountDeleteReceipt {
+                account_id: account_id.to_string(),
+                completed_at: now_ms,
+                rows_deleted,
+                table_counts,
+                digest,
+                plaintext_backup: "pending".to_string(),
+                wal_checkpoint: "deferred".to_string(),
+            });
         }
         if let Some(operation_id) = operation_id {
             let changed = transaction
@@ -2956,11 +3193,151 @@ impl Store {
         transaction
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        Ok(exists)
+        // §4.197: after the rows are gone, fold the WAL tail into the main
+        // file and truncate it — deleted pages do not linger in a side file.
+        // A busy checkpoint (a reader mid-page) is not a delete failure: the
+        // WAL stays bounded by wal_autocheckpoint and the receipt says
+        // "deferred" honestly.
+        let checkpoint = match conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
+            Ok(()) => "truncated",
+            Err(_) => "deferred",
+        };
+        if let Some(receipt) = receipt.as_mut() {
+            receipt.wal_checkpoint = checkpoint.to_string();
+            conn.execute(
+                "UPDATE account_delete_receipts SET wal_checkpoint=?2 WHERE account_id=?1",
+                params![account_id, checkpoint],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        drop(conn);
+        Ok(receipt)
+    }
+
+    /// Contract 1.197 (§4.197, D4): finish the privacy residue a deletion
+    /// leaves outside the encrypted store — the Phase 3 plaintext migration
+    /// backup. Only this account's rows are scrubbed (with `secure_delete`
+    /// and `VACUUM`), so other accounts keep their rollback window. Returns
+    /// the updated receipt, or `None` when no receipt exists (an account
+    /// deleted by a pre-1.197 binary).
+    pub fn finish_account_delete_residue(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<AccountDeleteReceipt>, StoreError> {
+        let Some(mut receipt) = self.account_delete_receipt(account_id)? else {
+            return Ok(None);
+        };
+        let disposition = self.scrub_plaintext_backup_account(account_id);
+        receipt.plaintext_backup = disposition.to_string();
+        self.lock_conn()?
+            .execute(
+                "UPDATE account_delete_receipts SET plaintext_backup=?2 WHERE account_id=?1",
+                params![account_id, disposition],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(Some(receipt))
+    }
+
+    /// Contract 1.197 (§4.197): read back one deletion receipt.
+    pub fn account_delete_receipt(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<AccountDeleteReceipt>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT account_id, completed_at, rows_deleted, table_counts, digest,
+                        plaintext_backup, wal_checkpoint
+                   FROM account_delete_receipts WHERE account_id=?1",
+                params![account_id],
+                |row| {
+                    let counts_json: String = row.get(3)?;
+                    let table_counts = serde_json::from_str(&counts_json).unwrap_or_default();
+                    Ok(AccountDeleteReceipt {
+                        account_id: row.get(0)?,
+                        completed_at: row.get::<_, i64>(1)?.max(0) as u64,
+                        rows_deleted: row.get::<_, i64>(2)?.max(0) as u64,
+                        table_counts,
+                        digest: row.get(4)?,
+                        plaintext_backup: row.get(5)?,
+                        wal_checkpoint: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
     pub fn delete_account_cascade(&self, account_id: &str) -> Result<bool, StoreError> {
-        self.complete_account_delete(account_id, None, 0)
+        let receipt =
+            self.complete_account_delete_recorded(account_id, None, crate::link::now_ms())?;
+        if receipt.is_some() {
+            self.finish_account_delete_residue(account_id)?;
+        }
+        Ok(receipt.is_some())
+    }
+
+    /// Scrub one account's rows from the plaintext migration backup.
+    ///
+    /// The backup is a whole-profile plaintext snapshot kept for seven days
+    /// for rollback; deleting an account from the encrypted store would
+    /// otherwise leave that account readable in the backup. The scrub opens
+    /// the backup unkeyed, deletes the same row set inside one transaction
+    /// with `secure_delete` on, then `VACUUM`s so no freed page survives. A
+    /// backup that cannot be scrubbed (corrupt, replaced, encrypted) is
+    /// removed outright: the account-deletion privacy claim outranks the
+    /// rollback convenience.
+    fn scrub_plaintext_backup_account(&self, account_id: &str) -> &'static str {
+        let backup = plaintext_backup_path(&self.path);
+        let state = match db_file_state(&backup) {
+            Ok(state) => state,
+            Err(_) => return "unavailable",
+        };
+        match state {
+            DbFileState::Absent => "absent",
+            DbFileState::Plaintext => {
+                let scrubbed = (|| -> Result<(), rusqlite::Error> {
+                    let conn = Connection::open(&backup)?;
+                    conn.busy_timeout(Duration::from_millis(250))?;
+                    conn.execute_batch("PRAGMA secure_delete=ON;")?;
+                    conn.execute_batch("BEGIN IMMEDIATE;")?;
+                    if table_exists(&conn, "message_receipts")? {
+                        conn.execute(
+                            "DELETE FROM message_receipts
+                              WHERE message_id IN
+                                (SELECT id FROM messages WHERE account_id=?1)",
+                            params![account_id],
+                        )?;
+                    }
+                    for table in ACCOUNT_DELETE_TABLES {
+                        if table_exists(&conn, table)? {
+                            conn.execute(
+                                &format!("DELETE FROM {table} WHERE account_id=?1"),
+                                params![account_id],
+                            )?;
+                        }
+                    }
+                    if table_exists(&conn, "meta")? {
+                        conn.execute(
+                            "DELETE FROM meta WHERE key=?1",
+                            params![format!("contacts_synced_at:{account_id}")],
+                        )?;
+                    }
+                    if table_exists(&conn, "accounts")? {
+                        conn.execute("DELETE FROM accounts WHERE id=?1", params![account_id])?;
+                    }
+                    conn.execute_batch("COMMIT;")?;
+                    // Rebuild the file: secure_delete zeroes row content in
+                    // place, VACUUM removes the freed pages entirely.
+                    conn.execute_batch("VACUUM;")?;
+                    Ok(())
+                })();
+                match scrubbed {
+                    Ok(()) => "scrubbed",
+                    Err(_) => discard_plaintext_backup(&backup),
+                }
+            }
+            DbFileState::Encrypted => discard_plaintext_backup(&backup),
+        }
     }
 
     /// Contract 1.170 (§4.170): the account identity pair the memo redirect
@@ -3364,7 +3741,9 @@ impl Store {
         let cursor_null = i64::from(decoded.as_ref().is_some_and(|value| value.0));
         let cursor_sent_at = decoded.as_ref().and_then(|value| value.1);
         let cursor_id = decoded.as_ref().map(|value| value.2.as_str());
-        let conn = self.lock_conn()?;
+        // ADR 0007: a pure page read runs on a pool connection, so it does
+        // not serialize behind a writer commit or another read.
+        let conn = self.read_conn()?;
         // Contract 1.43 (§4.42) with contract 1.170: is_self derives the row
         // from the account's own number and stored ACI at read time — one
         // lookup per page, through the already held connection guard.
@@ -3568,9 +3947,10 @@ impl Store {
         let before_id = anchor.as_ref().map(|value| value.1.as_str());
         // Scoped guard: the page query's connection lock must be released
         // before the reaction aggregation re-enters the store (a std Mutex
-        // is not reentrant — attach_reactions takes the lock itself).
+        // is not reentrant — attach_reactions takes the lock itself). ADR
+        // 0007: the page itself runs on a read-pool connection.
         let mut items = {
-            let conn = self.lock_conn()?;
+            let conn = self.read_conn()?;
             let mut stmt = conn
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
@@ -3758,9 +4138,10 @@ impl Store {
         // something to paper over with an unindexable full fold.
         let like = escape_like(query);
         // Scoped guard, same as `list_messages`: release the connection lock
-        // before `attach_reactions` re-enters the store.
+        // before `attach_reactions` re-enters the store. ADR 0007: the page
+        // runs on a read-pool connection.
         let mut items = {
-            let conn = self.lock_conn()?;
+            let conn = self.read_conn()?;
             let mut stmt = conn
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
@@ -9570,6 +9951,74 @@ fn prune_completed_account_deletes(
     Ok(())
 }
 
+/// Contract 1.197 (§4.197): keep the deletion-receipt ring bounded. Oldest
+/// receipts leave first; ties break on the opaque account id so the result is
+/// deterministic.
+fn prune_account_delete_receipts(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "DELETE FROM account_delete_receipts
+             WHERE account_id NOT IN (
+               SELECT account_id FROM account_delete_receipts
+               ORDER BY completed_at DESC, account_id DESC
+               LIMIT ?1
+             )",
+            params![MAX_ACCOUNT_DELETE_RECEIPTS],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(())
+}
+
+/// The receipt digest binds the account id, the completion moment, the total,
+/// and every per-table count. It is a content-free commitment to the evidence:
+/// anyone holding the receipt can detect a later edit to its numbers without
+/// the receipt ever carrying a row, body, number, or path.
+fn account_delete_digest(
+    account_id: &str,
+    completed_at: u64,
+    rows_deleted: u64,
+    table_counts: &BTreeMap<String, u64>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kt-signal-connector/account-delete-receipt/v1\0");
+    hasher.update(account_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(completed_at.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(rows_deleted.to_string().as_bytes());
+    for (table, count) in table_counts {
+        hasher.update(b"\0");
+        hasher.update(table.as_bytes());
+        hasher.update(b"=");
+        hasher.update(count.to_string().as_bytes());
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+/// Whether a table exists in this database. Used by the plaintext-backup
+/// scrub: a backup may predate tables the current schema has.
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        params![table],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+}
+
+/// Remove a plaintext migration backup that cannot be scrubbed row-wise. The
+/// rollback convenience never outranks an account-deletion privacy claim.
+fn discard_plaintext_backup(path: &Path) -> &'static str {
+    let removed = std::fs::remove_file(path).is_ok();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(append_suffix(path, suffix));
+    }
+    if removed { "removed" } else { "unavailable" }
+}
+
 fn encode_message_cursor(account_id: &str, conversation_id: &str, item: &MessageRecord) -> String {
     format!(
         "{MESSAGE_CURSOR_PREFIX}{account_id}:{conversation_id}:{}:{}",
@@ -10438,6 +10887,14 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             conn.execute("ALTER TABLE messages ADD COLUMN author_aci TEXT", [])
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
+    }
+    if current < 32 {
+        // Contract 1.197 (§4.197, D4): the deletion-receipt ledger. The
+        // table is created by SCHEMA_DDL's CREATE TABLE IF NOT EXISTS on
+        // every open, so no structural step is needed; the receipt is
+        // written by the delete transaction itself. Pre-1.197 deletions
+        // legitimately have no receipt — the proof starts with the first
+        // delete this binary performs.
     }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
@@ -17039,6 +17496,221 @@ mod tests {
     }
 
     #[test]
+    fn read_pool_serves_reads_while_the_writer_connection_is_held() {
+        let temp = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(temp.path(), Some(test_store_key())).unwrap());
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+
+        // Hold the writer connection. A pool read must still complete; the
+        // pre-ADR-0007 single connection would block until this guard drops.
+        let writer_guard = store.lock_conn().unwrap();
+        let reader_store = std::sync::Arc::clone(&store);
+        let account_id = account.id.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let count = reader_store
+                .list_conversations(&account_id, 10, None)
+                .map(|page| page.items.len());
+            sender.send(count).unwrap();
+        });
+        let count = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a pool read must not wait for the writer connection");
+        assert_eq!(count.unwrap(), 1);
+        drop(writer_guard);
+        reader.join().unwrap();
+
+        // The pool is read-only at the SQL layer: an accidental write fails
+        // instead of racing the writer.
+        {
+            let conn = store.read_conn().unwrap();
+            assert!(
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('pool-write', 'no')",
+                    [],
+                )
+                .is_err(),
+                "query_only must refuse writes on a pool connection"
+            );
+        }
+
+        // A committed write is visible to the next pool read.
+        store
+            .set_conversation_title_for_peer(&account.id, "direct", "+15555550101", "Renamed")
+            .unwrap();
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        assert_eq!(page.items[0].title, "Renamed");
+    }
+
+    #[test]
+    fn account_delete_leaves_a_receipt_scrubs_the_plaintext_backup_and_keeps_other_accounts() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let doomed = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let survivor = store
+            .upsert_account_from_signal("+15555550101", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let doomed_conversation = store
+            .ensure_conversation(&doomed.id, "direct", "+15555550102", "contact")
+            .unwrap();
+        store
+            .upsert_contact(&doomed.id, "contact", "+15555550102", "Alice", None, 10)
+            .unwrap();
+        store
+            .upsert_contact(&survivor.id, "contact", "+15555550103", "Bob", None, 10)
+            .unwrap();
+        let message = MessageRecord {
+            author_aci: None,
+            id: "receipt-message".into(),
+            account_id: doomed.id.clone(),
+            conversation_id: doomed_conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "+15555550102".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 10,
+            received_at: Some(11),
+            text: Some("delete me".into()),
+            text_bytes: Some(9),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            edited_at: None,
+            rich: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        store.insert_message(&message, None, None, false).unwrap();
+
+        // A plaintext migration backup holding both accounts: the deleted
+        // account's rows must not survive there just because the encrypted
+        // store is clean.
+        let backup = plaintext_backup_path(store.path());
+        {
+            let conn = Connection::open(&backup).unwrap();
+            conn.execute_batch(SCHEMA_DDL).unwrap();
+            for (id, number, marker) in [
+                (doomed.id.as_str(), "+15555550100", "doomed-secret-marker"),
+                (survivor.id.as_str(), "+15555550101", "survivor-marker"),
+            ] {
+                conn.execute(
+                    "INSERT INTO accounts(id, signal_account, masked_address, state, proxy_group)
+                     VALUES(?1, ?2, ?3, 'ready', 'default')",
+                    params![id, number, mask_address(number)],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO contacts(id, account_id, kind, peer_key, title, synced_at)
+                     VALUES(?1, ?2, 'contact', ?3, ?4, 10)",
+                    params![format!("backup-contact-{id}"), id, number, marker],
+                )
+                .unwrap();
+            }
+        }
+
+        assert!(store.delete_account_cascade(&doomed.id).unwrap());
+        assert!(!store.delete_account_cascade(&doomed.id).unwrap());
+
+        // Receipt: counts + digest only, binding the evidence to this account
+        // and moment without carrying a number, body, or path.
+        let receipt = store
+            .account_delete_receipt(&doomed.id)
+            .unwrap()
+            .expect("a recorded delete leaves a receipt");
+        assert_eq!(
+            receipt.rows_deleted,
+            receipt.table_counts.values().sum::<u64>()
+        );
+        assert_eq!(receipt.table_counts.get("accounts"), Some(&1));
+        assert_eq!(receipt.table_counts.get("messages"), Some(&1));
+        assert_eq!(receipt.table_counts.get("contacts"), Some(&1));
+        assert!(receipt.digest.starts_with("sha256:"));
+        assert_eq!(receipt.digest.len(), "sha256:".len() + 64);
+        assert_eq!(receipt.plaintext_backup, "scrubbed");
+        assert_eq!(receipt.wal_checkpoint, "truncated");
+        let receipt_json = serde_json::to_string(&receipt).unwrap();
+        assert!(!receipt_json.contains("+15555550100"));
+        assert!(!receipt_json.contains("delete me"));
+
+        // Secure deletion and the post-delete checkpoint are on.
+        {
+            let conn = store.conn();
+            let secure: i64 = conn
+                .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(secure, 1, "secure_delete must be on");
+        }
+        let wal = append_suffix(store.path(), "-wal");
+        let wal_len = std::fs::metadata(&wal).map(|meta| meta.len()).unwrap_or(0);
+        assert_eq!(wal_len, 0, "the post-delete checkpoint truncates the WAL");
+
+        // The backup lost only the doomed account; the survivor's rollback
+        // copy is intact.
+        {
+            let conn = Connection::open(&backup).unwrap();
+            let doomed_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM contacts WHERE account_id=?1",
+                    params![doomed.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let survivor_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM contacts WHERE account_id=?1",
+                    params![survivor.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let doomed_account: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM accounts WHERE id=?1",
+                    params![doomed.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(doomed_rows, 0);
+            assert_eq!(doomed_account, 0);
+            assert_eq!(survivor_rows, 1);
+        }
+        // The scrub is an erasure, not just a row delete: no free page in the
+        // rebuilt backup still carries the deleted account's row content.
+        let backup_bytes = std::fs::read(&backup).unwrap();
+        let contains = |needle: &[u8]| backup_bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(!contains(b"doomed-secret-marker"));
+        assert!(contains(b"survivor-marker"));
+
+        // The other account is untouched in the encrypted store.
+        assert!(store.account_by_id(&doomed.id).unwrap().is_none());
+        assert!(store.account_by_id(&survivor.id).unwrap().is_some());
+        assert_eq!(store.count_contacts(&survivor.id).unwrap(), (1, 0));
+    }
+
+    #[test]
     fn account_delete_operation_survives_unknown_and_completes_atomically() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
@@ -18990,6 +19662,213 @@ mod tests {
         assert!(store.prune_expired_plaintext_backup(now).unwrap());
         assert!(!backup.exists());
         assert!(!store.prune_expired_plaintext_backup(now).unwrap());
+    }
+
+    #[test]
+    fn realistic_size_schema_migration_and_plaintext_backup_rollback() {
+        // D2 drill: a v0 plaintext store with production-shaped volume, not
+        // an empty schema. 20k messages × 512 B bodies (~10 MB) over 200
+        // conversations exercises every additive ALTER, the v29 pin-table
+        // rebuild, the SQLCipher export, the plaintext backup, and a restore
+        // of that backup after the encrypted store is gone.
+        const CONVERSATIONS: usize = 200;
+        const MESSAGES: usize = 20_000;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(DATABASE_FILE_NAME);
+        let body = "x".repeat(512);
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO meta(key, value) VALUES('schema_version', '0');
+                 CREATE TABLE accounts (
+                   id TEXT PRIMARY KEY,
+                   signal_account TEXT NOT NULL UNIQUE,
+                   masked_address TEXT NOT NULL,
+                   state TEXT NOT NULL,
+                   linked_at INTEGER
+                 );
+                 CREATE TABLE conversations (
+                   id TEXT PRIMARY KEY,
+                   account_id TEXT NOT NULL,
+                   kind TEXT NOT NULL,
+                   peer_key TEXT NOT NULL,
+                   title TEXT NOT NULL,
+                   last_message_preview TEXT,
+                   last_message_at INTEGER,
+                   unread_count INTEGER NOT NULL DEFAULT 0,
+                   muted INTEGER NOT NULL DEFAULT 0,
+                   pinned INTEGER NOT NULL DEFAULT 0,
+                   UNIQUE(account_id, kind, peer_key)
+                 );
+                 CREATE TABLE messages (
+                   id TEXT PRIMARY KEY,
+                   account_id TEXT NOT NULL,
+                   conversation_id TEXT NOT NULL,
+                   direction TEXT NOT NULL,
+                   sender_id TEXT NOT NULL,
+                   sent_at INTEGER NOT NULL,
+                   received_at INTEGER,
+                   body TEXT,
+                   status TEXT NOT NULL,
+                   client_request_id TEXT
+                 );
+                 CREATE TABLE message_events (
+                   id TEXT PRIMARY KEY,
+                   account_id TEXT NOT NULL,
+                   conversation_id TEXT NOT NULL,
+                   target_timestamp INTEGER
+                 );
+                 CREATE TABLE history_import_stage_chats (
+                   account_id TEXT NOT NULL,
+                   conversation_id TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            let transaction = conn.transaction().unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO accounts(id, signal_account, masked_address, state, linked_at)
+                     VALUES('drill-account', '+15555550100', '+15***00', 'ready', 1)",
+                    [],
+                )
+                .unwrap();
+            for index in 0..CONVERSATIONS {
+                transaction
+                    .execute(
+                        "INSERT INTO conversations(
+                           id, account_id, kind, peer_key, title, last_message_at)
+                         VALUES(?1, 'drill-account', 'direct', ?2, ?3, ?4)",
+                        params![
+                            format!("drill-conversation-{index}"),
+                            format!("+1555555{index:04}"),
+                            format!("Drill chat {index}"),
+                            (MESSAGES - index) as i64,
+                        ],
+                    )
+                    .unwrap();
+            }
+            {
+                let mut statement = transaction
+                    .prepare(
+                        "INSERT INTO messages(
+                           id, account_id, conversation_id, direction, sender_id,
+                           sent_at, received_at, body, status)
+                         VALUES(?1, 'drill-account', ?2, 'incoming', '+15555550101',
+                                ?3, ?3, ?4, 'delivered')",
+                    )
+                    .unwrap();
+                for index in 0..MESSAGES {
+                    statement
+                        .execute(params![
+                            format!("drill-message-{index}"),
+                            format!("drill-conversation-{}", index % CONVERSATIONS),
+                            index as i64,
+                            body,
+                        ])
+                        .unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+        }
+        let source_bytes = std::fs::metadata(&path).unwrap().len();
+        let pre_migration = temp.path().join("pre-migration.sqlite3");
+        std::fs::copy(&path, &pre_migration).unwrap();
+
+        let started = std::time::Instant::now();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let migration_ms = started.elapsed().as_millis();
+        let (messages, conversations, version) = {
+            let conn = store.conn();
+            let messages: i64 = conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+                .unwrap();
+            let conversations: i64 = conn
+                .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+                .unwrap();
+            let version: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let integrity: String = conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok", "the migrated store must be intact");
+            (messages, conversations, version)
+        };
+        assert_eq!(messages as usize, MESSAGES);
+        assert_eq!(conversations as usize, CONVERSATIONS);
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+
+        // The rollback copy is a complete plaintext snapshot of the same
+        // rows, taken before the encrypted store replaced the source.
+        let backup = plaintext_backup_path(store.path());
+        assert!(backup.exists(), "the migration keeps its rollback backup");
+        let backup_bytes = std::fs::metadata(&backup).unwrap().len();
+        {
+            let conn = Connection::open(&backup).unwrap();
+            let backup_messages: i64 = conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+                .unwrap();
+            let integrity: String = conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(backup_messages as usize, MESSAGES);
+            assert_eq!(integrity, "ok");
+        }
+        drop(store);
+
+        // Rollback drill: put the pre-migration plaintext file back where the
+        // encrypted store lived and reopen. The binary re-runs the same
+        // migration over the restored file — the documented rollback route is
+        // the file-level backup, not a schema downgrade.
+        std::fs::remove_file(&path).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(append_suffix(&path, suffix));
+        }
+        std::fs::copy(&pre_migration, &path).unwrap();
+        let restored = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let restored_messages: i64 = restored
+            .conn()
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        let restored_version: String = restored
+            .conn()
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_messages as usize, MESSAGES);
+        assert_eq!(restored_version, SCHEMA_VERSION.to_string());
+
+        println!(
+            "migration-drill: messages={MESSAGES} conversations={CONVERSATIONS} \
+             source_bytes={source_bytes} backup_bytes={backup_bytes} \
+             migration_ms={migration_ms} rollback_rows={restored_messages}"
+        );
+    }
+
+    #[test]
+    fn a_newer_schema_fails_closed_instead_of_downgrading() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE meta SET value=?1 WHERE key='schema_version'",
+                params![(SCHEMA_VERSION + 1).to_string()],
+            )
+            .unwrap();
+        drop(store);
+        assert!(matches!(
+            Store::open(temp.path(), Some(test_store_key())),
+            Err(StoreError::Unavailable(_))
+        ));
     }
 
     #[test]

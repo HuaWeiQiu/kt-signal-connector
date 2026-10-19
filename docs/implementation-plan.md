@@ -38,6 +38,34 @@
   the pinned contract; the engine's own account removal is their stop. Both
   are KT adaptations: official Signal-Desktop is single-account per process
   and has no multi-account delete face.)
+- Contract revision: 1.199 (2026-10-20; §4.199 the data/security hygiene
+  batch. Five faces, no official multi-account counterpart — the shapes that
+  are official are cited in the section: (1) ADR 0006 makes the host accept
+  policy explicit — a second connection is answered
+  `runtime.busy {code: HOST_BUSY, message, retryable: true}` and closed
+  instead of queueing in the kernel backlog, with no challenge and no
+  session identity in the frame; (2) `accounts.deleteLocalData` now returns
+  a content-free deletion receipt under `deleted`
+  `{accountId, completedAt, rowsDeleted, tableCounts, digest, plaintextBackup,
+  walCheckpoint}` — counts and a SHA-256 commitment only, never a number,
+  body, peer key, or path — and the same receipt is persisted (bounded ring
+  of 256) so an idempotent replay answers identically; (3) the SQLCipher
+  store runs `secure_delete=ON` with a bounded WAL
+  (`wal_autocheckpoint=512`, `journal_size_limit=8 MiB`) and a post-delete
+  `wal_checkpoint(TRUNCATE)`; the Phase 3 plaintext migration backup is
+  row-scrubbed for the deleted account (`secure_delete` + `VACUUM`, other
+  accounts' rollback copy intact) or removed outright when it cannot be
+  scrubbed; (4) ADR 0007 adds a fixed two-connection read-only pool
+  (`query_only=ON`, 2 MiB cache each) used by the pure page reads
+  (`conversations.list`, the `messages.list` page, the `messages.search`
+  page) while every mutating method stays on the single writer; (5) the D2
+  drill lands as a realistic-size (20k messages / 200 conversations / ~14 MB)
+  migration-and-rollback test plus `scripts/migration-drill.sh`. Contract
+  revision 1.197 is additive on the wire: `runtime.busy` is a new event and
+  the delete result's `deleted` key is additive; pre-1.197 callers read
+  their old shapes unchanged. D3's engine-side last-moments dump audit is
+  recorded in `docs/last-moments-redaction-audit.md`; the engine worktree is
+  outside this repository and the fix lands there.)
 - Contract revision: 1.196 (2026-10-20; §4.196 the delete-for-me
   attachment arm: `syncMessage.deleteForMe.attachmentDeletes` — the
   official `handleDeleteForMeSync` fourth face
@@ -17223,6 +17251,123 @@ codes, the consumed-session replay, and the settled-delete relink).
 The fixture gains `KT_FAKE_DELETE_MODE=hold` (a background-released
 delete, since the fixture reads requests on one thread) and an
 `.fixture-import-cancel-log` account log.
+### 4.199 The data/security hygiene batch: explicit accept, deletion proof, SQLite erasure, read pool, migration drill (contract revision 1.199, 2026-10-20)
+
+This batch closes the connector-side items of the audit's §9.13.6 C table
+(D2/D3/D4, SQLite `secure_delete`/checkpoint, the store read pool, and S5).
+Official semantics first: the host socket is a KT boundary and multi-account
+local deletion has no official desktop counterpart (Signal Desktop is one
+account per app instance), so S5/D4/read-pool/SQLite decisions are marked
+`[KT 适配]`; the shapes that are official are cited below.
+
+**S5 — explicit busy accept (ADR 0006).** `host::serve` used to await one
+session before calling `accept()` again, so a second host waited in the
+kernel backlog with no answer. The serve loop now selects over the live
+session and `listener.accept()`; a late connection receives exactly one
+`runtime.busy` frame —
+`{code: "HOST_BUSY", message: "another host session already owns this
+connector", retryable: true}` — and is closed. No `runtime.challenge` is
+sent, so the caller cannot mistake the connection for an authenticatable
+session; the frame carries no session id, account, pid, or path. The answer
+is bounded by `HOST_BUSY_ANSWER_TIMEOUT` (1 s) so a peer that stops reading
+cannot stall the live session's polling. The live session keeps its dispatch
+lanes, pending budget, and account locks untouched. Official model the rule
+completes: one account = one client, one identified websocket, one job queue
+(`ts/textsecure/MessageSender.preload.ts` `singleProtoJobQueue`,
+`ts/jobs/JobManager.std.ts`). ADR 0006 records the alternatives (backlog
+queue, challenge-then-refuse, two concurrent sessions) and why each is
+rejected. Schema: `runtime.busy` in the event enum plus its fixed-shape
+`allOf` block; the frame is pinned by
+`a_second_host_connection_is_answered_busy_without_queueing`.
+
+**D4 — deletion completeness and proof.** The official `deleteAllData`
+sequence is logs → close DB → remove DB → remove other data
+(`ts/shims/deleteAllData.preload.ts:13-52`), with "other data" covering the
+SQL key, attachments, stickers, temp, downloads, and drafts
+(`ts/sql/Client.preload.ts:879-888`); the server-side deletion is
+`ts/textsecure/WebAPI.preload.ts:5096`. The connector's per-account analogue
+is `[KT 适配]`: the engine already owns and removes the account's data
+directory, keys, media, and store on `deleteLocalAccountData` (it is the only
+writer of that tree); the connector now clears its own residue in one place
+— store rows, the plaintext migration backup, plaintext export artifacts
+(`plaintext-exports/<accountId>/`), media/backup chunk handles, the plaintext
+task record, and the per-account in-memory caches (backup skip counters,
+receipt-failure debounce entries, group-resync stamps, and the import-cancel
+marker). The store transaction writes an
+`account_delete_receipts` row (bounded ring of 256) before the rows go:
+`accountId` (opaque), `completedAt`, `rowsDeleted`, `tableCounts` (fixed
+table names only), a `sha256:` digest over account + moment + counts, the
+plaintext-backup disposition, and the checkpoint disposition. The result of
+`accounts.deleteLocalData` is `{deleted: <receipt>}`; an account already gone
+(or deleted by a pre-1.197 binary) keeps the historical `{}`. The receipt
+never contains a phone number, body, peer key, path, or key material — the
+test reads it back and asserts the number and body are absent. Idempotent
+replay (`operationId`) returns the same digest. Tests:
+`account_delete_leaves_a_receipt_scrubs_the_plaintext_backup_and_keeps_other_accounts`
+(rows/counts/digest, secure-delete pragma, truncated WAL, backup scrub with
+a raw-byte marker scan, survivor isolation) and the integration receipt
+assertions in `account_delete_unknown_is_reconciled_only_on_explicit_retry`.
+
+**SQLite hygiene.** `[KT 适配]` — SQLite settings are an implementation
+detail with no official wire face. The store opens with
+`secure_delete=ON` (deleted row content is zeroed inside its page before the
+page returns to the freelist), `wal_autocheckpoint=512` pages,
+`journal_size_limit=8 MiB`, and a 4 MiB writer page cache; these are
+size/hygiene bounds and do not change `journal_mode=WAL`, `foreign_keys=ON`,
+or durability. After a successful
+delete transaction the writer runs `PRAGMA wal_checkpoint(TRUNCATE)` and the
+receipt records `truncated` or `deferred` honestly (a reader holding a page
+can answer busy; `wal_autocheckpoint` remains the bound). The Phase 3
+plaintext migration backup is now part of the delete path: the account's
+rows are deleted inside one transaction with `secure_delete=ON`, then
+`VACUUM` rebuilds the file, so the deleted rows do not survive in free pages;
+other accounts keep their rollback copy. A backup that cannot be scrubbed
+(corrupt/replaced/encrypted) is removed outright — the deletion privacy claim
+outranks the rollback convenience. The existing seven-day
+`prune_expired_plaintext_backup` retention is unchanged and still runs once
+per start.
+
+**D2 — realistic-size migration/rollback drill.** The drill is a test, not
+an empty-schema exercise: it builds a v0 plaintext store with 20,000 messages
+(512-byte bodies) over 200 conversations (~14 MB), opens it through the
+current binary so every additive `ALTER`, the v29 pin-table rebuild, the
+SQLCipher export, and the plaintext backup run, verifies `integrity_check`
+and the row counts, checks the backup's integrity, then restores the
+pre-migration file over the encrypted store and reopens it (the documented
+rollback route is file-level backup/restore; a *newer* schema fails closed
+rather than downgrading — pinned by
+`a_newer_schema_fails_closed_instead_of_downgrading`). Evidence is printed
+by `scripts/migration-drill.sh` (last run: 20,000 messages / 200
+conversations, 14,372,864 source bytes, 14,311,424 backup bytes, 350 ms
+migration, rollback rows 20,000).
+
+**Read pool (ADR 0007).** `[KT 适配]` — the single `Mutex<Connection>`
+serialized every read behind every write. The store now owns two read-only
+pool connections (`PRAGMA query_only=ON`, 250 ms busy timeout, 2 MiB cache
+each) beside the one writer. Only pure page reads use the pool
+(`conversations.list`, the `messages.list` page query, the `messages.search`
+page query); every mutating and read-modify-write method stays on the writer,
+so there is no second writer and no write concurrency. The round-robin pool
+means two concurrent reads do not wait for each other. Pinned by
+`read_pool_serves_reads_while_the_writer_connection_is_held` (a read
+completes while the writer guard is held; a write through a pool connection
+is refused; a committed write is visible to the next pool read).
+
+**D3 — last-moments dump (out of this repository).** The audit item names
+the engine's `src/logfile.rs` WIP (kt-signal-engine, a different repository
+and worktree). This batch is read-only over that tree; the findings and the
+required fix/test are recorded in `docs/last-moments-redaction-audit.md`.
+The highest-risk face is `vendor/libsignal-service/src/cipher.rs:464`, which
+logs `?envelope` at warn — the envelope debug carries source/destination
+service ids, ciphertext bytes, `updatedPni`, and `report_spam_token`; the
+ring buffer and last-moments sidecar copy it verbatim. A phone-number parse
+warn (`vendor/libsignal-service/src/models.rs:59`) and the RPC error message
+echo (`src/methods.rs:192`) are secondary. The fix and its redaction test
+must land in the engine repository; they are not claimed as done here.
+
+**Boundary.** S1 (engine actor per account), D1/B5 (per-account store key),
+C3 (group pin authority), and the desktop-side purge/IPC items are not part
+of this batch and stay open in the audit table.
 
 ## 5. signal-cli Boundary
 

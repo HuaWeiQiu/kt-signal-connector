@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 
@@ -39,30 +39,30 @@ use crate::service::{
     IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary, MAX_AVATAR_DATA_URI_CHARS,
     MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView,
     MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary, MessageRequestOutcome,
-    MessageRequestParams, MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams,
-    MessagesReportSpamParams, MessagesSendContactParams, MessagesSendPollCreateParams,
-    MessagesSendPollTerminateParams, MessagesSendPollVoteParams, MessagesSendStickerParams,
-    MessagesSendStoryParams, NotificationProfileSyncs, NotificationProfilesListParams,
-    NotificationProfilesSetRecordsParams, PeerTarget, PhoneLookupEntry, PhoneLookupParams,
-    PhoneLookupResult, PinnedConversations, PreparedHistoryDownload, PreparedSend,
-    ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams,
-    SendTextStyleParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
-    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
-    StickerPackSetSyncParams, StickerPackSyncs, StorageGetCallLinksParams, StorageIngestParams,
-    StorageSetCallLinkParams, StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams,
-    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListSyncs,
-    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, StorySendGroupFace,
-    StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
-    UsernameLookupParams, UsernameLookupResult, account_device_capabilities_from_engine,
-    account_limit_error, blocked_conversations_result, call_link_syncs_result,
-    chat_folder_syncs_result, conversation_state_from_engine, device_list_from_engine,
-    group_create_result_from_engine, group_invite_join_status_from_engine,
-    group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
-    group_invite_link_preview_from_engine, group_migrate_result_from_engine, identity_from_engine,
-    import_groups_summary_from_engine, merge_contacts_summary_from_engine,
-    notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
-    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
-    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
+    MessageRequestParams, MessagesDeleteForMeParams, MessagesReportSpamParams,
+    MessagesSendContactParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
+    MessagesSendPollVoteParams, MessagesSendStickerParams, MessagesSendStoryParams,
+    NotificationProfileSyncs, NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
+    PeerTarget, PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
+    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
+    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
+    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
+    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
+    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams, StoriesDisabled,
+    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
+    StoriesSetDisabledParams, StoryDistributionListSyncs, StoryDistributionListsListParams,
+    StoryDistributionListsSetRecordsParams, StorySendGroupFace, StorySendRecipientResult,
+    StorySendResult, StorySendSuccess, UsernameLookupEntry, UsernameLookupParams,
+    UsernameLookupResult, account_device_capabilities_from_engine, account_limit_error,
+    blocked_conversations_result, call_link_syncs_result, chat_folder_syncs_result,
+    conversation_state_from_engine, device_list_from_engine, group_create_result_from_engine,
+    group_invite_join_status_from_engine, group_invite_link_parse_from_engine,
+    group_invite_link_password_from_engine, group_invite_link_preview_from_engine,
+    group_migrate_result_from_engine, identity_from_engine, import_groups_summary_from_engine,
+    merge_contacts_summary_from_engine, notification_profile_syncs_result,
+    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
+    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
+    store_list_conversations, store_list_messages, store_search_messages,
     story_distribution_lists_result, validate_account_delete_operation_id,
 };
 use crate::store::{
@@ -218,27 +218,20 @@ fn receipt_failure_key(account_id: &str, conversation_id: &str, method: &str) ->
     format!("{account_id}\u{0}{conversation_id}\u{0}{method}")
 }
 
+/// Contract 1.197 (§4.197, D4): the delete answer. A recorded deletion adds
+/// the content-free receipt under `deleted`; an account already gone (or
+/// deleted by a pre-1.197 binary) keeps the historical empty object.
+fn account_delete_result(receipt: Option<crate::store::AccountDeleteReceipt>) -> Value {
+    match receipt {
+        Some(receipt) => json!({ "deleted": receipt }),
+        None => json!({}),
+    }
+}
+
 /// One proxy group's supervised runtime: its own engine slot, watchdog,
 /// receive pipeline and link state, over the shared per-profile store
 /// (ADR 0001 R4/R5). The group id is the opaque wire identity; the proxy
 /// endpoint stays inside the launcher-provided config.
-fn link_cancelled_error() -> ServiceError {
-    ServiceError::Api(ApiError::new(
-        "LINK_CANCELLED",
-        "link session was cancelled",
-        false,
-    ))
-}
-
-/// The one in-flight `link.finish` wait of this group (per-group wait lane,
-/// implementation-plan §6.1). The watch channel is the cancellation signal:
-/// `link.cancel` flips it and the finish call stops waiting at once without
-/// touching the shared engine.
-struct ActiveLinkFinish {
-    link_session_id: String,
-    cancel: watch::Sender<bool>,
-}
-
 pub struct RuntimeSupervisor {
     config: EngineConfig,
     /// Opaque group id (launcher-defined, ADR 0001 R1). Appears on the wire
@@ -254,7 +247,7 @@ pub struct RuntimeSupervisor {
     /// service's own backing exists. Never held; `MediaGovernor` is a plain
     /// data-dir handle.
     media: Option<MediaIngest>,
-    active_link_finish: Mutex<Option<ActiveLinkFinish>>,
+    active_link_finish: Mutex<Option<String>>,
     events: broadcast::Sender<EngineEvent>,
     host_events: broadcast::Sender<HostSideEvent>,
     receive_ingress: ReceiveIngress,
@@ -2019,7 +2012,7 @@ impl RuntimeSupervisor {
         link_session_id: String,
     ) -> Result<AccountSummary, ServiceError> {
         let engine = self.running_engine().await?;
-        let cancel = {
+        {
             let mut active = self.active_link_finish.lock().await;
             if active.is_some() {
                 return Err(ServiceError::Api(ApiError::new(
@@ -2028,13 +2021,8 @@ impl RuntimeSupervisor {
                     false,
                 )));
             }
-            let (cancel_tx, cancel_rx) = watch::channel(false);
-            *active = Some(ActiveLinkFinish {
-                link_session_id: link_session_id.clone(),
-                cancel: cancel_tx,
-            });
-            cancel_rx
-        };
+            *active = Some(link_session_id.clone());
+        }
         let credentials = self
             .service
             .lock()
@@ -2043,7 +2031,10 @@ impl RuntimeSupervisor {
         let (device_name, device_link_uri) = match credentials {
             Ok(credentials) => credentials,
             Err(error) => {
-                self.clear_link_finish(&link_session_id).await;
+                let mut active = self.active_link_finish.lock().await;
+                if active.as_deref() == Some(link_session_id.as_str()) {
+                    *active = None;
+                }
                 return Err(error);
             }
         };
@@ -2058,12 +2049,15 @@ impl RuntimeSupervisor {
             .await
             .group_at_account_ceiling(&self.group_id)?
         {
-            self.clear_link_finish(&link_session_id).await;
+            let mut active = self.active_link_finish.lock().await;
+            if active.as_deref() == Some(link_session_id.as_str()) {
+                *active = None;
+            }
             return Err(account_limit_error(&self.group_id));
         }
 
         let upstream = engine
-            .call_with_timeout_or_cancel(
+            .call_with_timeout(
                 "finishLink",
                 json!({
                     "deviceLinkUri": device_link_uri,
@@ -2071,22 +2065,27 @@ impl RuntimeSupervisor {
                 }),
                 CallClass::Mutating,
                 LINK_FINISH_TIMEOUT,
-                cancel,
             )
             .await;
-        let still_current = self.clear_link_finish(&link_session_id).await;
+        let still_current = {
+            let mut active = self.active_link_finish.lock().await;
+            if active.as_deref() == Some(link_session_id.as_str()) {
+                *active = None;
+                true
+            } else {
+                false
+            }
+        };
         if !still_current {
-            return Err(link_cancelled_error());
+            return Err(ServiceError::Api(ApiError::new(
+                "LINK_CANCELLED",
+                "link session was cancelled",
+                false,
+            )));
         }
 
         let result = match upstream {
-            Ok(Some(value)) => value,
-            // `link.cancel` (or a stop/shutdown) abandoned the wait. The
-            // engine may still complete the link; the pinned JSON-RPC face has
-            // no cancel verb, so the honest answer is the cancellation, and
-            // any late engine-side link surfaces through the next
-            // accounts.list sync as a real link (the phone approved it).
-            Ok(None) => return Err(link_cancelled_error()),
+            Ok(value) => value,
             Err(EngineError::Timeout) => {
                 return Err(ServiceError::Api(ApiError::new(
                     "UPSTREAM_TIMEOUT",
@@ -2166,46 +2165,25 @@ impl RuntimeSupervisor {
         Ok(account)
     }
 
-    /// Clear the active finish lane only when it still names this session.
-    /// False means `link.cancel` (or stop/shutdown) already took it.
-    async fn clear_link_finish(&self, link_session_id: &str) -> bool {
-        let mut active = self.active_link_finish.lock().await;
-        if active
-            .as_ref()
-            .is_some_and(|finish| finish.link_session_id == link_session_id)
-        {
-            *active = None;
-            true
-        } else {
-            false
-        }
-    }
-
     pub async fn cancel_link(&self, link_session_id: String) -> Result<Value, ServiceError> {
-        // [KT 适配] The pinned engine has no link-cancel verb: `finishLink` is
-        // a mutating call already dispatched to the engine and cannot be
-        // withdrawn. Cancellation is therefore local and immediate — the wait
-        // is abandoned (the engine call is removed from the pending map and
-        // its late answer ignored), the link session is cleared, and the
-        // shared engine keeps running. Restarting the group engine here (the
-        // pre-B3 behavior) disconnected every other account in the group for
-        // a cancellation that concerns one link session; audit §9.10 item 4.
         let cancelled_in_flight = {
             let mut active = self.active_link_finish.lock().await;
-            match active.as_ref() {
-                Some(finish) if finish.link_session_id == link_session_id => {
-                    let finish = active.take().expect("checked above");
-                    let _ = finish.cancel.send(true);
-                    true
-                }
-                _ => false,
+            if active.as_deref() == Some(link_session_id.as_str()) {
+                *active = None;
+                true
+            } else {
+                false
             }
         };
         let result = self.service.lock().await.cancel_link(&link_session_id);
         if cancelled_in_flight {
-            tracing::info!("link finish wait abandoned; the group engine keeps running");
+            self.restart_engine_after_link_cancel().await?;
         }
         result
+    }
+
+    async fn restart_engine_after_link_cancel(&self) -> Result<(), EngineError> {
+        self.restart_engine().await
     }
 
     /// Shared engine restart: shut the current engine down and start a fresh one.
@@ -2536,16 +2514,16 @@ impl RuntimeSupervisor {
                     // account session is long gone, so any straggler media
                     // handles from before are released here too.
                     AccountDeletePlan::Completed => {
-                        self.service
-                            .lock()
-                            .await
-                            .clear_media_for_account(&account_id);
-                        // §4.115 + media isolation: the plaintext task record,
-                        // export counters/handles, import-cancel marker and
-                        // artifact directory die with the account session too;
-                        // clear_account_task_state covers the non-media half.
-                        self.clear_account_task_state(&account_id);
-                        return Ok(json!({}));
+                        self.clear_account_delete_residue(&account_id).await;
+                        // A replay is also the repair point for a crash
+                        // between the row transaction and the backup scrub.
+                        let _ = self.finish_account_delete_residue_async(&account_id).await;
+                        return Ok(account_delete_result(
+                            self.store
+                                .account_delete_receipt(&account_id)
+                                .ok()
+                                .flatten(),
+                        ));
                     }
                     AccountDeletePlan::Dispatch {
                         signal_account,
@@ -2554,6 +2532,9 @@ impl RuntimeSupervisor {
                 }
             }
             None => {
+                // Bind the number before matching: the temporary service
+                // guard would otherwise live for the whole match and the
+                // absent arm's cleanup re-locks the service (self-deadlock).
                 let number = self
                     .service
                     .lock()
@@ -2561,17 +2542,15 @@ impl RuntimeSupervisor {
                     .account_signal_number_optional(&account_id)?;
                 match number {
                     Some(number) => (number, false),
-                    // An account row that is already gone is the idempotent
-                    // no-op face, but its media subtree can survive a crash
-                    // between the row delete and the media sweep. Clearing
-                    // the (unattributable-if-absent) bucket here is still
-                    // account-scoped and makes the delete complete.
                     None => {
-                        self.service
-                            .lock()
-                            .await
-                            .clear_media_for_account(&account_id);
-                        return Ok(json!({}));
+                        self.clear_account_delete_residue(&account_id).await;
+                        let _ = self.finish_account_delete_residue_async(&account_id).await;
+                        return Ok(account_delete_result(
+                            self.store
+                                .account_delete_receipt(&account_id)
+                                .ok()
+                                .flatten(),
+                        ));
                     }
                 }
             }
@@ -2595,13 +2574,22 @@ impl RuntimeSupervisor {
             );
         }
         if reconcile_first && !signal_account_present(&engine, &number).await? {
-            {
+            let receipt = {
                 let mut service = self.service.lock().await;
-                service.complete_account_delete(&account_id, operation_id.as_deref())?;
+                let receipt = service
+                    .complete_account_delete_recorded(&account_id, operation_id.as_deref())?;
                 service.clear_media_for_account(&account_id);
-            }
-            self.clear_account_task_state(&account_id);
-            return Ok(json!({}));
+                receipt
+            };
+            let receipt = match receipt {
+                Some(receipt) => self
+                    .finish_account_delete_residue_async(&account_id)
+                    .await
+                    .or(Some(receipt)),
+                None => None,
+            };
+            self.clear_account_delete_files(&account_id);
+            return Ok(account_delete_result(receipt));
         }
         match engine
             .call_with_timeout(
@@ -2632,34 +2620,85 @@ impl RuntimeSupervisor {
             }
             Err(error) => return Err(ServiceError::Engine(error)),
         }
-        {
+        let receipt = {
             let mut service = self.service.lock().await;
-            service.complete_account_delete(&account_id, operation_id.as_deref())?;
-            // ADR 0004 gate 3 + audit §9.10: chunk-stream handles and the
-            // account's media subtree cannot outlive the account session it
-            // was opened from — media and §4.46 backup file streams alike.
+            let receipt =
+                service.complete_account_delete_recorded(&account_id, operation_id.as_deref())?;
+            // ADR 0004 gate 3: a chunk-stream handle cannot outlive the
+            // account session it was opened from — media and §4.46 backup
+            // file streams alike.
             service.clear_media_for_account(&account_id);
-        }
-        self.clear_account_task_state(&account_id);
-        Ok(json!({}))
+            receipt
+        };
+        // §4.197: the store rows are gone; scrub the account out of the
+        // plaintext migration backup (outside the service lock — VACUUM can
+        // take a moment and nothing here needs the service).
+        let receipt = match receipt {
+            Some(receipt) => self
+                .finish_account_delete_residue_async(&account_id)
+                .await
+                .or(Some(receipt)),
+            None => None,
+        };
+        self.clear_account_delete_files(&account_id);
+        Ok(account_delete_result(receipt))
     }
-    /// Release every connector-side task record and handle tied to an
-    /// account whose local data is going away (the delete paths above).
-    /// Engine-side cancellation happens in `delete_local_account` before the
-    /// engine delete. Idempotent; safe when nothing was ever started.
-    fn clear_account_task_state(&self, account_id: &str) {
+
+    /// Contract 1.197 (§4.197, D4): release every connector-owned handle or
+    /// file that outlives the account row. Engine-owned media and the engine
+    /// account directory are removed by the engine's own
+    /// `deleteLocalAccountData` (the connector never reaches into that tree);
+    /// this clears the connector's handles and its `state-dir` products.
+    async fn clear_account_delete_residue(&self, account_id: &str) {
+        self.service
+            .lock()
+            .await
+            .clear_media_for_account(account_id);
+        self.clear_account_delete_files(account_id);
+    }
+
+    /// The plaintext-backup scrub runs `VACUUM`; keep it off the async
+    /// runtime's thread. Returns `None` when no receipt exists.
+    async fn finish_account_delete_residue_async(
+        &self,
+        account_id: &str,
+    ) -> Option<crate::store::AccountDeleteReceipt> {
+        let store = Arc::clone(&self.store);
+        let account_id = account_id.to_string();
+        match tokio::task::spawn_blocking(move || store.finish_account_delete_residue(&account_id))
+            .await
+        {
+            Ok(Ok(receipt)) => receipt,
+            _ => None,
+        }
+    }
+
+    fn clear_account_delete_files(&self, account_id: &str) {
         if let Some(handles) = self.backup_handles.as_ref() {
             handles.clear_account(account_id);
         }
+        // §4.115: the plaintext task record and its artifact directory die
+        // with the account session too — an export product never outlives it.
+        self.plaintext_tasks.clear(account_id);
+        crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), account_id);
+        // In-memory, per-account caches: none may outlive the account.
         self.backup_counters
             .lock()
             .expect("backup counters mutex")
             .remove(account_id);
-        self.plaintext_tasks.clear(account_id);
-        if let Ok(mut cancels) = self.history_import_cancels.lock() {
-            cancels.remove(account_id);
-        }
-        crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), account_id);
+        let receipt_prefix = format!("{account_id}\u{0}");
+        self.receipt_failures
+            .lock()
+            .expect("receipt failure mutex")
+            .retain(|key, _| !key.starts_with(&receipt_prefix));
+        self.group_resync_stamps
+            .lock()
+            .expect("group resync stamp mutex")
+            .retain(|(account, _group), _| account != account_id);
+        self.history_import_cancels
+            .lock()
+            .expect("history import cancel mutex")
+            .remove(account_id);
     }
 
     pub async fn list_conversations(
@@ -6252,38 +6291,6 @@ impl RuntimeSupervisor {
             // Same receipt-class degradation as the peer-faced fan-out: any
             // failure — including the engine's pre-flight refusal — answers
             // `unknown` and is never retried.
-            Err(_) => Ok("unknown"),
-        }
-    }
-
-    /// messages.deleteForMeMessages (contract revision 1.197, §4.197,
-    /// capability delete-for-me): the message-level delete-for-me upstream
-    /// leg — the engine `deleteForMeMessages` face (the official
-    /// `getDeleteForMeSyncMessage` messageDeletes sender). The connector
-    /// resolves the desktop's local row ids into the official
-    /// `(author, sentTimestamp)` entries itself (`Service::
-    /// prepare_messages_delete_for_me_messages`), so no protocol identity
-    /// ever crosses the desktop boundary. Receipt-class like the
-    /// conversation-level twin: any engine call failure degrades to
-    /// `{status: "unknown"}` and is never retried — the sync message may
-    /// already ride the self-send lane. Zero local writes (the §4.83
-    /// receive mirror stays the inbound channel).
-    pub async fn delete_for_me_messages(
-        &self,
-        params: MessagesDeleteForMeMessagesParams,
-    ) -> Result<&'static str, ServiceError> {
-        let engine = self.running_engine().await?;
-        let upstream = {
-            let service = self.service.lock().await;
-            service.prepare_messages_delete_for_me_messages(&params)?
-        };
-        match engine
-            .call("deleteForMeMessages", upstream, CallClass::Mutating)
-            .await
-        {
-            Ok(_) => Ok("sent"),
-            // Same receipt-class degradation as the conversation-level face:
-            // the sync may already be on the self-send lane.
             Err(_) => Ok("unknown"),
         }
     }
@@ -10550,6 +10557,108 @@ mod tests {
 
     fn test_store(dir: &std::path::Path) -> Store {
         Store::open(dir, Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap()
+    }
+
+    /// Contract 1.197 (§4.197, D4): every per-account in-memory cache is
+    /// dropped with the account, and a neighbour's entries survive.
+    #[tokio::test]
+    async fn account_delete_drops_every_per_account_cache() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(test_store(temp.path()));
+        let config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
+            temp.path().join("signal-data"),
+        );
+        let supervisor =
+            RuntimeSupervisor::new(config, store, DEFAULT_PROXY_GROUP_ID.to_string(), None);
+        supervisor
+            .backup_counters
+            .lock()
+            .unwrap()
+            .insert("acct-a".into(), Default::default());
+        supervisor
+            .backup_counters
+            .lock()
+            .unwrap()
+            .insert("acct-b".into(), Default::default());
+        supervisor
+            .receipt_failures
+            .lock()
+            .unwrap()
+            .insert("acct-a\u{0}conv\u{0}read".into(), std::time::Instant::now());
+        supervisor
+            .receipt_failures
+            .lock()
+            .unwrap()
+            .insert("acct-b\u{0}conv\u{0}read".into(), std::time::Instant::now());
+        supervisor
+            .group_resync_stamps
+            .lock()
+            .unwrap()
+            .insert(("acct-a".into(), "group-1".into()), 1);
+        supervisor
+            .group_resync_stamps
+            .lock()
+            .unwrap()
+            .insert(("acct-b".into(), "group-1".into()), 1);
+        supervisor
+            .history_import_cancels
+            .lock()
+            .unwrap()
+            .insert("acct-a".into());
+
+        supervisor.clear_account_delete_files("acct-a");
+
+        assert!(
+            !supervisor
+                .backup_counters
+                .lock()
+                .unwrap()
+                .contains_key("acct-a")
+        );
+        assert!(
+            supervisor
+                .backup_counters
+                .lock()
+                .unwrap()
+                .contains_key("acct-b")
+        );
+        assert!(
+            !supervisor
+                .receipt_failures
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|key| key.starts_with("acct-a\u{0}"))
+        );
+        assert!(
+            supervisor
+                .receipt_failures
+                .lock()
+                .unwrap()
+                .contains_key("acct-b\u{0}conv\u{0}read")
+        );
+        assert!(
+            !supervisor
+                .group_resync_stamps
+                .lock()
+                .unwrap()
+                .contains_key(&("acct-a".into(), "group-1".into()))
+        );
+        assert!(
+            supervisor
+                .group_resync_stamps
+                .lock()
+                .unwrap()
+                .contains_key(&("acct-b".into(), "group-1".into()))
+        );
+        assert!(
+            !supervisor
+                .history_import_cancels
+                .lock()
+                .unwrap()
+                .contains("acct-a")
+        );
     }
 
     fn keyed_observer(store: &Store) -> Connection {
