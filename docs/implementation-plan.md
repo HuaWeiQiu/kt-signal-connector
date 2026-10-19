@@ -22,6 +22,22 @@
   Receipt-class `{status: sent|unknown}`, never retried, zero local
   writes. Schema + bounds pairing + fake-engine gate + integration tests
   land with the revision.)
+- Contract revision: 1.197 (2026-10-20; §4.197 connector stability batch
+  B3/B4. `link.cancel` no longer stops/restarts the shared group engine: an
+  in-flight `finishLink` wait is abandoned locally (the pending request is
+  removed and its late answer ignored), the engine stays up for every other
+  account, and the cancelled session can link again. Account local-data
+  delete now cancels the account's engine tasks through the one cancel face
+  the pinned engine has (`history.importCancel`: transfer download + cloud
+  restore) before dispatching `deleteLocalAccountData`, and a relink of a
+  number whose delete has not settled is refused — `started` answers the new
+  `ACCOUNT_DELETE_IN_PROGRESS` (retryable=false, the definite-refusal class),
+  `unknown` keeps
+  `ACCOUNT_DELETE_OUTCOME_UNKNOWN` (retryable=false). `backup.export`,
+  `backup.importSnapshot` and `backups.uploadToCloud` have no cancel verb in
+  the pinned contract; the engine's own account removal is their stop. Both
+  are KT adaptations: official Signal-Desktop is single-account per process
+  and has no multi-account delete face.)
 - Contract revision: 1.196 (2026-10-20; §4.196 the delete-for-me
   attachment arm: `syncMessage.deleteForMe.attachmentDeletes` — the
   official `handleDeleteForMeSync` fourth face
@@ -17109,6 +17125,94 @@ refusals, and the empty/over-cap list), and
 `messages_delete_for_me_messages_rides_the_engine_sync_face` (the
 handshake advertisement, the resolved entries on the fixture dispatch
 log, and the batch refusals never reaching the engine).
+### 4.197 Connector stability B3/B4: link cancel stays local; delete cancels tasks and gates relink (contract revision 1.197, 2026-10-20)
+
+Two audit findings from §9.10 are closed here. Both are `[KT 适配]`: the
+official desktop is one account per process, so neither a shared group
+engine nor a multi-account delete face exists upstream.
+
+**Official anchor for link cancel.** `Provisioner.subscribe`
+(`ts/textsecure/Provisioner.preload.ts:125-139`) returns an unsubscribe
+that calls `#stop('Cancel, no subscribers')` when the last listener
+leaves; `#stop` (`:248-259`) aborts the local `AbortController` and stops
+the provisioning loop. Cancellation stops listening — it never restarts
+the process and never unlinks a link that already completed. B3 mirrors
+that shape at the connector boundary.
+
+**B3 — `link.cancel` no longer restarts the shared engine.** The old
+path (`src/supervisor.rs:2158-2176`) called `restart_engine` whenever a
+`finishLink` was in flight, and the watchdog/restart path
+(`:2183-2213`) tore down the group's one engine — every other account in
+the group lost its connection and scheduling for a cancellation that
+concerned one link session (audit §9.10 item 4). The pinned engine
+offers no cancel verb for `finishLink`, so the connector abandons only
+its own wait: `EngineHandle::call_with_timeout_or_cancel` removes the
+pending request from the actor map (a later response is an ignored
+unknown-id warning, not a fatal protocol event) and `finish_link`
+returns `LINK_CANCELLED` at once. `ActiveLinkFinish` carries a
+`watch` cancellation sender; `cancel_link` flips it and clears the
+service session. No engine stop, no restart, no other account touched.
+The honest boundary: the engine-side `finishLink` is not withdrawn — a
+phone approval after the cancel is a real link and surfaces through the
+next `accounts.list` sync, exactly as the official "cancel stops
+listening" semantics allow. The watchdog keeps its restart authority
+for real fatal triggers (`link_flow_active` still suppresses restarts
+only while a finish is genuinely in flight).
+
+**B4 — delete cancels the account's engine tasks.** The pinned contract
+carries exactly one account-task cancel face: `history.importCancel`
+(kt-signal-engine `docs/jsonrpc-compat.md:202`; engine
+`src/service/mod.rs:5903`) aborts an in-flight transfer-archive download
+and a live cloud-backup restore, clears their partial artifacts and
+snapshots, and releases the restore running gate. `delete_local_account`
+calls it best-effort before dispatching `deleteLocalAccountData`
+(audit §9.10 item 6); a cancel failure never blocks the user's delete.
+`backup.export`, `backup.importSnapshot` and `backups.uploadToCloud`
+have no cancel verb in the pinned contract, so the connector does not
+invent one — the engine's own account-directory removal is their stop
+(their next disk touch fails) — while the connector releases export
+handles, plaintext task records/counters, and artifacts locally.
+Engine `delete_account` already cancels the two import legs internally
+(`src/service/mod.rs:2401-2410`); the explicit connector call makes the
+cancellation part of the connector contract instead of an engine
+implementation detail, and applies the connector's own
+marker/ledger/abort semantics first.
+
+**B4 — relink gate.** An unfinished delete operation (`started` =
+dispatch in flight or interrupted; `unknown` = lost outcome) keeps the
+old account row. Committing a relink would upsert that row back to
+`ready` while the cleanup is still coming, so `complete_link_session`
+now refuses the commit after consuming the spent session:
+`started` → new `ACCOUNT_DELETE_IN_PROGRESS` (`retryable=false`: the spent
+finish cannot be retried, the user retries the delete and then the link
+flow),
+`unknown` → the existing `ACCOUNT_DELETE_OUTCOME_UNKNOWN`
+(`retryable=false`, matching §6.2's explicit-retry rule). The account
+list sync also skips re-adopting that number from the engine while the
+operation is unfinished, so an engine-side link that landed after the
+refusal cannot flip the mid-delete row back to `ready`. Once the delete
+completes (or its explicit retry reconciles), the number links normally.
+No local data is deleted by the refused link, and no other account is
+touched.
+
+**Tests.** `link_cancel_keeps_the_group_engine_and_other_accounts`
+(two accounts on one engine: cancel A's slow link, same pid, B still
+listed and its `contacts.sync` still answers, A links again);
+`phase2_link_receive_send_and_idempotent_text` now pins the same pid
+where it used to wait for an engine exit.
+`delete_refuses_same_number_relink_until_cleanup_settles` (held delete:
+the account's transfer task is cancelled, the relink answers
+`ACCOUNT_DELETE_IN_PROGRESS` + retryable=false, and the same number links after
+the delete lands), `delete_cancels_only_its_own_accounts_tasks`
+(multi-account: A's number is the only cancel-log entry, B keeps
+answering during A's held delete, double cancel of an idle account is
+`cancelled:false`), and service unit tests
+`relink_is_refused_while_the_same_numbers_delete_is_unfinished` /
+`relink_after_unknown_delete_outcome_asks_for_a_delete_retry` (both
+codes, the consumed-session replay, and the settled-delete relink).
+The fixture gains `KT_FAKE_DELETE_MODE=hold` (a background-released
+delete, since the fixture reads requests on one thread) and an
+`.fixture-import-cancel-log` account log.
 
 ## 5. signal-cli Boundary
 
@@ -17219,11 +17323,14 @@ reality and never truncates.
 Cancellation is linearized before it returns: a cancelled or superseded finish result cannot create
 an account row or emit `account.changed`. The pinned signal-cli JSON-RPC API has no operation that
 cancels an already-dispatched `finishLink`; when `link.cancel` finds one in flight, the connector
-restarts that link session's group engine after clearing the link session. This does not delete or
-unlink existing accounts, but it can briefly pause every Signal account bound to that group (in a
-single-group profile, every account in the profile).
-KT must therefore reuse an unexpired QR and perform this restart only for an explicit replacement,
-not an automatic render retry.
+abandons that wait locally — the request leaves the engine client's pending map and its eventual
+answer is ignored — and clears the link session. The shared group engine keeps running, so every
+other account bound to it keeps its connection and scheduling; the cancelled session may start a
+fresh link at once. This is a `[KT 适配]` of the official `Provisioner` cancel (an unsubscribe stops
+listening on the provisioning socket; `ts/textsecure/Provisioner.preload.ts` `subscribe` /
+`#stop`), which has no multi-account engine to protect. The engine-side link itself is not
+withdrawn: a phone approval that lands after the cancel is a real link and surfaces through the
+next `accounts.list` sync.
 
 Cancellation, timeout, client disconnect, or connector shutdown zeroizes and removes the state. QR
 data is never stored or logged.
@@ -17262,6 +17369,26 @@ result unknowable, the response is `ACCOUNT_DELETE_OUTCOME_UNKNOWN` with `retrya
 rows also remain. KT keeps the binding and the same `operationId`; only a new explicit user action may
 repeat the idempotent exit operation. This avoids both silent local data loss and background repeats
 of a destructive operation.
+
+[KT 适配] Before dispatching the engine delete, the Connector cancels the account's engine tasks
+through the one cancel face the pinned engine contract carries: `history.importCancel {account}`
+aborts an in-flight transfer-archive download and a live cloud-backup restore (kt-signal-engine
+`docs/jsonrpc-compat.md:202`) and settles the local import marker/ledger. The backup-export,
+snapshot-import, and cloud-upload task families expose no cancel verb in that contract; the
+Connector does not invent one, and the engine's own account removal is their stop (their next disk
+touch fails). Locally, the delete releases export handles, plaintext task records, and artifacts.
+A task-cancel failure never blocks the user's delete.
+
+[KT 适配] Relink gate (§9.10 item 7): while the same number's local-data delete has not settled,
+`link.finish` refuses the commit — `started` answers `ACCOUNT_DELETE_IN_PROGRESS`
+(`retryable=false`; the spent finish is not retryable, so the user retries the delete and then the
+link flow), `unknown` answers the existing
+`ACCOUNT_DELETE_OUTCOME_UNKNOWN` (`retryable=false`; only an explicit delete retry may reconcile a
+destructive outcome). The account list sync also skips re-adopting that number from the engine
+while the operation is unfinished, so a phone approval that lands after the refusal cannot flip the
+mid-delete row back to `ready`. Once the delete completes (or its explicit retry settles it), the
+number links normally. Official Signal-Desktop is one account per process and has no
+multi-account delete face; the gate is anchored only on the audit evidence.
 
 ### 6.3 Receive
 

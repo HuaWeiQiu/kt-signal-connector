@@ -119,7 +119,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
 
     let started = request(&mut client, "start-1", "runtime.start", json!({})).await;
     assert_eq!(started["result"]["state"], "running");
-    let mut engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
 
     let slow_link = request(
         &mut client,
@@ -177,7 +177,10 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     .await
     .expect("link.cancel must not wait for phone approval");
 
-    wait_for_process_exit(engine_pid).await;
+    // B3: cancellation abandons the finish wait locally; it must not stop or
+    // restart the shared engine (the pre-B3 restart disconnected every other
+    // account in the group). The same pid must survive and the engine stay
+    // running.
     let after_cancel = request(
         &mut client,
         "status-after-link-cancel",
@@ -186,7 +189,11 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     )
     .await;
     assert_eq!(after_cancel["result"]["state"], "running");
-    engine_pid = after_cancel["result"]["pid"].as_u64().unwrap() as u32;
+    assert_eq!(
+        after_cancel["result"]["pid"].as_u64().unwrap() as u32,
+        engine_pid,
+        "link.cancel must not restart the group engine"
+    );
 
     let link = request(
         &mut client,
@@ -542,6 +549,165 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     )
     .await;
     assert!(after_delete["result"].as_array().unwrap().is_empty());
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
+async fn link_cancel_keeps_the_group_engine_and_other_accounts() {
+    // B3: cancel one account's link on a shared engine/group. The engine must
+    // keep the same pid, the already-linked account must keep working, and
+    // the cancelled account must be linkable again afterwards.
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [13_u8; 32];
+    fs::write(&secret_file, bootstrap_payload(&secret)).unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_MULTI_ACCOUNT", "1")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "b3-start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    // Account B is linked first and keeps its engine connection throughout.
+    let b_link = request(
+        &mut client,
+        "b3-link-b",
+        "link.start",
+        json!({ "deviceName": "KT-B3-B" }),
+    )
+    .await;
+    let b_finished = request(
+        &mut client,
+        "b3-finish-b",
+        "link.finish",
+        json!({ "linkSessionId": b_link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let b_id = b_finished["result"]["id"]
+        .as_str()
+        .expect("account B links")
+        .to_string();
+    let b_synced = request(
+        &mut client,
+        "b3-sync-b-before",
+        "contacts.sync",
+        json!({ "accountId": b_id }),
+    )
+    .await;
+    assert_eq!(b_synced["result"]["contactCount"], 3);
+
+    // Account A's link stays in the phone-approval wait, then the user
+    // cancels it.
+    let a_link = request(
+        &mut client,
+        "b3-link-a",
+        "link.start",
+        json!({ "deviceName": "[slow-link-test]" }),
+    )
+    .await;
+    let a_session = a_link["result"]["linkSessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    send_request_frame(
+        &mut client,
+        "b3-finish-a",
+        "link.finish",
+        json!({ "linkSessionId": a_session }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "b3-cancel-a",
+        "link.cancel",
+        json!({ "linkSessionId": a_session }),
+    )
+    .await;
+    let mut finish_cancelled = false;
+    let mut cancel_answered = false;
+    timeout(Duration::from_secs(3), async {
+        while !finish_cancelled || !cancel_answered {
+            let response: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            match response.get("requestId").and_then(Value::as_str) {
+                Some("b3-finish-a") => {
+                    assert_eq!(response["error"]["code"], "LINK_CANCELLED");
+                    finish_cancelled = true;
+                }
+                Some("b3-cancel-a") => {
+                    assert!(response.get("result").is_some());
+                    cancel_answered = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("link.cancel must answer without waiting for phone approval");
+
+    // The shared engine must not have been stopped or restarted.
+    let status = request(&mut client, "b3-status", "runtime.status", json!({})).await;
+    assert_eq!(status["result"]["state"], "running");
+    assert_eq!(
+        status["result"]["pid"].as_u64().unwrap() as u32,
+        engine_pid,
+        "cancelling one link must not restart the group engine"
+    );
+
+    // B is still bound and its engine lane still answers.
+    let accounts = request(&mut client, "b3-accounts", "accounts.list", json!({})).await;
+    let ids: Vec<&str> = accounts["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|account| account["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![b_id.as_str()]);
+    let b_synced_after = request(
+        &mut client,
+        "b3-sync-b-after",
+        "contacts.sync",
+        json!({ "accountId": b_id }),
+    )
+    .await;
+    assert_eq!(b_synced_after["result"]["contactCount"], 3);
+
+    // The cancelled account can start over and link successfully.
+    let a_relink = request(
+        &mut client,
+        "b3-relink-a",
+        "link.start",
+        json!({ "deviceName": "KT-B3-A" }),
+    )
+    .await;
+    let a_finished = request(
+        &mut client,
+        "b3-finish-relink-a",
+        "link.finish",
+        json!({ "linkSessionId": a_relink["result"]["linkSessionId"] }),
+    )
+    .await;
+    assert!(
+        a_finished["result"]["id"].as_str().is_some(),
+        "the cancelled account must be linkable again: {a_finished}"
+    );
+    let accounts = request(&mut client, "b3-accounts-2", "accounts.list", json!({})).await;
+    assert_eq!(accounts["result"].as_array().unwrap().len(), 2);
 
     drop(client);
     assert_clean_exit(&mut connector).await;
@@ -2868,6 +3034,253 @@ async fn link_finish_reports_a_non_retryable_unknown_outcome_when_the_engine_die
     // retryable timeout: re-running it could claim a second device slot.
     assert_eq!(finished["error"]["code"], "LINK_OUTCOME_UNKNOWN");
     assert_eq!(finished["error"]["retryable"], false);
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
+async fn delete_refuses_same_number_relink_until_cleanup_settles() {
+    // B4 (§9.10 item 7): a relink of the number whose local-data delete has
+    // not settled must be refused honestly; once the delete completes the
+    // same number links again.
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [14_u8; 32];
+    fs::write(&secret_file, bootstrap_payload(&secret)).unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+
+    let mut connector =
+        spawn_connector_with(temp.path(), &endpoint, &secret_file, Some("hold"), &[]);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "b4-start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    let link = request(
+        &mut client,
+        "b4-link",
+        "link.start",
+        json!({ "deviceName": "KT-B4" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "b4-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // An in-flight transfer download for this account: the delete must cancel
+    // it through the only account-task cancel face the pinned engine has.
+    fs::write(signal_data.join(".fixture-transfer-running"), "").unwrap();
+    fs::write(signal_data.join(".fixture-transfer-bytes"), "0").unwrap();
+
+    send_request_frame(
+        &mut client,
+        "b4-delete",
+        "accounts.deleteLocalData",
+        json!({ "accountId": account_id, "operationId": "b4-delete-op" }),
+    )
+    .await;
+    wait_for_marker(&signal_data.join(".fixture-delete-running")).await;
+    let cancel_log =
+        fs::read_to_string(signal_data.join(".fixture-import-cancel-log")).unwrap_or_default();
+    assert_eq!(
+        cancel_log.lines().collect::<Vec<_>>(),
+        vec!["+15555550100"],
+        "the delete cancels the account's own import task before dispatch"
+    );
+    assert!(
+        !signal_data.join(".fixture-transfer-running").exists(),
+        "the in-flight transfer task was cancelled"
+    );
+
+    // While the delete is held open, the same number's relink is refused with
+    // the honest in-progress code and is retryable.
+    let relink = request(
+        &mut client,
+        "b4-relink-while-deleting",
+        "link.start",
+        json!({ "deviceName": "KT-B4-Relink" }),
+    )
+    .await;
+    let refused = request(
+        &mut client,
+        "b4-finish-while-deleting",
+        "link.finish",
+        json!({ "linkSessionId": relink["result"]["linkSessionId"] }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "ACCOUNT_DELETE_IN_PROGRESS");
+    assert_eq!(refused["error"]["retryable"], false);
+
+    // Release the delete and wait for the store cleanup to land.
+    fs::write(signal_data.join(".fixture-delete-release"), "").unwrap();
+    let delete_response = await_response(&mut client, "b4-delete").await;
+    assert!(
+        delete_response.get("result").is_some(),
+        "the delete must complete: {delete_response}"
+    );
+    wait_until_accounts_empty(&mut client, "b4-delete-settling").await;
+
+    // Same number links again after the cleanup.
+    let relink = request(
+        &mut client,
+        "b4-relink-after",
+        "link.start",
+        json!({ "deviceName": "KT-B4-Relink" }),
+    )
+    .await;
+    let relinked = request(
+        &mut client,
+        "b4-finish-after",
+        "link.finish",
+        json!({ "linkSessionId": relink["result"]["linkSessionId"] }),
+    )
+    .await;
+    assert!(
+        relinked["result"]["id"].as_str().is_some(),
+        "the same number must link after the delete settled: {relinked}"
+    );
+    let accounts = request(&mut client, "b4-accounts-after", "accounts.list", json!({})).await;
+    assert_eq!(accounts["result"].as_array().unwrap().len(), 1);
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
+async fn delete_cancels_only_its_own_accounts_tasks() {
+    // B4 (§9.10 item 6): deleting A cancels A's import task without touching
+    // B's engine connection, and the cancel face is idempotent when there is
+    // nothing in flight.
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [15_u8; 32];
+    fs::write(&secret_file, bootstrap_payload(&secret)).unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        Some("hold"),
+        &[("KT_FAKE_MULTI_ACCOUNT", "1")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "b4b-start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    let mut account_ids = Vec::new();
+    for (index, name) in ["KT-B4B-A", "KT-B4B-B"].iter().enumerate() {
+        let link = request(
+            &mut client,
+            &format!("b4b-link-{index}"),
+            "link.start",
+            json!({ "deviceName": name }),
+        )
+        .await;
+        let finished = request(
+            &mut client,
+            &format!("b4b-finish-{index}"),
+            "link.finish",
+            json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+        )
+        .await;
+        account_ids.push(finished["result"]["id"].as_str().unwrap().to_string());
+    }
+    let numbers: Vec<String> = fs::read_to_string(signal_data.join(".fixture-linked-numbers"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(numbers.len(), 2);
+    let (a_number, b_number) = (numbers[0].clone(), numbers[1].clone());
+    assert_ne!(a_number, b_number);
+
+    fs::write(signal_data.join(".fixture-transfer-running"), "").unwrap();
+    fs::write(signal_data.join(".fixture-transfer-bytes"), "0").unwrap();
+    send_request_frame(
+        &mut client,
+        "b4b-delete-a",
+        "accounts.deleteLocalData",
+        json!({ "accountId": account_ids[0], "operationId": "b4b-delete-op" }),
+    )
+    .await;
+    wait_for_marker(&signal_data.join(".fixture-delete-running")).await;
+
+    // A's task was cancelled; B's was not touched.
+    let cancel_log = fs::read_to_string(signal_data.join(".fixture-import-cancel-log")).unwrap();
+    assert_eq!(
+        cancel_log.lines().collect::<Vec<_>>(),
+        vec![a_number.as_str()],
+        "the delete cancels only its own account's task"
+    );
+
+    // B keeps working while A's delete is still held open.
+    let accounts = request(&mut client, "b4b-accounts", "accounts.list", json!({})).await;
+    assert!(
+        accounts["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|account| account["id"].as_str() == Some(account_ids[1].as_str())),
+        "B stays bound during A's delete"
+    );
+    let b_synced = request(
+        &mut client,
+        "b4b-sync-b",
+        "contacts.sync",
+        json!({ "accountId": account_ids[1] }),
+    )
+    .await;
+    assert_eq!(b_synced["result"]["contactCount"], 3);
+
+    // Cancelling an account with nothing in flight is an idempotent no-op.
+    for round in 0..2 {
+        let cancelled = request(
+            &mut client,
+            &format!("b4b-cancel-b-{round}"),
+            "history.importCancel",
+            json!({ "accountId": account_ids[1] }),
+        )
+        .await;
+        assert_eq!(cancelled["result"]["cancelled"], false);
+    }
+
+    fs::write(signal_data.join(".fixture-delete-release"), "").unwrap();
+    let delete_response = await_response(&mut client, "b4b-delete-a").await;
+    assert!(
+        delete_response.get("result").is_some(),
+        "A's delete must complete: {delete_response}"
+    );
+    wait_until_only_account(&mut client, &account_ids[1], "b4b-delete-settling").await;
+    let b_synced_after = request(
+        &mut client,
+        "b4b-sync-b-after",
+        "contacts.sync",
+        json!({ "accountId": account_ids[1] }),
+    )
+    .await;
+    assert_eq!(b_synced_after["result"]["contactCount"], 3);
 
     drop(client);
     assert_clean_exit(&mut connector).await;
@@ -12785,6 +13198,97 @@ async fn wait_for_path(path: &Path) {
     })
     .await
     .expect("connector socket should appear");
+}
+
+/// Read frames until the named response arrives; unrelated responses are
+/// skipped (the delete-hold tests interleave a fire-and-forget delete).
+async fn await_response(client: &mut Framed<UnixStream, LinesCodec>, request_id: &str) -> Value {
+    timeout(HARNESS_REQUEST_TIMEOUT, async {
+        loop {
+            let response: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if response.get("requestId").and_then(Value::as_str) == Some(request_id) {
+                return response;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("response {request_id} did not arrive"))
+}
+
+/// Wait for a fixture marker file (the delete-hold handshake).
+async fn wait_for_marker(path: &Path) {
+    timeout(Duration::from_secs(5), async {
+        while !path.exists() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("fixture marker {} should appear", path.display()));
+}
+
+/// Poll `accounts.list` until the delete's store cleanup lands.
+async fn wait_until_accounts_empty(client: &mut Framed<UnixStream, LinesCodec>, request_id: &str) {
+    let last = std::sync::Arc::new(std::sync::Mutex::new(Value::Null));
+    let observed = std::sync::Arc::clone(&last);
+    let settled = timeout(Duration::from_secs(10), async {
+        let mut attempt = 0_u32;
+        loop {
+            // Unique ids: the host rejects a replayed requestId on the same
+            // session, so a poll loop must not reuse one.
+            attempt += 1;
+            let accounts = request(
+                client,
+                &format!("{request_id}-poll-{attempt}"),
+                "accounts.list",
+                json!({}),
+            )
+            .await;
+            *observed.lock().unwrap() = accounts.clone();
+            if accounts["result"].as_array().is_some_and(Vec::is_empty) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if settled.is_err() {
+        panic!(
+            "{request_id}: accounts did not empty after the delete settled; last list: {}",
+            last.lock().unwrap()
+        );
+    }
+}
+
+/// Poll `accounts.list` until exactly the surviving account remains.
+async fn wait_until_only_account(
+    client: &mut Framed<UnixStream, LinesCodec>,
+    account_id: &str,
+    request_id: &str,
+) {
+    timeout(Duration::from_secs(10), async {
+        let mut attempt = 0_u32;
+        loop {
+            // Unique ids per poll: the host rejects replayed requestIds.
+            attempt += 1;
+            let accounts = request(
+                client,
+                &format!("{request_id}-poll-{attempt}"),
+                "accounts.list",
+                json!({}),
+            )
+            .await;
+            let rows = accounts["result"].as_array().cloned().unwrap_or_default();
+            if rows.len() == 1 && rows[0]["id"].as_str() == Some(account_id) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("{request_id}: account {account_id} did not become the only row after the delete")
+    });
 }
 
 async fn wait_for_process_exit(pid: u32) {

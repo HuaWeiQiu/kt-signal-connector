@@ -951,7 +951,54 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
+        if DELETE_MODE == "hold":
+            # Relink-gate fixture: hold the delete open in a background
+            # thread (the real engine dispatches each request independently,
+            # so later link calls must still be read) until the test creates
+            # the release marker. The account stays listable meanwhile.
+            running = SIGNAL_DATA_DIR / ".fixture-delete-running"
+            release = SIGNAL_DATA_DIR / ".fixture-delete-release"
+            running.touch()
+            held_account = params.get("account")
+
+            def release_delete(
+                running=running,
+                release=release,
+                account=held_account,
+                response={"jsonrpc": "2.0", "id": request_id, "result": {}},
+            ):
+                global ACCOUNT_LINKED
+                while not release.exists():
+                    time.sleep(0.02)
+                ACCOUNT_LINKED = False
+                if MULTI_ACCOUNT:
+                    # The multi-account list is the persisted numbers log;
+                    # deleting an account removes it from the engine's list
+                    # exactly like the real engine's registry removal.
+                    with WRITE_LOCK:
+                        numbers = [
+                            number
+                            for number in linked_multi_numbers()
+                            if number != account
+                        ]
+                        ACCOUNT_NUMBERS_LOG.write_text(
+                            "\n".join(numbers) + ("\n" if numbers else "")
+                        )
+                DELETED_MARKER.touch()
+                running.unlink(missing_ok=True)
+                emit_json(response)
+
+            threading.Thread(target=release_delete, daemon=True).start()
+            continue
         ACCOUNT_LINKED = False
+        if MULTI_ACCOUNT:
+            with WRITE_LOCK:
+                numbers = [
+                    number
+                    for number in linked_multi_numbers()
+                    if number != params.get("account")
+                ]
+                ACCOUNT_NUMBERS_LOG.write_text("\n".join(numbers) + ("\n" if numbers else ""))
         DELETED_MARKER.touch()
         if DELETE_MODE == "crash_after_delete_once":
             os._exit(19)
@@ -3599,6 +3646,13 @@ for line in sys.stdin:
         # live to cancel (false). A terminal error snapshot is not a live
         # download — it survives a cancel, like the engine's (it persists
         # until the next engine start).
+        # B4 delete-cancel fixture: record which account the connector asked
+        # to cancel, so a test can prove the delete targets only its own
+        # account (`.fixture-import-cancel-log`, one number per line). The
+        # marker semantics below stay unchanged.
+        with WRITE_LOCK:
+            with (SIGNAL_DATA_DIR / ".fixture-import-cancel-log").open("a") as log:
+                log.write(str(params.get("account", "")) + "\n")
         running_marker = SIGNAL_DATA_DIR / ".fixture-transfer-running"
         bytes_marker = SIGNAL_DATA_DIR / ".fixture-transfer-bytes"
         if running_marker.exists():

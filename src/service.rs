@@ -2140,6 +2140,20 @@ impl ConnectorService {
     ) -> Result<Vec<AccountSummary>, ServiceError> {
         let mut capabilities_by_id = std::collections::HashMap::new();
         for (number, aci, capabilities) in accounts {
+            // [KT 适配] Never re-adopt a number whose local-data delete has
+            // not settled: the engine may still list it while the delete is
+            // in flight, and an ordinary list sync would flip the mid-delete
+            // row back to `ready` (the same race the link commit gate refuses,
+            // §9.10 item 7). The row itself stays visible through the
+            // account list until the delete completes; only the engine-side
+            // re-adoption is skipped.
+            if self
+                .store
+                .unfinished_account_delete_state(number)?
+                .is_some()
+            {
+                continue;
+            }
             let summary = self
                 .store
                 .upsert_account_from_signal(number, None, proxy_group)?;
@@ -2295,6 +2309,19 @@ impl ConnectorService {
         aci: Option<&str>,
     ) -> Result<AccountSummary, ServiceError> {
         let _ = self.require_active_link(link_session_id)?;
+        // [KT 适配] Relink gate (§9.10 item 7): an unfinished local-data delete
+        // for this number keeps the old account row in place. Committing a
+        // relink here would upsert that row back to `ready` while the delete
+        // is still in flight (or its outcome unknown), so the cleanup could
+        // then erase the fresh link — or the engine delete could kill it.
+        // Refuse honestly and consume the spent session; the caller must
+        // retry the delete (which reconciles) before linking again. The
+        // official app has no multi-account delete face, hence no upstream
+        // anchor for this gate.
+        if let Some(state) = self.store.unfinished_account_delete_state(number)? {
+            let _ = self.take_link_session(link_session_id);
+            return Err(unfinished_delete_relink_error(&state));
+        }
         // Per-engine account ceiling (optimization-plan §6.4 M3.3): refuse a
         // finish that would add a ninth account before the session is
         // consumed or any row is written. Re-linking a number already bound
@@ -17117,6 +17144,25 @@ pub fn account_limit_error(proxy_group: &str) -> ServiceError {
     ))
 }
 
+/// [KT 适配] Relink refusal while the same number's local-data delete has not
+/// settled (§9.10 item 7). `started` is retryable — the in-flight delete will
+/// finish; `unknown` is not, because only a new explicit user action may
+/// retry a destructive delete (the §6.2 outcome rule).
+fn unfinished_delete_relink_error(state: &str) -> ServiceError {
+    match state {
+        "unknown" => ServiceError::Api(ApiError::new(
+            "ACCOUNT_DELETE_OUTCOME_UNKNOWN",
+            "this number's local-data delete has an unknown outcome; retry the delete before linking it again",
+            false,
+        )),
+        _ => ServiceError::Api(ApiError::new(
+            "ACCOUNT_DELETE_IN_PROGRESS",
+            "this number's local-data delete is still in progress; retry the delete before linking it again",
+            false,
+        )),
+    }
+}
+
 /// contacts.setLocalAlias bound (§4.9): a non-empty, short display name.
 fn validate_alias(alias: &str) -> Result<(), ServiceError> {
     if alias.is_empty() || alias.len() > MAX_ALIAS_BYTES {
@@ -19325,6 +19371,103 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// [KT 适配] §9.10 item 7: a relink of the number whose local-data delete
+    /// is still in progress is refused at commit; once the delete completes
+    /// the same number links. The official app has no multi-account delete
+    /// face, so this gate has no upstream anchor.
+    #[test]
+    fn relink_is_refused_while_the_same_numbers_delete_is_unfinished() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let account = service
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], group)
+            .unwrap()
+            .remove(0);
+        let plan = service
+            .prepare_account_delete(&account.id, "relink-delete-op")
+            .unwrap();
+        assert!(matches!(plan, AccountDeletePlan::Dispatch { .. }));
+
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?test".into())
+            .unwrap();
+        let link_session_id = started["linkSessionId"].as_str().unwrap().to_string();
+        let refused = service
+            .complete_link_session(&link_session_id, "+15555550100", group, None)
+            .expect_err("an unfinished delete refuses the relink");
+        let ServiceError::Api(error) = refused else {
+            panic!("expected an API error");
+        };
+        assert_eq!(error.code, "ACCOUNT_DELETE_IN_PROGRESS");
+        assert!(!error.retryable);
+        // The spent session is consumed; a replay is LINK_NOT_FOUND, not a
+        // second commit attempt.
+        let replay = service
+            .complete_link_session(&link_session_id, "+15555550100", group, None)
+            .expect_err("the session was consumed");
+        assert!(matches!(replay, ServiceError::Api(ref error) if error.code == "LINK_NOT_FOUND"));
+
+        // The explicit delete retry settles the cleanup; then the link lands.
+        assert!(
+            service
+                .complete_account_delete(&account.id, Some("relink-delete-op"))
+                .unwrap()
+        );
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?second".into())
+            .unwrap();
+        let link_session_id = started["linkSessionId"].as_str().unwrap().to_string();
+        service
+            .complete_link_session(&link_session_id, "+15555550100", group, None)
+            .expect("the same number links after the delete settled");
+        assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 1);
+    }
+
+    /// [KT 适配] §9.10 item 7: an unknown delete outcome is not retryable in
+    /// the background (§6.2) — the relink gate asks for an explicit delete
+    /// retry and only then lets the number link again.
+    #[test]
+    fn relink_after_unknown_delete_outcome_asks_for_a_delete_retry() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let account = service
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], group)
+            .unwrap()
+            .remove(0);
+        let _ = service
+            .prepare_account_delete(&account.id, "unknown-delete-op")
+            .unwrap();
+        service
+            .mark_account_delete_unknown("unknown-delete-op")
+            .unwrap();
+
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?test".into())
+            .unwrap();
+        let link_session_id = started["linkSessionId"].as_str().unwrap().to_string();
+        let refused = service
+            .complete_link_session(&link_session_id, "+15555550100", group, None)
+            .expect_err("an unknown delete outcome refuses the relink");
+        let ServiceError::Api(error) = refused else {
+            panic!("expected an API error");
+        };
+        assert_eq!(error.code, "ACCOUNT_DELETE_OUTCOME_UNKNOWN");
+        assert!(!error.retryable);
+
+        assert!(
+            service
+                .complete_account_delete(&account.id, Some("unknown-delete-op"))
+                .unwrap()
+        );
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?after".into())
+            .unwrap();
+        let link_session_id = started["linkSessionId"].as_str().unwrap().to_string();
+        service
+            .complete_link_session(&link_session_id, "+15555550100", group, None)
+            .expect("the explicit delete retry settled the cleanup");
     }
 
     /// Per-engine account ceiling (optimization-plan §6.4 M3.3, decision D3):

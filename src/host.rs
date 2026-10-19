@@ -5032,6 +5032,15 @@ mod tests {
     use crate::store::{Store, StoreKey};
     use crate::supervisor::RuntimeSupervisor;
 
+    /// Serializes the host-session unit tests. `host_pending_requests` is a
+    /// process-global gauge (production serves one authenticated session per
+    /// process, so a global is the truthful model there); concurrent test
+    /// sessions would race the gauge assertions in
+    /// `connection_exit_resets_the_host_pending_gauge` and the §4.169 wedge
+    /// tests. Holding this lock makes each test's zero-to-zero reading mean
+    /// what it says.
+    static HOST_SESSION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn test_supervisor() -> Arc<RuntimeSupervisor> {
         let temp = TempDir::new().unwrap();
         #[cfg(unix)]
@@ -5235,6 +5244,7 @@ mod tests {
     /// teardown drain unable to complete a stuck dispatch.
     #[tokio::test]
     async fn connection_exit_resets_the_host_pending_gauge() {
+        let _host_session = HOST_SESSION_TEST_LOCK.lock().await;
         metrics::set_host_pending(0);
         let secret_bytes = [7_u8; 32];
         let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
@@ -5350,6 +5360,7 @@ mod tests {
     /// with it (the 04:05:58Z wedge shape).
     #[tokio::test]
     async fn wedged_peer_parks_the_writer_task_and_the_session_loop_stays_alive() {
+        let _host_session = HOST_SESSION_TEST_LOCK.lock().await;
         metrics::set_host_pending(0);
         let (server, mut client) = authenticated_session(1024).await;
         // Fill the 1 KiB duplex buffer with unanswered answers: the writer
@@ -5385,6 +5396,7 @@ mod tests {
     /// keeps admitting (the lossy face, never a parked dispatch future).
     #[tokio::test]
     async fn saturated_write_queue_drops_the_answer_warns_and_releases_the_budget() {
+        let _host_session = HOST_SESSION_TEST_LOCK.lock().await;
         metrics::set_host_pending(0);
         let (server, mut client) = authenticated_session(1024).await;
         // Flood past the queue capacity without reading: admissions beyond
@@ -5423,6 +5435,7 @@ mod tests {
     /// error did — never a dead sink the loop keeps feeding forever.
     #[tokio::test]
     async fn writer_io_failure_still_ends_the_session() {
+        let _host_session = HOST_SESSION_TEST_LOCK.lock().await;
         // Unit face: the wedged writer reports the sink failure and exits.
         let (peer, server_side) = duplex(64);
         let (failures_tx, mut failures_rx) = mpsc::channel(1);
@@ -5990,6 +6003,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_session_can_query_status_and_rejects_replayed_id() {
+        let _host_session = HOST_SESSION_TEST_LOCK.lock().await;
         let secret_bytes = [7_u8; 32];
         let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
         let runtime = test_runtime();
@@ -6122,6 +6136,7 @@ mod tests {
     /// pre-1.98 payload unchanged.
     #[tokio::test]
     async fn handshake_gates_the_attachment_download_tag_on_media_ingest() {
+        let _host_session = HOST_SESSION_TEST_LOCK.lock().await;
         let unarmed = handshake_capabilities([7_u8; 32], test_runtime()).await;
         assert!(
             !unarmed
@@ -6175,6 +6190,7 @@ mod tests {
     /// 16 MiB codec limit ends the session instead of being parsed.
     #[tokio::test]
     async fn host_frame_limit_admits_attachment_sized_frames_and_rejects_beyond_it() {
+        let _host_session = HOST_SESSION_TEST_LOCK.lock().await;
         let secret_bytes = [7_u8; 32];
         let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
         let runtime = test_runtime();
@@ -6243,6 +6259,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_host_that_leaves_right_after_authenticating_still_ends_cleanly() {
+        let _host_session = HOST_SESSION_TEST_LOCK.lock().await;
         let secret_bytes = [7_u8; 32];
         let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
         let runtime = test_runtime();
@@ -6280,6 +6297,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_authentication_returns_generic_error_and_closes() {
+        let _host_session = HOST_SESSION_TEST_LOCK.lock().await;
         let secret = Arc::new(BootstrapSecret::for_test([7_u8; 32]));
         let runtime = test_runtime();
         let (server_stream, client_stream) = duplex(64 * 1024);

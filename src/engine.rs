@@ -2756,24 +2756,8 @@ impl EngineHandle {
         class: CallClass,
         request_timeout: Duration,
     ) -> Result<Value, EngineError> {
-        if self.is_terminal() {
-            return Err(EngineError::NotRunning);
-        }
         let started = Instant::now();
-        let id = format!("kt-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let (response_tx, response_rx) = oneshot::channel();
-        match self.commands.try_send(EngineCommand::Request {
-            id: id.clone(),
-            method,
-            params,
-            class,
-            response: response_tx,
-        }) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => return Err(EngineError::Backpressure),
-            Err(mpsc::error::TrySendError::Closed(_)) => return Err(EngineError::NotRunning),
-        }
-
+        let (id, response_rx) = self.dispatch_call(method, params, class)?;
         let outcome = match timeout(request_timeout, response_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(EngineError::Exited),
@@ -2788,24 +2772,90 @@ impl EngineHandle {
                 }
             }
         };
-        // signal-cli method names are fixed crate-internal literals; only the
-        // classified error variant is logged, never upstream error content.
-        match &outcome {
-            Ok(_) => tracing::debug!(
-                upstream_method = method,
-                call_class = call_class_label(class),
-                duration_ms = started.elapsed().as_millis() as u64,
-                result = "ok",
-                "engine call completed"
-            ),
-            Err(error) => log_engine_call_failure(
-                method,
-                call_class_label(class),
-                started.elapsed().as_millis() as u64,
-                error,
-            ),
-        }
+        log_call_outcome(method, class, started, &outcome);
         outcome
+    }
+
+    /// Same dispatch as [`Self::call_with_timeout`], but a caller-side
+    /// cancellation signal abandons the wait: the pending request is removed
+    /// from the actor's map (its eventual response is then an ignored
+    /// unknown-id warning) and `Ok(None)` is returned at once. The engine-side
+    /// operation itself is not cancellable — the pinned JSON-RPC surface has
+    /// no cancel verb — so a caller must treat `None` as "we stopped waiting;
+    /// the operation may still land upstream", never as "it did not happen".
+    /// This is the link-cancel path: the connector must not stop/restart a
+    /// shared engine just to abandon one account's `finishLink` wait.
+    pub async fn call_with_timeout_or_cancel(
+        &self,
+        method: &'static str,
+        params: Value,
+        class: CallClass,
+        request_timeout: Duration,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<Option<Value>, EngineError> {
+        let started = Instant::now();
+        let (id, response_rx) = self.dispatch_call(method, params, class)?;
+        let outcome = tokio::select! {
+            biased;
+            // A closed sender means the finish lane was torn down
+            // (`stop`/`shutdown`); both arms abandon the wait the same way.
+            _ = cancel.changed() => {
+                let commands = self.commands.clone();
+                tokio::spawn(async move {
+                    let _ = commands.send(EngineCommand::Cancel { id }).await;
+                });
+                tracing::debug!(
+                    upstream_method = method,
+                    call_class = call_class_label(class),
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    result = "cancelled",
+                    "engine call abandoned by the caller"
+                );
+                return Ok(None);
+            }
+            timed = timeout(request_timeout, response_rx) => match timed {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(EngineError::Exited),
+                Err(_) => {
+                    let commands = self.commands.clone();
+                    tokio::spawn(async move {
+                        let _ = commands.send(EngineCommand::Cancel { id }).await;
+                    });
+                    match class {
+                        CallClass::ReadOnly => Err(EngineError::Timeout),
+                        CallClass::Mutating => Err(EngineError::UnknownOutcome),
+                    }
+                }
+            },
+        };
+        log_call_outcome(method, class, started, &outcome);
+        Ok(Some(outcome?))
+    }
+
+    /// Register one request in the actor's pending map. The caller owns the
+    /// response receiver and the timeout/cancel decision.
+    fn dispatch_call(
+        &self,
+        method: &'static str,
+        params: Value,
+        class: CallClass,
+    ) -> Result<(String, oneshot::Receiver<Result<Value, EngineError>>), EngineError> {
+        if self.is_terminal() {
+            return Err(EngineError::NotRunning);
+        }
+        let id = format!("kt-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let (response_tx, response_rx) = oneshot::channel();
+        match self.commands.try_send(EngineCommand::Request {
+            id: id.clone(),
+            method,
+            params,
+            class,
+            response: response_tx,
+        }) {
+            Ok(()) => Ok((id, response_rx)),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(EngineError::Backpressure),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(EngineError::NotRunning),
+        }
     }
 
     /// Graceful stop with a total timeout. The command lane can be starved
@@ -2875,6 +2925,32 @@ fn log_engine_call_failure(
             duration_ms,
             error_class = error.class(),
             "engine call failed"
+        ),
+    }
+}
+
+/// The completion log for one engine call: signal-cli method names are fixed
+/// crate-internal literals; only the classified error variant is logged, never
+/// upstream error content.
+fn log_call_outcome(
+    upstream_method: &'static str,
+    class: CallClass,
+    started: Instant,
+    outcome: &Result<Value, EngineError>,
+) {
+    match outcome {
+        Ok(_) => tracing::debug!(
+            upstream_method,
+            call_class = call_class_label(class),
+            duration_ms = started.elapsed().as_millis() as u64,
+            result = "ok",
+            "engine call completed"
+        ),
+        Err(error) => log_engine_call_failure(
+            upstream_method,
+            call_class_label(class),
+            started.elapsed().as_millis() as u64,
+            error,
         ),
     }
 }
