@@ -1152,6 +1152,25 @@ pub enum HostSideEvent {
         message_id: String,
         receipts: Vec<crate::store::RecipientReceiptRow>,
     },
+    /// Contract 1.192 (§4.192): the primary device ANSWERED a backfill
+    /// request with the error arm — officially `ErrorEnum.MESSAGE_NOT_FOUND`
+    /// (attachmentBackfill.preload.ts:157-166), rendered as the
+    /// `BackfillFailureModal(NotFound)` face. Before this event the arm was
+    /// warn-only quiet convergence, so the desktop always waited out the
+    /// retry budget into the Timeout face — the wrong honest face whenever
+    /// the phone did answer. The payload names the resolved row
+    /// (conversation + message id) so the desktop's per-key bookkeeping can
+    /// settle, plus the bounded error word verbatim (≤64 chars at the
+    /// §4.175 parse). The locator merge stays a no-op on this arm (the
+    /// official keep-as-is posture); an unresolvable target stays the quiet
+    /// warn — the official `handleResponse` drops unmatchable responses the
+    /// same way.
+    MessageAttachmentBackfillError {
+        account_id: String,
+        conversation_id: String,
+        message_id: String,
+        error: String,
+    },
     /// A view-once message was viewed and its bytes erased (contract 1.38):
     /// emitted exactly once per message on the first burn transition — sync
     /// duplicates and replays emit nothing. Deliberately not folded into
@@ -11441,25 +11460,23 @@ impl ConnectorService {
     /// sender, one stamp, one row — the preference only breaks a
     /// pathological collision). The pointer faces merge into the row's
     /// empty live-locator slots ([`Store::merge_live_attachment_locators`]
-    /// — first face wins, never overwritten); the error arm
-    /// (MESSAGE_NOT_FOUND) and status entries change nothing, the official
-    /// `handleResponse` keep-as-is posture. No host event is minted: the
-    /// desktop's bounded retry loop re-asks `attachments.download` and the
-    /// fresh locator face is what answers. Every miss is warn-only quiet
-    /// convergence — a vanished conversation or row is not an error, the
-    /// request side already answered honestly.
+    /// — first face wins, never overwritten); the locator status entries
+    /// change nothing, the official `handleResponse` keep-as-is posture. No
+    /// host event rides the pointer arm: the desktop's bounded retry loop
+    /// re-asks `attachments.download` and the fresh locator face is what
+    /// answers. The ERROR arm is the phone's terminal answer (contract
+    /// 1.192, §4.192): it resolves the same ladder and names the row to the
+    /// desktop (`MessageAttachmentBackfillError` → wire
+    /// `message.attachmentBackfillError`) so the retry bookkeeping settles
+    /// into the official NotFound face instead of burning the budget into
+    /// the Timeout face. Every miss is warn-only quiet convergence — a
+    /// vanished conversation or row is not an error, the request side
+    /// already answered honestly.
     fn apply_sync_attachment_backfill_response(
         &mut self,
         account: &AccountRow,
         response: &crate::engine::SyncAttachmentBackfillResponse,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
-        if response.error.is_some() {
-            tracing::warn!(
-                kind = "attachment_backfill_response",
-                "backfill response carried an error arm; nothing merged"
-            );
-            return Ok(Vec::new());
-        }
         let identity = response
             .conversation_service_id
             .as_deref()
@@ -11525,6 +11542,23 @@ impl ConnectorService {
             );
             return Ok(Vec::new());
         };
+        // Contract 1.192 (§4.192): the error arm is the phone's terminal
+        // answer — officially `MESSAGE_NOT_FOUND`, rendered as the
+        // `BackfillFailureModal(NotFound)` face (attachmentBackfill.preload
+        // .ts:157-166). It resolves the same row ladder the pointer arm
+        // merges through, then names the row to the desktop so the retry
+        // bookkeeping settles into the honest NotFound face instead of
+        // burning the whole retry budget into the Timeout face. Unresolvable
+        // targets already returned above — the quiet-warn posture is the
+        // official handleResponse drop.
+        if let Some(error) = response.error.as_deref() {
+            return Ok(vec![HostSideEvent::MessageAttachmentBackfillError {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                message_id: record.id.clone(),
+                error: error.to_string(),
+            }]);
+        }
         self.store
             .merge_live_attachment_locators(&account.id, &record.id, &response.locators)?;
         Ok(Vec::new())
@@ -18158,7 +18192,9 @@ mod tests {
         assert_eq!(faces[0], face("cdn-a"));
         assert_eq!(faces[1], crate::store::HistoryAttachmentLocator::default());
 
-        // The error arm: nothing merged, quiet convergence.
+        // The error arm (contract 1.192, §4.192): the phone's terminal answer
+        // names the resolved row to the desktop (the official NotFound face)
+        // and never moves a face.
         let response = crate::engine::SyncAttachmentBackfillResponse {
             author: "peer".into(),
             sent_timestamp: 1726999999000,
@@ -18168,14 +18204,49 @@ mod tests {
             error: Some("MESSAGE_NOT_FOUND".into()),
             locators: Vec::new(),
         };
-        service
+        let events = service
             .apply_sync_attachment_backfill_response(&account, &response)
             .unwrap();
+        let [event] = events.as_slice() else {
+            panic!("the error arm names the row exactly once");
+        };
+        let HostSideEvent::MessageAttachmentBackfillError {
+            account_id,
+            conversation_id,
+            message_id,
+            error,
+        } = event
+        else {
+            panic!("the error arm emits MessageAttachmentBackfillError, got {event:?}");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(conversation_id, &conversation.id);
+        assert_eq!(message_id, "m-backfill");
+        assert_eq!(error, "MESSAGE_NOT_FOUND");
         let faces = service
             .store_ref()
             .live_attachment_locators(&account.id, "m-backfill")
             .unwrap();
         assert_eq!(faces[0], face("cdn-a"), "error arm never moves a face");
+
+        // An error arm whose target matches no row stays the quiet warn —
+        // no event, the official handleResponse drop.
+        let response = crate::engine::SyncAttachmentBackfillResponse {
+            author: "peer".into(),
+            sent_timestamp: 1726999999001,
+            conversation_service_id: None,
+            conversation_group_id: None,
+            conversation_e164: Some("+15555550101".into()),
+            error: Some("MESSAGE_NOT_FOUND".into()),
+            locators: Vec::new(),
+        };
+        let events = service
+            .apply_sync_attachment_backfill_response(&account, &response)
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "an unresolvable error target stays quiet (rows_by_sent_at misses)"
+        );
     }
 
     /// attachments.requestBackfill prepare (contract revision 1.175, §4.175;

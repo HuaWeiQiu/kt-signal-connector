@@ -20,6 +20,23 @@
   convicted on the inbound arms; the regression was born with the
   request face itself at §4.175 and became user-visible from ~1.178.)
 
+- Contract revision: 1.192 (2026-10-19; §4.192 the backfill response error
+  face projection: the phone's terminal error answer — officially
+  `SyncMessage.AttachmentBackfillResponse` `error=MESSAGE_NOT_FOUND`
+  (attachmentBackfill.preload.ts:157-166) — resolves the same row ladder
+  the pointer arm merges through and names the row to the desktop via the
+  new transient event `message.attachmentBackfillError`
+  ({accountId, conversationId, messageId, error}, error word verbatim
+  bounded ≤64 chars at the §4.175 parse). Before this face the error arm
+  was warn-only quiet convergence, so the desktop always burned the whole
+  bounded retry budget into the Timeout face — the wrong honest face
+  whenever the phone DID answer (the official desktop renders the
+  `BackfillFailureModal(NotFound)` body on this arm, a distinct copy from
+  the Timeout body). Unresolvable targets stay the quiet warn (the
+  official handleResponse drop); the locator merge stays a no-op on the
+  error arm (the official keep-as-is posture). Desktop consumption half =
+  desktop contract 1.249.)
+
 - Contract revision: 1.190 (2026-10-19; §4.190 the per-recipient receipt
   ledger and the group-receipt dead-letter repair: schema v30 adds the
   `message_receipts` table (one row per (message, recipient) — the three
@@ -16563,6 +16580,60 @@ and `schema_v31_upgrade_adds_the_row_author_aci_capture` (a v30 store
 migrates in place — column appears, the pre-upgrade row keeps NULL with
 its sender hash untouched, the stamp moves to 31, and a reopen is a
 no-op idempotent upgrade).
+
+### 4.192 The backfill response error face: the phone's terminal answer reaches the desktop (contract revision 1.192, 2026-10-19)
+
+The dev.5 diagnosis batch (2026-10-19, instance restart46 @ c9dacef8
+desktop / connector dev.5 binary) verified the §4.191 request half live:
+the engine window after the swap carries zero `-32603`, the
+`attachments.requestBackfill` host calls split into real engine
+round-trips (553–1176 ms — the protocol-identity author accepted, the
+sync request on its way to the primary) and the capture-less rows'
+honest 1 ms `INVALID_REQUEST` refusals — and the retry downloads all
+still missed, so the desktop kept converging on the official
+`BackfillFailureModal(Timeout)` face. That face is correct for a silent
+primary. But the official loop has a SECOND terminal face this
+connector never forwarded: when the phone answers with the error arm
+(`ErrorEnum.MESSAGE_NOT_FOUND`,
+attachmentBackfill.preload.ts:157-166), the official desktop shows
+`BackfillFailureModal(NotFound)` — a distinct body ("This media is no
+longer available on your phone and can't be downloaded." / zh-CN
+「该媒体在您的手机上已不可用，无法下载。」) from the Timeout body. The
+connector's consume arm swallowed that answer as a warn-only
+quiet convergence ("backfill response carried an error arm; nothing
+merged"), so the desktop could never tell the two terminal states apart
+— the recorded desktop contract 1.215 gap ①.
+
+**The face.** `apply_sync_attachment_backfill_response` restructured:
+the error arm now resolves the same conversation/row ladder the pointer
+arm merges through (it previously returned before any resolution), and
+on a resolved target emits the new transient
+`HostSideEvent::MessageAttachmentBackfillError` → wire
+`message.attachmentBackfillError`
+`{accountId, conversationId, messageId, error}`. The error word rides
+verbatim (the §4.175 parse bounds it to 64 chars, so a future proto
+error word rides without a connector release; the official
+`missingCaseError` throw on unknown words is a crash face KT does not
+copy — the desktop renders the NotFound body for any error word, the
+honest convergence). The locator merge stays a no-op on this arm (the
+official keep-as-is posture; the parse already guarantees an empty
+locator face on the error arm). An unresolvable target stays the
+warn-only quiet drop — the official `handleResponse`
+conversation/message-not-found early returns are drops, not faces.
+
+Wire: additive event only (schema event enum + payload block; the
+schema-consistency gate pins the emission literal). Nothing persists;
+a missed event converges the same way the pre-1.192 world did (retry
+budget → Timeout face). Desktop consumption half = desktop contract
+1.249: the event settles the row's backfill keys into the exhausted
+book and shows the official NotFound body.
+
+Tests: `backfill_response_merges_locators_into_the_target_row` (the
+error arm now asserts the resolved-row event — account/conversation/
+message id and the error word verbatim — plus the never-moves-a-face
+merge invariant and the unresolvable-target quiet drop),
+`attachment_backfill_error_event_names_the_row` (the wire frame: the
+event name and the four-key payload verbatim).
 
 ## 5. signal-cli Boundary
 

@@ -4140,6 +4140,26 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
             });
             Ok(HostEvent::new("message.receiptsChanged", payload))
         }
+        HostSideEvent::MessageAttachmentBackfillError {
+            account_id,
+            conversation_id,
+            message_id,
+            error,
+        } => {
+            // Contract 1.192 (§4.192): the phone's terminal error answer for
+            // a backfill request — officially MESSAGE_NOT_FOUND, rendered as
+            // the BackfillFailureModal(NotFound) face. The error word rides
+            // verbatim (bounded ≤64 chars at the §4.175 parse); the
+            // addressing trio is the resolved row face the desktop's
+            // per-key bookkeeping maps back.
+            let payload = json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "messageId": message_id,
+                "error": error,
+            });
+            Ok(HostEvent::new("message.attachmentBackfillError", payload))
+        }
         HostSideEvent::ConversationTyping {
             account_id,
             conversation_id,
@@ -5974,6 +5994,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(frame["data"]["receipts"], json!([]));
+    }
+
+    /// Contract 1.192 (§4.192): the backfill error answer frame —
+    /// `message.attachmentBackfillError` names the resolved row trio plus
+    /// the bounded error word verbatim, the wire face the desktop's
+    /// NotFound modal mapping consumes.
+    #[tokio::test]
+    async fn attachment_backfill_error_event_names_the_row() {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::MessageAttachmentBackfillError {
+                account_id: "acct-1".into(),
+                conversation_id: "conv-1".into(),
+                message_id: "msg-1".into(),
+                error: "MESSAGE_NOT_FOUND".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["event"], "message.attachmentBackfillError");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["conversationId"], "conv-1");
+        assert_eq!(frame["data"]["messageId"], "msg-1");
+        assert_eq!(frame["data"]["error"], "MESSAGE_NOT_FOUND");
     }
 
     /// Contract 1.134 (§4.117; the storage-pull face joins with 1.141,
