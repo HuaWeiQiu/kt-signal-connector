@@ -5,6 +5,21 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.191 (2026-10-19; §4.191 the backfill request author
+  face regression fix: `prepare_request_attachment_backfill` no longer
+  feeds the row's `sender_id` — the ingest privacy hash the protocol has
+  never spoken — to the engine's `requestAttachmentBackfill`. Direct
+  rows author through the §4.37 identity ladder (the captured ACI
+  first, the peer key itself second), group rows author through the new
+  row-level `author_aci` capture (schema v31: the receive envelope's
+  `sourceUuid` member ACI, never backfilled — a capture-less pre-1.191
+  row answers honest `INVALID_REQUEST` instead of spending an engine
+  call the engine must refuse), outgoing rows keep the account's own
+  number. Zero wire change: the author seat is engine-bound. Closes the
+  desktop "无法下载媒体" Timeout-popup family the diagnosis batch
+  convicted on the inbound arms; the regression was born with the
+  request face itself at §4.175 and became user-visible from ~1.178.)
+
 - Contract revision: 1.190 (2026-10-19; §4.190 the per-recipient receipt
   ledger and the group-receipt dead-letter repair: schema v30 adds the
   `message_receipts` table (one row per (message, recipient) — the three
@@ -31,6 +46,23 @@
   per-recipient Sent/Failed seeds. The §4.70 story split survives on the
   account-wide rowless probe; blocked (rows exist, sender qualifies for
   none) never leaks onto the story face.)
+
+- Contract revision: 1.189 (2026-10-19; §4.189 the poll-terminate notice
+  row: the live terminate fold's first flip lands the official standalone
+  `poll-terminate` system row beside the poll — the terminate envelope's
+  own stamp as the row identity, the folded poll face as the material
+  (`pollTerminate {pollQuestion, pollSentAt, selfTerminated}` additive
+  rich key), the poll row's author projection as the sender face (the
+  author-keyed fold IS the official terminator==creator check), the
+  first-flip-only fold answer as the replay gate, and the §4.91 buffered
+  terminate flushing into the byte-identical row. Closes desktop 1.230's
+  recorded gap ③; the desktop render half is desktop contract 1.240.
+  Boundaries recorded: the this-device send keeps the §4.106
+  no-local-effect posture (the row converges on the echo), the
+  View-poll button/unread/notify faces are the 1.181 desktop pill-chrome
+  ledger, and the §4.38 archive chain has no terminate events to mint.)
+
+
 - Contract revision: 1.188 (2026-10-19; §4.188 the two arms extracted from
   the stale pre-merge branches, everything those branches carried that a
   merged batch already supersedes dropped by record: the
@@ -15146,7 +15178,10 @@ sender for incoming rows and the account's own number for outgoing rows
 (the engine's `resolve_author_aci` maps it to the own ACI); the direct
 leg carries the conversation's peer key, the group leg the master key;
 and a zero upstream stamp fails closed `INVALID_REQUEST` (a stamp-0 row
-never went upstream and cannot be backfilled). The supervisor fires the
+never went upstream and cannot be backfilled). (The author derivation
+this paragraph states was the 1.175 defect: the row's `sender_id` is the
+ingest privacy hash, not a protocol identity — §4.191 corrects the arm
+per conversation kind and retired the hash from the seat.) The supervisor fires the
 engine's `requestAttachmentBackfill` on the mutating lane and answers the
 receipt-class `{status: "sent" | "unknown"}` — `unknown` never retries
 automatically; the desktop's bounded retry loop re-asks the download, and
@@ -16446,6 +16481,88 @@ schema enumerations gain `messages.receipts` /
 wire round trip through the fake engine: the group send, the member's
 Delivered receipt riding the extra-receives marker, both events on the
 host lane, the read face serving the stamped ledger).
+
+### 4.191 The backfill request author face: the protocol identity, never the ingest hash (contract revision 1.191, 2026-10-19)
+
+The diagnosis batch (2026-10-19) convicted the inbound arms of the
+backfill request face on a complete evidence chain: every
+`attachments.requestBackfill` the desktop issued for an **inbound** row
+was refused by the engine with `-32603` fail-closed within 0–1 ms, the
+primary device was never asked, and the desktop fell through to the
+official Timeout error toast ("无法下载媒体") — the loop's request half
+was structurally dead on exactly the rows it exists for (the outgoing
+arm worked, because the account's own number is a resolvable face).
+
+**Root cause — two identity faces conflated.** The row's `sender_id`
+has been the ingest privacy hash since the Phase-2 store (a
+`stable_hash_id` digest over account/kind/source; §4.37 kept it a
+local-only face on purpose — the engine envelope's raw address is never
+persisted verbatim). §4.175's request face derived the author as "the
+row's sender" (`message.sender_id`) and the engine's
+`resolve_author_aci` accepts exactly three shapes — a hyphenated
+service-id UUID, the linked account's own E.164, or a contacts-number
+digit suffix. A 64-hex digest matches none of the three arms, so the
+engine refused every hash-authored request. The regression archaeology:
+the hash-feeding arm was born **with the request face itself at §4.175**
+(commit `8d0b182`, replayed byte-identical through the §4.176 shared-tree
+replay `d537bd0`) and was never touched since; the diagnosis batch's
+"~1.178" dating marks the visible-regression window (the desktop
+consumption half started exercising the inbound arms then), not an
+author-arm edit. The bug is a category confusion, not a later edit: the
+store-level row identity was read as if it were the wire-level protocol
+identity.
+
+**The fix — three arms, no hash seat.**
+`prepare_request_attachment_backfill` (service.rs) now derives the
+author per conversation kind:
+
+- **Outgoing rows (unchanged):** the account's own number — the engine
+  resolves it to the own ACI (§4.175's original arm, never broken).
+- **Direct rows:** the §4.37 capture ladder — `aci_for_peer_key(peer_key)`
+  first (the ACI the envelope revealed for this peer key, engine arm 1),
+  the peer key itself second (an E.164 or UUID-shaped key is a resolvable
+  face through the engine's own-number/contacts/service-id arms). The
+  row's `sender_id` is never consulted in this seat, so the internal
+  hash cannot appear in a prepared frame by construction.
+- **Group rows:** the conversation's peer key addresses the **group**,
+  not the member, so no ladder over it can name the author. The ingest
+  now captures the receive envelope's `sourceUuid` (the member ACI)
+  verbatim onto the row — new additive `messages.author_aci` column —
+  and the prepare takes it. A row without the capture (every pre-1.191
+  row; the identity a past envelope carried was only knowable from that
+  envelope, and the store hash must not backfill the seat) answers an
+  honest `INVALID_REQUEST` ("message author has no resolvable protocol
+  identity") **before any engine traffic** — the old shape spent a
+  guaranteed-to-fail engine call per attempt; the honest refusal is also
+  the bounded-retry loop's cheaper stop.
+
+**Schema v31.** `SCHEMA_VERSION` 30→31; one additive nullable
+`messages.author_aci TEXT` (the same ingest-face discipline as
+`server_guid`/`server_timestamp`: connector-internal, `serde(skip)`, key
+material never crosses the host wire). Never backfilled. Merge-station
+record: the per-recipient-receipts batch (1.190) had numbered its
+`message_receipts` table migration v30 on the integration line ahead of
+this branch — the merge renumbered this migration v30→v31 by the
+standing merge-station renumber discipline (the §4.28-style "branch
+numbered it X; the merge renumbers it Y" precedent), the branch itself
+keeps the task-assigned v30.
+
+Wire: zero change — the author seat is engine-bound (the host
+`attachments.requestBackfill` params are untouched; the schema file
+needs no edit). Tests (updated + additive):
+`prepare_request_attachment_backfill_derives_the_official_target`
+(rewritten for the 1.191 arms: the direct E.164 fallback, the
+identity-ladder first arm via `upsert_peer_identity`, the outgoing arm,
+the group arm over the captured ACI, the capture-less group row's
+honest `INVALID_REQUEST` before any engine traffic, the id ladder, and
+the zero-stamp gate),
+`group_receive_captures_the_member_aci_and_the_backfill_names_it`
+(the ingest capture lands on the row, the prepared frame names the
+member ACI verbatim, and the ingest hash never rides the author seat),
+and `schema_v31_upgrade_adds_the_row_author_aci_capture` (a v30 store
+migrates in place — column appears, the pre-upgrade row keeps NULL with
+its sender hash untouched, the stamp moves to 31, and a reopen is a
+no-op idempotent upgrade).
 
 ## 5. signal-cli Boundary
 

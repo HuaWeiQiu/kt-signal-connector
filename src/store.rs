@@ -14,7 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_VERSION: i64 = 31;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -1662,6 +1662,19 @@ pub struct MessageRecord {
     /// folded the proto-absent 0 to unknown (never backfilled).
     #[serde(skip)]
     pub server_timestamp: Option<u64>,
+    /// The row author's protocol identity (contract revision 1.191, §4.191):
+    /// the receive envelope's `sourceUuid` (the member ACI), captured verbatim
+    /// at ingest — the wire-facing author the engine's
+    /// `requestAttachmentBackfill` resolves on group rows, where the
+    /// conversation's peer key addresses the group, never the member. The
+    /// row's `sender_id` is the ingest privacy hash (a local-only face the
+    /// protocol has never spoken) and must never ride a prepared frame in its
+    /// place. Connector-internal — never serialized onto the wire. NULL on
+    /// outgoing rows (the account's own number is the protocol face there),
+    /// system rows, pre-1.191 rows, and history-import rows (the archive face
+    /// carries no member identity — never backfilled, §4.191).
+    #[serde(skip)]
+    pub author_aci: Option<String>,
     /// The own-story sync transcript bit (contract 1.160, §4.158): true only
     /// on the event-only row face the multi-device
     /// `syncMessage.sentMessage.storyMessage` mirror lands — the outgoing
@@ -3518,7 +3531,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -3605,7 +3618,7 @@ impl Store {
                     AdjacentMediaDirection::Older => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -3615,7 +3628,7 @@ impl Store {
                     AdjacentMediaDirection::Newer => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
@@ -3708,7 +3721,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                      FROM messages
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
@@ -3758,7 +3771,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -3778,7 +3791,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -3808,7 +3821,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -3861,8 +3874,8 @@ impl Store {
                     stored_at, body, body_bytes, body_truncated, status, client_request_id,
                     quote_message_id, quote_snapshot, attachments_json, live_attachment_locators,
                     rich_json, edited_at, sender_name,
-                    mentions_self, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?17, ?19, ?18, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                    mentions_self, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, author_aci
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?17, ?19, ?18, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
                 params![
                     message.id,
                     message.account_id,
@@ -3916,6 +3929,7 @@ impl Store {
                     expire_deadline(message, stored_at).map(|value| value as i64),
                     message.server_guid,
                     message.server_timestamp.map(|value| value as i64),
+                    message.author_aci,
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -4180,7 +4194,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -4228,7 +4242,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -4355,7 +4369,7 @@ impl Store {
                 .query_row(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                      FROM messages WHERE id=?1",
                     params![message_id],
                     message_record_from_row,
@@ -4700,7 +4714,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -4776,7 +4790,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -4849,7 +4863,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -5033,7 +5047,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages
                  WHERE id=?1",
                 params![message_id],
@@ -5090,7 +5104,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3 AND sender_id=?4
                  ORDER BY id ASC LIMIT 1",
@@ -5296,7 +5310,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -6013,7 +6027,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY received_at DESC",
@@ -6351,7 +6365,7 @@ impl Store {
                     m.body, m.body_bytes, m.body_truncated, m.status, m.quote_message_id, m.client_request_id,
                     m.quote_snapshot, m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
                     m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
-                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.server_timestamp, m.viewed_at, m.send_outcomes_json
+                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id AND c.account_id = m.account_id
              WHERE m.account_id = ?1 AND m.sent_at = ?2 AND m.rich_json IS NOT NULL
@@ -6433,7 +6447,7 @@ impl Store {
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
                         quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self,
-                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
@@ -6508,7 +6522,7 @@ impl Store {
                             m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
                             m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
                             m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid,
-                            m.server_timestamp, m.viewed_at, m.send_outcomes_json,
+                            m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,
                             c.kind, c.peer_key
                      FROM messages m
                      JOIN conversations c ON c.id = m.conversation_id
@@ -6525,7 +6539,7 @@ impl Store {
                 let rows: Vec<(MessageRecord, String, String)> = stmt
                     .query_map(params![account_id, timestamp as i64], |row| {
                         let record = message_record_from_row(row)?;
-                        Ok((record, row.get::<_, String>(30)?, row.get::<_, String>(31)?))
+                        Ok((record, row.get::<_, String>(31)?, row.get::<_, String>(32)?))
                     })
                     .map_err(|error| StoreError::Unavailable(Some(error)))?
                     .collect::<Result<_, _>>()
@@ -6983,7 +6997,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming' AND sent_at=?3",
             )
@@ -7372,7 +7386,7 @@ impl Store {
         let sql = format!(
             "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
                    AND sent_at > ?3
@@ -7411,7 +7425,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3 AND direction='incoming'",
             )
@@ -7835,7 +7849,7 @@ impl Store {
                 let sql = format!(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND id IN ({placeholders})"
                 );
@@ -8215,7 +8229,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -10267,6 +10281,27 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 31 {
+        // Contract revision 1.191 (§4.191): the row author's protocol
+        // identity. One additive nullable column on the incoming row — the
+        // receive envelope's `sourceUuid` (the member ACI), captured verbatim
+        // at ingest, the wire-facing author the engine's
+        // `requestAttachmentBackfill` needs on group rows (the peer key of a
+        // group conversation is the master key and resolves no member).
+        // Pre-1.191 rows legitimately carry none and are never backfilled:
+        // the member identity a past envelope carried was only knowable from
+        // that envelope (the row's stored `sender_id` is the ingest privacy
+        // hash — a local face the protocol has never spoken), so a column-less
+        // row answers the backfill request honestly INVALID_REQUEST instead of
+        // feeding the hash upstream (the 1.175 regression, §4.191). (The
+        // branch numbered this migration v30; the merge renumbers it to v31
+        // because the parallel per-recipient-receipts batch landed v30 first
+        // on this line.)
+        if !table_has_column(conn, "messages", "author_aci")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN author_aci TEXT", [])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -10777,6 +10812,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
             .map(|value| value.max(0) as u64),
         is_story: false,
         story_message: None,
+        author_aci: row.get(30)?,
     })
 }
 
@@ -10812,6 +10848,7 @@ mod tests {
         next_attempt_at: Option<u64>,
     ) {
         let record = MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
             conversation_id: conversation_id.into(),
@@ -11784,6 +11821,7 @@ mod tests {
         sent_at: u64,
     ) {
         let record = MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
             conversation_id: conversation_id.into(),
@@ -12846,6 +12884,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            author_aci: None,
             id: "m1".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -12920,6 +12959,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -13103,6 +13143,7 @@ mod tests {
                    rich: Option<NormalizedRich>|
          -> MessageRecord {
             MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -13313,6 +13354,7 @@ mod tests {
             duration: None,
         };
         let row = |id: &str, sent_at: u64, media: bool| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -13433,6 +13475,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -13571,6 +13614,7 @@ mod tests {
         let now = now_ms();
         let seed = |store: &Store, id: &str, sent_at: u64| {
             let record = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -14040,6 +14084,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -14162,6 +14207,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -14341,6 +14387,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -14540,6 +14587,128 @@ mod tests {
             .unwrap();
     }
 
+    /// Schema 31 (contract revision 1.191, §4.191): a v30 database migrates
+    /// in place — the row-level author-identity capture column appears
+    /// (additive nullable), the pre-upgrade row keeps NULL (the member
+    /// identity a past envelope carried was never stored, and the ingest
+    /// hash in `sender_id` is not backfilled into the seat), and the version
+    /// stamp moves to 31. A second open is a no-op: the column exists, the
+    /// row survives, the stamp stays.
+    #[test]
+    fn schema_v31_upgrade_adds_the_row_author_aci_capture() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '30');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               state TEXT NOT NULL
+             );
+             CREATE TABLE conversations (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               peer_key TEXT NOT NULL,
+               title TEXT,
+               unread_count INTEGER NOT NULL DEFAULT 0,
+               muted INTEGER NOT NULL DEFAULT 0,
+               pinned INTEGER NOT NULL DEFAULT 0,
+               last_message_at INTEGER,
+               read_watermark_ms INTEGER,
+               report_spam_token TEXT
+             );
+             INSERT INTO accounts VALUES('a1', '+15555550100', '+1555***00', 'ready');
+             INSERT INTO conversations
+               VALUES('c1', 'a1', 'group', 'ZmFrZS1ncm91cA==', NULL, 0, 0, 0, NULL, NULL, NULL);
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               attachment_locators TEXT,
+               live_attachment_locators TEXT,
+               rich_json TEXT,
+               sticker_json TEXT,
+               expire_seconds INTEGER,
+               expire_start_at INTEGER,
+               expire_at INTEGER,
+               server_guid TEXT,
+               server_timestamp INTEGER,
+               edited_at INTEGER,
+               sender_name TEXT,
+               mentions_self INTEGER NOT NULL DEFAULT 0,
+               first_send_attempted_at INTEGER,
+               retry_attempt_count INTEGER NOT NULL DEFAULT 0,
+               next_attempt_at INTEGER
+             );
+             INSERT INTO messages(id, account_id, conversation_id, direction, sender_id, sent_at, body, status)
+               VALUES('m1', 'a1', 'c1', 'incoming', 'legacy-sender-hash', 1726999999000, 'photo', 'delivered');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(table_has_column(&store.conn(), "messages", "author_aci").unwrap());
+        // The pre-upgrade row survives with the honest NULL capture — the
+        // sender hash stays exactly where it was, never promoted into the
+        // author seat.
+        let (sender_id, author_aci): (String, Option<String>) = store
+            .conn()
+            .query_row(
+                "SELECT sender_id, author_aci FROM messages WHERE id='m1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sender_id, "legacy-sender-hash");
+        assert_eq!(author_aci, None);
+
+        // The upgrade is idempotent: a reopen re-runs nothing and moves
+        // nothing (same version, column present, row intact).
+        drop(store);
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(table_has_column(&store.conn(), "messages", "author_aci").unwrap());
+        let rows: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
     /// The admin-delete tombstone (contract 1.33): the flag flips exactly
     /// once per row (idempotent replays answer `false` and re-emit nothing),
     /// the status ladder and body are untouched, and system rows are exempt —
@@ -14555,6 +14724,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
             .unwrap();
         let base = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -14661,6 +14831,7 @@ mod tests {
              attachments: Vec<crate::engine::NormalizedAttachment>| {
                 clock += 1;
                 let message = MessageRecord {
+                    author_aci: None,
                     id: format!("m{clock}"),
                     account_id: account.id.clone(),
                     conversation_id: conversation.id.clone(),
@@ -14801,6 +14972,7 @@ mod tests {
                     sent_at: u64,
                     text: Option<&str>| {
             let message = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -15002,6 +15174,7 @@ mod tests {
             .unwrap();
         let push = |id: &str, status: &'static str, sent_at: u64| {
             let message = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -15109,6 +15282,7 @@ mod tests {
             .unwrap();
         let push = |id: &str, authors: &[&str], increment_unread: bool| {
             let message = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -15237,6 +15411,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
         let plain = MessageRecord {
+            author_aci: None,
             id: "m1".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -15342,6 +15517,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            author_aci: None,
             id: "pending".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -15451,6 +15627,7 @@ mod tests {
             )
             .unwrap();
         let message = MessageRecord {
+            author_aci: None,
             id: "atomic-message".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -15528,6 +15705,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            author_aci: None,
             id: "unread-message".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -15610,6 +15788,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            author_aci: None,
             id: "system-message".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -15677,6 +15856,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            author_aci: None,
             id: "contended".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -15759,6 +15939,7 @@ mod tests {
             .unwrap();
         let row = |store: &Store, id: &str, sender: &str| {
             let message = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -15858,6 +16039,7 @@ mod tests {
             .unwrap();
         let row = |store: &Store, id: &str, status: &'static str| {
             let message = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -15963,6 +16145,7 @@ mod tests {
                    sent_at: u64,
                    status: &'static str| {
             let message = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -16074,6 +16257,7 @@ mod tests {
             (&same_time, "same-time-message", 20),
         ] {
             let message = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -16159,6 +16343,7 @@ mod tests {
         ));
 
         let changed = MessageRecord {
+            author_aci: None,
             id: "newer-message-2".into(),
             account_id: account.id.clone(),
             conversation_id: cursor_conversation.id.clone(),
@@ -16219,6 +16404,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "other-peer", "Other peer")
             .unwrap();
         let other_message = MessageRecord {
+            author_aci: None,
             id: "other-message".into(),
             account_id: account.id.clone(),
             conversation_id: other_conversation.id.clone(),
@@ -16321,6 +16507,7 @@ mod tests {
             .unwrap();
         let hit = |id: &str, conversation_id: &str, sent_at: u64, text: &str| {
             let mut message = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation_id.into(),
@@ -16425,6 +16612,7 @@ mod tests {
         .enumerate()
         {
             let message = MessageRecord {
+                author_aci: None,
                 id: format!("row-{index}"),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -16534,6 +16722,7 @@ mod tests {
             .unwrap();
         let hit = |id: &str, conversation_id: &str, sent_at: u64, text: &str| {
             let message = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation_id.into(),
@@ -16635,6 +16824,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            author_aci: None,
             id: "delete-message".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -17399,6 +17589,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            author_aci: None,
             id: "kept".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -17479,6 +17670,7 @@ mod tests {
         let now = 40 * 365 * 24 * 60 * 60 * 1_000;
         let day = 24 * 60 * 60 * 1_000;
         let message = MessageRecord {
+            author_aci: None,
             id: "before-upgrade".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -17582,6 +17774,7 @@ mod tests {
             .map(|(index, age)| {
                 let id = format!("message-{index}");
                 let message = MessageRecord {
+                    author_aci: None,
                     id: id.clone(),
                     account_id: account.id.clone(),
                     conversation_id: conversation.id.clone(),
@@ -17739,6 +17932,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            author_aci: None,
             id: "in-flight".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -17842,6 +18036,7 @@ mod tests {
                     direction: &'static str,
                     sent_at: u64| {
             let record = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account_id.to_string(),
                 conversation_id: conversation_id.to_string(),
@@ -17989,6 +18184,7 @@ mod tests {
             .unwrap();
         let sent_at = now_ms() - 60_000;
         let record = MessageRecord {
+            author_aci: None,
             id: "reconcile-row".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -18100,6 +18296,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550102", "contact")
             .unwrap();
         let recent = MessageRecord {
+            author_aci: None,
             id: "recent".into(),
             account_id: account.id.clone(),
             conversation_id: kept.id.clone(),
@@ -18177,6 +18374,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            author_aci: None,
             id: "kept".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -18257,6 +18455,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            author_aci: None,
             id: "unread-incoming".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -18690,6 +18889,7 @@ mod tests {
         sent_at: u64,
     ) {
         let message = MessageRecord {
+            author_aci: None,
             id: message_id.into(),
             account_id: account_id.to_string(),
             conversation_id: conversation_id.to_string(),
@@ -18745,6 +18945,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            author_aci: None,
             id: "m-edited".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -19005,6 +19206,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550199", "peer")
             .unwrap();
         let message = MessageRecord {
+            author_aci: None,
             id: "m-own".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -19276,6 +19478,7 @@ mod tests {
             .unwrap();
         let base =
             |id: &str, conversation_id: &str, direction: &'static str, rich: bool| MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation_id.into(),
@@ -19390,6 +19593,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = MessageRecord {
+            author_aci: None,
             id: "m-view".into(),
             account_id: account.id.clone(),
             conversation_id: peer.id.clone(),
@@ -19485,6 +19689,7 @@ mod tests {
 
     fn expire_record(id: &str, account_id: &str, conversation_id: &str) -> MessageRecord {
         MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
             conversation_id: conversation_id.into(),
@@ -20320,6 +20525,7 @@ mod tests {
         sent_at: u64,
     ) -> MessageRecord {
         MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
             conversation_id: conversation_id.into(),
@@ -20675,6 +20881,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, status: &'static str| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -20824,6 +21031,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550201", "contact")
             .unwrap();
         let record = |id: &str, conversation_id: &str, sent_at: u64| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation_id.to_string(),
@@ -20989,6 +21197,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550303", "contact")
             .unwrap();
         let record = |id: &str, conversation_id: &str| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation_id.to_string(),
@@ -21102,6 +21311,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAta2V5", "Group")
             .unwrap();
         let record = MessageRecord {
+            author_aci: None,
             id: "m-cascade-600".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -21204,6 +21414,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAta2V5", "Group")
             .unwrap();
         let record = MessageRecord {
+            author_aci: None,
             id: "m-seed-700".into(),
             account_id: account.id.clone(),
             conversation_id: group.id.clone(),
@@ -21401,6 +21612,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -21509,6 +21721,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -21622,6 +21835,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -22383,6 +22597,7 @@ mod tests {
         let insert_poll =
             |store: &Store, id: &str, sender: &str, sent_at: u64, status: &'static str| {
                 let message = MessageRecord {
+                    author_aci: None,
                     id: id.into(),
                     account_id: account.id.clone(),
                     conversation_id: conversation.id.clone(),
@@ -22584,6 +22799,7 @@ mod tests {
                       status: &'static str,
                       rich: Option<NormalizedRich>| {
             let message = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -22770,6 +22986,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAtcG9sbA==", "Polls")
             .unwrap();
         let message = MessageRecord {
+            author_aci: None,
             id: "poll-capped".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -23017,6 +23234,7 @@ mod tests {
 
         let row =
             |id: &str, direction: &'static str, sender_id: &str, sent_at: u64| MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -23231,6 +23449,7 @@ mod tests {
         assert_eq!(summary_watermark(), None);
 
         let row = |id: &str, direction: &'static str, sent_at: u64| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),

@@ -58,6 +58,7 @@ fn seed_account_and_conversation(store: &Store) -> (String, String) {
 fn seed_queued_row(store: &Store, account_id: &str, conversation_id: &str, request: &str) {
     let id = stable_hash_id(&[account_id, conversation_id, "outgoing", request]);
     let record = MessageRecord {
+        author_aci: None,
         id: id.clone(),
         account_id: account_id.to_string(),
         conversation_id: conversation_id.to_string(),
