@@ -57,7 +57,7 @@ use kt_signal_connector::service::{
     STICKER_PACK_BROWSE_ID_HEX_CHARS, STICKER_PACK_SYNC_KEY_B64_CHARS,
     USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES, USERNAME_MAX_WIRE_CHARS,
 };
-use kt_signal_connector::store::MAX_PAGE_LIMIT;
+use kt_signal_connector::store::{MAX_MESSAGE_RECEIPT_RECIPIENTS, MAX_PAGE_LIMIT};
 
 /// Events the code emits but the schema event enum does not declare. Currently
 /// none: `runtime.resourcePressure` (emitted by the RSS sampler bridge,
@@ -675,6 +675,20 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/event/allOf/16/then/properties/data/properties/identityKey",
             "maxLength",
             MAX_SYNC_IDENTITY_KEY_CHARS as u64,
+        ),
+        // Receipts ledger (contract 1.190, §4.190): the recipient key mirrors
+        // the receive-id bound (the envelope source passes it verbatim) and
+        // the ledger array mirrors the roster ceiling (the ledger's own
+        // recipient cap, the store's MAX_MESSAGE_RECEIPT_RECIPIENTS).
+        (
+            "/$defs/event/allOf/32/then/properties/data/properties/receipts/items/properties/recipient",
+            "maxLength",
+            MAX_RECEIVE_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/event/allOf/32/then/properties/data/properties/receipts",
+            "maxItems",
+            MAX_MESSAGE_RECEIPT_RECIPIENTS as u64,
         ),
         // Call-event sync (contract 1.104, §4.85): the decimal call id
         // mirrors its own bound (the parse also demands all-ASCII digits);

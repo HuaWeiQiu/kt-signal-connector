@@ -1060,6 +1060,91 @@ impl RuntimeSupervisor {
         });
     }
 
+    /// §4.190 ⑥: fetch each account's configuration once per engine landing
+    /// and mirror the readReceipts flag onto the account row — the receipt
+    /// gate's local input (the official `shouldDropReceipt` privacy
+    /// symmetry; the engine's `getConfiguration` is the truth source, the
+    /// §4.87 sync and the §4.45 write face are the incremental writers).
+    /// Best-effort and idempotent: an engine that never answers leaves the
+    /// flag at its previous value (never-answered stays the honest unknown,
+    /// which the gate reads as off — the official falsy parity), a transport
+    /// error warns and moves on, and nothing here blocks startup. The
+    /// settle delay lets the fresh engine finish its own startup work first
+    /// (the contacts-resync and reconcile beats).
+    fn spawn_configuration_gate_sync(&self) {
+        let Ok(engine_slot) = self.engine.try_lock() else {
+            return;
+        };
+        let Some(engine) = engine_slot
+            .as_ref()
+            .filter(|engine| !engine.is_terminal())
+            .cloned()
+        else {
+            return;
+        };
+        drop(engine_slot);
+        let store = Arc::clone(&self.store);
+        let group_id = self.group_id.clone();
+        tokio::spawn(async move {
+            sleep(UNKNOWN_RECONCILE_SETTLE_DELAY).await;
+            let accounts = match blocking_service({
+                let store = Arc::clone(&store);
+                let group_id = group_id.clone();
+                move || {
+                    store
+                        .list_accounts_in_group(&group_id)
+                        .map_err(ServiceError::Store)
+                }
+            })
+            .await
+            {
+                Ok(accounts) => accounts,
+                Err(error) => {
+                    tracing::warn!(
+                        error_class = error.class(),
+                        "configuration gate sync could not list accounts"
+                    );
+                    return;
+                }
+            };
+            for summary in accounts {
+                // The summary masks the address; the engine wants the real
+                // one, so the row answers it (the same account_by_id walk the
+                // control plane's fallback runs).
+                let Ok(Some(account)) = store.account_by_id(&summary.id) else {
+                    continue;
+                };
+                let answer = engine
+                    .call(
+                        "getConfiguration",
+                        json!({ "account": account.signal_account }),
+                        CallClass::ReadOnly,
+                    )
+                    .await;
+                match answer {
+                    Ok(result) => {
+                        let read_receipts = result.get("readReceipts").and_then(Value::as_bool);
+                        if let Err(error) =
+                            store.set_account_read_receipts(&account.id, read_receipts)
+                        {
+                            tracing::warn!(
+                                error_class = ServiceError::Store(error).class(),
+                                "configuration gate sync mirror write failed"
+                            );
+                        }
+                    }
+                    Err(EngineError::NotRunning | EngineError::Exited) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            error_class = ServiceError::from(error).class(),
+                            "configuration gate sync probe failed; the flag keeps its last answer"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     /// After a `link.finish`, watch for the archive the engine is
     /// downloading in the background (§4.38): poll every few seconds for at
     /// most [`crate::history_import::LINK_WAIT_MS`], import when the file
@@ -1678,6 +1763,10 @@ impl RuntimeSupervisor {
             // unknown-outcome rows against the engine's own dispatch ledger
             // (best-effort, idempotent, warn-only).
             self.spawn_unknown_outcome_reconcile();
+            // §4.190 ⑥: the engine landed — fetch each account's
+            // configuration and mirror the readReceipts gate flag
+            // (best-effort, idempotent, warn-only).
+            self.spawn_configuration_gate_sync();
             // §4.123: engine landed — the offline queue drains now instead of
             // waiting out the tick (the official online-event re-dispatch).
             self.notify_outbox_drain();
@@ -2095,6 +2184,10 @@ impl RuntimeSupervisor {
         drop(slot);
         self.spawn_contacts_resync_with(fresh);
         self.spawn_history_import_pass();
+        // §4.190 ⑥: a fresh engine (watchdog recovery included) re-fetches
+        // the accounts' configuration — the readReceipts gate flag converges
+        // on every landing.
+        self.spawn_configuration_gate_sync();
         // §4.123: a fresh engine (watchdog recovery included) drains the
         // offline queue immediately — the official online-event re-dispatch.
         self.notify_outbox_drain();
@@ -2760,6 +2853,19 @@ impl RuntimeSupervisor {
         service.get_message_by_client_request(&account_id, &conversation_id, &client_request_id)
     }
 
+    /// messages.receipts (contract 1.190, §4.190 ⑤): the per-recipient
+    /// receipt ledger read — local store only, under the service lock like
+    /// every read face; no engine touch, no mutation.
+    pub async fn get_message_receipts(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_id: String,
+    ) -> Result<Vec<crate::store::RecipientReceiptRow>, ServiceError> {
+        let service = self.service.lock().await;
+        service.get_message_receipts(&account_id, &conversation_id, &message_id)
+    }
+
     /// Retry one definitively-failed outgoing text in place (contract 1.31,
     /// implementation-plan §4.26, replay semantics §4.172). Same settlement
     /// path as `send_text` — the
@@ -2802,6 +2908,41 @@ impl RuntimeSupervisor {
         (counted.succeeded > 0 || counted.failed > 0).then_some(counted)
     }
 
+    /// §4.190 ⑦ (the optional arm): expand the same `results` array into
+    /// per-recipient Sent/Failed ledger seeds — the §4.173 counts
+    /// de-aggregated, the official `sendStateByConversationId` posture
+    /// (every addressed recipient starts at Sent,
+    /// MessageReceipts.preload.ts:462-490). `None` when the reply carried no
+    /// recognizable array (the direct-send shape: single recipient, the row
+    /// status is the whole story — no seeds); entries without a usable
+    /// recipient identity skip individually; the batch is bounded at 256,
+    /// the receipt faces' own ceiling.
+    fn send_receipt_seeds_from_reply(result: &Value) -> Option<Vec<crate::store::SendReceiptSeed>> {
+        let entries = result.get("results")?.as_array()?;
+        let mut seeds = Vec::new();
+        for entry in entries.iter().take(256) {
+            let Some(recipient) = entry
+                .get("recipientNumber")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if entry.get("success").is_some() {
+                seeds.push(crate::store::SendReceiptSeed {
+                    recipient: recipient.to_string(),
+                    succeeded: true,
+                });
+            } else if entry.get("failure").is_some() {
+                seeds.push(crate::store::SendReceiptSeed {
+                    recipient: recipient.to_string(),
+                    succeeded: false,
+                });
+            }
+        }
+        (!seeds.is_empty()).then_some(seeds)
+    }
+
     async fn dispatch_prepared(
         &self,
         engine: &EngineHandle,
@@ -2826,7 +2967,10 @@ impl RuntimeSupervisor {
                     // Absent on direct sends (single recipient — the row
                     // status is the whole story) and on any shape-hostile
                     // array, which degrade to the pre-1.173 behavior.
+                    // §4.190 ⑦: the same array expands into per-recipient
+                    // Sent/Failed ledger seeds beside the counts.
                     let outcomes = Self::send_outcomes_from_reply(&result);
+                    let seeds = Self::send_receipt_seeds_from_reply(&result);
                     if outcomes
                         .as_ref()
                         .is_some_and(|counted| counted.succeeded == 0)
@@ -2844,6 +2988,7 @@ impl RuntimeSupervisor {
                                 outcomes
                                     .as_ref()
                                     .expect("guarded by the succeeded == 0 check"),
+                                seeds.as_deref().unwrap_or(&[]),
                             )?;
                         for event in events {
                             let _ = self.host_events.send(event);
@@ -2854,13 +2999,15 @@ impl RuntimeSupervisor {
                             true,
                         )));
                     }
-                    let (message, events) = self.service.lock().await.complete_send_success(
-                        &pending_id,
-                        &account_id,
-                        &conversation_id,
-                        sent_at,
-                        outcomes.as_ref(),
-                    )?;
+                    let (message, events) =
+                        self.service.lock().await.complete_send_success_seeded(
+                            &pending_id,
+                            &account_id,
+                            &conversation_id,
+                            sent_at,
+                            outcomes.as_ref(),
+                            seeds.as_deref().unwrap_or(&[]),
+                        )?;
                     for event in events {
                         let _ = self.host_events.send(event);
                     }
@@ -4214,7 +4361,11 @@ impl RuntimeSupervisor {
     /// mutating engine call — reaction-class discipline: an unknown outcome
     /// answers SEND_OUTCOME_UNKNOWN and is never retried. The result is the
     /// definite-success ack, not state: the settings live upstream and the
-    /// desktop re-reads them through its own channel.
+    /// desktop re-reads them through its own channel. §4.190 (contract
+    /// 1.190 ⑥): a definite-success `readReceipts` write mirrors the flag
+    /// onto the account row — the receipt gate's local input (the §4.87
+    /// sync arm and the startup `getConfiguration` fetch are the other two
+    /// writers; a failed or unknown write mirrors nothing).
     pub async fn update_account_configuration(
         &self,
         params: AccountsUpdateConfigurationParams,
@@ -4228,7 +4379,19 @@ impl RuntimeSupervisor {
             .call("setAccountConfiguration", upstream, CallClass::Mutating)
             .await
         {
-            Ok(_) => Ok("saved"),
+            Ok(_) => {
+                if let Some(read_receipts) = params.read_receipts
+                    && let Err(error) = self
+                        .store
+                        .set_account_read_receipts(&params.account_id, Some(read_receipts))
+                {
+                    tracing::warn!(
+                        error_class = ServiceError::Store(error).class(),
+                        "readReceipts mirror write failed; the startup fetch re-converges it"
+                    );
+                }
+                Ok("saved")
+            }
             Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
                 "SEND_OUTCOME_UNKNOWN",
                 "mutating request has an unknown outcome",
@@ -9667,6 +9830,56 @@ mod tests {
                 "results": []
             })),
             None
+        );
+    }
+
+    /// §4.190 ⑦: the same `results` array expands into per-recipient
+    /// Sent/Failed seeds — the §4.173 counts de-aggregated, the official
+    /// sendState fan-out posture. Entries without a usable recipient skip
+    /// individually; direct sends (no array) and shape-hostile arrays answer
+    /// `None` (no seeds face); the batch is bounded at 256.
+    #[test]
+    fn send_receipt_seeds_from_reply_expands_the_results_roster() {
+        let seeds = RuntimeSupervisor::send_receipt_seeds_from_reply(&json!({
+            "timestamp": 7,
+            "results": [
+                { "recipientNumber": "+1", "success": { "timestamp": 7 } },
+                { "recipientNumber": "+2", "failure": { "type": "NetworkFailure" } },
+                { "success": { "timestamp": 7 } },
+                { "recipientNumber": "", "success": { "timestamp": 7 } },
+                { "recipientNumber": "+3" }
+            ]
+        }))
+        .expect("recognizable entries expand");
+        assert_eq!(seeds.len(), 2, "{seeds:?}");
+        assert_eq!(seeds[0].recipient, "+1");
+        assert!(seeds[0].succeeded);
+        assert_eq!(seeds[1].recipient, "+2");
+        assert!(!seeds[1].succeeded);
+
+        // The 256 bound: a hostile array cannot grow the seed batch.
+        let hostile: Vec<serde_json::Value> = (0..600)
+            .map(|index| {
+                json!({ "recipientNumber": format!("+1555{index:04}"), "success": {"timestamp": 7} })
+            })
+            .collect();
+        let seeds = RuntimeSupervisor::send_receipt_seeds_from_reply(&json!({
+            "timestamp": 7,
+            "results": hostile
+        }))
+        .expect("the bounded batch still answers");
+        assert_eq!(seeds.len(), 256);
+
+        // The direct-send shape (no array) and an empty array answer None.
+        assert!(
+            RuntimeSupervisor::send_receipt_seeds_from_reply(&json!({ "timestamp": 7 })).is_none()
+        );
+        assert!(
+            RuntimeSupervisor::send_receipt_seeds_from_reply(&json!({
+                "timestamp": 7,
+                "results": []
+            }))
+            .is_none()
         );
     }
 

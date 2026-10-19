@@ -13,7 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::engine::{
     ControlReceive, EngineError, GROUPV2_ID_LENGTH, NormalizedAttachment, NormalizedReceive,
-    ReceiptKind, SyncReadEntry, timer_change_material, timer_change_rich, truncate_utf8_bytes,
+    SyncReadEntry, timer_change_material, timer_change_rich, truncate_utf8_bytes,
 };
 /// The official ACCEPT member of the `messageRequestResponseType` enum
 /// (`SignalService.proto:666-678`): the member the §4.58 factor weight reads.
@@ -1141,6 +1141,17 @@ pub enum HostSideEvent {
         sender_id: Option<String>,
         sender_name: Option<String>,
     },
+    /// Contract 1.190 (§4.190 ⑤): a peer receipt changed a message's
+    /// per-recipient ledger — additive beside the aggregate
+    /// `MessageStatusChanged` (which keeps firing for the row's own ladder
+    /// transitions). The payload carries the message's full ledger face
+    /// (every recipient row, first stamps only) so the host merge stays
+    /// total; a change that only re-confirms existing stamps emits nothing.
+    MessageReceiptsChanged {
+        account_id: String,
+        message_id: String,
+        receipts: Vec<crate::store::RecipientReceiptRow>,
+    },
     /// A view-once message was viewed and its bytes erased (contract 1.38):
     /// emitted exactly once per message on the first burn transition — sync
     /// duplicates and replays emit nothing. Deliberately not folded into
@@ -1892,6 +1903,28 @@ enum EarlyControlPayload {
     PollTerminate,
 }
 
+/// Contract 1.190 (§4.190 ③): one early-arriving peer receipt — a receipt
+/// whose timestamps matched no outgoing row anywhere in the account, riding
+/// the §4.91 early-control precedent (the official `forMessage` early face,
+/// MessageReceipts.preload.ts:414-456: a receipt that lands before its
+/// message row is matched the moment the row lands). The flush key is the
+/// (account, sentAt) pair — a receipt addresses our own outgoing rows, so
+/// the row's landing conversation is the receipt's business, never its
+/// identity — and the entry carries the whole attribution (recipient, tier,
+/// envelope timestamp) so the flush replays the live arm verbatim.
+#[derive(Debug, Clone)]
+struct EarlyReceiptEntry {
+    account_id: String,
+    target_sent_at: u64,
+    recipient: String,
+    kind: crate::engine::ReceiptKind,
+    /// The receipt's arrival instant, already resolved at buffer time (the
+    /// envelope timestamp with the connector-clock fallback) so the flush
+    /// replays the identical stamp the live arm would have written.
+    when: u64,
+    buffered_at: u64,
+}
+
 pub struct ConnectorService {
     store: Arc<Store>,
     link: Option<ActiveLinkSession>,
@@ -1900,6 +1933,9 @@ pub struct ConnectorService {
     /// Early-arrival edit/remoteDelete buffer (§4.91): flat table, bounded
     /// by capacity with oldest-eviction and lazy TTL sweeps at every touch.
     early_controls: Vec<EarlyControlEntry>,
+    /// Early-arrival peer receipts (§4.190 ③): the §4.91 discipline at the
+    /// same bounds — flat, capacity-bounded with oldest eviction, TTL-swept.
+    early_receipts: Vec<EarlyReceiptEntry>,
     /// Media ingest backing (ADR 0004); `None` keeps every media method on
     /// the pre-PoC `CAPABILITY_UNAVAILABLE` answer.
     media: Option<MediaIngest>,
@@ -1920,6 +1956,7 @@ impl ConnectorService {
             link: None,
             typing_last_emission: std::collections::HashMap::new(),
             early_controls: Vec::new(),
+            early_receipts: Vec::new(),
             media,
         }
     }
@@ -2454,6 +2491,29 @@ impl ConnectorService {
         message_id: &str,
     ) -> Result<MessageText, ServiceError> {
         store_get_message_text(&self.store, account_id, conversation_id, message_id)
+    }
+
+    /// `messages.receipts` (contract 1.190 §4.190 ⑤): one message's
+    /// per-recipient receipt ledger, read-only. The message must resolve in
+    /// the named conversation (the getText addressing discipline); a message
+    /// that predates the ledger — or one no peer ever receipted — answers
+    /// the honest empty list, never an error.
+    pub fn get_message_receipts(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<crate::store::RecipientReceiptRow>, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        let Some(_record) = self
+            .store
+            .message_by_id(account_id, conversation_id, message_id)?
+        else {
+            return Err(ServiceError::Store(StoreError::MessageNotFound));
+        };
+        Ok(self.store.message_receipts_for(account_id, message_id)?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8647,6 +8707,29 @@ impl ConnectorService {
         sent_at: u64,
         outcomes: Option<&crate::store::MessageSendOutcomes>,
     ) -> Result<(MessageRecord, Vec<HostSideEvent>), ServiceError> {
+        self.complete_send_success_seeded(
+            pending_id,
+            account_id,
+            conversation_id,
+            sent_at,
+            outcomes,
+            &[],
+        )
+    }
+
+    /// §4.190 ⑦: the seeded settlement — `complete_send_success` plus the
+    /// per-recipient Sent/Failed ledger seeds (the engine `send` reply's
+    /// `results` array, the official sendState fan-out's local twin).
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_send_success_seeded(
+        &self,
+        pending_id: &str,
+        account_id: &str,
+        conversation_id: &str,
+        sent_at: u64,
+        outcomes: Option<&crate::store::MessageSendOutcomes>,
+        seeds: &[crate::store::SendReceiptSeed],
+    ) -> Result<(MessageRecord, Vec<HostSideEvent>), ServiceError> {
         // A missing pending row at this point means the local state vanished
         // underneath a send that already completed upstream (e.g. the account's
         // rows were deleted in a race): the message may well be delivered, so
@@ -8674,6 +8757,10 @@ impl ConnectorService {
         if status_transitioned {
             events.push(status_changed_event(&updated));
         }
+        // §4.190 ⑦: the per-recipient Sent/Failed seeds ride the settlement
+        // (the official sendState fan-out's local twin) — best-effort beside
+        // the row settle, additive to the events above.
+        events = self.seed_send_receipts_events(pending_id, seeds, events)?;
         if let Some(conversation) = self
             .store
             .conversation_summary(account_id, conversation_id)?
@@ -8961,18 +9048,48 @@ impl ConnectorService {
     /// the manual Retry Send face stays), the counted outcomes ride the row
     /// for the desktop's error face, and the caller answers
     /// `GROUP_SEND_FAILED` (retryable) so the optimistic funnel marks the
-    /// row retryable-failed like any definitive engine error.
+    /// row retryable-failed like any definitive engine error. §4.190 ⑦: the
+    /// per-recipient Failed seeds ride the ledger beside the counts.
     pub fn complete_send_failed_group_outcomes(
         &self,
         pending_id: &str,
         outcomes: &crate::store::MessageSendOutcomes,
+        seeds: &[crate::store::SendReceiptSeed],
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
-        Ok(status_change_events(self.store.settle_send_failed(
+        let events = status_change_events(self.store.settle_send_failed(
             pending_id,
             now_ms(),
             crate::store::SendRetrySchedule::None,
             Some(outcomes),
-        )?))
+        )?);
+        self.seed_send_receipts_events(pending_id, seeds, events)
+    }
+
+    /// §4.190 ⑦: stamp the send-settlement seeds onto the settled row and
+    /// append the ledger's changed event. Best-effort beside the settlement
+    /// itself: a seed write that cannot land (the row vanished underneath
+    /// the settlement) skips — the receipts the peers send anyway still
+    /// create their rows on demand, so the seeds are an enrichment, never a
+    /// dependency.
+    fn seed_send_receipts_events(
+        &self,
+        message_id: &str,
+        seeds: &[crate::store::SendReceiptSeed],
+        mut events: Vec<HostSideEvent>,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        if seeds.is_empty() {
+            return Ok(events);
+        }
+        let when = now_ms();
+        let Some(account_id) = self.store.seed_send_receipts(message_id, seeds, when)? else {
+            return Ok(events);
+        };
+        events.push(HostSideEvent::MessageReceiptsChanged {
+            account_id: account_id.clone(),
+            message_id: message_id.to_string(),
+            receipts: self.store.message_receipts_for(&account_id, message_id)?,
+        });
+        Ok(events)
     }
 
     /// The §4.123 three-arm classification (contract 1.143, §4.139): the
@@ -9305,6 +9422,18 @@ impl ConnectorService {
             sent_at,
             &flush_sender_id,
         )?;
+        // §4.190 ③: the outgoing row just landed — apply any peer receipt
+        // that arrived before it (the official `forMessage` early face). The
+        // flush keys on (account, sentAt) only: a receipt addresses our own
+        // outgoing rows by timestamp, and the store fold re-runs the full
+        // recipient qualification, so a landed row the sender does not
+        // qualify for drops the entry (the official non-recipient skip)
+        // instead of re-buffering it.
+        let landed_receipt_events = if direction == "outgoing" {
+            self.drain_early_receipts(&account.id, sent_at)?
+        } else {
+            Vec::new()
+        };
         // Read-time quote deep link on the live face too (official
         // `doubleCheckMissingQuoteReference` parity): the just-landed row's
         // quote snapshot resolves against the store before the upsert event
@@ -9318,6 +9447,7 @@ impl ConnectorService {
             message,
         ))];
         events.extend(landed_events);
+        events.extend(landed_receipt_events);
         // §4.37: record the ACI→peer-key identity the envelope revealed, so a
         // later view-once open sync (which names the author by ACI only) can
         // find this conversation. One bounded row per (account, ACI); only
@@ -9507,6 +9637,198 @@ impl ConnectorService {
         }
         self.early_controls = remaining;
         Ok(drained)
+    }
+
+    /// §4.190 ③: admit one early-arriving receipt into the bounded buffer —
+    /// the §4.91 admission discipline verbatim (lazy TTL sweep, then the
+    /// single-oldest eviction at capacity), shared bounds.
+    fn buffer_early_receipt(&mut self, entry: EarlyReceiptEntry) {
+        let now = now_ms();
+        self.early_receipts
+            .retain(|entry| now.saturating_sub(entry.buffered_at) < EARLY_CONTROL_BUFFER_TTL_MS);
+        if self.early_receipts.len() >= EARLY_CONTROL_BUFFER_CAPACITY
+            && let Some(oldest) = self
+                .early_receipts
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.buffered_at)
+                .map(|(index, _)| index)
+        {
+            self.early_receipts.remove(oldest);
+        }
+        self.early_receipts.push(entry);
+    }
+
+    /// §4.190 ③: the flush half — an outgoing row just landed under this
+    /// (account, sentAt), so every fresh buffered receipt keyed to it applies
+    /// now, replaying the live arm verbatim (the same store fold, the same
+    /// event set). Stale entries leave silently; entries keyed to other
+    /// timestamps stay buffered. A flush that re-matches nothing (the landed
+    /// row is in a conversation the recipient does not qualify for) drops
+    /// the entry the official way — the `getTargetMessage` non-recipient
+    /// skip — never re-buffering it.
+    fn drain_early_receipts(
+        &mut self,
+        account_id: &str,
+        sent_at: u64,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        if self.early_receipts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = now_ms();
+        let table = std::mem::take(&mut self.early_receipts);
+        let mut events = Vec::new();
+        let mut remaining = Vec::new();
+        for entry in table {
+            let fresh = now.saturating_sub(entry.buffered_at) < EARLY_CONTROL_BUFFER_TTL_MS;
+            let matches =
+                fresh && entry.account_id == account_id && entry.target_sent_at == sent_at;
+            if !matches {
+                if fresh {
+                    remaining.push(entry);
+                }
+                continue;
+            }
+            events.extend(self.apply_receipt_batch(
+                account_id,
+                &entry.recipient,
+                std::slice::from_ref(&entry.target_sent_at),
+                entry.kind,
+                entry.when,
+            )?);
+        }
+        self.early_receipts = remaining;
+        Ok(events)
+    }
+
+    /// §4.190: the live peer-receipt arm — one receipt envelope's whole
+    /// effect. Shared by the live interception and the early-buffer flush so
+    /// a converged row is byte-identical whether its receipt arrived early
+    /// or late. The caller has already resolved the account; `recipient` is
+    /// the variant's envelope-source identity (absent = the pre-1.85 drop
+    /// fate — no attribution, no fold, 宁缺勿错).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_peer_receipt_event(
+        &mut self,
+        account: &AccountRow,
+        viewer_source: Option<&String>,
+        viewer_source_uuid: Option<&String>,
+        viewer_name: Option<&String>,
+        kind: crate::engine::ReceiptKind,
+        timestamps: &[u64],
+        when: Option<u64>,
+        recipient: Option<&str>,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some(recipient) = recipient.filter(|source| !source.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        // §4.190 ⑥: the official `shouldDropReceipt` privacy symmetry
+        // (MessageReceipts.preload.ts:394-412) — DELIVERY receipts are never
+        // dropped; READ and VIEWED receipts are dropped unless the account's
+        // own readReceipts flag is on. The flag's source of truth is the
+        // engine's account configuration (`getConfiguration` fetched at
+        // engine landing, plus the §4.87 sync and the §4.45 write face); an
+        // unanswered flag is the official falsy parity — unknown means off.
+        // The official's separate story-view-receipts flag has no engine
+        // face; this batch gates both READ and VIEWED by the one visible
+        // flag (§4.190 records the nuance).
+        if matches!(
+            kind,
+            crate::engine::ReceiptKind::Read | crate::engine::ReceiptKind::Viewed
+        ) && self.store.account_read_receipts(&account.id)? != Some(true)
+        {
+            return Ok(Vec::new());
+        }
+        let when = when.unwrap_or_else(crate::link::now_ms);
+        let mut events =
+            self.apply_receipt_batch(&account.id, recipient, timestamps, kind, when)?;
+        // The story split (§4.70, contract 1.85) rides the VIEWED leg: a
+        // timestamp that matched NO outgoing row anywhere in the account is
+        // the story candidate (own stories are the rowless sends, §4.67); a
+        // timestamp that found rows but no qualifying one is NOT — the row
+        // exists, the sender just is not its recipient (the official
+        // non-recipient skip, which never leaks onto the story face).
+        if matches!(kind, crate::engine::ReceiptKind::Viewed) {
+            let mut unseen = Vec::new();
+            for timestamp in timestamps.iter().copied().take(256) {
+                if !self.store.outgoing_sent_at_seen(&account.id, timestamp)? {
+                    unseen.push(timestamp);
+                }
+            }
+            if !unseen.is_empty() {
+                events.push(HostSideEvent::StoryViewed {
+                    account_id: account.id.clone(),
+                    viewer: viewer_source.cloned(),
+                    viewer_aci: viewer_source_uuid.cloned(),
+                    viewer_name: viewer_name.cloned(),
+                    sent_timestamps: unseen,
+                    viewed_at: when,
+                });
+            }
+        }
+        Ok(events)
+    }
+
+    /// §4.190: the store fold plus its events — one batch against one
+    /// recipient. The unmatched timestamps (no outgoing row anywhere) buffer
+    /// §4.91-style for the row's landing; the blocked ones (rows exist, the
+    /// sender qualified for none) drop, the official warn-and-skip.
+    fn apply_receipt_batch(
+        &mut self,
+        account_id: &str,
+        recipient: &str,
+        timestamps: &[u64],
+        kind: crate::engine::ReceiptKind,
+        when: u64,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let outcome = self
+            .store
+            .apply_peer_receipt(account_id, recipient, timestamps, kind, when)?;
+        let mut events = Vec::new();
+        for record in outcome.moved.iter().chain(&outcome.viewed_confirmed) {
+            // The §4.77 viewed face rides the same event: moved rows carry
+            // their new status plus the first viewed stamp; already-read
+            // rows keep `read` and carry the stamp only.
+            events.push(HostSideEvent::MessageStatusChanged {
+                account_id: record.account_id.clone(),
+                message_id: record.id.clone(),
+                status: record.status,
+                delivered_at: record.delivered_at,
+                read_at: record.read_at,
+                viewed_at: record.viewed_at,
+            });
+        }
+        for (message_id, _) in &outcome.receipts_changed {
+            // The additive per-recipient face: one event per changed message,
+            // carrying the message's whole ledger so the host merge is total.
+            let receipts = self.store.message_receipts_for(account_id, message_id)?;
+            events.push(HostSideEvent::MessageReceiptsChanged {
+                account_id: account_id.to_string(),
+                message_id: message_id.clone(),
+                receipts,
+            });
+        }
+        let matched = outcome.matched_timestamps;
+        let blocked = outcome.blocked_timestamps;
+        let unseen: Vec<u64> = timestamps
+            .iter()
+            .copied()
+            .filter(|timestamp| !matched.contains(timestamp) && !blocked.contains(timestamp))
+            .take(256)
+            .collect();
+        if !unseen.is_empty() {
+            for timestamp in unseen {
+                self.buffer_early_receipt(EarlyReceiptEntry {
+                    account_id: account_id.to_string(),
+                    target_sent_at: timestamp,
+                    recipient: recipient.to_string(),
+                    kind,
+                    when,
+                    buffered_at: now_ms(),
+                });
+            }
+        }
+        Ok(events)
     }
 
     /// The live poll fold (§4.118): a vote or termination addresses the
@@ -9977,80 +10299,38 @@ impl ConnectorService {
                 recipients: recipients.clone(),
             }]);
         }
-        // Story view receipts (contract 1.85, §4.70). A VIEWED receipt is
-        // intercepted before the conversation ladder because its story half
-        // addresses no conversation at all: the viewer may never have
-        // exchanged a direct message with the account, and the old ladder
-        // dropped the whole envelope there. The wire carries no story bit
-        // (the ReceiptMessage proto has none), so the split is local: the
-        // timestamps are tried against the viewer conversation's outgoing
-        // rows first — the §4.29 fold, Viewed still upgrades rows to `read` —
-        // and the timestamps that hit no row are the story-anchored
-        // candidates (own stories are the rowless sends, §4.67). The
-        // desktop's own story timeline is the authoritative join, so the
-        // event claims candidacy, not identity: a stale or deleted-row
-        // timestamp finds no (self, sentAt) match desktop-side and no-ops.
-        // A receipt with no resolvable source has neither a conversation to
-        // fold against nor a viewer the desktop could record — the whole
-        // envelope drops (宁缺勿错), exactly the pre-1.85 fate. The
-        // stories-disabled gate does not apply: it gates incoming story
-        // material, and a view receipt is about the account's own stories.
+        // Contract 1.190 (§4.190): a peer receipt addresses our outgoing rows
+        // by timestamp across conversations — the official account-level
+        // `getMessagesBySentAt` find (MessageReceipts.preload.ts:111-113) —
+        // never the receipt sender's own conversation. Intercepted after
+        // account resolution, before the generic ladder, like the
+        // view-once-open sync family: the pre-1.190 path resolved the
+        // sender's DIRECT conversation and upgraded rows there, so a group
+        // member's receipt never matched the group's rows — the group
+        // dead-letter (Delivered/Read died silently, VIEWED leaked onto
+        // `story.viewed` as a false StoryViewed). One arm now carries every
+        // tier: the ledger stamp, the row ladder, the receiptsChanged event,
+        // the readReceipts gate, the story split (the §4.70 story-viewed face
+        // lives on inside the arm — the wire still carries no story bit, so
+        // the timestamps that match no outgoing row anywhere stay the story
+        // candidates), and the §4.91-style early buffer.
         if let ControlReceive::Receipt {
-            kind: ReceiptKind::Viewed,
+            kind,
             timestamps,
             when,
+            recipient,
         } = &control
         {
-            let Some(peer) = receive.source.as_deref().filter(|s| !s.is_empty()) else {
-                return Ok(Vec::new());
-            };
-            let when = when.unwrap_or_else(crate::link::now_ms);
-            let mut events = Vec::new();
-            let mut unmatched = timestamps.clone();
-            if let Ok(Some(conversation)) =
-                self.store.conversation_by_peer(&account.id, "direct", peer)
-            {
-                let upgraded = self.store.upgrade_outgoing_receipts(
-                    &account.id,
-                    &conversation.id,
-                    timestamps,
-                    ReceiptKind::Viewed,
-                    when,
-                )?;
-                for record in upgraded.moved.iter().chain(&upgraded.viewed_confirmed) {
-                    // The §4.77 viewed face rides the same event: moved rows
-                    // carry their new status plus the first viewed stamp;
-                    // already-read rows keep `read` and carry the stamp only.
-                    events.push(HostSideEvent::MessageStatusChanged {
-                        account_id: record.account_id.clone(),
-                        message_id: record.id.clone(),
-                        status: record.status,
-                        delivered_at: record.delivered_at,
-                        read_at: record.read_at,
-                        viewed_at: record.viewed_at,
-                    });
-                }
-                // A timestamp whose row exists (any status — moved or already
-                // read) is a message receipt, never a story candidate: the
-                // replayed-viewed face must not leak onto the story event.
-                let hits = self.store.existing_outgoing_sent_at(
-                    &account.id,
-                    &conversation.id,
-                    timestamps,
-                )?;
-                unmatched.retain(|timestamp| !hits.contains(timestamp));
-            }
-            if !unmatched.is_empty() {
-                events.push(HostSideEvent::StoryViewed {
-                    account_id: account.id.clone(),
-                    viewer: receive.source.clone(),
-                    viewer_aci: receive.source_uuid.clone(),
-                    viewer_name: receive.peer_name.clone(),
-                    sent_timestamps: unmatched,
-                    viewed_at: when,
-                });
-            }
-            return Ok(events);
+            return self.apply_peer_receipt_event(
+                &account,
+                receive.source.as_ref(),
+                receive.source_uuid.as_ref(),
+                receive.peer_name.as_ref(),
+                *kind,
+                timestamps,
+                *when,
+                recipient.as_deref(),
+            );
         }
         // Resolve the conversation: group id, or peer (incoming source /
         // outgoing destination). Control receives address existing
@@ -10467,37 +10747,11 @@ impl ConnectorService {
                     sender_name: receive.peer_name.clone(),
                 }])
             }
-            ControlReceive::Receipt {
-                kind,
-                timestamps,
-                when,
-            } => {
-                // Contract 1.32: the receipt's arrival instant (envelope
-                // timestamp; connector clock as fallback) stamps the rows the
-                // receipt moves, and each status event carries the stamp it
-                // just wrote.
-                let when = when.unwrap_or_else(crate::link::now_ms);
-                let moved = self
-                    .store
-                    .upgrade_outgoing_receipts(
-                        &account.id,
-                        &conversation.id,
-                        &timestamps,
-                        kind,
-                        when,
-                    )?
-                    .moved;
-                Ok(moved
-                    .into_iter()
-                    .map(|record| HostSideEvent::MessageStatusChanged {
-                        account_id: record.account_id,
-                        message_id: record.id,
-                        status: record.status,
-                        delivered_at: record.delivered_at,
-                        read_at: record.read_at,
-                        viewed_at: record.viewed_at,
-                    })
-                    .collect())
+            // The Receipt variant never reaches the ladder: the §4.190 arm
+            // above intercepts it right after account resolution (the
+            // account-level find addresses no single conversation).
+            ControlReceive::Receipt { .. } => {
+                unreachable!("the receipt arm is intercepted before the ladder")
             }
             ControlReceive::PinMessage {
                 target_author,
@@ -11702,16 +11956,24 @@ impl ConnectorService {
     /// Contract 1.106 (§4.87): forward one `syncMessage.configuration`
     /// projection — the account's own linked device changed the four
     /// official settings flags (the official handleConfiguration face). Pure
-    /// forwarding, no store mirror: the flags live in the engine-side account
-    /// configuration (the §4.45 write face reads them back from there and is
-    /// no-local-persistence by the same discipline), so the connector keeps
-    /// no settings row to mirror into and the event's whole job is to tell
-    /// the host when its own view is stale. Transient.
+    /// forwarding kept the §4.87 no-store-mirror discipline until §4.190
+    /// (contract 1.190) narrowed it: the readReceipts flag now ALSO persists
+    /// onto the account row when the sync states it — the receipt gate's
+    /// local input (the official `shouldDropReceipt` privacy symmetry), too
+    /// cheap to re-ask the engine per receipt and honestly unknown until
+    /// some source answers. The other three flags keep the pure-forwarding
+    /// posture verbatim (no consumer, no mirror); the event's whole job
+    /// stays telling the host when its own view is stale. Transient in every
+    /// other respect.
     fn apply_sync_configuration(
         &mut self,
         account: &AccountRow,
         configuration: &crate::engine::SyncConfigurationFlags,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        if let Some(read_receipts) = configuration.read_receipts {
+            self.store
+                .set_account_read_receipts(&account.id, Some(read_receipts))?;
+        }
         Ok(vec![HostSideEvent::SettingsConfigurationSync {
             account_id: account.id.clone(),
             read_receipts: configuration.read_receipts,
@@ -13958,6 +14220,17 @@ pub struct MessageGetByClientRequestIdParams {
     pub account_id: String,
     pub conversation_id: String,
     pub client_request_id: String,
+}
+
+/// messages.receipts params (contract 1.190, §4.190): the per-recipient
+/// receipt ledger read's addressing triple — the same getText addressing
+/// discipline, read-only.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageGetReceiptsParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -29409,19 +29682,28 @@ mod tests {
         assert_eq!(error.code, "INVALID_REQUEST");
     }
 
-    /// Story view receipts (contract 1.85, §4.70): a VIEWED receipt splits
-    /// at the local row face — timestamps that hit outgoing rows keep the
-    /// §4.29 fold (one statusChanged per real transition, read tier), the
-    /// leftovers ride exactly one transient StoryViewed carrying the viewer
-    /// identity and the contract 1.32 arrival stamp; a replayed viewed
-    /// receipt (row already read) leaks nothing onto the story event; a
-    /// receipt from a conversation-less viewer forwards whole; a READ
-    /// receipt never grows a story leg; the stories-disabled gate does not
-    /// apply; and a source-less envelope drops entirely. Nothing persists.
+    /// Story view receipts (contract 1.85, §4.70; the §4.190 account-level
+    /// find and the additive receiptsChanged face layered on): a VIEWED
+    /// receipt splits at the local row face — timestamps that hit outgoing
+    /// rows keep the §4.29 fold (one statusChanged per real transition, read
+    /// tier, plus the per-recipient ledger's receiptsChanged), the leftovers
+    /// ride exactly one transient StoryViewed carrying the viewer identity
+    /// and the contract 1.32 arrival stamp; a replayed viewed receipt (row
+    /// already read, ledger already stamped) leaks nothing onto the story
+    /// event; a receipt from a conversation-less viewer forwards whole; a
+    /// READ receipt never grows a story leg; the stories-disabled gate does
+    /// not apply; and a source-less envelope drops entirely. Nothing
+    /// persists as a row.
     #[test]
     fn story_viewed_receipt_splits_from_the_read_fold() {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
+        // §4.190 ⑥: the receipt gate is open for this account (the flag's
+        // own faces carry their own tests).
+        service
+            .store_ref()
+            .set_account_read_receipts(&account.id, Some(true))
+            .unwrap();
         seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
 
         let viewed = |source: Option<&str>, timestamps: Vec<u64>| {
@@ -29433,6 +29715,7 @@ mod tests {
                     kind: ReceiptKind::Viewed,
                     timestamps,
                     when: Some(1234),
+                    recipient: source.map(str::to_string),
                 },
             );
             receive.source_uuid = Some("22222222-2222-2222-2222-222222222222".into());
@@ -29445,15 +29728,16 @@ mod tests {
             receive
         };
 
-        // Mixed receipt: 400 hits the outgoing row (folds to read), 1727... is
-        // the own story's timestamp (rowless) and rides the story event.
+        // Mixed receipt: 400 hits the outgoing row (folds to read — the
+        // status event plus the ledger's receiptsChanged), 1727... is the
+        // own story's timestamp (rowless) and rides the story event.
         let events = service
             .ingest_receive(
                 viewed(Some("+15555550101"), vec![400, 1727000000000]),
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
             .unwrap();
-        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events.len(), 3, "{events:?}");
         assert!(matches!(
             &events[0],
             HostSideEvent::MessageStatusChanged {
@@ -29462,6 +29746,10 @@ mod tests {
                 ..
             }
         ));
+        assert!(
+            matches!(&events[1], HostSideEvent::MessageReceiptsChanged { .. }),
+            "the ledger change rides beside the status fold"
+        );
         let HostSideEvent::StoryViewed {
             account_id: event_account,
             viewer,
@@ -29469,7 +29757,7 @@ mod tests {
             viewer_name,
             sent_timestamps,
             viewed_at,
-        } = &events[1]
+        } = &events[2]
         else {
             panic!("expected a StoryViewed event: {events:?}");
         };
@@ -29522,6 +29810,7 @@ mod tests {
                 kind: ReceiptKind::Read,
                 timestamps: vec![1727000000003],
                 when: Some(1234),
+                recipient: Some("+15555550101".into()),
             },
         );
         read.source_uuid = Some("22222222-2222-2222-2222-222222222222".into());
@@ -33778,11 +34067,17 @@ mod tests {
     /// ladder and projects `viewedAt` — the row it moves carries the stamp
     /// on its `message.statusChanged`, an already-read row answers a
     /// stamp-only event, a pure replay stays silent, and the stamps persist
-    /// on the row projection.
+    /// on the row projection. §4.190: each fold also answers the additive
+    /// per-recipient `message.receiptsChanged` beside the status event.
     #[test]
     fn viewed_receipt_projects_viewed_at_on_events_and_rows() {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
+        // §4.190 ⑥: the receipt gate is open for this account.
+        service
+            .store_ref()
+            .set_account_read_receipts(&account.id, Some(true))
+            .unwrap();
         seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
         // A second sent row, seeded directly (seed_outgoing_sent's fixed
         // clientRequestId makes it a one-shot per conversation).
@@ -33838,6 +34133,7 @@ mod tests {
                     kind: ReceiptKind::Viewed,
                     timestamps,
                     when: Some(when),
+                    recipient: Some("+15555550101".into()),
                 },
             )
         };
@@ -33846,7 +34142,7 @@ mod tests {
         let events = service
             .ingest_receive(viewed(vec![400], 1234), crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
-        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events.len(), 2, "{events:?}");
         assert!(matches!(
             &events[0],
             HostSideEvent::MessageStatusChanged {
@@ -33855,6 +34151,10 @@ mod tests {
                 viewed_at: Some(1234),
                 ..
             }
+        ));
+        assert!(matches!(
+            &events[1],
+            HostSideEvent::MessageReceiptsChanged { .. }
         ));
         let row = service
             .list_messages(&account.id, &conversation.id, 10, None)
@@ -33890,12 +34190,13 @@ mod tests {
                 kind: ReceiptKind::Read,
                 timestamps: vec![401],
                 when: Some(2000),
+                recipient: Some("+15555550101".into()),
             },
         );
         let events = service
             .ingest_receive(read, crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
-        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events.len(), 2, "{events:?}");
         assert!(matches!(
             &events[0],
             HostSideEvent::MessageStatusChanged {
@@ -33911,7 +34212,7 @@ mod tests {
         let events = service
             .ingest_receive(viewed(vec![401], 3000), crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
-        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events.len(), 2, "{events:?}");
         assert!(matches!(
             &events[0],
             HostSideEvent::MessageStatusChanged {
@@ -35478,11 +35779,17 @@ mod tests {
     /// Peer receipts upgrade earlier outgoing rows monotonically
     /// (sent → delivered → read): a lower tier never downgrades a higher
     /// one, incoming rows stay put, and only real transitions emit
-    /// message.statusChanged.
+    /// message.statusChanged (each with the additive §4.190 receiptsChanged
+    /// beside it).
     #[test]
     fn inbound_receipts_upgrade_outgoing_rows_monotonically() {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
+        // §4.190 ⑥: the receipt gate is open for this account.
+        service
+            .store_ref()
+            .set_account_read_receipts(&account.id, Some(true))
+            .unwrap();
         seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
         // An incoming row the receipts must never touch.
         service
@@ -35532,6 +35839,7 @@ mod tests {
                     kind,
                     timestamps: vec![400],
                     when: Some(1234),
+                    recipient: Some("+15555550101".into()),
                 },
             )
         };
@@ -35541,7 +35849,7 @@ mod tests {
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
             .unwrap();
-        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered.len(), 2);
         assert!(matches!(
             &delivered[0],
             HostSideEvent::MessageStatusChanged { status, .. } if *status == "delivered"
@@ -35550,7 +35858,7 @@ mod tests {
         let read = service
             .ingest_receive(receipt(ReceiptKind::Read), crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
-        assert_eq!(read.len(), 1);
+        assert_eq!(read.len(), 2);
         assert!(matches!(
             &read[0],
             HostSideEvent::MessageStatusChanged { status, .. } if *status == "read"
@@ -35580,11 +35888,16 @@ mod tests {
     /// Receipt envelopes carrying a `when` stamp the delivered/read timeline
     /// (contract 1.32): the first stamp wins, a replayed receipt neither
     /// re-stamps nor re-emits, and reloaded rows keep both stamps for the
-    /// host projection.
+    /// host projection (the §4.190 receiptsChanged rides beside each fold).
     #[test]
     fn receipts_stamp_the_delivered_read_timeline_once() {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
+        // §4.190 ⑥: the receipt gate is open for this account.
+        service
+            .store_ref()
+            .set_account_read_receipts(&account.id, Some(true))
+            .unwrap();
         seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
 
         let receipt = |kind, when: u64| {
@@ -35595,6 +35908,7 @@ mod tests {
                     kind,
                     timestamps: vec![400],
                     when: Some(when),
+                    recipient: Some("+15555550101".into()),
                 },
             )
         };
@@ -35605,7 +35919,7 @@ mod tests {
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
             .unwrap();
-        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered.len(), 2);
         assert!(matches!(
             &delivered[0],
             HostSideEvent::MessageStatusChanged { status, delivered_at, read_at, .. }
@@ -35620,7 +35934,7 @@ mod tests {
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
             .unwrap();
-        assert_eq!(read.len(), 1);
+        assert_eq!(read.len(), 2);
         assert!(matches!(
             &read[0],
             HostSideEvent::MessageStatusChanged { status, delivered_at, read_at, .. }
@@ -35671,6 +35985,7 @@ mod tests {
                         kind: ReceiptKind::Delivered,
                         timestamps: vec![400],
                         when: None,
+                        recipient: Some("+15555550101".into()),
                     },
                 ),
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -35678,7 +35993,7 @@ mod tests {
             .unwrap();
         let after = crate::link::now_ms();
 
-        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered.len(), 2);
         let fallback = match &delivered[0] {
             HostSideEvent::MessageStatusChanged {
                 status,
@@ -35705,6 +36020,344 @@ mod tests {
         assert_eq!(outgoing.status, "delivered");
         assert_eq!(outgoing.delivered_at, Some(fallback));
         assert_eq!(outgoing.read_at, None);
+    }
+
+    /// Contract 1.190 (§4.190 ②) — the group dead-letter fix, service face:
+    /// a group member's DELIVERED receipt (their own direct conversation
+    /// holds no such row and may not even exist) finds the GROUP's outgoing
+    /// row through the account-level find, answers one statusChanged plus
+    /// one receiptsChanged, and the `messages.receipts` read face serves the
+    /// stamped ledger. The pre-1.190 path resolved the sender's direct
+    /// conversation and died there.
+    #[test]
+    fn group_peer_receipt_lands_the_group_row_and_serves_the_ledger() {
+        let (_temp, mut service) = service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "Z3JvdXAta2V5", "Group")
+            .unwrap();
+        let row = MessageRecord {
+            id: "m-group-400".into(),
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            direction: "outgoing",
+            sender_id: account.id.clone(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 400,
+            received_at: None,
+            text: Some("group body".into()),
+            text_bytes: Some(11),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "sent",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        assert!(
+            service
+                .store_ref()
+                .insert_message(&row, None, row.text.as_deref(), true)
+                .unwrap()
+        );
+
+        let events = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550201",
+                    ControlReceive::Receipt {
+                        kind: ReceiptKind::Delivered,
+                        timestamps: vec![400],
+                        when: Some(1234),
+                        recipient: Some("+15555550201".into()),
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            HostSideEvent::MessageStatusChanged { status, .. } if *status == "delivered"
+        ));
+        let HostSideEvent::MessageReceiptsChanged {
+            account_id: ledger_account,
+            message_id,
+            receipts,
+        } = &events[1]
+        else {
+            panic!("expected the ledger event: {events:?}");
+        };
+        assert_eq!(ledger_account, &account.id);
+        assert_eq!(message_id, "m-group-400");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].recipient, "+15555550201");
+        assert_eq!(receipts[0].delivered_at, Some(1234));
+
+        // The read face serves the same ledger through the conversation's
+        // addressing, and refuses a foreign conversation honestly.
+        let items = service
+            .get_message_receipts(&account.id, &group.id, "m-group-400")
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].recipient, "+15555550201");
+        assert!(matches!(
+            service.get_message_receipts(&account.id, "acct-none", "m-group-400"),
+            Err(ServiceError::Store(StoreError::MessageNotFound))
+        ));
+    }
+
+    /// Contract 1.190 (§4.190 ⑥): the official `shouldDropReceipt` privacy
+    /// symmetry — DELIVERY receipts land regardless of the account's
+    /// readReceipts flag; READ and VIEWED receipts drop while the flag is
+    /// off or unanswered (unknown = the official falsy parity) and land the
+    /// moment it is on.
+    #[test]
+    fn read_viewed_receipts_are_gated_by_the_read_receipts_flag() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
+        let receipt = |kind, when: u64| {
+            control_receive(
+                "+15555550100",
+                "+15555550101",
+                ControlReceive::Receipt {
+                    kind,
+                    timestamps: vec![400],
+                    when: Some(when),
+                    recipient: Some("+15555550101".into()),
+                },
+            )
+        };
+
+        // Flag unanswered: READ and VIEWED drop, DELIVERY lands.
+        assert!(
+            service
+                .ingest_receive(
+                    receipt(ReceiptKind::Read, 1000),
+                    crate::DEFAULT_PROXY_GROUP_ID
+                )
+                .unwrap()
+                .is_empty(),
+            "an unanswered flag reads off — the official falsy parity"
+        );
+        assert!(
+            service
+                .ingest_receive(
+                    receipt(ReceiptKind::Viewed, 1001),
+                    crate::DEFAULT_PROXY_GROUP_ID
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let delivered = service
+            .ingest_receive(
+                receipt(ReceiptKind::Delivered, 1002),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(delivered.len(), 2, "delivery receipts are never gated");
+
+        // Flag on: the READ receipt lands.
+        service
+            .store_ref()
+            .set_account_read_receipts(&account.id, Some(true))
+            .unwrap();
+        let read = service
+            .ingest_receive(
+                receipt(ReceiptKind::Read, 1003),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(read.len(), 2);
+
+        // Flag off again: a fresh row's READ receipts drop once more.
+        service
+            .store_ref()
+            .set_account_read_receipts(&account.id, Some(false))
+            .unwrap();
+        let second = MessageRecord {
+            id: "m-gate-401".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "outgoing",
+            sender_id: account.id.clone(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 401,
+            received_at: None,
+            text: Some("gate probe".into()),
+            text_bytes: Some(10),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "sent",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        assert!(
+            service
+                .store_ref()
+                .insert_message(&second, None, second.text.as_deref(), true)
+                .unwrap()
+        );
+        assert!(
+            service
+                .ingest_receive(
+                    control_receive(
+                        "+15555550100",
+                        "+15555550101",
+                        ControlReceive::Receipt {
+                            kind: ReceiptKind::Read,
+                            timestamps: vec![401],
+                            when: Some(1004),
+                            recipient: Some("+15555550101".into()),
+                        },
+                    ),
+                    crate::DEFAULT_PROXY_GROUP_ID,
+                )
+                .unwrap()
+                .is_empty(),
+            "the gate closes with the flag"
+        );
+    }
+
+    /// Contract 1.190 (§4.190 ③): a receipt that arrives before its outgoing
+    /// row (the multi-device transcript race) buffers §4.91-style — no
+    /// events, nothing dropped — and the row's landing flushes it: the
+    /// statusChanged and receiptsChanged ride after the upsert, and a
+    /// receipt whose row never lands dies at the TTL (the official
+    /// `forMessage` early face).
+    #[test]
+    fn early_peer_receipt_buffers_and_flushes_on_row_landing() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        service
+            .store_ref()
+            .set_account_read_receipts(&account.id, Some(true))
+            .unwrap();
+
+        // The receipt finds no row anywhere: it buffers, silently.
+        let events = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::Receipt {
+                        kind: ReceiptKind::Delivered,
+                        timestamps: vec![450],
+                        when: Some(1234),
+                        recipient: Some("+15555550101".into()),
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(events.is_empty(), "an early receipt emits nothing yet");
+        assert_eq!(service.early_receipts.len(), 1);
+
+        // The multi-device transcript lands the outgoing row at 450: the
+        // flush replays the buffered receipt after the upsert.
+        let events = service
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(450),
+                    content_kind: "dataMessage",
+                    direction: "outgoing",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550101".into()),
+                    source_uuid: None,
+                    peer_name: None,
+                    group_id: None,
+                    text: Some("transcript body".into()),
+                    text_bytes: Some(15),
+                    text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    rich: None,
+                    sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
+                    control: None,
+                    server_guid: None,
+                    reporting_token: None,
+                    server_timestamp: None,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(HostSideEvent::MessageUpserted(_))
+        ));
+        let statuses = events
+            .iter()
+            .filter(|event| matches!(event, HostSideEvent::MessageStatusChanged { .. }))
+            .count();
+        let ledgers = events
+            .iter()
+            .filter(|event| matches!(event, HostSideEvent::MessageReceiptsChanged { .. }))
+            .count();
+        assert_eq!(statuses, 1, "the flush moves the row: {events:?}");
+        assert_eq!(ledgers, 1, "the flush stamps the ledger: {events:?}");
+        assert!(
+            service.early_receipts.is_empty(),
+            "the flush drained the buffer"
+        );
+
+        // The landed row carries the receipt's stamp.
+        let row = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|row| row.sent_at == 450)
+            .unwrap();
+        assert_eq!(row.status, "delivered");
+        assert_eq!(row.delivered_at, Some(1234));
     }
 
     /// Peer edits snapshot the body they replace (contract 1.32): each

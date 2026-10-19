@@ -740,6 +740,21 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// messages.receipts (contract 1.190, §4.190 ⑤): the per-recipient
+    /// receipt ledger read, delegated to the account's supervisor like every
+    /// store-only read face.
+    pub async fn get_message_receipts(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_id: String,
+    ) -> Result<Vec<crate::store::RecipientReceiptRow>, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .get_message_receipts(account_id, conversation_id, message_id)
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn send_text(
         &self,

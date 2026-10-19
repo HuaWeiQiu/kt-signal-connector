@@ -14,7 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 29;
+const SCHEMA_VERSION: i64 = 30;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -165,7 +165,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   last_message_at INTEGER,
   unread_count INTEGER NOT NULL DEFAULT 0,
   proxy_group TEXT NOT NULL DEFAULT 'default',
-  aci TEXT
+  aci TEXT,
+  read_receipts_enabled INTEGER
 );
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
@@ -228,6 +229,8 @@ CREATE INDEX IF NOT EXISTS messages_conversation_sent_at
   ON messages(conversation_id, sent_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS messages_signal_identity_v2
   ON messages(account_id, conversation_id, direction, sent_at, sender_id);
+CREATE INDEX IF NOT EXISTS messages_account_sent_at
+  ON messages(account_id, sent_at);
 CREATE INDEX IF NOT EXISTS conversations_account_last_message
   ON conversations(account_id, last_message_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS account_delete_operations (
@@ -347,6 +350,18 @@ CREATE TABLE IF NOT EXISTS history_import_stage_chats (
   expire_timer_ms INTEGER,
   PRIMARY KEY(account_id, id),
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS message_receipts (
+  message_id TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  sent_at INTEGER,
+  failed_at INTEGER,
+  delivered_at INTEGER,
+  read_at INTEGER,
+  viewed_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(message_id, recipient),
+  FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
 );
 ";
 /// DDL that must run after [`migrate_schema`], not in [`SCHEMA_DDL`], because
@@ -1142,6 +1157,192 @@ fn aci_for_phone_key_on(
     }
 }
 
+/// Contract 1.190 (§4.190): one peer key's full identity set — the key
+/// itself, its alternate phone spelling (§4.144 two forms), the ACI(s) the
+/// `peer_identities` table holds for either spelling, and — when the key is
+/// itself ACI-shaped — every peer key observed under it. This is the
+/// `groups_in_common` identity ladder extracted for reuse: the receipt fold
+/// resolves both the recipient's identities and each candidate row's
+/// conversation identities through the same set, so a member known by any
+/// observed spelling matches (the official `sourceConversationId` fold in
+/// miniature). Read-only, no cache (one source, the §4.97 posture).
+fn peer_identity_set(
+    conn: &Connection,
+    account_id: &str,
+    peer_key: &str,
+) -> Result<std::collections::BTreeSet<String>, StoreError> {
+    let mut identities = std::collections::BTreeSet::from([peer_key.to_string()]);
+    if let Some(alternate) = alternate_phone_spelling(peer_key) {
+        identities.insert(alternate);
+    }
+    let mut acis = Vec::new();
+    for key in identities.iter() {
+        if let Some(aci) = aci_for_phone_key_on(conn, account_id, key)? {
+            acis.push(aci);
+        }
+    }
+    identities.extend(acis);
+    if crate::engine::is_uuid_shaped(peer_key) {
+        let mut stmt = conn
+            .prepare("SELECT peer_key FROM peer_identities WHERE account_id=?1 AND aci=?2")
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id, peer_key], |row| row.get::<_, String>(0))
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        identities.extend(rows);
+    }
+    Ok(identities)
+}
+
+/// Contract 1.190 (§4.190): does the group's captured roster carry the
+/// recipient under any of their identities? The roster is the sync capture's
+/// `contacts` extra (`members[].id`/`uuid`, bounded by the capture cap); a
+/// malformed, absent, or empty roster answers `true` — the honest degraded
+/// accept, because refusing on an unknown roster would resurrect the group
+/// dead-letter this batch fixes (every engine-mode group captured before the
+/// roster face, every roster-less group). A KNOWN roster that does not carry
+/// the sender answers `false` — the official `getTargetMessage` non-recipient
+/// skip: a receipt from a non-member never stamps the group's rows.
+fn group_roster_carries(
+    conn: &Connection,
+    account_id: &str,
+    group_key: &str,
+    recipient_identities: &std::collections::BTreeSet<String>,
+) -> Result<bool, StoreError> {
+    let extra: Option<String> = conn
+        .query_row(
+            "SELECT extra FROM contacts WHERE account_id=?1 AND kind='group' AND peer_key=?2",
+            params![account_id, group_key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::Unavailable(Some(error)))?
+        .flatten();
+    let Some(members) = extra
+        .as_deref()
+        .and_then(|extra| serde_json::from_str::<serde_json::Value>(extra).ok())
+        .and_then(|extra| extra.get("members").cloned())
+        .and_then(|members| members.as_array().cloned())
+    else {
+        return Ok(true);
+    };
+    if members.is_empty() {
+        return Ok(true);
+    }
+    Ok(members
+        .iter()
+        .take(crate::service::MAX_GROUP_MEMBERS)
+        .any(|entry| {
+            entry.as_object().is_some_and(|object| {
+                ["id", "uuid"].iter().any(|key| {
+                    object
+                        .get(*key)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| recipient_identities.contains(value))
+                })
+            })
+        }))
+}
+
+/// Contract 1.190 (§4.190 ①): first-stamp one recipient's ledger row with
+/// the receipt's tier and answer the row's current face — `None` when
+/// nothing changed (a replay, a tier already stamped, or the recipient
+/// ceiling refusing a new row). First stamp wins on every tier: the UPDATE
+/// COALESCEs each stamp so a later or replayed receipt never re-stamps, and
+/// the changed detection reads the row first so the face only surfaces on a
+/// real transition (the official `sendStateReducer` monotonicity — a tier
+/// never regresses, an earlier-tier receipt after a later tier is a no-op).
+fn ledger_stamp_receipt(
+    transaction: &Connection,
+    message_id: &str,
+    recipient: &str,
+    receipt: crate::engine::ReceiptKind,
+    when: u64,
+) -> Result<Option<Vec<RecipientReceiptRow>>, StoreError> {
+    let tier = |row: &RecipientReceiptRow| -> Option<u64> {
+        match receipt {
+            crate::engine::ReceiptKind::Delivered => row.delivered_at,
+            crate::engine::ReceiptKind::Read => row.read_at,
+            crate::engine::ReceiptKind::Viewed => row.viewed_at,
+        }
+    };
+    let existing: Option<RecipientReceiptRow> = transaction
+        .query_row(
+            "SELECT recipient, sent_at, failed_at, delivered_at, read_at, viewed_at
+             FROM message_receipts WHERE message_id=?1 AND recipient=?2",
+            params![message_id, recipient],
+            |row| {
+                Ok(RecipientReceiptRow {
+                    recipient: row.get(0)?,
+                    sent_at: row.get::<_, Option<i64>>(1)?.map(|v| v.max(0) as u64),
+                    failed_at: row.get::<_, Option<i64>>(2)?.map(|v| v.max(0) as u64),
+                    delivered_at: row.get::<_, Option<i64>>(3)?.map(|v| v.max(0) as u64),
+                    read_at: row.get::<_, Option<i64>>(4)?.map(|v| v.max(0) as u64),
+                    viewed_at: row.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u64),
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let row = match existing {
+        Some(row) => row,
+        None => {
+            let count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM message_receipts WHERE message_id=?1",
+                    params![message_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if count >= MAX_MESSAGE_RECEIPT_RECIPIENTS {
+                return Ok(None);
+            }
+            transaction
+                .execute(
+                    "INSERT INTO message_receipts(message_id, recipient, updated_at)
+                     VALUES(?1, ?2, ?3)",
+                    params![message_id, recipient, when as i64],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            RecipientReceiptRow {
+                recipient: recipient.to_string(),
+                ..RecipientReceiptRow::default()
+            }
+        }
+    };
+    if tier(&row).is_some() {
+        // Already stamped at this or a later tier — nothing changes, not even
+        // `updated_at` (a replay is not an update).
+        return Ok(None);
+    }
+    let (delivered, read, viewed) = match receipt {
+        crate::engine::ReceiptKind::Delivered => (Some(when), None, None),
+        crate::engine::ReceiptKind::Read => (None, Some(when), None),
+        crate::engine::ReceiptKind::Viewed => (None, None, Some(when)),
+    };
+    transaction
+        .execute(
+            "UPDATE message_receipts
+             SET delivered_at=COALESCE(delivered_at, ?3),
+                 read_at=COALESCE(read_at, ?4),
+                 viewed_at=COALESCE(viewed_at, ?5),
+                 updated_at=?6
+             WHERE message_id=?1 AND recipient=?2",
+            params![message_id, recipient, delivered, read, viewed, when as i64],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(Some(vec![RecipientReceiptRow {
+        recipient: recipient.to_string(),
+        sent_at: row.sent_at,
+        failed_at: row.failed_at,
+        delivered_at: row.delivered_at.or(delivered),
+        read_at: row.read_at.or(read),
+        viewed_at: row.viewed_at.or(viewed),
+    }]))
+}
+
 /// One summary row's derived identifiers (§4.129): each leg absent-key on
 /// the wire.
 #[derive(Clone, Debug, Default)]
@@ -1511,15 +1712,69 @@ pub struct MessageEditEntry {
 /// shape the engine normalization produces).
 pub type MessageQuoteSnapshot = crate::engine::NormalizedQuote;
 
-/// The outcome of `upgrade_outgoing_receipts` (contract 1.94, §4.77): rows
-/// whose status actually moved, plus — for a VIEWED receipt only — rows that
-/// were already `read` but had never been viewed-stamped and took their
-/// first `viewed_at` now. A row appears in at most one face; a replayed
-/// receipt that changes nothing appears in neither.
+/// One per-recipient ledger row of the receipt face (contract 1.190, §4.190):
+/// the recipient's identity key — the receipt envelope's source as the engine
+/// projected it (E.164 preferred, the ACI string as the fallback spelling) —
+/// beside every tier's FIRST stamp and the send-settlement seeds. Absent
+/// stamps are honest absents: never backfilled, never invented, and a
+/// pre-1.190 row never appears here at all (the aggregate stamps on the
+/// message row keep serving those rows). Serialized camelCase by the host
+/// layer; skip-when-none keeps each tier's wire face total.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipientReceiptRow {
+    pub recipient: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewed_at: Option<u64>,
+}
+
+/// The outcome of `apply_peer_receipt` (contract 1.190, §4.190; the
+/// conversation-scoped pre-1.190 ladder's two faces carried forward):
+/// `moved` rows actually transitioned, `viewed_confirmed` rows already `read`
+/// that took their first `viewed_at` now, `receipts_changed` the per-message
+/// ledger faces whose rows changed (the `message.receiptsChanged` payload),
+/// and the timestamp split for the story/early-buffer arms — `matched`
+/// stamped at least one qualifying row, `blocked` found outgoing rows
+/// account-wide but the sender qualified for none of them (the official
+/// `getTargetMessage` non-recipient warn-and-skip,
+/// MessageReceipts.preload.ts:330-365), and everything else matched no row
+/// at all (§4.70's story candidates on the VIEWED leg, the §4.91-style
+/// early-buffer candidates on every leg).
 #[derive(Debug, Default)]
-pub struct UpgradedReceipts {
+pub struct PeerReceiptOutcome {
     pub moved: Vec<MessageRecord>,
     pub viewed_confirmed: Vec<MessageRecord>,
+    pub receipts_changed: Vec<(String, Vec<RecipientReceiptRow>)>,
+    pub matched_timestamps: Vec<u64>,
+    pub blocked_timestamps: Vec<u64>,
+}
+
+/// Contract 1.190 (§4.190): the ledger's per-message recipient ceiling — the
+/// same bound the roster capture takes (the `MAX_GROUP_MEMBERS` GroupsV2
+/// ceiling, the store-side spelling). A group send can address no more
+/// recipients than a group can hold, so a ledger that reached the ceiling is
+/// a pathological or hostile store and further recipients skip the ledger
+/// (warn-free, the hostile-roster discipline) while the row-level aggregate
+/// ladder keeps working.
+pub const MAX_MESSAGE_RECEIPT_RECIPIENTS: i64 = 1001;
+
+/// One send-settlement seed entry (contract 1.190 §4.190, the optional arm):
+/// the engine `send` reply's per-recipient result — the recipient number the
+/// engine named and whether that leg settled Sent or Failed (§4.173's
+/// `{recipientNumber, success|failure}` shape, expanded out of its counted
+/// form).
+#[derive(Clone, Debug)]
+pub struct SendReceiptSeed {
+    pub recipient: String,
+    pub succeeded: bool,
 }
 
 /// One attachment descriptor (metadata only, §4.13; same wire shape the
@@ -5131,32 +5386,13 @@ impl Store {
         peer_key: &str,
     ) -> Result<Vec<CommonGroupRow>, StoreError> {
         let conn = self.lock_conn()?;
-        // The contact's identity set: the peer key itself, its alternate
-        // phone spelling, the ACI the identity table holds for either
-        // spelling (the §4.144 two-form resolution), and — when the peer key
-        // is itself an ACI — every peer key observed under it.
-        let mut identities = std::collections::BTreeSet::from([peer_key.to_string()]);
-        if let Some(alternate) = alternate_phone_spelling(peer_key) {
-            identities.insert(alternate);
-        }
-        let mut acis = Vec::new();
-        for key in identities.iter() {
-            if let Some(aci) = aci_for_phone_key_on(&conn, account_id, key)? {
-                acis.push(aci);
-            }
-        }
-        identities.extend(acis);
-        if crate::engine::is_uuid_shaped(peer_key) {
-            let mut stmt = conn
-                .prepare("SELECT peer_key FROM peer_identities WHERE account_id=?1 AND aci=?2")
-                .map_err(|error| StoreError::Unavailable(Some(error)))?;
-            let rows = stmt
-                .query_map(params![account_id, peer_key], |row| row.get::<_, String>(0))
-                .map_err(|error| StoreError::Unavailable(Some(error)))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| StoreError::Unavailable(Some(error)))?;
-            identities.extend(rows);
-        }
+        // The contact's identity set (the ladder §4.190 extracted into
+        // `peer_identity_set` for the receipt fold's reuse): the peer key
+        // itself, its alternate phone spelling, the ACI the identity table
+        // holds for either spelling (the §4.144 two-form resolution), and —
+        // when the peer key is itself an ACI — every peer key observed under
+        // it.
+        let identities = peer_identity_set(&conn, account_id, peer_key)?;
         let mut stmt = conn
             .prepare(
                 "SELECT peer_key, title, extra FROM contacts
@@ -6211,115 +6447,126 @@ impl Store {
         Ok(record.map(|record| (record, changed)))
     }
 
-    /// Which of the given upstream timestamps exist as outgoing rows in one
-    /// conversation (contract 1.85, §4.70): the story-viewed split's hit
-    /// face. A timestamp that hits any outgoing row — whatever its status —
-    /// is a message receipt, so a replayed `read`-already receipt never
-    /// leaks onto the story-viewed event; the leftovers are the story
-    /// candidates. Input order preserved, bounded at the same 256 the
-    /// receipt upgrade takes.
-    pub fn existing_outgoing_sent_at(
+    /// The account-level receipt fold (contract 1.190, §4.190): one peer's
+    /// receipt for the given upstream timestamps, applied against the
+    /// account's outgoing rows wherever they live — the official
+    /// `getMessagesBySentAt` find (MessageReceipts.preload.ts:111-113), which
+    /// fixes the group dead-letter: the pre-1.190 path resolved the receipt
+    /// sender's DIRECT conversation and upgraded rows there
+    /// (`upgrade_outgoing_receipts`), so a group member's receipt never
+    /// matched the group's rows — Delivered/Read died silently and VIEWED
+    /// leaked onto `story.viewed`.
+    ///
+    /// Per timestamp, the candidate rows (outgoing, `sent_at` equal, at most
+    /// 8 — the pre-1.190 read bound) are qualified against the recipient:
+    /// a direct row takes the receipt only when the sender resolves to the
+    /// conversation's peer identity set (the §4.144 two-form phone ladder +
+    /// §4.37 `peer_identities`, the `groups_in_common` identity resolution in
+    /// reverse), a group row when the captured roster carries the sender
+    /// (`id`/`uuid`, the roster capture's bound) — a group with no captured
+    /// roster accepts every sender (the honest degraded face; refusing would
+    /// resurrect the dead-letter for every engine-mode group). The official
+    /// parity is `getTargetMessage`'s sendState membership probe
+    /// (MessageReceipts.preload.ts:330-365).
+    ///
+    /// A qualifying row takes both faces in one transaction: the per-recipient
+    /// ledger's tier first-stamp (COALESCE — a replay never re-stamps, the
+    /// official `sendStateReducer` monotonicity) and the row's aggregate
+    /// ladder — `pending|sent` → `delivered` → `read`, VIEWED riding to
+    /// `read` plus the §4.77 `viewed_at` first stamp with the
+    /// `viewed_confirmed` face. Failed and non-outgoing rows stay untouched;
+    /// a receipt never downgrades. The ledger is capped at
+    /// [`MAX_MESSAGE_RECEIPT_RECIPIENTS`] rows per message; over the cap the
+    /// row ladder continues while the ledger skips (the roster bound).
+    pub fn apply_peer_receipt(
         &self,
         account_id: &str,
-        conversation_id: &str,
-        target_sent_at: &[u64],
-    ) -> Result<Vec<u64>, StoreError> {
-        if target_sent_at.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.lock_conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT 1 FROM messages
-                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
-                   AND direction='outgoing'
-                 LIMIT 1",
-            )
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let mut hits = Vec::new();
-        for timestamp in target_sent_at.iter().copied().take(256) {
-            let found = stmt
-                .query_row(
-                    params![account_id, conversation_id, timestamp as i64],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(|error| StoreError::Unavailable(Some(error)))?;
-            if found.is_some() {
-                hits.push(timestamp);
-            }
-        }
-        Ok(hits)
-    }
-
-    /// Upgrade earlier outgoing rows on an inbound peer receipt (delivery /
-    /// read / viewed). The status ladder is monotonic — `pending|sent` →
-    /// `delivered` → `read` — and a receipt never downgrades a row (`read`
-    /// over `delivered`), never touches terminal or non-outgoing rows. `when`
-    /// is the receipt's arrival instant (envelope timestamp, contract 1.32)
-    /// and stamps `delivered_at` / `read_at` on the rows the receipt actually
-    /// moves — first stamp wins, a replayed or later receipt never re-stamps.
-    /// A VIEWED receipt (contract 1.94, §4.77) rides the same ladder to
-    /// `read` and additionally first-stamps `viewed_at` on every hit row in
-    /// the read-upgrade eligibility set (`pending|sent|delivered|read`;
-    /// failed rows never take the stamp): rows the receipt moves carry the
-    /// stamp inside `moved`, rows already `read` that take their first stamp
-    /// surface as `viewed_confirmed`, and a pure replay (already read,
-    /// already stamped) produces neither. The two faces let the service emit
-    /// one `message.statusChanged` per real transition, viewed included.
-    pub fn upgrade_outgoing_receipts(
-        &self,
-        account_id: &str,
-        conversation_id: &str,
+        recipient: &str,
         target_sent_at: &[u64],
         receipt: crate::engine::ReceiptKind,
         when: u64,
-    ) -> Result<UpgradedReceipts, StoreError> {
-        if target_sent_at.is_empty() {
-            return Ok(UpgradedReceipts::default());
+    ) -> Result<PeerReceiptOutcome, StoreError> {
+        if target_sent_at.is_empty() || recipient.is_empty() {
+            return Ok(PeerReceiptOutcome::default());
         }
-        // Ranked per row: the target tier only applies when every earlier
-        // tier is already past (or the row is still below it).
+        // Ranked per row exactly like the pre-1.190 ladder: the target tier
+        // only applies when every earlier tier is already past (or the row is
+        // still below it).
         let target = receipt.as_str();
         let stamp_viewed = matches!(receipt, crate::engine::ReceiptKind::Viewed);
         let conn = self.lock_conn()?;
         let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let mut moved = Vec::new();
-        let mut viewed_confirmed = Vec::new();
+        let mut outcome = PeerReceiptOutcome::default();
         {
             let mut stmt = transaction
                 .prepare(
-                    "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
-                            received_at, body, body_bytes, body_truncated, status,
-                            quote_message_id, client_request_id, quote_snapshot,
-                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json
-                     FROM messages
-                     WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
-                       AND direction='outgoing'
-                     ORDER BY id ASC LIMIT 8",
+                    "SELECT m.id, m.account_id, m.conversation_id, m.direction, m.sender_id,
+                            m.sent_at, m.received_at, m.body, m.body_bytes, m.body_truncated, m.status,
+                            m.quote_message_id, m.client_request_id, m.quote_snapshot,
+                            m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
+                            m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
+                            m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid,
+                            m.server_timestamp, m.viewed_at, m.send_outcomes_json,
+                            c.kind, c.peer_key
+                     FROM messages m
+                     JOIN conversations c ON c.id = m.conversation_id
+                     WHERE m.account_id=?1 AND m.sent_at=?2 AND m.direction='outgoing'
+                     ORDER BY m.id ASC LIMIT 8",
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            // The recipient's identity set, built once: both phone spellings, the
+            // ACI(s) the identity table holds for either, and — for an ACI-shaped
+            // source — every peer key observed under it (the engine-mode groups'
+            // members are ACI strings).
+            let recipient_identities = peer_identity_set(&transaction, account_id, recipient)?;
             for timestamp in target_sent_at.iter().copied().take(256) {
-                let rows: Vec<MessageRecord> = stmt
-                    .query_map(
-                        params![account_id, conversation_id, timestamp as i64],
-                        message_record_from_row,
-                    )
+                let rows: Vec<(MessageRecord, String, String)> = stmt
+                    .query_map(params![account_id, timestamp as i64], |row| {
+                        let record = message_record_from_row(row)?;
+                        Ok((record, row.get::<_, String>(30)?, row.get::<_, String>(31)?))
+                    })
                     .map_err(|error| StoreError::Unavailable(Some(error)))?
                     .collect::<Result<_, _>>()
                     .map_err(|error| StoreError::Unavailable(Some(error)))?;
-                for record in rows {
+                if rows.is_empty() {
+                    continue;
+                }
+                let mut qualified_any = false;
+                for (record, kind, peer_key) in rows {
+                    let qualified = if kind == "direct" {
+                        peer_identity_set(&transaction, account_id, &peer_key)?
+                            .intersection(&recipient_identities)
+                            .next()
+                            .is_some()
+                    } else {
+                        group_roster_carries(
+                            &transaction,
+                            account_id,
+                            &peer_key,
+                            &recipient_identities,
+                        )?
+                    };
+                    if !qualified {
+                        continue;
+                    }
+                    qualified_any = true;
+                    // The per-recipient ledger first-stamp (§4.190 ①): the tier's
+                    // COALESCE stamp plus the current face for the changed event.
+                    if let Some(face) =
+                        ledger_stamp_receipt(&transaction, &record.id, recipient, receipt, when)?
+                    {
+                        outcome.receipts_changed.push((record.id.clone(), face));
+                    }
+                    // The row's aggregate ladder — the pre-1.190 upgrade SQL
+                    // verbatim, keyed to the row's own conversation.
                     let current = record.status;
                     let next = match (target, current) {
                         ("delivered", "pending" | "sent") => Some("delivered"),
                         ("read", "pending" | "sent" | "delivered") => Some("read"),
                         _ => None,
                     };
-                    // A VIEWED receipt first-stamps `viewed_at` on every hit
-                    // row inside the read-upgrade eligibility set, whether or
-                    // not the status moves this time (§4.77).
                     let first_view = stamp_viewed
                         && record.viewed_at.is_none()
                         && matches!(current, "pending" | "sent" | "delivered" | "read");
@@ -6328,20 +6575,20 @@ impl Store {
                             transaction
                                 .execute(
                                     "UPDATE messages SET viewed_at=?4
-                                     WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3",
+                                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3",
                                     params![
                                         account_id,
-                                        conversation_id,
+                                        record.conversation_id,
                                         timestamp as i64,
                                         when as i64
                                     ],
                                 )
                                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
-                            viewed_confirmed.push(MessageRecord {
+                            outcome.viewed_confirmed.push(MessageRecord {
                                 viewed_at: Some(when),
-                                send_outcomes: None,
                                 server_guid: None,
                                 server_timestamp: None,
+                                send_outcomes: None,
                                 is_story: false,
                                 story_message: None,
                                 ..record
@@ -6352,16 +6599,16 @@ impl Store {
                     transaction
                         .execute(
                             "UPDATE messages SET status=?4,
-                               delivered_at=CASE WHEN ?4='delivered'
-                                 THEN COALESCE(delivered_at, ?5) ELSE delivered_at END,
-                               read_at=CASE WHEN ?4='read'
-                                 THEN COALESCE(read_at, ?5) ELSE read_at END,
-                               viewed_at=CASE WHEN ?6=1
-                                 THEN COALESCE(viewed_at, ?5) ELSE viewed_at END
-                             WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3",
+                           delivered_at=CASE WHEN ?4='delivered'
+                             THEN COALESCE(delivered_at, ?5) ELSE delivered_at END,
+                           read_at=CASE WHEN ?4='read'
+                             THEN COALESCE(read_at, ?5) ELSE read_at END,
+                           viewed_at=CASE WHEN ?6=1
+                             THEN COALESCE(viewed_at, ?5) ELSE viewed_at END
+                         WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3",
                             params![
                                 account_id,
-                                conversation_id,
+                                record.conversation_id,
                                 timestamp as i64,
                                 next,
                                 when as i64,
@@ -6384,27 +6631,227 @@ impl Store {
                     } else {
                         record.viewed_at
                     };
-                    moved.push(MessageRecord {
+                    outcome.moved.push(MessageRecord {
                         status: next,
                         delivered_at,
                         read_at,
                         viewed_at,
                         server_guid: None,
                         server_timestamp: None,
+                        send_outcomes: None,
                         is_story: false,
                         story_message: None,
                         ..record
                     });
+                }
+                if qualified_any {
+                    outcome.matched_timestamps.push(timestamp);
+                } else {
+                    outcome.blocked_timestamps.push(timestamp);
                 }
             }
         }
         transaction
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        Ok(UpgradedReceipts {
-            moved,
-            viewed_confirmed,
-        })
+        Ok(outcome)
+    }
+
+    /// Contract 1.190 (§4.190): does ANY outgoing row in the account carry
+    /// this upstream timestamp? The story-viewed split's hit face — a
+    /// timestamp that hits a row (whatever its status, whichever of its
+    /// conversations, whether or not the sender qualified) is a message
+    /// receipt and never a story candidate. One probe off the account-level
+    /// `messages_account_sent_at` index.
+    pub fn outgoing_sent_at_seen(
+        &self,
+        account_id: &str,
+        sent_at: u64,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let found = conn
+            .query_row(
+                "SELECT 1 FROM messages
+                 WHERE account_id=?1 AND sent_at=?2 AND direction='outgoing'
+                 LIMIT 1",
+                params![account_id, sent_at as i64],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(found.is_some())
+    }
+
+    /// The send-settlement seed face (contract 1.190 §4.190 ⑦): expand the
+    /// engine `send` reply's per-recipient `results` into ledger rows — a
+    /// success entry seeds the recipient's `sent_at`, a failure entry its
+    /// `failed_at` (first stamp wins both, so a receipt that raced the
+    /// settlement is never clobbered). The seeds give the ledger the send's
+    /// roster: the official `sendStateByConversationId` starts every
+    /// addressed recipient at Sent, and the failed recipients' receipts are
+    /// dead on arrival (nothing was delivered to them). Bounded by the
+    /// ledger's recipient ceiling like every write; a seed for a vanished
+    /// row (the pending row deleted mid-flight) no-ops — the FK would drop
+    /// it with the row anyway.
+    pub fn seed_send_receipts(
+        &self,
+        message_id: &str,
+        seeds: &[SendReceiptSeed],
+        when: u64,
+    ) -> Result<Option<String>, StoreError> {
+        if seeds.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // The settled row's account — the changed event's scope, answered
+        // even when every seed skipped (the caller still learns the row).
+        let account: Option<String> = transaction
+            .query_row(
+                "SELECT account_id FROM messages WHERE id=?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some(account_id) = account.as_deref().map(str::to_string) else {
+            // The settled row vanished underneath the settlement — nothing
+            // to seed, nothing to report (the FK would drop it with the row).
+            return Ok(None);
+        };
+        for seed in seeds.iter().take(256) {
+            if seed.recipient.is_empty() {
+                continue;
+            }
+            let exists: Option<i64> = transaction
+                .query_row(
+                    "SELECT 1 FROM message_receipts WHERE message_id=?1 AND recipient=?2",
+                    params![message_id, seed.recipient],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if exists.is_none() {
+                let count: i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM message_receipts WHERE message_id=?1",
+                        params![message_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                if count >= MAX_MESSAGE_RECEIPT_RECIPIENTS {
+                    continue;
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO message_receipts
+                           (message_id, recipient, sent_at, failed_at, updated_at)
+                         VALUES(?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            message_id,
+                            seed.recipient,
+                            seed.succeeded.then_some(when as i64),
+                            (!seed.succeeded).then_some(when as i64),
+                            when as i64
+                        ],
+                    )
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            } else {
+                transaction
+                    .execute(
+                        "UPDATE message_receipts
+                         SET sent_at=COALESCE(sent_at, ?3),
+                             failed_at=COALESCE(failed_at, ?4),
+                             updated_at=?5
+                         WHERE message_id=?1 AND recipient=?2",
+                        params![
+                            message_id,
+                            seed.recipient,
+                            seed.succeeded.then_some(when as i64),
+                            (!seed.succeeded).then_some(when as i64),
+                            when as i64
+                        ],
+                    )
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(Some(account_id))
+    }
+
+    /// The per-recipient receipt read face (contract 1.190 §4.190 ⑤): one
+    /// message's ledger rows, recipient-sorted, account-scoped through the
+    /// message row. Never fails for a message with no ledger rows — the
+    /// honest empty list (every pre-1.190 message reads this way).
+    pub fn message_receipts_for(
+        &self,
+        account_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<RecipientReceiptRow>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT r.recipient, r.sent_at, r.failed_at, r.delivered_at, r.read_at,
+                        r.viewed_at
+                 FROM message_receipts r
+                 JOIN messages m ON m.id = r.message_id
+                 WHERE m.account_id=?1 AND r.message_id=?2
+                 ORDER BY r.recipient ASC",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id, message_id], |row| {
+                Ok(RecipientReceiptRow {
+                    recipient: row.get(0)?,
+                    sent_at: row.get::<_, Option<i64>>(1)?.map(|v| v.max(0) as u64),
+                    failed_at: row.get::<_, Option<i64>>(2)?.map(|v| v.max(0) as u64),
+                    delivered_at: row.get::<_, Option<i64>>(3)?.map(|v| v.max(0) as u64),
+                    read_at: row.get::<_, Option<i64>>(4)?.map(|v| v.max(0) as u64),
+                    viewed_at: row.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u64),
+                })
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<_, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
+    /// Contract 1.190 (§4.190 ⑥): persist the locally mirrored readReceipts
+    /// answer — written by the startup `getConfiguration` fetch, the §4.87
+    /// configuration sync, and the §4.45 write face. `None` clears back to
+    /// the honest unknown.
+    pub fn set_account_read_receipts(
+        &self,
+        account_id: &str,
+        enabled: Option<bool>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE accounts SET read_receipts_enabled=?2 WHERE id=?1",
+            params![account_id, enabled.map(i64::from)],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// Contract 1.190 (§4.190 ⑥): the mirrored readReceipts answer, `None`
+    /// when no source ever answered (the official `itemStorage.get` falsy
+    /// parity — the caller treats unknown as off).
+    pub fn account_read_receipts(&self, account_id: &str) -> Result<Option<bool>, StoreError> {
+        let conn = self.lock_conn()?;
+        let enabled = conn
+            .query_row(
+                "SELECT read_receipts_enabled FROM accounts WHERE id=?1",
+                params![account_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(enabled.flatten().map(|value| value != 0))
     }
 
     /// First-stamp `viewed_at` on the given incoming rows (contract 1.94,
@@ -6413,7 +6860,7 @@ impl Store {
     /// instant (the official `readStatus === Viewed`) even when the send
     /// later fails. First stamp wins — a repeated markViewed never
     /// re-stamps. Only incoming rows qualify: the outbound viewed face rides
-    /// the receipt ladder (`upgrade_outgoing_receipts`), never this stamp.
+    /// the receipt ladder (`apply_peer_receipt`), never this stamp.
     /// Returns how many rows took their first stamp.
     pub fn stamp_incoming_viewed(
         &self,
@@ -9768,6 +10215,57 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             [],
         )
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
+    if current < 30 {
+        // Contract revision 1.190 (§4.190): the per-recipient receipt ledger
+        // and the account-level receipt-addressing index. Three additive
+        // pieces, no rebuild:
+        // - `message_receipts` — one row per (message, recipient) with the
+        //   three receipt tiers' first stamps plus the send-settlement seeds
+        //   (§4.173's per-recipient face, expanded out of its counted shape
+        //   by the optional arm). New rows only; pre-1.190 history never
+        //   accretes and is never backfilled (absence is the honest face —
+        //   the aggregate stamps on the message row keep serving those rows).
+        //   Created by SCHEMA_DDL's CREATE TABLE IF NOT EXISTS for fresh
+        //   stores; the migration statement covers stores opened here.
+        // - `messages_account_sent_at` — the account-level sent_at probe the
+        //   receipt path now runs per timestamp (the official
+        //   `getMessagesBySentAt` find, MessageReceipts.preload.ts:111-113);
+        //   without it every probe degrades to a conversation-index scan.
+        // - `accounts.read_receipts_enabled` — the locally mirrored
+        //   readReceipts answer (engine `getConfiguration` at startup, the
+        //   §4.87 configuration sync, and the §4.45 write face), the gate
+        //   input of the official `shouldDropReceipt` privacy symmetry.
+        //   NULL = never answered (the pre-gate behavior's honest unknown).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS message_receipts (
+               message_id TEXT NOT NULL,
+               recipient TEXT NOT NULL,
+               sent_at INTEGER,
+               failed_at INTEGER,
+               delivered_at INTEGER,
+               read_at INTEGER,
+               viewed_at INTEGER,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY(message_id, recipient),
+               FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+             )",
+            [],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS messages_account_sent_at
+             ON messages(account_id, sent_at)",
+            [],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if !table_has_column(conn, "accounts", "read_receipts_enabled")? {
+            conn.execute(
+                "ALTER TABLE accounts ADD COLUMN read_receipts_enabled INTEGER",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
     }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
@@ -20226,7 +20724,7 @@ mod tests {
         }
         let upgrade = |sent_at: u64, kind, when: u64| {
             store
-                .upgrade_outgoing_receipts(&account.id, &conversation.id, &[sent_at], kind, when)
+                .apply_peer_receipt(&account.id, "+15555550101", &[sent_at], kind, when)
                 .unwrap()
         };
         let stored = |id: &str| {
@@ -20297,6 +20795,596 @@ mod tests {
         assert!(upgraded.moved.is_empty());
         assert_eq!(upgraded.viewed_confirmed.len(), 1);
         assert_eq!(stored("m-400").viewed_at, Some(2003));
+    }
+
+    /// Contract 1.190 (§4.190 ②) — the group dead-letter regression: a group
+    /// member's receipt finds the GROUP's outgoing row through the
+    /// account-level sentAt find, even when the member's own direct
+    /// conversation exists and holds no matching row (the pre-1.190 path
+    /// resolved the sender's direct conversation and died there), and even
+    /// when no roster was ever captured (the engine-mode degraded accept —
+    /// refusing would resurrect the dead-letter for every roster-less
+    /// group). A known roster that does NOT carry the sender refuses the
+    /// stamp (the official getTargetMessage non-recipient skip), and a
+    /// foreign sender never touches another conversation's row sharing the
+    /// timestamp.
+    #[test]
+    fn peer_receipt_finds_the_group_row_and_respects_the_roster() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let group = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAta2V5", "Group")
+            .unwrap();
+        // The member's own direct conversation exists — with its own outgoing
+        // row at a DIFFERENT timestamp (the pre-1.190 misroute target).
+        let member_direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550201", "contact")
+            .unwrap();
+        let record = |id: &str, conversation_id: &str, sent_at: u64| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation_id.to_string(),
+            direction: "outgoing",
+            sender_id: "self".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("group text".into()),
+            text_bytes: Some(10),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "sent",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        let group_row = record("m-grp-400", &group.id, 400);
+        store
+            .insert_message(&group_row, None, group_row.text.as_deref(), true)
+            .unwrap();
+        let direct_row = record("m-dir-999", &member_direct.id, 999);
+        store
+            .insert_message(&direct_row, None, direct_row.text.as_deref(), true)
+            .unwrap();
+
+        // No roster captured: the degraded accept still finds the group row.
+        let outcome = store
+            .apply_peer_receipt(
+                &account.id,
+                "+15555550201",
+                &[400],
+                crate::engine::ReceiptKind::Delivered,
+                1700,
+            )
+            .unwrap();
+        assert_eq!(outcome.moved.len(), 1, "the group row takes the receipt");
+        assert_eq!(outcome.moved[0].conversation_id, group.id);
+        assert_eq!(outcome.moved[0].status, "delivered");
+        assert_eq!(outcome.matched_timestamps, vec![400]);
+        assert_eq!(outcome.receipts_changed.len(), 1);
+        assert_eq!(outcome.receipts_changed[0].0, "m-grp-400");
+        let ledger = store
+            .message_receipts_for(&account.id, "m-grp-400")
+            .unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].recipient, "+15555550201");
+        assert_eq!(ledger[0].delivered_at, Some(1700));
+        assert_eq!(ledger[0].read_at, None);
+        // The member's own direct row at 999 stays untouched.
+        let untouched = store
+            .message_by_id(&account.id, &member_direct.id, "m-dir-999")
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.status, "sent");
+
+        // A known roster that carries the member keeps accepting; one that
+        // does not carry the sender refuses (the non-recipient skip: the row
+        // is neither moved nor ledger-stamped, the timestamp reports
+        // blocked — it is a message receipt, never a story candidate).
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z3JvdXAta2V5",
+                "Group",
+                Some(r#"{"members":[{"id":"+15555550301","name":"Other"}]}"#),
+                1,
+            )
+            .unwrap();
+        let outcome = store
+            .apply_peer_receipt(
+                &account.id,
+                "+15555550201",
+                &[400],
+                crate::engine::ReceiptKind::Read,
+                1800,
+            )
+            .unwrap();
+        assert!(
+            outcome.moved.is_empty(),
+            "a non-member's receipt is skipped"
+        );
+        assert!(outcome.receipts_changed.is_empty());
+        assert_eq!(outcome.blocked_timestamps, vec![400]);
+        let ledger = store
+            .message_receipts_for(&account.id, "m-grp-400")
+            .unwrap();
+        assert_eq!(ledger.len(), 1, "no second ledger row for a non-member");
+        assert_eq!(ledger[0].read_at, None, "no read stamp for a non-member");
+        let row = store
+            .message_by_id(&account.id, &group.id, "m-grp-400")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.status, "delivered",
+            "the ladder never moved past delivered"
+        );
+
+        // The roster member the capture names qualifies (uuid arm too).
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z3JvdXAta2V5",
+                "Group",
+                Some(r#"{"members":[{"id":"+15555550301","uuid":"11111111-1111-1111-1111-111111111111"}]}"#),
+                2,
+            )
+            .unwrap();
+        let outcome = store
+            .apply_peer_receipt(
+                &account.id,
+                "11111111-1111-1111-1111-111111111111",
+                &[400],
+                crate::engine::ReceiptKind::Read,
+                1900,
+            )
+            .unwrap();
+        assert_eq!(outcome.moved.len(), 1, "the uuid-form member qualifies");
+        assert_eq!(outcome.moved[0].status, "read");
+        assert_eq!(outcome.matched_timestamps, vec![400]);
+    }
+
+    /// Contract 1.190 (§4.190 ②): direct rows qualify through the §4.144
+    /// identity ladder — the recipient spelled by ACI still stamps the
+    /// phone-keyed conversation (peer_identities), the alternate phone
+    /// spelling matches, and a receipt from an unrelated peer never touches
+    /// the row (the cross-talk guard for two conversations sharing a
+    /// timestamp).
+    #[test]
+    fn peer_receipt_qualifies_direct_rows_through_the_identity_ladder() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        // A second direct conversation whose outgoing row SHARES the
+        // timestamp — the cross-talk probe.
+        let other = store
+            .ensure_conversation(&account.id, "direct", "+15555550303", "contact")
+            .unwrap();
+        let record = |id: &str, conversation_id: &str| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation_id.to_string(),
+            direction: "outgoing",
+            sender_id: "self".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 500,
+            received_at: None,
+            text: Some("shared timestamp".into()),
+            text_bytes: Some(16),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "sent",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        let mine = record("m-mine-500", &conversation.id);
+        store
+            .insert_message(&mine, None, mine.text.as_deref(), true)
+            .unwrap();
+        let theirs = record("m-theirs-500", &other.id);
+        store
+            .insert_message(&theirs, None, theirs.text.as_deref(), true)
+            .unwrap();
+
+        // The peer's ACI, recorded by a past envelope, stamps the
+        // phone-keyed conversation.
+        store
+            .upsert_peer_identity(
+                &account.id,
+                "22222222-2222-2222-2222-222222222222",
+                "+15555550101",
+            )
+            .unwrap();
+        let outcome = store
+            .apply_peer_receipt(
+                &account.id,
+                "22222222-2222-2222-2222-222222222222",
+                &[500],
+                crate::engine::ReceiptKind::Read,
+                2100,
+            )
+            .unwrap();
+        assert_eq!(outcome.moved.len(), 1);
+        assert_eq!(outcome.moved[0].id, "m-mine-500");
+        assert_eq!(outcome.moved[0].status, "read");
+
+        // The alternate phone spelling matches too.
+        let outcome = store
+            .apply_peer_receipt(
+                &account.id,
+                "15555550101",
+                &[500],
+                crate::engine::ReceiptKind::Viewed,
+                2200,
+            )
+            .unwrap();
+        assert_eq!(outcome.viewed_confirmed.len(), 1);
+        assert_eq!(outcome.viewed_confirmed[0].id, "m-mine-500");
+
+        // The other conversation's row with the SAME timestamp is never
+        // touched by this peer's receipts.
+        let foreign = store
+            .message_by_id(&account.id, &other.id, "m-theirs-500")
+            .unwrap()
+            .unwrap();
+        assert_eq!(foreign.status, "sent");
+        assert!(
+            store
+                .message_receipts_for(&account.id, "m-theirs-500")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Contract 1.190 (§4.190 ①): the ledger's first stamps are COALESCE
+    /// monotonic per recipient (a replay never re-stamps and never answers a
+    /// changed face), the rows cascade with their message (retention deletes
+    /// the ledger with the row), and the read face answers account-scoped
+    /// and recipient-sorted. The two-recipient ledger rides a GROUP row — a
+    /// direct conversation's ladder takes receipts from its own peer only
+    /// (the qualification test's own ruling).
+    #[test]
+    fn message_receipts_first_stamp_replay_and_cascade() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAta2V5", "Group")
+            .unwrap();
+        let record = MessageRecord {
+            id: "m-cascade-600".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "outgoing",
+            sender_id: "self".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 600,
+            received_at: None,
+            text: Some("cascade".into()),
+            text_bytes: Some(7),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "sent",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        store
+            .insert_message(&record, None, record.text.as_deref(), true)
+            .unwrap();
+
+        let apply = |recipient: &str, kind, when: u64| {
+            store
+                .apply_peer_receipt(&account.id, recipient, &[600], kind, when)
+                .unwrap()
+        };
+        let first = apply("+15555550101", crate::engine::ReceiptKind::Delivered, 2300);
+        assert_eq!(first.receipts_changed.len(), 1);
+        // A replay answers nothing — not even a changed face.
+        let replay = apply("+15555550101", crate::engine::ReceiptKind::Delivered, 9999);
+        assert!(replay.receipts_changed.is_empty());
+        assert!(replay.moved.is_empty());
+        let ledger = store
+            .message_receipts_for(&account.id, "m-cascade-600")
+            .unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].delivered_at, Some(2300), "first stamp wins");
+
+        // A second recipient lands its own ledger row; the read face is
+        // recipient-sorted.
+        let _ = apply("+15555550102", crate::engine::ReceiptKind::Delivered, 2301);
+        let ledger = store
+            .message_receipts_for(&account.id, "m-cascade-600")
+            .unwrap();
+        assert_eq!(
+            ledger
+                .iter()
+                .map(|row| row.recipient.as_str())
+                .collect::<Vec<_>>(),
+            vec!["+15555550101", "+15555550102"],
+            "recipient-sorted read face"
+        );
+
+        // Deleting the message row cascades the ledger with it (the FK the
+        // retention sweep's DELETE rides — no orphan ledger rows survive
+        // their row).
+        store
+            .conn()
+            .execute("DELETE FROM messages WHERE id='m-cascade-600'", [])
+            .unwrap();
+        assert!(
+            store
+                .message_receipts_for(&account.id, "m-cascade-600")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Contract 1.190 (§4.190 ⑦): the send-settlement seeds expand the
+    /// counted outcomes into per-recipient Sent/Failed ledger rows — first
+    /// stamp wins against a receipt that raced the settlement, and the
+    /// recipient ceiling bounds the ledger (the roster cap).
+    #[test]
+    fn send_seeds_expand_receipt_rows_with_first_stamp_and_cap() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let group = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAta2V5", "Group")
+            .unwrap();
+        let record = MessageRecord {
+            id: "m-seed-700".into(),
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            direction: "outgoing",
+            sender_id: "self".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 700,
+            received_at: None,
+            text: Some("group send".into()),
+            text_bytes: Some(10),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "sent",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        store
+            .insert_message(&record, None, record.text.as_deref(), true)
+            .unwrap();
+
+        // A delivery receipt that raced the settlement lands first.
+        store
+            .apply_peer_receipt(
+                &account.id,
+                "+15555550201",
+                &[700],
+                crate::engine::ReceiptKind::Delivered,
+                2400,
+            )
+            .unwrap();
+        // The settlement seeds the full roster: the raced recipient keeps
+        // its delivered stamp, the seed never clobbers it.
+        let seeds = vec![
+            crate::store::SendReceiptSeed {
+                recipient: "+15555550201".into(),
+                succeeded: true,
+            },
+            crate::store::SendReceiptSeed {
+                recipient: "+15555550202".into(),
+                succeeded: true,
+            },
+            crate::store::SendReceiptSeed {
+                recipient: "+15555550203".into(),
+                succeeded: false,
+            },
+        ];
+        let seeded_account = store
+            .seed_send_receipts("m-seed-700", &seeds, 2500)
+            .unwrap();
+        assert_eq!(seeded_account.as_deref(), Some(account.id.as_str()));
+        let ledger = store
+            .message_receipts_for(&account.id, "m-seed-700")
+            .unwrap();
+        assert_eq!(ledger.len(), 3);
+        let raced = ledger
+            .iter()
+            .find(|row| row.recipient == "+15555550201")
+            .unwrap();
+        assert_eq!(
+            raced.delivered_at,
+            Some(2400),
+            "the raced receipt keeps its stamp"
+        );
+        assert_eq!(raced.sent_at, Some(2500));
+        let failed = ledger
+            .iter()
+            .find(|row| row.recipient == "+15555550203")
+            .unwrap();
+        assert_eq!(failed.sent_at, None);
+        assert_eq!(failed.failed_at, Some(2500));
+
+        // The recipient ceiling: a ledger at the cap refuses new rows
+        // (warn-free, the roster bound) while existing rows still update.
+        let current: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM message_receipts WHERE message_id='m-seed-700'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for index in 0..(MAX_MESSAGE_RECEIPT_RECIPIENTS - current) {
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO message_receipts(message_id, recipient, updated_at)
+                     VALUES('m-seed-700', ?1, 2600)",
+                    params![format!("cap-{index:04}")],
+                )
+                .unwrap();
+        }
+        let over = vec![crate::store::SendReceiptSeed {
+            recipient: "+15555559999".into(),
+            succeeded: true,
+        }];
+        store.seed_send_receipts("m-seed-700", &over, 2700).unwrap();
+        let ledger = store
+            .message_receipts_for(&account.id, "m-seed-700")
+            .unwrap();
+        assert_eq!(
+            ledger.len() as i64,
+            MAX_MESSAGE_RECEIPT_RECIPIENTS,
+            "the cap refuses the new recipient row"
+        );
+        assert!(ledger.iter().all(|row| row.recipient != "+15555559999"));
+        // The existing raced row still takes its update inside the cap.
+        store
+            .seed_send_receipts(
+                "m-seed-700",
+                &[crate::store::SendReceiptSeed {
+                    recipient: "+15555550202".into(),
+                    succeeded: false,
+                }],
+                2800,
+            )
+            .unwrap();
+        let ledger = store
+            .message_receipts_for(&account.id, "m-seed-700")
+            .unwrap();
+        let second = ledger
+            .iter()
+            .find(|row| row.recipient == "+15555550202")
+            .unwrap();
+        assert_eq!(
+            second.sent_at,
+            Some(2500),
+            "existing seed stamps never clobber"
+        );
+        assert_eq!(second.failed_at, Some(2800), "the missing tier still lands");
+    }
+
+    /// Contract 1.190 (§4.190 ⑥): the mirrored readReceipts flag persists
+    /// and clears — the gate's local input, three writers' shared landing.
+    #[test]
+    fn account_read_receipts_flag_persists_and_clears() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(store.account_read_receipts(&account.id).unwrap(), None);
+        store
+            .set_account_read_receipts(&account.id, Some(true))
+            .unwrap();
+        assert_eq!(
+            store.account_read_receipts(&account.id).unwrap(),
+            Some(true)
+        );
+        store
+            .set_account_read_receipts(&account.id, Some(false))
+            .unwrap();
+        assert_eq!(
+            store.account_read_receipts(&account.id).unwrap(),
+            Some(false)
+        );
+        store.set_account_read_receipts(&account.id, None).unwrap();
+        assert_eq!(
+            store.account_read_receipts(&account.id).unwrap(),
+            None,
+            "a sync that states no flag never invents one"
+        );
     }
 
     /// `stamp_incoming_viewed` (contract 1.94, §4.77): the local

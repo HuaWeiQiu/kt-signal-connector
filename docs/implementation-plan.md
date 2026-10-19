@@ -5,6 +5,32 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.190 (2026-10-19; §4.190 the per-recipient receipt
+  ledger and the group-receipt dead-letter repair: schema v30 adds the
+  `message_receipts` table (one row per (message, recipient) — the three
+  receipt tiers' first stamps beside the send-settlement seeds, capped at
+  the roster ceiling, cascading with the message row), the
+  `messages_account_sent_at` index, and the `accounts.read_receipts_enabled`
+  mirror; peer-receipt addressing moves from the receipt sender's direct
+  conversation to the official account-level sentAt find
+  (MessageReceipts.preload.ts:111-113), which repairs the discovered
+  group dead-letter (every group member's Delivered/Read receipt silently
+  died, and Viewed leaked onto `story.viewed`, because the pre-1.190 fold
+  was bound to the sender's direct conversation) — recipient
+  qualification rides the §4.144 identity ladder for direct rows and the
+  captured roster for group rows (roster-less groups degrade to accept);
+  `ControlReceive::Receipt` carries the envelope source as the
+  per-recipient identity; early-arriving receipts buffer §4.91-style and
+  flush on the outgoing row's landing; the readReceipts gate mirrors the
+  official shouldDropReceipt privacy symmetry (Delivered never dropped,
+  Read/Viewed dropped unless the engine getConfiguration flag answers on
+  — three writers: the startup fetch, the §4.87 sync, the §4.45 write);
+  read face `messages.receipts` and additive event
+  `message.receiptsChanged` (the whole ledger face per message); and the
+  group send settlement expands the §4.173 counted outcomes into
+  per-recipient Sent/Failed seeds. The §4.70 story split survives on the
+  account-wide rowless probe; blocked (rows exist, sender qualifies for
+  none) never leaks onto the story face.)
 - Contract revision: 1.188 (2026-10-19; §4.188 the two arms extracted from
   the stale pre-merge branches, everything those branches carried that a
   merged batch already supersedes dropped by record: the
@@ -16173,6 +16199,157 @@ dispatching as the engine's `announcementsOnly` true/false with the host
 permission words never reaching the wire, the mixed refusal set still
 dispatching nothing, and the quit-dispatch filter excluding the new fold
 key the way it excludes the 1.180 password).
+
+### 4.190 The per-recipient receipt ledger and the group-receipt dead-letter repair (contract revision 1.190, 2026-10-19)
+
+Provenance: the per-recipient ledger batch (the desktop MessageDetail
+supply arm of the receipts chain), interrupted mid-implementation by a
+model-pool rate limit and completed as the same batch. Verification
+against the pinned desktop and engine sources (v8.31.0-alpha.1 anchors
+transcribed in the batch report; engine `abede69`, engine arm zero
+delta) found the connector's three existing receipt faces — the counted
+send outcomes (§4.173), the row-level stamp ladder (§4.77), the
+receipt-routed events — all aggregate or row-level, with the per-recipient
+dimension absent everywhere; and found one hidden gap deeper than the
+ledger itself, recorded here for the first time.
+
+**The group dead-letter (discovered, same batch).** Peer receipts routed
+through the conversation ladder: `ControlReceive::Receipt` carried no
+recipient, the service resolved the receipt sender's DIRECT conversation,
+and the upgrade bound the row WHERE to that conversation. A group
+member's receipt therefore never matched the group's rows: Delivered and
+Read died silently, and the Viewed leftovers were mis-dispatched onto
+`story.viewed` (the desktop's (self, sentAt) story join no-ops them, so
+the leak was invisible but real). Official parity is account-level:
+`getMessagesBySentAt` finds the message by (account, sentAt) wherever it
+lives (MessageReceipts.preload.ts:111-113), then `getTargetMessage`
+qualifies the sender against `sendStateByConversationId`
+(MessageReceipts.preload.ts:317-383 — a non-recipient is a
+warn-and-skip). The dead-letter and the ledger are the same code face,
+repaired in the same arm.
+
+**Schema v30 (three additive pieces, no rebuild).** `message_receipts` —
+one row per (message_id, recipient), `sent_at`/`failed_at` the
+send-settlement seeds, `delivered_at`/`read_at`/`viewed_at` the three
+tiers' first stamps (COALESCE writes; a replay never re-stamps), the
+foreign key cascading with the message row, the ledger capped at
+`MAX_MESSAGE_RECEIPT_RECIPIENTS = 1001` per message (the roster ceiling:
+a group send addresses no more recipients than a group holds; over the
+cap the row ladder continues and the ledger skips, warn-free).
+`messages_account_sent_at` — the account-level sentAt probe the receipt
+arm now runs per timestamp. `accounts.read_receipts_enabled` — the
+readReceipts mirror (NULL = never answered, the honest unknown the gate
+reads as off). Pre-1.190 history never accretes and is never backfilled:
+absence is the honest face, the aggregate stamps on the message row keep
+serving those rows.
+
+**The account-level fold (`apply_peer_receipt`).** Per timestamp: the
+candidate outgoing rows (account-wide, at most 8, the pre-1.190 bound)
+are qualified against the receipt's sender before anything stamps. A
+direct row qualifies when the sender resolves into the conversation
+peer's identity set — the §4.144 two-form phone ladder plus §4.37
+`peer_identities`, the `groups_in_common` resolution in reverse. A group
+row qualifies when the captured roster carries the sender under any
+identity (`members[].id`/`uuid`, the capture's bound); a KNOWN roster
+that does not carry the sender refuses (the official non-recipient skip,
+MessageReceipts.preload.ts:330-365), and a group with no captured roster
+— every engine-mode group captured before the roster face — degrades to
+accept, because refusing would resurrect the dead-letter this batch
+repairs. A qualified row takes both faces in one transaction: the
+ledger's tier first-stamp (COALESCE — the official `sendStateReducer`
+monotonicity, a tier never regresses, a replay changes nothing) and the
+row's aggregate ladder — `pending|sent` → `delivered` → `read`, Viewed
+riding to `read` plus the §4.77 `viewed_at` first stamp with the
+`viewed_confirmed` face — unchanged SQL, now keyed to the row's own
+conversation. The timestamp outcome splits three ways: `matched` (stamped
+at least one qualifying row), `blocked` (rows exist, the sender qualified
+for none — a message receipt, never a story candidate), and `unseen` (no
+outgoing row anywhere — the §4.70 story candidates on the Viewed leg,
+and the §4.91-style buffer on every leg).
+
+**Recipient identity on the variant.** `ControlReceive::Receipt` carries
+`recipient: Option<String>` — the proto names no recipient
+(SignalService.proto:451-460), the official receiver attributes the
+receipt by the envelope source (MessageReceiver.preload.ts:2849-2855),
+and the routing copies the same `envelope_peer_source` ladder verbatim.
+An absent source keeps the pre-1.85 fate: no attribution, no fold, 宁缺勿错.
+
+**The early buffer (§4.190 ③, the §4.91 discipline).** A receipt whose
+timestamps matched no outgoing row anywhere buffers (bounded at the
+shared early-control capacity, TTL-swept, oldest-evicted); the flush key
+is (account, sentAt) — a receipt addresses our own outgoing rows, the
+landing row's conversation is the receipt's business, never its identity.
+When the outgoing row lands, the buffered entries replay the live arm
+verbatim (the same fold, the same qualification, the same event set); a
+flush that re-matches nothing (the landed row's conversation refuses the
+sender) drops the entry the official way — never re-buffered. Nothing
+dies silently at the TTL: an unmatched receipt is the official
+`forMessage` early face (MessageReceipts.preload.ts:414-456) with the
+same honest expiry.
+
+**The readReceipts gate (§4.190 ⑥, the official `shouldDropReceipt`
+privacy symmetry, MessageReceipts.preload.ts:394-412).** Delivered
+receipts are never dropped; Read and Viewed drop unless the account's
+own readReceipts flag answers on (an unanswered flag is the official
+falsy parity — unknown means off). The flag's source of truth is the
+engine's account configuration; three writers converge the local mirror:
+the engine `getConfiguration` fetch at every engine landing (the
+supervisor's configuration-gate sync — best-effort, idempotent,
+warn-only, never blocks startup), the §4.87 sync (the flag persists when
+the sync states it; the other three flags keep the pure-forwarding
+posture verbatim), and the §4.45 write face (mirrored only on a definite
+success). The official separate story-view-receipts flag has no engine
+face; this batch gates Read and Viewed by the one visible flag, recorded.
+
+**The read face and the event (§4.190 ⑤).** `messages.receipts` — the
+addressing triple mirrors `messages.getText` (the message must resolve in
+the named conversation), read-only, no upstream traffic; the answer's
+items array is always present, recipient-sorted, each row carrying only
+the tiers actually stamped (absent tiers absent keys). The additive
+`message.receiptsChanged` event rides beside the aggregate
+`message.statusChanged` (which keeps firing for the row's own ladder):
+one event per changed message, carrying the message's whole ledger face
+so the host merge is total (the empty array always serializes; a change
+that only re-confirms existing stamps emits nothing). Schema: the new
+method entry with its params def, the event enum entry, and the event
+data branch pinned by the numeric-bounds test at `allOf/32` (the
+recipient key mirrors the receive-id bound, the array the roster
+ceiling).
+
+**The send-settlement seeds (§4.190 ⑦, the optional arm).** The group
+send reply's per-recipient `results` array (§4.173, folded to counts and
+dropped) now also expands into per-recipient Sent/Failed seeds — the
+official `sendStateByConversationId` posture: every addressed recipient
+starts at Sent, and a failed recipient's receipts are dead on arrival.
+First stamp wins both ways (a receipt that raced the settlement is never
+clobbered); direct sends (no array) seed nothing — the row status is the
+whole story; the batch is bounded at 256, the receipt faces' own
+ceiling.
+
+Tests (additive): store — `peer_receipt_finds_the_group_row_and_respects_the_roster`
+(the group row found through the account-level find with the member's
+direct conversation present and rowless at the timestamp, the roster-less
+degraded accept, the known-roster refusal reporting blocked, the uuid
+form qualifying), `peer_receipt_qualifies_direct_rows_through_the_identity_ladder`
+(the ACI spelling stamping the phone-keyed row, the alternate spelling,
+the cross-talk guard), `message_receipts_first_stamp_replay_and_cascade`
+(replays answer nothing, the recipient-sorted read face, the FK cascade),
+`send_seeds_expand_receipt_rows_with_first_stamp_and_cap` (the raced
+receipt keeping its stamp, the cap refusing new rows while existing rows
+still update), `account_read_receipts_flag_persists_and_clears`;
+service — `group_peer_receipt_lands_the_group_row_and_serves_the_ledger`,
+`read_viewed_receipts_are_gated_by_the_read_receipts_flag` (Delivered
+never gated, the unanswered flag reading off, the flag toggling the gate),
+`early_peer_receipt_buffers_and_flushes_on_row_landing`, and the
+existing receipt tests extended with the ledger face and the flag
+setup; supervisor — `send_receipt_seeds_from_reply_expands_the_results_roster`
+; host — `receipts_changed_event_carries_the_ledger_face`; methods and
+schema enumerations gain `messages.receipts` /
+`message.receiptsChanged`; integration —
+`group_receipt_finds_the_group_row_and_serves_the_ledger` (the full
+wire round trip through the fake engine: the group send, the member's
+Delivered receipt riding the extra-receives marker, both events on the
+host lane, the read face serving the stamped ledger).
 
 ## 5. signal-cli Boundary
 
