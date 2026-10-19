@@ -2507,7 +2507,7 @@ impl RuntimeSupervisor {
                         self.service
                             .lock()
                             .await
-                            .clear_media_handles_for_account(&account_id);
+                            .clear_media_for_account(&account_id);
                         if let Some(handles) = self.backup_handles.as_ref() {
                             handles.clear_account(&account_id);
                         }
@@ -2527,22 +2527,35 @@ impl RuntimeSupervisor {
                     } => (signal_account, reconcile_first),
                 }
             }
-            None => match self
-                .service
-                .lock()
-                .await
-                .account_signal_number_optional(&account_id)?
-            {
-                Some(number) => (number, false),
-                None => return Ok(json!({})),
-            },
+            None => {
+                let number = self
+                    .service
+                    .lock()
+                    .await
+                    .account_signal_number_optional(&account_id)?;
+                match number {
+                    Some(number) => (number, false),
+                    // An account row that is already gone is the idempotent
+                    // no-op face, but its media subtree can survive a crash
+                    // between the row delete and the media sweep. Clearing
+                    // the (unattributable-if-absent) bucket here is still
+                    // account-scoped and makes the delete complete.
+                    None => {
+                        self.service
+                            .lock()
+                            .await
+                            .clear_media_for_account(&account_id);
+                        return Ok(json!({}));
+                    }
+                }
+            }
         };
         let engine = self.running_engine().await?;
         if reconcile_first && !signal_account_present(&engine, &number).await? {
             {
                 let mut service = self.service.lock().await;
                 service.complete_account_delete(&account_id, operation_id.as_deref())?;
-                service.clear_media_handles_for_account(&account_id);
+                service.clear_media_for_account(&account_id);
             }
             if let Some(handles) = self.backup_handles.as_ref() {
                 handles.clear_account(&account_id);
@@ -2583,10 +2596,10 @@ impl RuntimeSupervisor {
         {
             let mut service = self.service.lock().await;
             service.complete_account_delete(&account_id, operation_id.as_deref())?;
-            // ADR 0004 gate 3: a chunk-stream handle cannot outlive the
-            // account session it was opened from — media and §4.46 backup
-            // file streams alike.
-            service.clear_media_handles_for_account(&account_id);
+            // ADR 0004 gate 3 + audit §9.10: chunk-stream handles and the
+            // account's media subtree cannot outlive the account session it
+            // was opened from — media and §4.46 backup file streams alike.
+            service.clear_media_for_account(&account_id);
         }
         if let Some(handles) = self.backup_handles.as_ref() {
             handles.clear_account(&account_id);

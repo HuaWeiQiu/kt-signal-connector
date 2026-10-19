@@ -488,12 +488,22 @@ async fn a_digest_mismatch_is_terminal_and_lands_nothing() {
 
     // Terminal and clean: nothing landed under the story id, no temp
     // residue, and the story open face answers the not-available error.
-    let attachments = temp.path().join("signal-data/attachments");
-    let landed: Vec<_> = std::fs::read_dir(&attachments)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
+    // `[KT 适配]` audit §9.10: the landing bucket is the account's own
+    // `<data>/media/<account-id>/attachments/`; an absent bucket is the
+    // cleanest form of "nothing landed".
+    let attachments = temp
+        .path()
+        .join("signal-data")
+        .join("media")
+        .join(&account)
+        .join("attachments");
+    let landed: Vec<_> = match std::fs::read_dir(&attachments) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
     assert!(landed.is_empty(), "no file may land: {landed:?}");
     let open_params: kt_signal_connector::service::StoryOpenAttachmentParams =
         serde_json::from_value(json!({

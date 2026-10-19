@@ -1807,14 +1807,22 @@ impl MediaIngest {
         &self.handles
     }
 
-    /// Resolve a sanitized attachment id to its on-disk file and size by
-    /// probing the engine's candidate `attachments/` directories
-    /// (signal-cli `PathConfig` layout — see
-    /// [`MediaGovernor::attachments_dirs`]). `None` means the id names no
-    /// downloaded file: not-downloaded and governor-deleted are
-    /// deliberately indistinguishable (UPSTREAM_ERROR, as before the PoC).
-    fn locate_attachment(&self, sanitized_id: &str) -> Option<(PathBuf, u64)> {
-        for dir in self.governor.attachments_dirs() {
+    /// Resolve a sanitized attachment id to its on-disk file and size.
+    /// `[KT 适配]` (audit §9.10): the account's own bucket is probed first,
+    /// so one account can never read another account's file. The legacy
+    /// signal-cli probes (`<data>/attachments/` and
+    /// `<data>/<account>/attachments/`) stay as a read-only compatibility
+    /// fallback for files written before the per-account layout existed.
+    /// `None` means the id names no downloaded file: not-downloaded and
+    /// governor-deleted are deliberately indistinguishable (UPSTREAM_ERROR,
+    /// as before the PoC).
+    fn locate_attachment(&self, account_id: &str, sanitized_id: &str) -> Option<(PathBuf, u64)> {
+        let mut candidates = Vec::new();
+        if let Some(dir) = self.governor.account_attachments_dir(account_id) {
+            candidates.push(dir);
+        }
+        candidates.extend(self.governor.legacy_attachments_dirs());
+        for dir in candidates {
             let candidate = dir.join(sanitized_id);
             if let Ok(metadata) = std::fs::metadata(&candidate)
                 && metadata.is_file()
@@ -1825,36 +1833,38 @@ impl MediaIngest {
         None
     }
 
-    /// The directory a history download writes into: the first existing
-    /// probe candidate — the same directory `locate_attachment` reads — or
-    /// the plain `<data-dir>/attachments` the eager probe would name, so a
-    /// fresh install creates exactly the layout signal-cli itself uses.
-    fn write_dir(&self) -> Result<PathBuf, ServiceError> {
-        if let Some(dir) = self.governor.attachments_dirs().into_iter().next() {
-            return Ok(dir);
-        }
-        let dir = self.governor.data_dir().join("attachments");
-        std::fs::create_dir_all(&dir).map_err(|_| ServiceError::Io)?;
-        Ok(dir)
+    /// The directory a download or send-time stash writes into
+    /// (`[KT 适配]` audit §9.10): always the account's own bucket,
+    /// `<data>/media/<account-id>/attachments/`, created on first use. The
+    /// legacy probes are never write targets, so two accounts cannot
+    /// overwrite each other even when their attachment ids collide.
+    fn write_dir(&self, account_id: &str) -> Result<PathBuf, ServiceError> {
+        self.governor
+            .ensure_account_attachments_dir(account_id)
+            .map_err(|_| ServiceError::Io)
     }
 
     /// Stash one just-sent attachment's plaintext bytes into the governed
     /// attachments directory (contract revision 1.183, §4.183) — the
     /// official outgoing-attachment local-retention semantics: the sender's
     /// own bubble reads its own bytes back from the local store without any
-    /// transit pointer or backfill round. The bytes land under the
-    /// descriptor's own sanitized id — the same addressing the download and
-    /// open faces already resolve — so the stash is per-account per-message
-    /// by construction (the id is the §4.12 stable hash of
-    /// account+clientRequestId+index) and stays inside the existing
-    /// retention machine: the governor's 7-day TTL and 2 GiB LRU passes
-    /// evict it like any other file in these directories, the view-once
-    /// burn erases it by the same id, and the per-file 100 MiB send budget
-    /// bounds one write. Best-effort by design: any failure is reported as
-    /// a class string (never ids or paths) and the send proceeds without
-    /// local bytes — the wire never depends on the filesystem answering.
+    /// transit pointer or backfill round. `[KT 适配]` (audit §9.10): the
+    /// bytes land in the account's own bucket under the descriptor's own
+    /// sanitized id — the same addressing the download and open faces
+    /// already resolve — so the stash is per-account per-message by
+    /// construction (the id is the §4.12 stable hash of
+    /// account+clientRequestId+index) and a colliding id from another
+    /// account can neither overwrite nor be overwritten. It stays inside the
+    /// existing retention machine: the governor's 7-day TTL and per-account
+    /// 2 GiB LRU passes evict it like any other file, the view-once burn
+    /// erases it inside the same bucket, and the per-file 100 MiB send
+    /// budget bounds one write. Best-effort by design: any failure is
+    /// reported as a class string (never ids or paths) and the send proceeds
+    /// without local bytes — the wire never depends on the filesystem
+    /// answering.
     pub fn stash_outbound_attachment(
         &self,
+        account_id: &str,
         descriptor_id: &str,
         data_uri: &str,
     ) -> Result<(), &'static str> {
@@ -1871,7 +1881,7 @@ impl MediaIngest {
             return Err("empty-payload");
         }
         let sanitized = sanitize_attachment_id(descriptor_id).map_err(|_| "id-shape")?;
-        let dir = self.write_dir().map_err(|_| "write-dir")?;
+        let dir = self.write_dir(account_id).map_err(|_| "write-dir")?;
         let target = dir.join(&sanitized);
         let temp = dir.join(format!(".{sanitized}.{}.tmp", random_id()));
         std::fs::write(&temp, &bytes).map_err(|_| "write")?;
@@ -3598,7 +3608,8 @@ impl ConnectorService {
         {
             for (descriptor, data_uri) in pending.attachments.iter().zip(attachments.iter()) {
                 if let Some(data_uri) = data_uri.as_str()
-                    && let Err(kind) = media.stash_outbound_attachment(&descriptor.id, data_uri)
+                    && let Err(kind) =
+                        media.stash_outbound_attachment(account_id, &descriptor.id, data_uri)
                 {
                     tracing::warn!(
                         kind = %kind,
@@ -8210,17 +8221,20 @@ impl ConnectorService {
     }
 
     /// Erase one view-once row's recoverable media channels (§4.37): the
-    /// attachment files and previews under the connector-owned directories,
-    /// then any open chunk-stream handle for the message. Best-effort — a
-    /// vanished file is success, and `--media-ingest` being off means there
-    /// is nothing on disk to erase.
+    /// attachment files and previews under the addressed account's
+    /// connector-owned bucket (`[KT 适配]` audit §9.10: never another
+    /// account's same-id file), then any open chunk-stream handle for the
+    /// message. Best-effort — a vanished file is success, and
+    /// `--media-ingest` being off means there is nothing on disk to erase.
     fn burn_view_once_media(&self, record: &MessageRecord) {
         let Some(media) = self.media.as_ref() else {
             return;
         };
         for descriptor in &record.attachments {
             if let Ok(sanitized_id) = sanitize_attachment_id(&descriptor.id) {
-                media.governor().delete_attachment(&sanitized_id);
+                media
+                    .governor()
+                    .delete_attachment(&record.account_id, &sanitized_id);
             }
         }
         media
@@ -8355,7 +8369,7 @@ impl ConnectorService {
                 true,
             )));
         }
-        let Some((path, size_bytes)) = media.locate_attachment(&sanitized_id) else {
+        let Some((path, size_bytes)) = media.locate_attachment(account_id, &sanitized_id) else {
             return Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "attachment is not available in the engine data directory",
@@ -8438,15 +8452,14 @@ impl ConnectorService {
                 false,
             )));
         }
-        let write_dir = media.write_dir()?;
+        let write_dir = media.write_dir(account_id)?;
         let target = write_dir.join(&sanitized_id);
-        if let Ok(metadata) = std::fs::metadata(&target)
-            && metadata.is_file()
-        {
+        if let Some((_, size_bytes)) = media.locate_attachment(account_id, &sanitized_id) {
             // Idempotent dedup: the bytes already landed (an earlier call, or
-            // the engine downloaded the same attachment live). Answering the
-            // measured size keeps the success honest without re-fetching.
-            let size_bytes = metadata.len();
+            // the engine downloaded the same attachment live). The account
+            // bucket wins; the legacy probe keeps a pre-isolation download a
+            // local hit instead of re-fetching it. Answering the measured
+            // size keeps the success honest without re-fetching.
             return Ok(PreparedHistoryDownload::AlreadyPresent { size_bytes });
         }
         let temp_path = write_dir.join(format!(".{}.{}.tmp", sanitized_id, random_id()));
@@ -8524,19 +8537,16 @@ impl ConnectorService {
         let descriptor_size = descriptor.size;
         let attachment_id = descriptor.id.clone();
         let sanitized_id = sanitize_attachment_id(&attachment_id)?;
-        let write_dir = media.write_dir()?;
+        let write_dir = media.write_dir(account_id)?;
         let target = write_dir.join(&sanitized_id);
-        if let Ok(metadata) = std::fs::metadata(&target)
-            && metadata.is_file()
-        {
-            // Idempotent dedup, same posture as the history face — and now
-            // the §4.183 local-hit arm too: the file may be an inbound
-            // download, an engine live download of the same id, or the
-            // outgoing row's own send-time stash. The measured size is the
-            // honest answer; the pointer face below is never consulted for
-            // bytes that are already local (an outgoing row has no pointer
-            // face at all — the stash IS its bytes face).
-            let size_bytes = metadata.len();
+        if let Some((_, size_bytes)) = media.locate_attachment(account_id, &sanitized_id) {
+            // Idempotent dedup, same posture as the history face — and the
+            // §4.183 local-hit arm too: the file may be an inbound download,
+            // an engine live download of the same id, the outgoing row's own
+            // send-time stash, or a pre-isolation legacy file. The measured
+            // size is the honest answer; the pointer face below is never
+            // consulted for bytes that are already local (an outgoing row has
+            // no pointer face at all — the stash IS its bytes face).
             return Ok(PreparedHistoryDownload::AlreadyPresent { size_bytes });
         }
         let locator = self.attachment_locator_for_index(account_id, &message, attachment_index)?;
@@ -8774,16 +8784,13 @@ impl ConnectorService {
             digest: locator.digest.clone(),
             plaintext_hash: locator.plaintext_hash.clone(),
         };
-        let write_dir = media.write_dir()?;
+        let write_dir = media.write_dir(&params.account_id)?;
         let target = write_dir.join(&sanitized_id);
-        if let Ok(metadata) = std::fs::metadata(&target)
-            && metadata.is_file()
-        {
+        if let Some((_, size_bytes)) = media.locate_attachment(&params.account_id, &sanitized_id) {
             // Idempotent dedup, the 1.57/1.61 posture verbatim: the bytes
-            // already landed (an earlier call for the same story
-            // attachment). The measured size is the honest answer; the CDN
-            // is never re-asked.
-            let size_bytes = metadata.len();
+            // already landed (an earlier call for the same story attachment,
+            // or a pre-isolation legacy file). The measured size is the
+            // honest answer; the CDN is never re-asked.
             return Ok(PreparedHistoryDownload::AlreadyPresent { size_bytes });
         }
         let temp_path = write_dir.join(format!(".{}.{}.tmp", sanitized_id, random_id()));
@@ -8823,7 +8830,7 @@ impl ConnectorService {
         }
         let sanitized_id = sanitize_attachment_id(attachment_id)?;
         self.resolve_account(account_id)?;
-        let Some((path, size_bytes)) = media.locate_attachment(&sanitized_id) else {
+        let Some((path, size_bytes)) = media.locate_attachment(account_id, &sanitized_id) else {
             return Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "attachment is not available in the engine data directory",
@@ -8881,12 +8888,25 @@ impl ConnectorService {
         })
     }
 
-    /// ADR 0004 gate 3: handles cannot outlive their account session. The
-    /// delete-local-data path calls this once the account rows are gone; the
-    /// 300 s TTL backstops every other kind of abandonment.
-    pub fn clear_media_handles_for_account(&self, account_id: &str) {
-        if let Some(media) = self.media.as_ref() {
-            media.handles.clear_account(account_id);
+    /// The `deleteLocalData` hook (`[KT 适配]` audit §9.10): once the
+    /// account rows are gone, drop both its live chunk-stream handles
+    /// (ADR 0004 gate 3: a handle cannot outlive its account session; the
+    /// 300 s TTL backstops every other abandonment) and its media subtree
+    /// (`<data>/media/<account-id>/`). Both operations are account-scoped by
+    /// construction, so another account's same-id files and open streams are
+    /// untouched.
+    pub fn clear_media_for_account(&self, account_id: &str) {
+        let Some(media) = self.media.as_ref() else {
+            return;
+        };
+        media.handles.clear_account(account_id);
+        let stats = media.governor().clear_account(account_id);
+        if stats.deleted > 0 {
+            tracing::info!(
+                deleted = stats.deleted,
+                bytes_freed = stats.bytes_deleted,
+                "media governor cleared an account's media"
+            );
         }
     }
 
@@ -12447,7 +12467,7 @@ impl ConnectorService {
         if let Some(media) = self.media.as_ref()
             && let Ok(sanitized) = sanitize_attachment_id(&attachment_id)
         {
-            media.governor().delete_attachment(&sanitized);
+            media.governor().delete_attachment(&account.id, &sanitized);
         }
         event.attachment_id = Some(attachment_id);
         Ok(event)
@@ -30751,7 +30771,8 @@ mod tests {
             )
             .unwrap()
             .remove(0);
-        let landed = temp.path().join("signal-data/attachments/story-bytes");
+        let landed = account_media_dir(&temp, &account.id).join("story-bytes");
+        std::fs::create_dir_all(landed.parent().unwrap()).unwrap();
         std::fs::write(&landed, [0xAB_u8; 1234]).unwrap();
         let params = StoryAttachmentDownloadParams {
             account_id: account.id,
@@ -30819,11 +30840,9 @@ mod tests {
         // Landed: the handle reads the exact bytes back through the
         // sequential chunk face and reports EOF.
         let plaintext: Vec<u8> = (0..=255_u8).collect();
-        std::fs::write(
-            temp.path().join("signal-data/attachments/story-bytes"),
-            &plaintext,
-        )
-        .unwrap();
+        let story_dir = account_media_dir(&temp, &account.id);
+        std::fs::create_dir_all(&story_dir).unwrap();
+        std::fs::write(story_dir.join("story-bytes"), &plaintext).unwrap();
         let view = service
             .open_story_attachment_handle(&account.id, "story-bytes")
             .unwrap();
@@ -38804,7 +38823,8 @@ mod tests {
     // ---- Media ingest (ADR 0004) -------------------------------------
 
     /// A service with the media backing armed over an engine-shaped data
-    /// directory (`<data>/attachments/`, the single-account probe layout).
+    /// directory. The flat `<data>/attachments/` directory keeps the legacy
+    /// read path exercised; account-scoped tests use [`account_media_dir`].
     fn media_service() -> (TempDir, ConnectorService) {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
@@ -38818,6 +38838,16 @@ mod tests {
                 Some(MediaIngest::new(data_dir, handles)),
             ),
         )
+    }
+
+    /// `[KT 适配]` (audit §9.10): the per-account write bucket the governor
+    /// must use, created by the first write.
+    fn account_media_dir(temp: &TempDir, account_id: &str) -> PathBuf {
+        temp.path()
+            .join("signal-data")
+            .join("media")
+            .join(account_id)
+            .join("attachments")
     }
 
     /// Addressing rows for one account, mirroring the media-open test setup:
@@ -38903,10 +38933,7 @@ mod tests {
             .message_by_client_request(&account.id, "req-stash-1")
             .unwrap()
             .unwrap();
-        let stashed = temp
-            .path()
-            .join("signal-data/attachments")
-            .join(&row.attachments[0].id);
+        let stashed = account_media_dir(&temp, &account.id).join(&row.attachments[0].id);
         assert_eq!(
             std::fs::read(&stashed).unwrap(),
             bytes,
@@ -38923,6 +38950,69 @@ mod tests {
             panic!("a stashed outgoing row answers the local-hit arm, never a network chain");
         };
         assert_eq!(size_bytes, bytes.len() as u64);
+    }
+
+    /// `[KT 适配]` migration face: a pre-isolation stash lives in the flat
+    /// `<data>/attachments/` directory. The download arm still answers the
+    /// local-hit size instead of failing the no-pointer arm, so an outgoing
+    /// row written before the per-account layout keeps its bytes face.
+    #[test]
+    fn outbound_download_still_serves_a_legacy_flat_stash() {
+        let (temp, service) = media_service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let bytes = b"legacy stash bytes".to_vec();
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&direct.id),
+                "req-stash-legacy",
+                &base64_encode(&bytes),
+                bytes.len() as u64,
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { pending_id, .. } = prepared else {
+            panic!("new client request must dispatch");
+        };
+        service
+            .complete_send_success(&pending_id, &account.id, &direct.id, 900, None)
+            .unwrap();
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-stash-legacy")
+            .unwrap()
+            .unwrap();
+        // Simulate the pre-isolation layout: move the stash into the flat
+        // shared directory the old connector wrote.
+        let stashed = account_media_dir(&temp, &account.id).join(&row.attachments[0].id);
+        let legacy = temp
+            .path()
+            .join("signal-data/attachments")
+            .join(&row.attachments[0].id);
+        std::fs::rename(&stashed, &legacy).unwrap();
+
+        let PreparedHistoryDownload::AlreadyPresent { size_bytes } = service
+            .prepare_attachment_download(&account.id, &direct.id, &pending_id, 0)
+            .unwrap()
+        else {
+            panic!("a legacy local stash must still answer the local-hit arm");
+        };
+        assert_eq!(size_bytes, bytes.len() as u64);
+        assert!(legacy.is_file());
     }
 
     /// §4.183: a stash the governor evicted (the 7-day TTL arm is used
@@ -38971,10 +39061,7 @@ mod tests {
             .message_by_client_request(&account.id, "req-stash-2")
             .unwrap()
             .unwrap();
-        let stashed = temp
-            .path()
-            .join("signal-data/attachments")
-            .join(&row.attachments[0].id);
+        let stashed = account_media_dir(&temp, &account.id).join(&row.attachments[0].id);
         assert!(stashed.is_file());
         // Backdate past the MEDIA_TTL and let one governor pass evict the
         // stash — the same retention machine inbound media answers to.
@@ -39013,11 +39100,12 @@ mod tests {
             .store_ref()
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
-        // Occupy the write path: the probe skips a non-directory and the
-        // fresh-install fallback create_dir_all fails on the file.
-        let attachments = temp.path().join("signal-data/attachments");
-        std::fs::remove_dir(&attachments).unwrap();
-        std::fs::write(&attachments, b"occupied").unwrap();
+        // Occupy the account's media write path: `<data>/media/<account-id>`
+        // is a regular file, so the per-account create_dir_all fails and the
+        // stash reports its class.
+        let media_root = temp.path().join("signal-data/media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        std::fs::write(media_root.join(&account.id), b"occupied").unwrap();
 
         let bytes = b"unsaved bytes".to_vec();
         let prepared = service
@@ -39108,10 +39196,7 @@ mod tests {
             .unwrap();
         assert_eq!(row.attachments.len(), 2);
         for (descriptor, want) in row.attachments.iter().zip([first, second]) {
-            let stashed = temp
-                .path()
-                .join("signal-data/attachments")
-                .join(&descriptor.id);
+            let stashed = account_media_dir(&temp, &account.id).join(&descriptor.id);
             assert_eq!(
                 std::fs::read(&stashed).unwrap(),
                 want,
@@ -39178,10 +39263,7 @@ mod tests {
             .message_by_client_request(&account.id, "req-stash-vo")
             .unwrap()
             .unwrap();
-        let stashed = temp
-            .path()
-            .join("signal-data/attachments")
-            .join(&row.attachments[0].id);
+        let stashed = account_media_dir(&temp, &account.id).join(&row.attachments[0].id);
         assert_eq!(std::fs::read(&stashed).unwrap(), bytes);
 
         // The §4.37 burn face erases the stash exactly like the other media
@@ -39260,7 +39342,8 @@ mod tests {
         let (account_id, conversation_id, message_id) =
             addressed_message(&service, "+15555550100", "+15555550101", "req-media-open");
         let body: Vec<u8> = (0..8192_u32).map(|i| (i % 251) as u8).collect();
-        let attachment_dir = _temp.path().join("signal-data").join("attachments");
+        let attachment_dir = account_media_dir(&_temp, &account_id);
+        std::fs::create_dir_all(&attachment_dir).unwrap();
         std::fs::write(attachment_dir.join("a1b2c3.dat"), &body).unwrap();
 
         let view = service
@@ -39341,7 +39424,8 @@ mod tests {
         let (_temp, service) = media_service();
         let (account_id, conversation_id, message_id) =
             addressed_message(&service, "+15555550100", "+15555550101", "req-media-seq");
-        let attachment_dir = _temp.path().join("signal-data").join("attachments");
+        let attachment_dir = account_media_dir(&_temp, &account_id);
+        std::fs::create_dir_all(&attachment_dir).unwrap();
         std::fs::write(attachment_dir.join("seq.dat"), [0_u8; 4096]).unwrap();
         let view = service
             .open_media_handle(&account_id, &conversation_id, &message_id, "seq.dat")
@@ -39367,9 +39451,13 @@ mod tests {
             addressed_message(&service, "+15555550100", "+15555550191", "req-media-a");
         let (account_b, conversation_b, message_b) =
             addressed_message(&service, "+15555550101", "+15555550192", "req-media-b");
-        let attachment_dir = _temp.path().join("signal-data").join("attachments");
-        std::fs::write(attachment_dir.join("a.dat"), [1_u8; 64]).unwrap();
-        std::fs::write(attachment_dir.join("b.dat"), [2_u8; 64]).unwrap();
+        let media_a = account_media_dir(&_temp, &account_a);
+        let media_b = account_media_dir(&_temp, &account_b);
+        std::fs::create_dir_all(&media_a).unwrap();
+        std::fs::create_dir_all(&media_b).unwrap();
+        std::fs::write(media_a.join("a.dat"), [1_u8; 64]).unwrap();
+        let b_file = media_b.join("b.dat");
+        std::fs::write(&b_file, [2_u8; 64]).unwrap();
         let handle_a = service
             .open_media_handle(&account_a, &conversation_a, &message_a, "a.dat")
             .unwrap()
@@ -39379,7 +39467,7 @@ mod tests {
             .unwrap()
             .media_handle;
 
-        service.clear_media_handles_for_account(&account_a);
+        service.clear_media_for_account(&account_a);
 
         assert_eq!(
             service
@@ -39393,6 +39481,106 @@ mod tests {
         let chunk_b = service.read_media_chunk(&handle_b, 0).unwrap();
         assert_eq!(chunk_b.size_bytes, 64);
         assert!(chunk_b.eof);
+        // Audit §9.10: the deleteLocalData hook also removes the deleted
+        // account's media subtree and nothing else.
+        assert!(!media_a.exists());
+        assert!(b_file.exists());
+    }
+
+    /// Audit §9.10: media access is account-scoped end to end. B's file is
+    /// on disk under B's bucket, but A's row addressing must not resolve it.
+    #[test]
+    fn media_open_never_resolves_another_accounts_file() {
+        let (_temp, service) = media_service();
+        let (account_a, conversation_a, message_a) = addressed_message(
+            &service,
+            "+15555550100",
+            "+15555550191",
+            "req-media-scope-a",
+        );
+        let (account_b, _conversation_b, _message_b) = addressed_message(
+            &service,
+            "+15555550101",
+            "+15555550192",
+            "req-media-scope-b",
+        );
+        let media_b = account_media_dir(&_temp, &account_b);
+        std::fs::create_dir_all(&media_b).unwrap();
+        std::fs::write(media_b.join("shared-name.dat"), b"b's bytes").unwrap();
+
+        let error = service
+            .open_media_handle(&account_a, &conversation_a, &message_a, "shared-name.dat")
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "UPSTREAM_ERROR");
+        assert!(error.retryable);
+    }
+
+    /// Audit §9.10: a view-once burn erases only the addressed account's
+    /// copy; another account's identical attachment id keeps its bytes.
+    #[test]
+    fn view_once_burn_never_deletes_another_accounts_same_id_file() {
+        let (temp, service) = media_service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let other = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550101", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let bytes = b"view once bytes".to_vec();
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&direct.id),
+                "req-stash-vo-scope",
+                &base64_encode(&bytes),
+                bytes.len() as u64,
+                None,
+                Some("image/png"),
+                None,
+                None,
+                false,
+                true,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { pending_id, .. } = prepared else {
+            panic!("new client request must dispatch");
+        };
+        service
+            .complete_send_success(&pending_id, &account.id, &direct.id, 900, None)
+            .unwrap();
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-stash-vo-scope")
+            .unwrap()
+            .unwrap();
+        let own = account_media_dir(&temp, &account.id).join(&row.attachments[0].id);
+        assert!(own.is_file());
+        // The same file name under a different account must survive the burn.
+        let foreign_dir = account_media_dir(&temp, &other.id);
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = foreign_dir.join(&row.attachments[0].id);
+        std::fs::write(&foreign, b"not mine").unwrap();
+
+        service
+            .prepare_mark_view_once_opened(&MessagesMarkViewOnceOpenedParams {
+                account_id: account.id.clone(),
+                conversation_id: direct.id.clone(),
+                message_id: pending_id,
+            })
+            .unwrap();
+
+        assert!(!own.exists());
+        assert!(foreign.is_file());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"not mine");
     }
 
     /// The encoder emits the exact canonical form the upstream
