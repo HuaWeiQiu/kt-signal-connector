@@ -36291,16 +36291,14 @@ mod tests {
     }
 
     /// Contract 1.136 (§4.122 consume batch): the passive `syncMessage.
-    /// contacts` mirror lands its records in the existing contacts cache and
-    /// materializes the direct conversation skeletons through the pull
-    /// path's sibling store write — the pull marker untouched — and exactly
-    /// the changed conversations ride `conversation.changed`: a replay is
-    /// silent, a name that upgrades a masked title emits again. Contract
-    /// 1.146 (§4.144): a numbered record's ACI lands in `peer_identities`
-    /// (the aci-only sibling writes nothing), so the materialized summary
-    /// derives its serviceId.
+    /// contacts` mirror lands its records in the contacts cache without
+    /// materializing any conversation (P0 crosstalk fix, §6.5 amendment): a
+    /// contact is not a chat, so a passive batch over never-messaged peers
+    /// emits **no** `conversation.changed`. A replay stays silent. Contract
+    /// 1.146 (§4.144): a numbered record's ACI still lands in
+    /// `peer_identities` for later resolution.
     #[test]
-    fn sync_contacts_passive_batch_lands_cache_and_emits_changes() {
+    fn sync_contacts_passive_batch_lands_cache_without_creating_conversations() {
         let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(
@@ -36339,28 +36337,25 @@ mod tests {
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
             .unwrap();
-        // Both skeletons are new — both summaries ride conversation.changed,
-        // the nameless record titling with the masked ACI.
-        assert_eq!(events.len(), 2, "{events:?}");
-        for event in &events {
-            assert!(matches!(event, HostSideEvent::ConversationChanged(_)));
-        }
-        let titled = events
-            .iter()
-            .filter_map(|event| match event {
-                HostSideEvent::ConversationChanged(summary) => Some(summary),
-                _ => None,
-            })
-            .find(|summary| summary.title == "Alice")
-            .expect("the named contact's summary rode the change");
-        assert_eq!(titled.kind, "direct");
-        // Contract 1.146 (§4.144): the numbered record's ACI landed in
-        // peer_identities, so the summary derives its serviceId at read
-        // time — the row the pre-1.146 ingest left identifier-less.
-        assert_eq!(
-            titled.service_id.as_deref(),
-            Some("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+        // P0 regression: neither direct record produces a conversation, so the
+        // batch emits nothing — contacts land in the cache only.
+        assert!(
+            events.is_empty(),
+            "a direct contact must not become a chat: {events:?}"
         );
+        for peer_key in ["+15551234567", "0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283"] {
+            assert!(
+                service
+                    .store_ref()
+                    .conversation_by_peer(&account.id, "direct", peer_key)
+                    .unwrap()
+                    .is_none(),
+                "passive contacts created a conversation for {peer_key}"
+            );
+        }
+        // Contract 1.146 (§4.144): the numbered record's ACI still lands in
+        // peer_identities — only the conversation materialization is gone, the
+        // identity mapping is independent of it.
         assert_eq!(
             service
                 .store_ref()
@@ -36378,12 +36373,15 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let row = service
-            .store_ref()
-            .conversation_by_peer(&account.id, "direct", "+15551234567")
-            .unwrap()
-            .expect("the skeleton materialized");
-        assert_eq!(titled.id, row.id);
+        // No conversation exists for the contact — the P0 invariant.
+        assert!(
+            service
+                .store_ref()
+                .conversation_by_peer(&account.id, "direct", "+15551234567")
+                .unwrap()
+                .is_none(),
+            "the contact must not have materialized a conversation"
+        );
         // The pull marker stays pull-owned: a passive batch is not a pull.
         assert_eq!(service.contacts_synced_at(&account.id).unwrap(), None);
         let (contact_count, _) = service.count_contacts(&account.id).unwrap();

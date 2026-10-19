@@ -23,15 +23,14 @@ fn test_store(dir: &std::path::Path) -> Arc<Store> {
 }
 
 /// A fresh engine start must re-sync contacts/groups for already-linked
-/// accounts: the sync materializes the contract-1.14 conversation skeletons,
-/// which is the only path existing chats surface after a restart (pinned
-/// signal-cli has no message-history backfill). Covers an account whose
-/// link-time inline sync failed or predates the skeleton revision. Since
-/// contract 1.43 (§4.42) the linked account's own entry ("note to self") is
-/// no longer dropped: its skeleton materializes like any contact's and the
-/// summary marks it `isSelf`.
+/// accounts. Contract 1.201 (§6.5 amendment): that resync materializes only
+/// **structurally-owned** chats — a group the account is in, and its own
+/// Note-to-Self row — never a direct conversation for a bare contact. A peer
+/// becomes a chat when a message flows, not because their profile synced.
+/// Since contract 1.43 (§4.42) the linked account's own entry ("note to
+/// self") is no longer dropped and its summary marks it `isSelf`.
 #[tokio::test]
-async fn engine_start_resyncs_conversation_skeletons_for_linked_accounts() {
+async fn engine_start_resyncs_structurally_owned_chats_only() {
     let temp = TempDir::new().unwrap();
     let seeded = {
         let seed = test_store(temp.path());
@@ -55,18 +54,20 @@ async fn engine_start_resyncs_conversation_skeletons_for_linked_accounts() {
 
     supervisor.start().await.unwrap();
 
-    // Background pass: settle delay plus read-only fixture calls.
+    // Background pass: settle delay plus read-only fixture calls. Two
+    // structurally-owned chats (the fixture group and the self row) is the
+    // full expected count under 1.201.
     timeout(Duration::from_secs(15), async {
         loop {
             let page = store.list_conversations(&seeded.id, 50, None).unwrap();
-            if page.items.len() >= 4 {
+            if page.items.len() >= 2 {
                 break;
             }
             sleep(Duration::from_millis(200)).await;
         }
     })
     .await
-    .expect("engine start must materialize contact/group skeletons");
+    .expect("engine start must materialize the structurally-owned chats");
 
     let final_page = store.list_conversations(&seeded.id, 50, None).unwrap();
     let mut names: Vec<&str> = final_page
@@ -75,22 +76,18 @@ async fn engine_start_resyncs_conversation_skeletons_for_linked_accounts() {
         .map(|row| row.title.as_str())
         .collect();
     names.sort_unstable();
-    // Contract 1.43: the self entry ("Test User", the account's own profile
-    // name — raw material, the desktop localizes the title) joins the
-    // skeletons; the non-member group stays skipped. Profile names win over
-    // the raw contact name in the title composition.
-    assert_eq!(
-        names,
-        ["Alice Example", "Bob", "Fixture Group", "Test User"]
-    );
-    // Exactly the own direct chat is marked; the three peer skeletons are not.
+    // Contract 1.201: only the group and the self entry materialize. Alice and
+    // Bob stay bare contacts (P0 crosstalk fix) — a profile sync must not
+    // conjure a chat. The non-member group stays skipped.
+    assert_eq!(names, ["Fixture Group", "Test User"]);
+    // Exactly the own direct chat is marked; the group is the only other row.
     let self_rows: Vec<_> = final_page.items.iter().filter(|row| row.is_self).collect();
     assert_eq!(self_rows.len(), 1);
     assert_eq!(self_rows[0].kind, "direct");
     assert_eq!(self_rows[0].title, "Test User");
     assert_eq!(
         final_page.items.iter().filter(|row| !row.is_self).count(),
-        3
+        1
     );
 
     supervisor.shutdown().await.unwrap();

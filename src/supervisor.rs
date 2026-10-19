@@ -11889,13 +11889,13 @@ mod tests {
         supervisor.shutdown().await.unwrap();
     }
 
-    /// Contract 1.140 (§4.135): the contacts pull is no longer a silent
-    /// materialization — every skeleton the pull creates rides
-    /// `conversation.changed` on the host lane (the §4.122 passive batch's
-    /// event semantics, now shared by the pull), and a pull inside the 60 s
-    /// short-circuit window emits nothing.
+    /// Contract 1.140 (§4.135) as amended by 1.201 (§6.5): the contacts pull no
+    /// longer creates conversations at all (P0 crosstalk fix), so it also
+    /// emits nothing on the host lane — a contact is not a chat. A pull inside
+    /// the 60 s short-circuit window is likewise silent, and the account's chat
+    /// list stays empty across both passes.
     #[tokio::test]
-    async fn pull_contacts_sync_emits_conversation_changed_for_new_skeletons() {
+    async fn pull_contacts_sync_creates_no_conversations_and_emits_nothing() {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
@@ -11926,56 +11926,50 @@ mod tests {
 
         supervisor.sync_contacts(&account.id).await.unwrap();
 
-        // The fixture lists the account itself plus two contacts; the two
-        // contact skeletons must each surface as conversation.changed within
-        // the startup window (whichever pull materialized them emitted them;
-        // the other pass short-circuits on the fresh marker).
-        let mut seen: Vec<String> = Vec::new();
-        for _ in 0..40 {
-            match timeout(Duration::from_millis(150), host_lane.recv()).await {
-                Ok(Ok(HostSideEvent::ConversationChanged(summary))) => {
-                    if summary.kind == "direct" && !seen.contains(&summary.id) {
-                        seen.push(summary.id);
-                    }
-                    // The fixture lists the account itself plus two contacts:
-                    // three direct skeletons total. Stop once all three rode
-                    // the lane.
-                    if seen.len() >= 3 {
-                        break;
-                    }
-                }
-                Ok(Ok(_)) => {}
-                _ => {}
-            }
-        }
-        let mut expected: Vec<String> = Vec::new();
+        // Drain any lane traffic the startup/self passes produced, then assert
+        // the P0 invariant directly: the contacts the fixture lists are in the
+        // cache, but no direct conversation was materialized for any of them.
+        while timeout(Duration::from_millis(200), host_lane.recv())
+            .await
+            .is_ok()
+        {}
         for peer_key in ["+15555550101", "+15555550102"] {
-            let id = supervisor
-                .service
-                .lock()
-                .await
-                .store_ref()
-                .conversation_by_peer(&account.id, "direct", peer_key)
-                .unwrap()
-                .expect("the pull materialized the skeleton")
-                .id;
-            expected.push(id);
-        }
-        for id in &expected {
             assert!(
-                seen.contains(id),
-                "skeleton {id} never rode conversation.changed; seen {seen:?}"
+                supervisor
+                    .service
+                    .lock()
+                    .await
+                    .store_ref()
+                    .conversation_by_peer(&account.id, "direct", peer_key)
+                    .unwrap()
+                    .is_none(),
+                "the pull materialized a conversation for {peer_key}"
             );
         }
+        // The pull may still materialize structurally-owned chats (a group the
+        // account was synced into), but never a direct conversation for a person
+        // it has not messaged.
+        let page = supervisor
+            .service
+            .lock()
+            .await
+            .list_conversations(&account.id, 50, None)
+            .unwrap();
+        // The account's own Note-to-Self row is structurally owned and may
+        // materialize; any *other* direct row would mean a contact became a chat.
+        assert!(
+            page.items
+                .iter()
+                .all(|row| row.kind != "direct" || row.is_self),
+            "a contacts pull produced non-self direct chats: {page:?}"
+        );
 
-        // Drain the lane dry before the second pull: the first pull's group
-        // summaries may still be queued behind the direct ones, and the
-        // silence proof must be about the second pull only. (Bounded: 300 ms
-        // of lane silence closes the drain.)
+        // Drain the lane dry before the second pull so the silence proof is
+        // about the second pass only. (Bounded: 300 ms of lane silence closes
+        // the drain.)
         while let Ok(Ok(_)) = timeout(Duration::from_millis(300), host_lane.recv()).await {}
 
-        // A second pull inside the window short-circuits: no further
-        // conversation.changed may arrive.
+        // A second pull inside the window short-circuits: no event may arrive.
         supervisor.sync_contacts(&account.id).await.unwrap();
         let mut quiet = true;
         for _ in 0..6 {

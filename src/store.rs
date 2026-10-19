@@ -9099,24 +9099,38 @@ impl Store {
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
             }
         }
-        // Contract revision 1.14 (§6.5): every synced direct contact and member
-        // group also materializes its conversation skeleton, so the linked
-        // account sees its existing chats right after the sync instead of one
-        // message at a time. The insert is idempotent on the same
-        // stable_hash_id key ensure_conversation uses; existing rows keep
-        // their state (unread/muted/pinned), and a masked/placeholder title
-        // upgrades through the normal path when a real message later lands.
+        // Contract revision 1.14b (§6.5 amendment, 2026-10-20): a contacts sync
+        // must never CREATE a conversation. It only refreshes the title of a
+        // conversation that already exists (a real message, an outbound send, or
+        // a group sync produced it).
+        //
+        // Why (cross-account crosstalk, P0): §6.5 originally materialized a
+        // skeleton row for every synced contact. A contact is not a chat — Signal
+        // only shows a thread once messages exist. With one account the
+        // difference was invisible (you usually have messaged your contacts);
+        // with two it is fatal: account B stored account A's number, A's profile
+        // sync arrived, and B's chat list grew rows for people B never messaged,
+        // whose peer keys were A's identities. Evidence: SIGNAL-ACCOUNT-CROSSTALK-P0.md.
         // Contract 1.170 (§4.170): the own entry's skeleton lands on the
         // canonical ACI key — the same redirect ensure_conversation applies.
         let mut changed: Vec<String> = Vec::new();
         {
             let memo_identity = memo_skeleton_identity(&transaction, account_id)?;
-            let mut stmt = transaction
+            // A contacts sync materializes a skeleton only for a chat the user is
+            // structurally part of: a group they were synced into, or the
+            // account's own Note-to-Self row. A **direct** entry for another person
+            // never becomes a chat here — the P0 crosstalk fix — it can only
+            // refresh the title of a conversation that already exists (produced by
+            // a real message, inbound or outbound).
+            let mut insert_stmt = transaction
                 .prepare(
                     "INSERT INTO conversations(id, account_id, kind, peer_key, title, unread_count, muted, pinned)
                      VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, 0)
                      ON CONFLICT(id) DO NOTHING",
                 )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let mut title_stmt = transaction
+                .prepare("UPDATE conversations SET title=?2 WHERE id=?1")
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
             for entry in entries {
                 let conversation_kind = match entry.kind {
@@ -9129,40 +9143,44 @@ impl Store {
                     entry.peer_key,
                 );
                 let id = stable_hash_id(&[account_id, conversation_kind, peer_key]);
-                let inserted = stmt
-                    .execute(params![
-                        id,
-                        account_id,
-                        conversation_kind,
-                        peer_key,
-                        entry.title,
-                    ])
-                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
-                if inserted == 0 {
-                    // The row already exists (created by an earlier sync or a
-                    // real message): leave its state alone, but still upgrade
-                    // masked/placeholder titles — the sync cache may carry a
-                    // display name the conversation has not learned yet.
-                    let existing = transaction
-                        .query_row(
-                            "SELECT title FROM conversations WHERE id=?1",
-                            params![id],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
+                // Structural membership: a group row, or the own direct row (peer
+                // key equals the account's own number or its canonical ACI).
+                let structural = conversation_kind != "direct"
+                    || memo_identity.as_ref().is_some_and(|(number, aci)| {
+                        peer_key == number.as_str()
+                            || aci.as_deref().is_some_and(|aci| peer_key == aci)
+                    });
+                if structural {
+                    let inserted = insert_stmt
+                        .execute(params![
+                            id,
+                            account_id,
+                            conversation_kind,
+                            peer_key,
+                            entry.title
+                        ])
                         .map_err(|error| StoreError::Unavailable(Some(error)))?;
-                    if let Some(current) = existing
-                        && title_should_upgrade(&current, entry.title)
-                    {
-                        transaction
-                            .execute(
-                                "UPDATE conversations SET title=?2 WHERE id=?1",
-                                params![id, entry.title],
-                            )
-                            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                    if inserted > 0 {
                         changed.push(id);
+                        continue;
                     }
-                } else {
+                }
+                // Existing rows only: refresh a masked/placeholder title through
+                // the same guard a real message uses.
+                let existing = transaction
+                    .query_row(
+                        "SELECT title FROM conversations WHERE id=?1",
+                        params![id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                if let Some(current) = existing
+                    && title_should_upgrade(&current, entry.title)
+                {
+                    title_stmt
+                        .execute(params![id, entry.title])
+                        .map_err(|error| StoreError::Unavailable(Some(error)))?;
                     changed.push(id);
                 }
             }
@@ -9234,12 +9252,21 @@ impl Store {
             // own entry on the canonical ACI key — the same redirect
             // ensure_conversation applies.
             let memo_identity = memo_skeleton_identity(&transaction, account_id)?;
-            let mut stmt = transaction
+            // A contacts sync materializes a skeleton only for a chat the user is
+            // structurally part of: a group they were synced into, or the
+            // account's own Note-to-Self row. A **direct** entry for another person
+            // never becomes a chat here — the P0 crosstalk fix — it can only
+            // refresh the title of a conversation that already exists (produced by
+            // a real message, inbound or outbound).
+            let mut insert_stmt = transaction
                 .prepare(
                     "INSERT INTO conversations(id, account_id, kind, peer_key, title, unread_count, muted, pinned)
                      VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, 0)
                      ON CONFLICT(id) DO NOTHING",
                 )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let mut title_stmt = transaction
+                .prepare("UPDATE conversations SET title=?2 WHERE id=?1")
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
             for entry in entries {
                 let conversation_kind = match entry.kind {
@@ -9252,40 +9279,44 @@ impl Store {
                     entry.peer_key,
                 );
                 let id = stable_hash_id(&[account_id, conversation_kind, peer_key]);
-                let inserted = stmt
-                    .execute(params![
-                        id,
-                        account_id,
-                        conversation_kind,
-                        peer_key,
-                        entry.title,
-                    ])
-                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
-                if inserted == 0 {
-                    // The row already exists (created by an earlier sync or a
-                    // real message): leave its state alone, but still upgrade
-                    // masked/placeholder titles — the sync cache may carry a
-                    // display name the conversation has not learned yet.
-                    let existing = transaction
-                        .query_row(
-                            "SELECT title FROM conversations WHERE id=?1",
-                            params![id],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
+                // Structural membership: a group row, or the own direct row (peer
+                // key equals the account's own number or its canonical ACI).
+                let structural = conversation_kind != "direct"
+                    || memo_identity.as_ref().is_some_and(|(number, aci)| {
+                        peer_key == number.as_str()
+                            || aci.as_deref().is_some_and(|aci| peer_key == aci)
+                    });
+                if structural {
+                    let inserted = insert_stmt
+                        .execute(params![
+                            id,
+                            account_id,
+                            conversation_kind,
+                            peer_key,
+                            entry.title
+                        ])
                         .map_err(|error| StoreError::Unavailable(Some(error)))?;
-                    if let Some(current) = existing
-                        && title_should_upgrade(&current, entry.title)
-                    {
-                        transaction
-                            .execute(
-                                "UPDATE conversations SET title=?2 WHERE id=?1",
-                                params![id, entry.title],
-                            )
-                            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                    if inserted > 0 {
                         changed.push(id);
+                        continue;
                     }
-                } else {
+                }
+                // Existing rows only: refresh a masked/placeholder title through
+                // the same guard a real message uses.
+                let existing = transaction
+                    .query_row(
+                        "SELECT title FROM conversations WHERE id=?1",
+                        params![id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                if let Some(current) = existing
+                    && title_should_upgrade(&current, entry.title)
+                {
+                    title_stmt
+                        .execute(params![id, entry.title])
+                        .map_err(|error| StoreError::Unavailable(Some(error)))?;
                     changed.push(id);
                 }
             }
@@ -18451,15 +18482,14 @@ mod tests {
         assert_eq!(store.count_contacts(&account.id).unwrap(), (2, 1));
     }
 
-    /// Contract 1.136 (§4.122): the passive contacts batch shares the pull
-    /// batch's upsert columns and skeleton materialization but never moves
-    /// the pull marker — `contacts_synced_at` means "a full `listContacts`
-    /// pull completed", and the passive face must not let the 60s
-    /// short-circuit report a freshness the pull never delivered. The return
-    /// is exactly the change set: a newly materialized skeleton or a
-    /// placeholder title upgrade; a replay changes nothing.
+    /// Contract 1.136 (§4.122) as amended by 1.14b (§6.5): the passive contacts
+    /// batch shares the pull batch's upsert columns but **never materializes a
+    /// conversation** — a contact is not a chat — and never moves the pull
+    /// marker (`contacts_synced_at` means "a full `listContacts` pull
+    /// completed"). The change set therefore only ever names a placeholder
+    /// title upgrade on a conversation that already exists.
     #[test]
-    fn passive_contacts_batch_keeps_the_pull_marker_and_reports_changes() {
+    fn passive_contacts_batch_keeps_the_pull_marker_and_never_creates_conversations() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
@@ -18483,20 +18513,19 @@ mod tests {
         let changed = store
             .upsert_passive_contacts(&account.id, &entries, 42)
             .unwrap();
-        // Both skeletons are new: the change set names both conversations,
-        // and the pull marker is untouched.
-        assert_eq!(changed.len(), 2, "{changed:?}");
+        // P0 regression: neither direct contact produces a conversation.
+        assert!(changed.is_empty(), "{changed:?}");
         assert_eq!(store.contacts_synced_at(&account.id).unwrap(), None);
         assert_eq!(store.count_contacts(&account.id).unwrap(), (2, 0));
-        let conversation = store
-            .conversation_by_peer(&account.id, "direct", "+15555550101")
-            .unwrap()
-            .expect("the skeleton materialized");
-        let summary = store
-            .conversation_summary(&account.id, &conversation.id)
-            .unwrap()
-            .expect("the new skeleton summarizes");
-        assert_eq!(summary.title, "Alice");
+        for peer_key in ["+15555550101", "+15555550102"] {
+            assert!(
+                store
+                    .conversation_by_peer(&account.id, "direct", peer_key)
+                    .unwrap()
+                    .is_none(),
+                "a direct contact alone must not become a chat"
+            );
+        }
 
         // A replay of the same batch is a no-op change set.
         let changed = store
@@ -18537,13 +18566,13 @@ mod tests {
         assert_eq!(store.contacts_synced_at(&account.id).unwrap(), Some(45));
     }
 
-    /// Contract 1.140 (§4.135): the pull batch reports exactly the skeleton
-    /// change set the §4.122 passive batch reports — a newly materialized
-    /// skeleton or a placeholder title the batch upgraded — so the pull path
-    /// can mirror the passive batch's `conversation.changed` semantics. A
-    /// replay changes nothing, and the sync marker still belongs to the pull.
+    /// Contract 1.140 (§4.135) as amended by 1.14b (§6.5): the pull batch and
+    /// the §4.122 passive batch report the same change set — a placeholder
+    /// title upgrade on an **already existing** conversation. Neither creates a
+    /// conversation: a contact is not a chat (P0 crosstalk fix). A replay
+    /// changes nothing, and the sync marker still belongs to the pull.
     #[test]
-    fn synced_contacts_pull_reports_the_changed_skeleton_set() {
+    fn synced_contacts_pull_only_upgrades_existing_conversations() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
@@ -18567,13 +18596,22 @@ mod tests {
         let changed = store
             .upsert_synced_contacts(&account.id, &entries, 42)
             .unwrap();
-        assert_eq!(changed.len(), 2, "{changed:?}");
-        // The change set names the conversations, not the contacts rows.
-        let direct = store
-            .conversation_by_peer(&account.id, "direct", "+15555550101")
+        // P0 regression: the direct contact creates no conversation. The synced
+        // **group** still materializes (structural membership — you are in it),
+        // and it is the only conversation the change set names.
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", "+15555550101")
+                .unwrap()
+                .is_none(),
+            "a contact alone must not become a chat"
+        );
+        let group_row = store
+            .conversation_by_peer(&account.id, "group", "Z3JvdXAtMQ==")
             .unwrap()
-            .expect("the skeleton materialized");
-        assert!(changed.contains(&direct.id));
+            .expect("a synced group is structurally a chat");
+        assert_eq!(changed, vec![group_row.id.clone()]);
 
         // A replay of the same batch is a no-op change set; the marker still
         // advances (the pull owns it, the §4.122 passive face never does).
@@ -18606,6 +18644,129 @@ mod tests {
             .unwrap()
             .expect("the upgraded conversation summarizes");
         assert_eq!(summary.title, "Carol");
+    }
+
+    /// **P0 regression (cross-account crosstalk, 2026-10-20).** Two accounts on
+    /// one connector. Account B stores account A's number, so A's profile sync
+    /// delivers A's identities into B's contacts cache. Before the §6.5
+    /// amendment that contact sync materialized conversations, and B's chat
+    /// list grew rows for people B had never messaged — rows whose peer keys
+    /// were A's own identities (bx y / 菲菲 林 / y y on the real device).
+    ///
+    /// The invariant: a contacts sync never creates a conversation, on either
+    /// the pull face or the passive face, for either account — and each
+    /// account's cache stays in its own domain.
+    #[test]
+    fn contacts_sync_never_crosses_the_account_boundary_into_chat_lists() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let a = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let b = store
+            .upsert_account_from_signal("+447434026244", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        // A's own ACI plus two of A's contacts: exactly the identities that
+        // leaked into B's chat list on the real device.
+        let a_aci = "b1d73c45-8225-4421-bcf8-7b2f57442865";
+        let a_contact_1 = "8fc7f3b1-c017-4c89-b55c-d106dfaa2fe2";
+        let a_contact_2 = "c9bf3cad-0efd-447e-963f-3f5e40d4324b";
+
+        // B stores A's number as a contact, so A's profile sync lands every one
+        // of A's identities in B's cache.
+        let b_entries = [
+            SyncedContact {
+                kind: "contact",
+                peer_key: a_aci,
+                title: "bx y",
+                extra: None,
+            },
+            SyncedContact {
+                kind: "contact",
+                peer_key: a_contact_1,
+                title: "菲菲 林",
+                extra: None,
+            },
+            SyncedContact {
+                kind: "contact",
+                peer_key: a_contact_2,
+                title: "y y",
+                extra: None,
+            },
+            SyncedContact {
+                kind: "contact",
+                peer_key: "+8618827970450",
+                title: "",
+                extra: None,
+            },
+        ];
+        let changed = store.upsert_synced_contacts(&b.id, &b_entries, 10).unwrap();
+        assert!(
+            changed.is_empty(),
+            "pull face created conversations: {changed:?}"
+        );
+        let changed = store
+            .upsert_passive_contacts(&b.id, &b_entries, 11)
+            .unwrap();
+        assert!(
+            changed.is_empty(),
+            "passive face created conversations: {changed:?}"
+        );
+
+        // B's chat list is still empty — the whole point of the fix.
+        let page = store.list_conversations(&b.id, 50, None).unwrap();
+        assert!(page.items.is_empty(), "B has phantom chats: {page:?}");
+
+        // A's domain is untouched and independent: A sending to a real peer
+        // still creates A's own conversation, never B's.
+        let a_conversation = store
+            .ensure_conversation(&a.id, "direct", a_contact_1, "菲菲 林")
+            .unwrap();
+        let b_page = store.list_conversations(&b.id, 50, None).unwrap();
+        assert!(b_page.items.is_empty(), "A's conversation leaked into B");
+        let a_page = store.list_conversations(&a.id, 50, None).unwrap();
+        assert_eq!(a_page.items.len(), 1);
+        assert_eq!(a_page.items[0].id, a_conversation.id);
+        assert_eq!(a_page.items[0].account_id, a.id);
+
+        // Both accounts know the same peer key, yet each conversation id is
+        // account-scoped: the fixed hash inputs keep the domains disjoint.
+        let b_conversation = store
+            .ensure_conversation(&b.id, "direct", a_contact_1, "菲菲 林")
+            .unwrap();
+        assert_ne!(b_conversation.id, a_conversation.id);
+        assert_eq!(b_conversation.account_id, b.id);
+        let b_page = store.list_conversations(&b.id, 50, None).unwrap();
+        assert_eq!(b_page.items.len(), 1, "exactly the one B actually created");
+        assert_eq!(b_page.items[0].account_id, b.id);
+
+        // Counter-proof that the fix is not over-broad: a group B was synced
+        // into still materializes its skeleton (structural membership).
+        let group_entries = [SyncedContact {
+            kind: "group",
+            peer_key: "Z3JvdXAtYnktc3luYw==",
+            title: "B's group",
+            extra: None,
+        }];
+        let changed = store
+            .upsert_synced_contacts(&b.id, &group_entries, 12)
+            .unwrap();
+        assert_eq!(changed.len(), 1, "the group skeleton must materialize");
+        let group_row = store
+            .conversation_by_peer(&b.id, "group", "Z3JvdXAtYnktc3luYw==")
+            .unwrap()
+            .expect("a synced group is structurally a chat");
+        assert_eq!(group_row.account_id, b.id);
+        // A's chat list is unaffected by B's group.
+        assert_eq!(
+            store
+                .list_conversations(&a.id, 50, None)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
     }
 
     /// Performance sanity, not a benchmark: a phone-scale contacts sync (a few

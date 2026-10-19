@@ -293,11 +293,12 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     assert_eq!(accounts["result"].as_array().unwrap().len(), 1);
 
     // Fixture finishLink emits one receive notification (+15555550101) after
-    // the JSON-RPC result. Contract revision 1.14: the inline contacts.sync
-    // materializes skeletons for Alice, Bob, and the fixture group; contract
-    // 1.43 (§4.42) adds the linked account's own Note to Self skeleton, so
-    // the listing has 4 rows — the messaged conversation first (history
-    // ordering), then the empty skeletons.
+    // the JSON-RPC result. Contract 1.201 (§6.5 amendment): the inline
+    // contacts.sync no longer materializes skeletons for **other people** —
+    // only structurally-owned chats do (the fixture group, and the linked
+    // account's own Note to Self row per 1.43/§4.42). Alice and Bob are bare
+    // contacts until a message flows, so the listing is the messaged
+    // conversation first, then the group and the self row.
     sleep(Duration::from_millis(50)).await;
     let conversations = request(
         &mut client,
@@ -307,7 +308,11 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     )
     .await;
     let items = conversations["result"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 3, "messaged + group + self: {items:?}");
+    assert!(
+        items.iter().all(|row| row["title"] != "Bob"),
+        "Bob is a bare contact and must not appear as a chat: {items:?}"
+    );
     // The messaged conversation first; its title follows the sync cache's
     // profile-name preference ("Alice Example" over the envelope peer name).
     assert_eq!(items[0]["title"], "Alice Example");
