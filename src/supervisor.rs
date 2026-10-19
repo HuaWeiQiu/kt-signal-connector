@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 
@@ -222,6 +222,23 @@ fn receipt_failure_key(account_id: &str, conversation_id: &str, method: &str) ->
 /// receive pipeline and link state, over the shared per-profile store
 /// (ADR 0001 R4/R5). The group id is the opaque wire identity; the proxy
 /// endpoint stays inside the launcher-provided config.
+fn link_cancelled_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "LINK_CANCELLED",
+        "link session was cancelled",
+        false,
+    ))
+}
+
+/// The one in-flight `link.finish` wait of this group (per-group wait lane,
+/// implementation-plan §6.1). The watch channel is the cancellation signal:
+/// `link.cancel` flips it and the finish call stops waiting at once without
+/// touching the shared engine.
+struct ActiveLinkFinish {
+    link_session_id: String,
+    cancel: watch::Sender<bool>,
+}
+
 pub struct RuntimeSupervisor {
     config: EngineConfig,
     /// Opaque group id (launcher-defined, ADR 0001 R1). Appears on the wire
@@ -237,7 +254,7 @@ pub struct RuntimeSupervisor {
     /// service's own backing exists. Never held; `MediaGovernor` is a plain
     /// data-dir handle.
     media: Option<MediaIngest>,
-    active_link_finish: Mutex<Option<String>>,
+    active_link_finish: Mutex<Option<ActiveLinkFinish>>,
     events: broadcast::Sender<EngineEvent>,
     host_events: broadcast::Sender<HostSideEvent>,
     receive_ingress: ReceiveIngress,
@@ -2002,7 +2019,7 @@ impl RuntimeSupervisor {
         link_session_id: String,
     ) -> Result<AccountSummary, ServiceError> {
         let engine = self.running_engine().await?;
-        {
+        let cancel = {
             let mut active = self.active_link_finish.lock().await;
             if active.is_some() {
                 return Err(ServiceError::Api(ApiError::new(
@@ -2011,8 +2028,13 @@ impl RuntimeSupervisor {
                     false,
                 )));
             }
-            *active = Some(link_session_id.clone());
-        }
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            *active = Some(ActiveLinkFinish {
+                link_session_id: link_session_id.clone(),
+                cancel: cancel_tx,
+            });
+            cancel_rx
+        };
         let credentials = self
             .service
             .lock()
@@ -2021,10 +2043,7 @@ impl RuntimeSupervisor {
         let (device_name, device_link_uri) = match credentials {
             Ok(credentials) => credentials,
             Err(error) => {
-                let mut active = self.active_link_finish.lock().await;
-                if active.as_deref() == Some(link_session_id.as_str()) {
-                    *active = None;
-                }
+                self.clear_link_finish(&link_session_id).await;
                 return Err(error);
             }
         };
@@ -2039,15 +2058,12 @@ impl RuntimeSupervisor {
             .await
             .group_at_account_ceiling(&self.group_id)?
         {
-            let mut active = self.active_link_finish.lock().await;
-            if active.as_deref() == Some(link_session_id.as_str()) {
-                *active = None;
-            }
+            self.clear_link_finish(&link_session_id).await;
             return Err(account_limit_error(&self.group_id));
         }
 
         let upstream = engine
-            .call_with_timeout(
+            .call_with_timeout_or_cancel(
                 "finishLink",
                 json!({
                     "deviceLinkUri": device_link_uri,
@@ -2055,27 +2071,22 @@ impl RuntimeSupervisor {
                 }),
                 CallClass::Mutating,
                 LINK_FINISH_TIMEOUT,
+                cancel,
             )
             .await;
-        let still_current = {
-            let mut active = self.active_link_finish.lock().await;
-            if active.as_deref() == Some(link_session_id.as_str()) {
-                *active = None;
-                true
-            } else {
-                false
-            }
-        };
+        let still_current = self.clear_link_finish(&link_session_id).await;
         if !still_current {
-            return Err(ServiceError::Api(ApiError::new(
-                "LINK_CANCELLED",
-                "link session was cancelled",
-                false,
-            )));
+            return Err(link_cancelled_error());
         }
 
         let result = match upstream {
-            Ok(value) => value,
+            Ok(Some(value)) => value,
+            // `link.cancel` (or a stop/shutdown) abandoned the wait. The
+            // engine may still complete the link; the pinned JSON-RPC face has
+            // no cancel verb, so the honest answer is the cancellation, and
+            // any late engine-side link surfaces through the next
+            // accounts.list sync as a real link (the phone approved it).
+            Ok(None) => return Err(link_cancelled_error()),
             Err(EngineError::Timeout) => {
                 return Err(ServiceError::Api(ApiError::new(
                     "UPSTREAM_TIMEOUT",
@@ -2155,25 +2166,46 @@ impl RuntimeSupervisor {
         Ok(account)
     }
 
+    /// Clear the active finish lane only when it still names this session.
+    /// False means `link.cancel` (or stop/shutdown) already took it.
+    async fn clear_link_finish(&self, link_session_id: &str) -> bool {
+        let mut active = self.active_link_finish.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|finish| finish.link_session_id == link_session_id)
+        {
+            *active = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub async fn cancel_link(&self, link_session_id: String) -> Result<Value, ServiceError> {
+        // [KT 适配] The pinned engine has no link-cancel verb: `finishLink` is
+        // a mutating call already dispatched to the engine and cannot be
+        // withdrawn. Cancellation is therefore local and immediate — the wait
+        // is abandoned (the engine call is removed from the pending map and
+        // its late answer ignored), the link session is cleared, and the
+        // shared engine keeps running. Restarting the group engine here (the
+        // pre-B3 behavior) disconnected every other account in the group for
+        // a cancellation that concerns one link session; audit §9.10 item 4.
         let cancelled_in_flight = {
             let mut active = self.active_link_finish.lock().await;
-            if active.as_deref() == Some(link_session_id.as_str()) {
-                *active = None;
-                true
-            } else {
-                false
+            match active.as_ref() {
+                Some(finish) if finish.link_session_id == link_session_id => {
+                    let finish = active.take().expect("checked above");
+                    let _ = finish.cancel.send(true);
+                    true
+                }
+                _ => false,
             }
         };
         let result = self.service.lock().await.cancel_link(&link_session_id);
         if cancelled_in_flight {
-            self.restart_engine_after_link_cancel().await?;
+            tracing::info!("link finish wait abandoned; the group engine keeps running");
         }
         result
-    }
-
-    async fn restart_engine_after_link_cancel(&self) -> Result<(), EngineError> {
-        self.restart_engine().await
     }
 
     /// Shared engine restart: shut the current engine down and start a fresh one.
@@ -2508,17 +2540,11 @@ impl RuntimeSupervisor {
                             .lock()
                             .await
                             .clear_media_handles_for_account(&account_id);
-                        if let Some(handles) = self.backup_handles.as_ref() {
-                            handles.clear_account(&account_id);
-                        }
-                        // §4.115: the plaintext task record and its artifact
-                        // directory die with the account session too — an
-                        // export product never outlives it.
-                        self.plaintext_tasks.clear(&account_id);
-                        crate::backup_export::clear_plaintext_artifacts(
-                            self.store.state_dir(),
-                            &account_id,
-                        );
+                        // §4.115: the plaintext task record, the export
+                        // counters/handles, the import-cancel marker and the
+                        // artifact directory die with the account session too
+                        // — an export product never outlives it.
+                        self.clear_account_task_state(&account_id);
                         return Ok(json!({}));
                     }
                     AccountDeletePlan::Dispatch {
@@ -2538,17 +2564,30 @@ impl RuntimeSupervisor {
             },
         };
         let engine = self.running_engine().await?;
+        // [KT 适配] §9.10 item 6: cancel this account's engine-side tasks
+        // before the destructive delete. The pinned engine exposes exactly one
+        // account-task cancel face, `history.importCancel {account}` — it
+        // aborts the in-flight transfer-archive download and a live
+        // cloud-backup restore (kt-signal-engine `docs/jsonrpc-compat.md:202`).
+        // `backup.export`, `backup.importSnapshot` and `backups.uploadToCloud`
+        // have no cancel verb in that contract, and inventing one is
+        // forbidden; for those the engine's own account removal is the stop
+        // (their next disk touch fails), while the connector releases every
+        // local handle below. Best-effort: a cancel failure never blocks the
+        // user's delete.
+        if let Err(error) = self.history_import_cancel(account_id.clone()).await {
+            tracing::warn!(
+                error_class = error.class(),
+                "account task cancel before local-data delete failed; delete proceeds"
+            );
+        }
         if reconcile_first && !signal_account_present(&engine, &number).await? {
             {
                 let mut service = self.service.lock().await;
                 service.complete_account_delete(&account_id, operation_id.as_deref())?;
                 service.clear_media_handles_for_account(&account_id);
             }
-            if let Some(handles) = self.backup_handles.as_ref() {
-                handles.clear_account(&account_id);
-            }
-            self.plaintext_tasks.clear(&account_id);
-            crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), &account_id);
+            self.clear_account_task_state(&account_id);
             return Ok(json!({}));
         }
         match engine
@@ -2588,14 +2627,26 @@ impl RuntimeSupervisor {
             // file streams alike.
             service.clear_media_handles_for_account(&account_id);
         }
-        if let Some(handles) = self.backup_handles.as_ref() {
-            handles.clear_account(&account_id);
-        }
-        // §4.115: the plaintext task record and its artifact directory die
-        // with the account session too — an export product never outlives it.
-        self.plaintext_tasks.clear(&account_id);
-        crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), &account_id);
+        self.clear_account_task_state(&account_id);
         Ok(json!({}))
+    }
+    /// Release every connector-side task record and handle tied to an
+    /// account whose local data is going away (the delete paths above).
+    /// Engine-side cancellation happens in `delete_local_account` before the
+    /// engine delete. Idempotent; safe when nothing was ever started.
+    fn clear_account_task_state(&self, account_id: &str) {
+        if let Some(handles) = self.backup_handles.as_ref() {
+            handles.clear_account(account_id);
+        }
+        self.backup_counters
+            .lock()
+            .expect("backup counters mutex")
+            .remove(account_id);
+        self.plaintext_tasks.clear(account_id);
+        if let Ok(mut cancels) = self.history_import_cancels.lock() {
+            cancels.remove(account_id);
+        }
+        crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), account_id);
     }
 
     pub async fn list_conversations(

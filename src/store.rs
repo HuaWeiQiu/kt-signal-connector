@@ -2835,6 +2835,30 @@ impl Store {
         })
     }
 
+    /// [KT 适配] The unfinished local-data delete state for one Signal number,
+    /// if any: `started` (a dispatch is in flight, or the connector stopped
+    /// mid-delete) or `unknown` (the engine's outcome was lost). A relink of
+    /// this number must not upsert over the row the delete is still cleaning
+    /// up (§9.10 item 7; official Signal-Desktop has no multi-account delete
+    /// face to copy). Completed operations never match — their account row is
+    /// gone in the same transaction.
+    pub fn unfinished_account_delete_state(
+        &self,
+        signal_account: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT o.state FROM account_delete_operations o
+                 JOIN accounts a ON a.id = o.account_id
+                 WHERE a.signal_account=?1 AND o.state != 'completed'
+                 LIMIT 1",
+                params![signal_account],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
     pub fn mark_account_delete_unknown(
         &self,
         operation_id: &str,
