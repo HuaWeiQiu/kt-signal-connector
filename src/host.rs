@@ -53,22 +53,22 @@ use crate::service::{
     LinkSessionParams, LinkStartParams, MessageGetByClientRequestIdParams,
     MessageGetReceiptsParams, MessageGetTextParams, MessageRequestParams,
     MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesDeleteForMeParams,
-    MessagesEditParams, MessagesListParams, MessagesMarkReadParams,
-    MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams, MessagesRemoteDeleteParams,
-    MessagesReportSpamParams, MessagesRetryTextParams, MessagesSearchParams,
-    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendContactParams,
-    MessagesSendPinMessageParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
-    MessagesSendPollVoteParams, MessagesSendReactionParams, MessagesSendStickerParams,
-    MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
-    MessagesSendViewOnceOpenParams, MessagesSyncReadParams, MessagesSyncViewedParams,
-    NotificationProfilesListParams, NotificationProfilesSetRecordsParams, PhoneLookupParams,
-    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
-    StickerPackManifestParams, StickerPackSetSyncParams, StorageGetCallLinksParams,
-    StorageIngestParams, StorageSetCallLinkParams, StoriesDeleteForEveryoneParams,
-    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
-    StoriesSetDisabledParams, StoryDistributionListsListParams,
-    StoryDistributionListsSetRecordsParams, UsernameLookupParams,
+    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams,
+    MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams, MessagesEditParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
+    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
+    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
+    MessagesSendAttachmentParams, MessagesSendContactParams, MessagesSendPinMessageParams,
+    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
+    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendStoryParams,
+    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    MessagesSyncReadParams, MessagesSyncViewedParams, NotificationProfilesListParams,
+    NotificationProfilesSetRecordsParams, PhoneLookupParams, PresenceSetTypingMessageParams,
+    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    StickerPackSetSyncParams, StorageGetCallLinksParams, StorageIngestParams,
+    StorageSetCallLinkParams, StoriesDeleteForEveryoneParams, StoriesGetDisabledParams,
+    StoriesMarkViewedParams, StoriesSendReactionParams, StoriesSetDisabledParams,
+    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, UsernameLookupParams,
 };
 use crate::store::{MAX_ADJACENT_MEDIA_LIMIT, MAX_PAGE_LIMIT};
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -3617,6 +3617,30 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                         "messages.deleteForMe",
                         "params",
                         "invalid messages.deleteForMe params",
+                    ),
+                ),
+            }
+        }
+        // Message-level delete-for-me SELF-SYNC upstream leg (contract
+        // revision 1.197, §4.197): the desktop addresses local row ids, the
+        // connector resolves each to the official (author, sentTimestamp)
+        // entry from its own store, and the whole batch rides one engine
+        // `deleteForMeMessages` call. Receipt-class like the conversation
+        // twin: params shape errors answer INVALID_REQUEST, the answer is
+        // {status: sent|unknown}, and an engine failure never fails the
+        // request.
+        "messages.deleteForMeMessages" => {
+            match serde_json::from_value::<MessagesDeleteForMeMessagesParams>(request.params) {
+                Ok(params) => match runtime.delete_for_me_messages(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "messages.deleteForMeMessages",
+                        "params",
+                        "invalid messages.deleteForMeMessages params",
                     ),
                 ),
             }

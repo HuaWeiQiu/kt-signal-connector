@@ -96,6 +96,7 @@
             "messages.syncRead",
             "messages.syncViewed",
             "messages.deleteForMe",
+            "messages.deleteForMeMessages",
             "messages.sendViewOnceOpen",
             "messages.markViewOnceOpened",
             "messages.reportSpam",
@@ -944,6 +945,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesDeleteForMeParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.deleteForMeMessages" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesDeleteForMeMessagesParams" }
             }
           }
         },
@@ -2380,6 +2392,23 @@
           "maxItems": 5,
           "items": { "$ref": "#/$defs/messagesDeleteForMeEntry" },
           "description": "Optional companion list for conversations with disappearing messages (the official areAnyDisappearing companion; ≤5)."
+        }
+      }
+    },
+    "messagesDeleteForMeMessagesParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageIds"],
+      "description": "Send the message-level delete-for-me upstream leg (contract revision 1.197, §4.197, capability delete-for-me): the official getDeleteForMeSyncMessage messageDeletes sender (ts/state/ducks/conversations.preload.ts:1866-1965; frame ts/textsecure/SendMessage.preload.ts:1840-1936) the desktop fires after removing rows locally, so the account's other linked devices drop their copies too. [KT adaptation] The desktop addresses local row ids only — its incoming rows carry a privacy hash, never the protocol author — and the connector resolves each id to the official {author, sentTimestamp} entry from its own store: outgoing rows use the account's own address, incoming direct rows the peer (peer_identities ACI first, the peer key second), incoming group rows the ingest-captured member ACI (a pre-1.191 row without one answers INVALID_REQUEST rather than a fabricated author). The conversation kind derives from the local row (direct → contact, group → group; legacy/unknown refuses). All-or-nothing: an unknown row, zero upstream stamp, system row, or unaddressable author refuses the whole request before any engine call — a destructive intent is never sent as a half batch. 1..=256 messageIds (the engine single-request ceiling; the official sender chunks at MAX_MESSAGE_COUNT 500). Send lane, account-scoped mutating; receipt-class {status: sent|unknown}: any engine call failure degrades to unknown and is never retried (the sync may already ride the self-send lane). Zero local writes: the §4.83 receive mirror stays the inbound channel.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageIds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/opaqueId" },
+          "description": "Local row ids of this conversation; 1..=256, resolved connector-side to the official (author, sentTimestamp) pairs."
         }
       }
     },

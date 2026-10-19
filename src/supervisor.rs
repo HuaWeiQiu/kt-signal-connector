@@ -39,30 +39,30 @@ use crate::service::{
     IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary, MAX_AVATAR_DATA_URI_CHARS,
     MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView,
     MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary, MessageRequestOutcome,
-    MessageRequestParams, MessagesDeleteForMeParams, MessagesReportSpamParams,
-    MessagesSendContactParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
-    MessagesSendPollVoteParams, MessagesSendStickerParams, MessagesSendStoryParams,
-    NotificationProfileSyncs, NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
-    PeerTarget, PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
-    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
-    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
-    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
-    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams, StoriesDisabled,
-    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
-    StoriesSetDisabledParams, StoryDistributionListSyncs, StoryDistributionListsListParams,
-    StoryDistributionListsSetRecordsParams, StorySendGroupFace, StorySendRecipientResult,
-    StorySendResult, StorySendSuccess, UsernameLookupEntry, UsernameLookupParams,
-    UsernameLookupResult, account_device_capabilities_from_engine, account_limit_error,
-    blocked_conversations_result, call_link_syncs_result, chat_folder_syncs_result,
-    conversation_state_from_engine, device_list_from_engine, group_create_result_from_engine,
-    group_invite_join_status_from_engine, group_invite_link_parse_from_engine,
-    group_invite_link_password_from_engine, group_invite_link_preview_from_engine,
-    group_migrate_result_from_engine, identity_from_engine, import_groups_summary_from_engine,
-    merge_contacts_summary_from_engine, notification_profile_syncs_result,
-    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
-    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
+    MessageRequestParams, MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams,
+    MessagesReportSpamParams, MessagesSendContactParams, MessagesSendPollCreateParams,
+    MessagesSendPollTerminateParams, MessagesSendPollVoteParams, MessagesSendStickerParams,
+    MessagesSendStoryParams, NotificationProfileSyncs, NotificationProfilesListParams,
+    NotificationProfilesSetRecordsParams, PeerTarget, PhoneLookupEntry, PhoneLookupParams,
+    PhoneLookupResult, PinnedConversations, PreparedHistoryDownload, PreparedSend,
+    ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams,
+    SendTextStyleParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
+    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
+    StickerPackSetSyncParams, StickerPackSyncs, StorageGetCallLinksParams, StorageIngestParams,
+    StorageSetCallLinkParams, StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams,
+    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListSyncs,
+    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, StorySendGroupFace,
+    StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
+    UsernameLookupParams, UsernameLookupResult, account_device_capabilities_from_engine,
+    account_limit_error, blocked_conversations_result, call_link_syncs_result,
+    chat_folder_syncs_result, conversation_state_from_engine, device_list_from_engine,
+    group_create_result_from_engine, group_invite_join_status_from_engine,
+    group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
+    group_invite_link_preview_from_engine, group_migrate_result_from_engine, identity_from_engine,
+    import_groups_summary_from_engine, merge_contacts_summary_from_engine,
+    notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
+    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
+    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
     story_distribution_lists_result, validate_account_delete_operation_id,
 };
 use crate::store::{
@@ -6188,6 +6188,38 @@ impl RuntimeSupervisor {
             // Same receipt-class degradation as the peer-faced fan-out: any
             // failure — including the engine's pre-flight refusal — answers
             // `unknown` and is never retried.
+            Err(_) => Ok("unknown"),
+        }
+    }
+
+    /// messages.deleteForMeMessages (contract revision 1.197, §4.197,
+    /// capability delete-for-me): the message-level delete-for-me upstream
+    /// leg — the engine `deleteForMeMessages` face (the official
+    /// `getDeleteForMeSyncMessage` messageDeletes sender). The connector
+    /// resolves the desktop's local row ids into the official
+    /// `(author, sentTimestamp)` entries itself (`Service::
+    /// prepare_messages_delete_for_me_messages`), so no protocol identity
+    /// ever crosses the desktop boundary. Receipt-class like the
+    /// conversation-level twin: any engine call failure degrades to
+    /// `{status: "unknown"}` and is never retried — the sync message may
+    /// already ride the self-send lane. Zero local writes (the §4.83
+    /// receive mirror stays the inbound channel).
+    pub async fn delete_for_me_messages(
+        &self,
+        params: MessagesDeleteForMeMessagesParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_messages_delete_for_me_messages(&params)?
+        };
+        match engine
+            .call("deleteForMeMessages", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            // Same receipt-class degradation as the conversation-level face:
+            // the sync may already be on the self-send lane.
             Err(_) => Ok("unknown"),
         }
     }
