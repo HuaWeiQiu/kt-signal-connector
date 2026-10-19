@@ -507,6 +507,16 @@
   vocabulary did not — zero new methods, events, error codes, capability
   bits, or schema moves. Tests +4 (lib); superseded in reach by the 1.169
   write-back bound, which its deadline wrapper now sits inside.)
+- No-revision record: 2026-10-20; the media per-account isolation batch (audit
+  §9.10) lands as connector-internal retention and path layout only — every
+  connector-written media file moves from the group-shared `attachments/`
+  tree to `<data-dir>/media/<account-id>/attachments/`, the 2 GiB quota and
+  its mtime LRU run per account bucket (one account's flood can no longer
+  evict another's media), the view-once burn and `deleteLocalData` are scoped
+  to the addressed account's subtree, and the legacy flat/per-account
+  `attachments/` trees stay readable (and TTL-governed) for upgrades. Zero
+  wire change: no method, event, error code, capability bit, or schema move;
+  the contract revision stays 1.196 (the §4.196 entry above). Tests +9 (lib).
 - No-revision record: 2026-10-16; the group-history resync batch (§4.167)
   lands as connector-internal behavior only — a `groups.get` cache miss
   or an empty roster now triggers one throttled (5-minute TTL, official
