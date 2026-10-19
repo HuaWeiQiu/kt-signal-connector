@@ -101,6 +101,55 @@ async fn binary_serves_authenticated_runtime_lifecycle() {
 }
 
 #[tokio::test]
+async fn a_second_host_connection_is_answered_busy_without_queueing() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret = [7_u8; 32];
+
+    let mut connector = spawn_connector_from_stdin(temp.path(), &endpoint, &secret).await;
+    wait_for_path(&endpoint).await;
+
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut owner = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut owner, &secret).await;
+
+    // ADR 0006: the second connection is accepted and answered, not left in
+    // the kernel backlog behind the live session.
+    let second_stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut second = Framed::new(second_stream, LinesCodec::new());
+    let line = timeout(Duration::from_secs(5), second.next())
+        .await
+        .expect("the busy answer must not wait for the live session to end")
+        .expect("the second connection must receive one frame")
+        .expect("the busy frame must be a valid line");
+    let busy: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(busy["apiVersion"], API_VERSION);
+    assert_eq!(busy["event"], "runtime.busy");
+    assert_eq!(busy["data"]["code"], "HOST_BUSY");
+    assert_eq!(busy["data"]["retryable"], true);
+    assert!(
+        busy["data"].get("sessionId").is_none(),
+        "the busy answer carries no session identity"
+    );
+    // The same connection is closed after the one frame.
+    assert!(
+        timeout(Duration::from_secs(5), second.next())
+            .await
+            .expect("the busy connection must close")
+            .is_none(),
+        "the busy connection ends after its single answer"
+    );
+
+    // The live session is untouched by the rejected second connection.
+    let status = request(&mut owner, "status-after-busy", "runtime.status", json!({})).await;
+    assert_eq!(status["result"]["state"], "stopped");
+
+    drop(owner);
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
 async fn phase2_link_receive_send_and_idempotent_text() {
     let temp = TempDir::new().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -2937,6 +2986,23 @@ async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
     )
     .await;
     assert!(reconciled.get("result").is_some());
+    let deleted = &reconciled["result"]["deleted"];
+    assert_eq!(deleted["accountId"], account_id);
+    assert!(
+        deleted["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:")),
+        "the delete answer carries the content-free receipt: {reconciled:?}"
+    );
+    assert!(deleted["rowsDeleted"].as_u64().is_some());
+    assert!(
+        deleted["tableCounts"].is_object(),
+        "counts ride the receipt: {reconciled:?}"
+    );
+    assert!(
+        reconciled["result"].get("signalAccount").is_none(),
+        "the receipt never echoes the linked number"
+    );
     let idempotent = request(
         &mut client,
         "delete-completed",
@@ -2950,6 +3016,10 @@ async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
     assert!(
         idempotent.get("result").is_some(),
         "idempotent delete response: {idempotent:?}"
+    );
+    assert_eq!(
+        idempotent["result"]["deleted"]["digest"], deleted["digest"],
+        "the replay returns the recorded receipt unchanged"
     );
     let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
     assert!(accounts["result"].as_array().unwrap().is_empty());

@@ -1678,6 +1678,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId"],
+      "description": "Delete one account's local data (contract 1.197, §4.197). The engine removes its own account directory/keys/media first; the connector then removes the store rows, the account's slice of the plaintext migration backup, plaintext export artifacts, and handles, and answers {deleted: {accountId, completedAt, rowsDeleted, tableCounts, digest, plaintextBackup, walCheckpoint}} — a content-free receipt (counts + SHA-256 commitment only). An account already gone (or deleted by a pre-1.197 binary) answers {}, and an operationId replay returns the recorded receipt unchanged.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "operationId": { "$ref": "#/$defs/opaqueId" }
@@ -4666,6 +4667,7 @@
         "event": {
           "enum": [
             "runtime.challenge",
+            "runtime.busy",
             "runtime.stateChanged",
             "runtime.protocolWarning",
             "runtime.storageChanged",
@@ -6052,6 +6054,27 @@
                     "type": "boolean",
                     "description": "Contract 1.195 (§4.195): the official response.longText entry is Status.TERMINAL_ERROR (attachmentBackfill.preload.ts:260-267) — the phone gave up on the long-text body, the official markAttachmentAsErrored + download-failed toast face. Serialized only when true and mutually exclusive with longTextPending; absent for a pointer longText, a PENDING entry, or no longText at all (the pre-1.195 frame byte-for-byte)."
                   }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "runtime.busy" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["code", "message", "retryable"],
+                "description": "ADR 0006 (contract 1.197, §4.197): the explicit single-session busy answer. Emitted instead of runtime.challenge when a host connects while another session owns this connector process; the connection is closed after this one frame. retryable=true: the caller may reconnect after the live session ends (a fresh process and bootstrap secret are then required), never queue. The fields are fixed content only — no session id, account, or path.",
+                "properties": {
+                  "code": { "const": "HOST_BUSY" },
+                  "message": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "retryable": { "const": true }
                 }
               }
             }

@@ -2226,6 +2226,20 @@ impl ConnectorService {
             .complete_account_delete(account_id, operation_id, now_ms())?)
     }
 
+    /// Contract 1.197 (§4.197): the recorded delete face — same transaction,
+    /// plus the content-free receipt (row counts + digest). The caller runs
+    /// [`Self::finish_account_delete_residue`]'s store sibling after releasing
+    /// this lock so the plaintext backup scrub never blocks service traffic.
+    pub fn complete_account_delete_recorded(
+        &mut self,
+        account_id: &str,
+        operation_id: Option<&str>,
+    ) -> Result<Option<crate::store::AccountDeleteReceipt>, ServiceError> {
+        Ok(self
+            .store
+            .complete_account_delete_recorded(account_id, operation_id, now_ms())?)
+    }
+
     pub fn begin_link(
         &mut self,
         device_name: String,

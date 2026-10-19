@@ -33,9 +33,11 @@ The current model has four coupling points:
 2. **Global lane quotas.** `connector/src/host.rs:89-99` defines control 1 /
    read 4 / send 2 **per connector**, not per account. With multiple
    accounts, unrelated accounts serialize behind each other.
-3. **Serial host accept.** `host.rs:467` serves one client connection at a
-   time; a second connect (reconnect race, another window) waits in the
-   backlog with no explicit busy answer.
+3. **Serial host accept.** `host.rs:467` served one client connection at a
+   time; a second connect (reconnect race, another window) waited in the
+   backlog with no explicit busy answer. **Resolved by ADR 0006** (contract
+   1.197): a late connection is answered `runtime.busy` and closed, never
+   queued.
 4. **Blast radius = engine process.** A fault in one account's path can take
    down every account in the proxy group (the 2026-10-19 4.4 MB incident
    surfaced as `SEND_OUTCOME_UNKNOWN` for the whole group).

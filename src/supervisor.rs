@@ -218,6 +218,16 @@ fn receipt_failure_key(account_id: &str, conversation_id: &str, method: &str) ->
     format!("{account_id}\u{0}{conversation_id}\u{0}{method}")
 }
 
+/// Contract 1.197 (§4.197, D4): the delete answer. A recorded deletion adds
+/// the content-free receipt under `deleted`; an account already gone (or
+/// deleted by a pre-1.197 binary) keeps the historical empty object.
+fn account_delete_result(receipt: Option<crate::store::AccountDeleteReceipt>) -> Value {
+    match receipt {
+        Some(receipt) => json!({ "deleted": receipt }),
+        None => json!({}),
+    }
+}
+
 /// One proxy group's supervised runtime: its own engine slot, watchdog,
 /// receive pipeline and link state, over the shared per-profile store
 /// (ADR 0001 R4/R5). The group id is the opaque wire identity; the proxy
@@ -2504,22 +2514,16 @@ impl RuntimeSupervisor {
                     // account session is long gone, so any straggler media
                     // handles from before are released here too.
                     AccountDeletePlan::Completed => {
-                        self.service
-                            .lock()
-                            .await
-                            .clear_media_handles_for_account(&account_id);
-                        if let Some(handles) = self.backup_handles.as_ref() {
-                            handles.clear_account(&account_id);
-                        }
-                        // §4.115: the plaintext task record and its artifact
-                        // directory die with the account session too — an
-                        // export product never outlives it.
-                        self.plaintext_tasks.clear(&account_id);
-                        crate::backup_export::clear_plaintext_artifacts(
-                            self.store.state_dir(),
-                            &account_id,
-                        );
-                        return Ok(json!({}));
+                        self.clear_account_delete_residue(&account_id).await;
+                        // A replay is also the repair point for a crash
+                        // between the row transaction and the backup scrub.
+                        let _ = self.finish_account_delete_residue_async(&account_id).await;
+                        return Ok(account_delete_result(
+                            self.store
+                                .account_delete_receipt(&account_id)
+                                .ok()
+                                .flatten(),
+                        ));
                     }
                     AccountDeletePlan::Dispatch {
                         signal_account,
@@ -2527,29 +2531,48 @@ impl RuntimeSupervisor {
                     } => (signal_account, reconcile_first),
                 }
             }
-            None => match self
-                .service
-                .lock()
-                .await
-                .account_signal_number_optional(&account_id)?
-            {
-                Some(number) => (number, false),
-                None => return Ok(json!({})),
-            },
+            None => {
+                // Bind the number before matching: the temporary service
+                // guard would otherwise live for the whole match and the
+                // absent arm's cleanup re-locks the service (self-deadlock).
+                let number = self
+                    .service
+                    .lock()
+                    .await
+                    .account_signal_number_optional(&account_id)?;
+                match number {
+                    Some(number) => (number, false),
+                    None => {
+                        self.clear_account_delete_residue(&account_id).await;
+                        let _ = self.finish_account_delete_residue_async(&account_id).await;
+                        return Ok(account_delete_result(
+                            self.store
+                                .account_delete_receipt(&account_id)
+                                .ok()
+                                .flatten(),
+                        ));
+                    }
+                }
+            }
         };
         let engine = self.running_engine().await?;
         if reconcile_first && !signal_account_present(&engine, &number).await? {
-            {
+            let receipt = {
                 let mut service = self.service.lock().await;
-                service.complete_account_delete(&account_id, operation_id.as_deref())?;
+                let receipt = service
+                    .complete_account_delete_recorded(&account_id, operation_id.as_deref())?;
                 service.clear_media_handles_for_account(&account_id);
-            }
-            if let Some(handles) = self.backup_handles.as_ref() {
-                handles.clear_account(&account_id);
-            }
-            self.plaintext_tasks.clear(&account_id);
-            crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), &account_id);
-            return Ok(json!({}));
+                receipt
+            };
+            let receipt = match receipt {
+                Some(receipt) => self
+                    .finish_account_delete_residue_async(&account_id)
+                    .await
+                    .or(Some(receipt)),
+                None => None,
+            };
+            self.clear_account_delete_files(&account_id);
+            return Ok(account_delete_result(receipt));
         }
         match engine
             .call_with_timeout(
@@ -2580,22 +2603,85 @@ impl RuntimeSupervisor {
             }
             Err(error) => return Err(ServiceError::Engine(error)),
         }
-        {
+        let receipt = {
             let mut service = self.service.lock().await;
-            service.complete_account_delete(&account_id, operation_id.as_deref())?;
+            let receipt =
+                service.complete_account_delete_recorded(&account_id, operation_id.as_deref())?;
             // ADR 0004 gate 3: a chunk-stream handle cannot outlive the
             // account session it was opened from — media and §4.46 backup
             // file streams alike.
             service.clear_media_handles_for_account(&account_id);
+            receipt
+        };
+        // §4.197: the store rows are gone; scrub the account out of the
+        // plaintext migration backup (outside the service lock — VACUUM can
+        // take a moment and nothing here needs the service).
+        let receipt = match receipt {
+            Some(receipt) => self
+                .finish_account_delete_residue_async(&account_id)
+                .await
+                .or(Some(receipt)),
+            None => None,
+        };
+        self.clear_account_delete_files(&account_id);
+        Ok(account_delete_result(receipt))
+    }
+
+    /// Contract 1.197 (§4.197, D4): release every connector-owned handle or
+    /// file that outlives the account row. Engine-owned media and the engine
+    /// account directory are removed by the engine's own
+    /// `deleteLocalAccountData` (the connector never reaches into that tree);
+    /// this clears the connector's handles and its `state-dir` products.
+    async fn clear_account_delete_residue(&self, account_id: &str) {
+        self.service
+            .lock()
+            .await
+            .clear_media_handles_for_account(account_id);
+        self.clear_account_delete_files(account_id);
+    }
+
+    /// The plaintext-backup scrub runs `VACUUM`; keep it off the async
+    /// runtime's thread. Returns `None` when no receipt exists.
+    async fn finish_account_delete_residue_async(
+        &self,
+        account_id: &str,
+    ) -> Option<crate::store::AccountDeleteReceipt> {
+        let store = Arc::clone(&self.store);
+        let account_id = account_id.to_string();
+        match tokio::task::spawn_blocking(move || store.finish_account_delete_residue(&account_id))
+            .await
+        {
+            Ok(Ok(receipt)) => receipt,
+            _ => None,
         }
+    }
+
+    fn clear_account_delete_files(&self, account_id: &str) {
         if let Some(handles) = self.backup_handles.as_ref() {
-            handles.clear_account(&account_id);
+            handles.clear_account(account_id);
         }
         // §4.115: the plaintext task record and its artifact directory die
         // with the account session too — an export product never outlives it.
-        self.plaintext_tasks.clear(&account_id);
-        crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), &account_id);
-        Ok(json!({}))
+        self.plaintext_tasks.clear(account_id);
+        crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), account_id);
+        // In-memory, per-account caches: none may outlive the account.
+        self.backup_counters
+            .lock()
+            .expect("backup counters mutex")
+            .remove(account_id);
+        let receipt_prefix = format!("{account_id}\u{0}");
+        self.receipt_failures
+            .lock()
+            .expect("receipt failure mutex")
+            .retain(|key, _| !key.starts_with(&receipt_prefix));
+        self.group_resync_stamps
+            .lock()
+            .expect("group resync stamp mutex")
+            .retain(|(account, _group), _| account != account_id);
+        self.history_import_cancels
+            .lock()
+            .expect("history import cancel mutex")
+            .remove(account_id);
     }
 
     pub async fn list_conversations(
@@ -10454,6 +10540,108 @@ mod tests {
 
     fn test_store(dir: &std::path::Path) -> Store {
         Store::open(dir, Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap()
+    }
+
+    /// Contract 1.197 (§4.197, D4): every per-account in-memory cache is
+    /// dropped with the account, and a neighbour's entries survive.
+    #[tokio::test]
+    async fn account_delete_drops_every_per_account_cache() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(test_store(temp.path()));
+        let config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
+            temp.path().join("signal-data"),
+        );
+        let supervisor =
+            RuntimeSupervisor::new(config, store, DEFAULT_PROXY_GROUP_ID.to_string(), None);
+        supervisor
+            .backup_counters
+            .lock()
+            .unwrap()
+            .insert("acct-a".into(), Default::default());
+        supervisor
+            .backup_counters
+            .lock()
+            .unwrap()
+            .insert("acct-b".into(), Default::default());
+        supervisor
+            .receipt_failures
+            .lock()
+            .unwrap()
+            .insert("acct-a\u{0}conv\u{0}read".into(), std::time::Instant::now());
+        supervisor
+            .receipt_failures
+            .lock()
+            .unwrap()
+            .insert("acct-b\u{0}conv\u{0}read".into(), std::time::Instant::now());
+        supervisor
+            .group_resync_stamps
+            .lock()
+            .unwrap()
+            .insert(("acct-a".into(), "group-1".into()), 1);
+        supervisor
+            .group_resync_stamps
+            .lock()
+            .unwrap()
+            .insert(("acct-b".into(), "group-1".into()), 1);
+        supervisor
+            .history_import_cancels
+            .lock()
+            .unwrap()
+            .insert("acct-a".into());
+
+        supervisor.clear_account_delete_files("acct-a");
+
+        assert!(
+            !supervisor
+                .backup_counters
+                .lock()
+                .unwrap()
+                .contains_key("acct-a")
+        );
+        assert!(
+            supervisor
+                .backup_counters
+                .lock()
+                .unwrap()
+                .contains_key("acct-b")
+        );
+        assert!(
+            !supervisor
+                .receipt_failures
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|key| key.starts_with("acct-a\u{0}"))
+        );
+        assert!(
+            supervisor
+                .receipt_failures
+                .lock()
+                .unwrap()
+                .contains_key("acct-b\u{0}conv\u{0}read")
+        );
+        assert!(
+            !supervisor
+                .group_resync_stamps
+                .lock()
+                .unwrap()
+                .contains_key(&("acct-a".into(), "group-1".into()))
+        );
+        assert!(
+            supervisor
+                .group_resync_stamps
+                .lock()
+                .unwrap()
+                .contains_key(&("acct-b".into(), "group-1".into()))
+        );
+        assert!(
+            !supervisor
+                .history_import_cancels
+                .lock()
+                .unwrap()
+                .contains("acct-a")
+        );
     }
 
     fn keyed_observer(store: &Store) -> Connection {

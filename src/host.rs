@@ -74,6 +74,14 @@ use crate::store::{MAX_ADJACENT_MEDIA_LIMIT, MAX_PAGE_LIMIT};
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// ADR 0006: how long the explicit busy answer may take. The frame is one
+/// line; a peer that cannot read it within this window is closed rather than
+/// allowed to hold the accept loop (and the live session's polling) open.
+const HOST_BUSY_ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
+/// How many busy answers may be in flight at once. A connect flood beyond
+/// this ceiling has its connection dropped immediately instead of growing a
+/// task per attempt; the live session is never paused for a busy answer.
+const HOST_BUSY_ANSWER_CONCURRENCY: usize = 4;
 const HOST_DISPATCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the redacted in-process metrics (src/metrics.rs) are logged.
 const METRICS_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -572,6 +580,7 @@ pub async fn serve(
 ) -> Result<(), HostError> {
     let secret = Arc::new(secret);
     spawn_metrics_log(Arc::downgrade(&runtime));
+    let busy_answers = Arc::new(Semaphore::new(HOST_BUSY_ANSWER_CONCURRENCY));
     loop {
         let stream = tokio::select! {
             accepted = listener.accept() => accepted?,
@@ -591,13 +600,35 @@ pub async fn serve(
         );
         tokio::pin!(connection);
         let mut interrupted = false;
-        let connection_result = tokio::select! {
-            result = &mut connection => result,
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                interrupted = true;
-                let _ = shutdown_tx.send(true);
-                connection.await
+        // ADR 0006: one host session owns the connector. A second connection
+        // is accepted only to be told so — it never queues in the kernel
+        // backlog behind the live session. The first session keeps running;
+        // the busy answer is bounded so a peer that stopped reading cannot
+        // stall dispatch.
+        let connection_result = loop {
+            tokio::select! {
+                result = &mut connection => break result,
+                accepted = listener.accept() => match accepted {
+                    Ok(stream) => {
+                        // Spawn the answer so the live session keeps being
+                        // polled; the ceiling bounds task growth under a
+                        // connect flood, and an over-ceiling connection is
+                        // closed without an answer.
+                        if let Ok(permit) = busy_answers.clone().try_acquire_owned() {
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                answer_host_busy(stream).await;
+                            });
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                },
+                signal = tokio::signal::ctrl_c() => {
+                    signal?;
+                    interrupted = true;
+                    let _ = shutdown_tx.send(true);
+                    break connection.await;
+                }
             }
         };
         if interrupted || authenticated.load(Ordering::Acquire) {
@@ -616,6 +647,34 @@ pub async fn serve(
         // successful authentication does: when that session ends, a fresh process and secret
         // are required.
     }
+}
+
+/// ADR 0006: answer a second host connection with an explicit busy frame and
+/// close it. The frame is the same NDJSON envelope as every other event; it
+/// deliberately does not send `runtime.challenge`, because a client that saw a
+/// challenge would try to authenticate into a session it cannot own. The
+/// answer carries fixed content only (a code, a static message, retryability)
+/// — never a session id, account, or path.
+async fn answer_host_busy<S>(stream: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut framed = Framed::new(
+        stream,
+        LinesCodec::new_with_max_length(DEFAULT_HOST_FRAME_LIMIT),
+    );
+    let event = HostEvent::new(
+        "runtime.busy",
+        json!({
+            "code": "HOST_BUSY",
+            "message": "another host session already owns this connector",
+            "retryable": true,
+        }),
+    );
+    let Ok(line) = serde_json::to_string(&event) else {
+        return;
+    };
+    let _ = timeout(HOST_BUSY_ANSWER_TIMEOUT, framed.send(line)).await;
 }
 
 #[cfg(test)]
