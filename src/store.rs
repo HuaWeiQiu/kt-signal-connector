@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 32;
+const SCHEMA_VERSION: i64 = 33;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -4276,6 +4276,44 @@ impl Store {
             return Ok(None);
         }
         Ok(first)
+    }
+
+    /// Test-only: plant one message row straight into a conversation so the
+    /// schema-33 cleanup test can distinguish "has history" from "phantom".
+    #[cfg(test)]
+    pub(crate) fn seed_message_row_for_test(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "INSERT OR IGNORE INTO messages(
+                    id, account_id, conversation_id, direction, sender_id, sent_at,
+                    received_at, stored_at, body, body_bytes, body_truncated, status
+                 ) VALUES(?1, ?2, ?3, 'incoming', ?4, 1, 1, 1, '', 0, 0, 'sent')",
+                params![
+                    format!("seed-{conversation_id}"),
+                    account_id,
+                    conversation_id,
+                    conversation_id
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// Test-only: rewind the schema marker so the next open re-runs the
+    /// migrations from that point (used by the schema-33 cleanup test).
+    #[cfg(test)]
+    pub(crate) fn force_schema_version_for_test(&self, version: i64) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "UPDATE meta SET value=?1 WHERE key='schema_version'",
+                params![version.to_string()],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
     }
 
     pub fn insert_message(
@@ -11003,6 +11041,55 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             [],
         )
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
+    if current < 33 {
+        // Contract 1.201 (§6.5 amendment) cleanup: before this revision a
+        // contacts sync materialized a conversation for **every** synced
+        // contact, so an account that merely knew someone's profile grew an
+        // empty chat row for them. With two accounts on one connector this
+        // produced phantom chats: account B stored account A's number, A's
+        // profile synced in, and B's list filled with rows keyed by A's own
+        // identities (SIGNAL-ACCOUNT-CROSSTALK-P0.md).
+        //
+        // The write path no longer creates those rows, but existing stores
+        // still carry them. Delete the ones that are provably phantom: a
+        // **direct** conversation with no message row at all, whose peer key is
+        // not the account's own number or its canonical ACI (a Note-to-Self
+        // skeleton is legitimate and stays). Group rows are never touched —
+        // membership is structural. Messages, receipts, pins, drafts and
+        // events all reference conversations with ON DELETE CASCADE, but a row
+        // with no message has no such dependants; the NOT EXISTS guard keeps
+        // this honest even if one appears.
+        // Narrow on purpose: only a row that is BOTH empty (no message) AND keyed
+        // by an identity belonging to a *different* account is provably the
+        // crosstalk artefact. A plain empty conversation is left alone — it may
+        // be a legitimate pending skeleton from an older revision, and deleting
+        // it would rewrite unrelated history.
+        // The accounts `aci` column only exists from a later revision, so the
+        // predicate is assembled from the columns this store actually has (a
+        // hand-written legacy store replayed by the migration tests may lack it).
+        let has_aci = table_has_column(conn, "accounts", "aci")?;
+        let aci_leg = if has_aci {
+            "OR (other.aci IS NOT NULL AND conversations.peer_key = other.aci)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "DELETE FROM conversations
+              WHERE kind='direct'
+                AND NOT EXISTS (
+                  SELECT 1 FROM messages m
+                   WHERE m.conversation_id = conversations.id
+                     AND m.account_id = conversations.account_id
+                )
+                AND EXISTS (
+                  SELECT 1 FROM accounts other
+                   WHERE other.id <> conversations.account_id
+                     AND (conversations.peer_key = other.signal_account {aci_leg})
+                )"
+        );
+        conn.execute(&sql, [])
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
@@ -18644,6 +18731,99 @@ mod tests {
             .unwrap()
             .expect("the upgraded conversation summarizes");
         assert_eq!(summary.title, "Carol");
+    }
+
+    /// Schema 33 (contract 1.201, §6.5 amendment): a store written by an older
+    /// binary still carries phantom direct conversations — rows a contacts sync
+    /// materialized for people the account never messaged. The migration deletes
+    /// exactly those, keeping every row that has a message, every group row and
+    /// the Note-to-Self skeleton.
+    #[test]
+    fn schema_33_deletes_phantom_direct_conversations_only() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+447434026244", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        // The other account whose identities leaked in — the migration keys on
+        // "this peer belongs to a *different* account".
+        let other = store
+            .upsert_account_from_signal("+8618827970450", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .set_account_aci(&other.id, Some("b1d73c45-8225-4421-bcf8-7b2f57442865"))
+            .unwrap();
+        // A real conversation (has a message) and a group (structural) survive.
+        let real = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Real peer")
+            .unwrap();
+        store
+            .seed_message_row_for_test(&account.id, &real.id)
+            .unwrap();
+        let group = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXA=", "Group")
+            .unwrap();
+        // A Note-to-Self skeleton (peer == own number) also survives.
+        let memo = store
+            .ensure_conversation(&account.id, "direct", "+447434026244", "Note to Self")
+            .unwrap();
+        // Phantom rows: direct conversations nobody ever messaged.
+        let phantom_a = store
+            .ensure_conversation(&account.id, "direct", "+8618827970450", "+86***50")
+            .unwrap();
+        let phantom_b = store
+            .ensure_conversation(
+                &account.id,
+                "direct",
+                "b1d73c45-8225-4421-bcf8-7b2f57442865",
+                "bx y",
+            )
+            .unwrap();
+        // Rewind the schema marker so the migration runs on reopen.
+        store.force_schema_version_for_test(32).unwrap();
+        drop(store);
+
+        let reopened = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(
+            reopened
+                .conversation_by_peer(&account.id, "direct", "+15555550101")
+                .unwrap()
+                .is_some(),
+            "a messaged conversation must survive"
+        );
+        assert!(
+            reopened
+                .conversation_by_peer(&account.id, "group", "Z3JvdXA=")
+                .unwrap()
+                .is_some(),
+            "a group row must survive"
+        );
+        assert!(
+            reopened
+                .conversation_by_peer(&account.id, "direct", "+447434026244")
+                .unwrap()
+                .is_some(),
+            "the Note-to-Self skeleton must survive"
+        );
+        assert!(
+            reopened
+                .conversation_by_peer(&account.id, "direct", "+8618827970450")
+                .unwrap()
+                .is_none(),
+            "the other account's number-keyed phantom row must be gone"
+        );
+        assert!(
+            reopened
+                .conversation_by_peer(
+                    &account.id,
+                    "direct",
+                    "b1d73c45-8225-4421-bcf8-7b2f57442865"
+                )
+                .unwrap()
+                .is_none(),
+            "the phantom row must be gone"
+        );
+        let _ = (group, memo, phantom_a, phantom_b);
     }
 
     /// **P0 regression (cross-account crosstalk, 2026-10-20).** Two accounts on
