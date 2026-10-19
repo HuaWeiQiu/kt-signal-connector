@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 
@@ -39,30 +39,30 @@ use crate::service::{
     IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary, MAX_AVATAR_DATA_URI_CHARS,
     MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView,
     MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary, MessageRequestOutcome,
-    MessageRequestParams, MessagesDeleteForMeParams, MessagesReportSpamParams,
-    MessagesSendContactParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
-    MessagesSendPollVoteParams, MessagesSendStickerParams, MessagesSendStoryParams,
-    NotificationProfileSyncs, NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
-    PeerTarget, PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
-    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
-    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
-    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
-    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams, StoriesDisabled,
-    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
-    StoriesSetDisabledParams, StoryDistributionListSyncs, StoryDistributionListsListParams,
-    StoryDistributionListsSetRecordsParams, StorySendGroupFace, StorySendRecipientResult,
-    StorySendResult, StorySendSuccess, UsernameLookupEntry, UsernameLookupParams,
-    UsernameLookupResult, account_device_capabilities_from_engine, account_limit_error,
-    blocked_conversations_result, call_link_syncs_result, chat_folder_syncs_result,
-    conversation_state_from_engine, device_list_from_engine, group_create_result_from_engine,
-    group_invite_join_status_from_engine, group_invite_link_parse_from_engine,
-    group_invite_link_password_from_engine, group_invite_link_preview_from_engine,
-    group_migrate_result_from_engine, identity_from_engine, import_groups_summary_from_engine,
-    merge_contacts_summary_from_engine, notification_profile_syncs_result,
-    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
-    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
+    MessageRequestParams, MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams,
+    MessagesReportSpamParams, MessagesSendContactParams, MessagesSendPollCreateParams,
+    MessagesSendPollTerminateParams, MessagesSendPollVoteParams, MessagesSendStickerParams,
+    MessagesSendStoryParams, NotificationProfileSyncs, NotificationProfilesListParams,
+    NotificationProfilesSetRecordsParams, PeerTarget, PhoneLookupEntry, PhoneLookupParams,
+    PhoneLookupResult, PinnedConversations, PreparedHistoryDownload, PreparedSend,
+    ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams,
+    SendTextStyleParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
+    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
+    StickerPackSetSyncParams, StickerPackSyncs, StorageGetCallLinksParams, StorageIngestParams,
+    StorageSetCallLinkParams, StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams,
+    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListSyncs,
+    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, StorySendGroupFace,
+    StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
+    UsernameLookupParams, UsernameLookupResult, account_device_capabilities_from_engine,
+    account_limit_error, blocked_conversations_result, call_link_syncs_result,
+    chat_folder_syncs_result, conversation_state_from_engine, device_list_from_engine,
+    group_create_result_from_engine, group_invite_join_status_from_engine,
+    group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
+    group_invite_link_preview_from_engine, group_migrate_result_from_engine, identity_from_engine,
+    import_groups_summary_from_engine, merge_contacts_summary_from_engine,
+    notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
+    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
+    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
     story_distribution_lists_result, validate_account_delete_operation_id,
 };
 use crate::store::{
@@ -232,6 +232,23 @@ fn account_delete_result(receipt: Option<crate::store::AccountDeleteReceipt>) ->
 /// receive pipeline and link state, over the shared per-profile store
 /// (ADR 0001 R4/R5). The group id is the opaque wire identity; the proxy
 /// endpoint stays inside the launcher-provided config.
+fn link_cancelled_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "LINK_CANCELLED",
+        "link session was cancelled",
+        false,
+    ))
+}
+
+/// The one in-flight `link.finish` wait of this group (per-group wait lane,
+/// implementation-plan §6.1). The watch channel is the cancellation signal:
+/// `link.cancel` flips it and the finish call stops waiting at once without
+/// touching the shared engine.
+struct ActiveLinkFinish {
+    link_session_id: String,
+    cancel: watch::Sender<bool>,
+}
+
 pub struct RuntimeSupervisor {
     config: EngineConfig,
     /// Opaque group id (launcher-defined, ADR 0001 R1). Appears on the wire
@@ -247,7 +264,7 @@ pub struct RuntimeSupervisor {
     /// service's own backing exists. Never held; `MediaGovernor` is a plain
     /// data-dir handle.
     media: Option<MediaIngest>,
-    active_link_finish: Mutex<Option<String>>,
+    active_link_finish: Mutex<Option<ActiveLinkFinish>>,
     events: broadcast::Sender<EngineEvent>,
     host_events: broadcast::Sender<HostSideEvent>,
     receive_ingress: ReceiveIngress,
@@ -2012,7 +2029,7 @@ impl RuntimeSupervisor {
         link_session_id: String,
     ) -> Result<AccountSummary, ServiceError> {
         let engine = self.running_engine().await?;
-        {
+        let cancel = {
             let mut active = self.active_link_finish.lock().await;
             if active.is_some() {
                 return Err(ServiceError::Api(ApiError::new(
@@ -2021,8 +2038,13 @@ impl RuntimeSupervisor {
                     false,
                 )));
             }
-            *active = Some(link_session_id.clone());
-        }
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            *active = Some(ActiveLinkFinish {
+                link_session_id: link_session_id.clone(),
+                cancel: cancel_tx,
+            });
+            cancel_rx
+        };
         let credentials = self
             .service
             .lock()
@@ -2031,10 +2053,7 @@ impl RuntimeSupervisor {
         let (device_name, device_link_uri) = match credentials {
             Ok(credentials) => credentials,
             Err(error) => {
-                let mut active = self.active_link_finish.lock().await;
-                if active.as_deref() == Some(link_session_id.as_str()) {
-                    *active = None;
-                }
+                self.clear_link_finish(&link_session_id).await;
                 return Err(error);
             }
         };
@@ -2049,15 +2068,12 @@ impl RuntimeSupervisor {
             .await
             .group_at_account_ceiling(&self.group_id)?
         {
-            let mut active = self.active_link_finish.lock().await;
-            if active.as_deref() == Some(link_session_id.as_str()) {
-                *active = None;
-            }
+            self.clear_link_finish(&link_session_id).await;
             return Err(account_limit_error(&self.group_id));
         }
 
         let upstream = engine
-            .call_with_timeout(
+            .call_with_timeout_or_cancel(
                 "finishLink",
                 json!({
                     "deviceLinkUri": device_link_uri,
@@ -2065,27 +2081,22 @@ impl RuntimeSupervisor {
                 }),
                 CallClass::Mutating,
                 LINK_FINISH_TIMEOUT,
+                cancel,
             )
             .await;
-        let still_current = {
-            let mut active = self.active_link_finish.lock().await;
-            if active.as_deref() == Some(link_session_id.as_str()) {
-                *active = None;
-                true
-            } else {
-                false
-            }
-        };
+        let still_current = self.clear_link_finish(&link_session_id).await;
         if !still_current {
-            return Err(ServiceError::Api(ApiError::new(
-                "LINK_CANCELLED",
-                "link session was cancelled",
-                false,
-            )));
+            return Err(link_cancelled_error());
         }
 
         let result = match upstream {
-            Ok(value) => value,
+            Ok(Some(value)) => value,
+            // `link.cancel` (or a stop/shutdown) abandoned the wait. The
+            // engine may still complete the link; the pinned JSON-RPC face has
+            // no cancel verb, so the honest answer is the cancellation, and
+            // any late engine-side link surfaces through the next
+            // accounts.list sync as a real link (the phone approved it).
+            Ok(None) => return Err(link_cancelled_error()),
             Err(EngineError::Timeout) => {
                 return Err(ServiceError::Api(ApiError::new(
                     "UPSTREAM_TIMEOUT",
@@ -2165,25 +2176,46 @@ impl RuntimeSupervisor {
         Ok(account)
     }
 
+    /// Clear the active finish lane only when it still names this session.
+    /// False means `link.cancel` (or stop/shutdown) already took it.
+    async fn clear_link_finish(&self, link_session_id: &str) -> bool {
+        let mut active = self.active_link_finish.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|finish| finish.link_session_id == link_session_id)
+        {
+            *active = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub async fn cancel_link(&self, link_session_id: String) -> Result<Value, ServiceError> {
+        // [KT 适配] The pinned engine has no link-cancel verb: `finishLink` is
+        // a mutating call already dispatched to the engine and cannot be
+        // withdrawn. Cancellation is therefore local and immediate — the wait
+        // is abandoned (the engine call is removed from the pending map and
+        // its late answer ignored), the link session is cleared, and the
+        // shared engine keeps running. Restarting the group engine here (the
+        // pre-B3 behavior) disconnected every other account in the group for
+        // a cancellation that concerns one link session; audit §9.10 item 4.
         let cancelled_in_flight = {
             let mut active = self.active_link_finish.lock().await;
-            if active.as_deref() == Some(link_session_id.as_str()) {
-                *active = None;
-                true
-            } else {
-                false
+            match active.as_ref() {
+                Some(finish) if finish.link_session_id == link_session_id => {
+                    let finish = active.take().expect("checked above");
+                    let _ = finish.cancel.send(true);
+                    true
+                }
+                _ => false,
             }
         };
         let result = self.service.lock().await.cancel_link(&link_session_id);
         if cancelled_in_flight {
-            self.restart_engine_after_link_cancel().await?;
+            tracing::info!("link finish wait abandoned; the group engine keeps running");
         }
         result
-    }
-
-    async fn restart_engine_after_link_cancel(&self) -> Result<(), EngineError> {
-        self.restart_engine().await
     }
 
     /// Shared engine restart: shut the current engine down and start a fresh one.
@@ -6291,6 +6323,38 @@ impl RuntimeSupervisor {
             // Same receipt-class degradation as the peer-faced fan-out: any
             // failure — including the engine's pre-flight refusal — answers
             // `unknown` and is never retried.
+            Err(_) => Ok("unknown"),
+        }
+    }
+
+    /// messages.deleteForMeMessages (contract revision 1.197, §4.197,
+    /// capability delete-for-me): the message-level delete-for-me upstream
+    /// leg — the engine `deleteForMeMessages` face (the official
+    /// `getDeleteForMeSyncMessage` messageDeletes sender). The connector
+    /// resolves the desktop's local row ids into the official
+    /// `(author, sentTimestamp)` entries itself (`Service::
+    /// prepare_messages_delete_for_me_messages`), so no protocol identity
+    /// ever crosses the desktop boundary. Receipt-class like the
+    /// conversation-level twin: any engine call failure degrades to
+    /// `{status: "unknown"}` and is never retried — the sync message may
+    /// already ride the self-send lane. Zero local writes (the §4.83
+    /// receive mirror stays the inbound channel).
+    pub async fn delete_for_me_messages(
+        &self,
+        params: MessagesDeleteForMeMessagesParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_messages_delete_for_me_messages(&params)?
+        };
+        match engine
+            .call("deleteForMeMessages", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            // Same receipt-class degradation as the conversation-level face:
+            // the sync may already be on the self-send lane.
             Err(_) => Ok("unknown"),
         }
     }
