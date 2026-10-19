@@ -4677,6 +4677,7 @@
             "message.upserted",
             "message.statusChanged",
             "message.receiptsChanged",
+            "message.attachmentBackfillError",
             "message.viewOnceOpened",
             "message.expired",
             "call.incoming",
@@ -5938,6 +5939,33 @@
                         }
                       }
                     }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "message.attachmentBackfillError" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "conversationId", "messageId", "error"],
+                "description": "Contract 1.192 (§4.192): the phone's terminal error answer for an attachment backfill request — officially SyncMessage.AttachmentBackfillResponse error=MESSAGE_NOT_FOUND (attachmentBackfill.preload.ts:157-166), rendered as the BackfillFailureModal(NotFound) face. Emitted only when the error arm's target resolves to a local conversation row (the same ladder the pointer arm merges through); an unresolvable target stays the quiet warn (the official handleResponse drop). The error word rides verbatim, bounded to 64 characters at the §4.175 response parse. Account+conversation transient lane: nothing persists, the desktop's per-key retry bookkeeping consumes the face.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "conversationId": { "$ref": "#/$defs/opaqueId" },
+                  "messageId": { "$ref": "#/$defs/opaqueId" },
+                  "error": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "The response's bounded error word verbatim (MESSAGE_NOT_FOUND today; the bounded parse accepts any <=64-char word so a future proto word rides without a connector release)."
                   }
                 }
               }
