@@ -32,9 +32,9 @@ use serde_json::Value;
 
 use kt_signal_connector::PHASE2_CAPABILITIES;
 use kt_signal_connector::engine::{
-    MAX_ATTACHMENT_BLUR_HASH_CHARS, MAX_RECEIVE_ID_CHARS, MAX_SYNC_CALL_ID_CHARS,
-    MAX_SYNC_CALL_LINK_KEY_CHARS, MAX_SYNC_DELETE_GROUP_MESSAGES, MAX_SYNC_DELETE_GROUPS,
-    MAX_SYNC_IDENTITY_KEY_CHARS,
+    MAX_ATTACHMENT_BLUR_HASH_CHARS, MAX_INBOUND_ATTACHMENTS, MAX_RECEIVE_ID_CHARS,
+    MAX_SYNC_CALL_ID_CHARS, MAX_SYNC_CALL_LINK_KEY_CHARS, MAX_SYNC_DELETE_GROUP_MESSAGES,
+    MAX_SYNC_DELETE_GROUPS, MAX_SYNC_IDENTITY_KEY_CHARS,
 };
 use kt_signal_connector::history_attachment::MAX_PLAINTEXT_BYTES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
@@ -689,6 +689,14 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/event/allOf/32/then/properties/data/properties/receipts",
             "maxItems",
             MAX_MESSAGE_RECEIPT_RECIPIENTS as u64,
+        ),
+        // Backfill settle face (contract 1.193, §4.193): the entry array
+        // mirrors the parse bound (§4.175's MAX_INBOUND_ATTACHMENTS — one
+        // entry per remote attachment position).
+        (
+            "/$defs/event/allOf/34/then/properties/data/properties/attachments",
+            "maxItems",
+            MAX_INBOUND_ATTACHMENTS as u64,
         ),
         // Call-event sync (contract 1.104, §4.85): the decimal call id
         // mirrors its own bound (the parse also demands all-ASCII digits);

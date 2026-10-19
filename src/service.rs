@@ -12,8 +12,9 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::engine::{
-    ControlReceive, EngineError, GROUPV2_ID_LENGTH, NormalizedAttachment, NormalizedReceive,
-    SyncReadEntry, timer_change_material, timer_change_rich, truncate_utf8_bytes,
+    BackfillEntry, BackfillStatus, ControlReceive, EngineError, GROUPV2_ID_LENGTH,
+    NormalizedAttachment, NormalizedReceive, SyncReadEntry, timer_change_material,
+    timer_change_rich, truncate_utf8_bytes,
 };
 /// The official ACCEPT member of the `messageRequestResponseType` enum
 /// (`SignalService.proto:666-678`): the member the §4.58 factor weight reads.
@@ -1098,6 +1099,22 @@ fn cloud_upload_message_family_error(
     api
 }
 
+/// One index-aligned entry of the `message.attachmentBackfillSettled`
+/// payload (contract 1.193, §4.193): `index` is the attachment's position in
+/// the target message's attachment list (the official
+/// `remoteAttachments.entries()` index, attachmentBackfill.preload.ts:286),
+/// `status` one of `available` / `pending` / `terminal` — the wire words for
+/// the official pointer / `Status.PENDING` / `Status.TERMINAL_ERROR` arms.
+/// The unknown word converges to `pending`: the official `missingCaseError`
+/// throw (:303) is a crash face KT does not copy, and a non-crash wait face
+/// is the honest convergence (the retry budget still ends in the Timeout
+/// face, exactly the pre-1.193 world, if the phone never settles).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AttachmentBackfillSettledEntry {
+    pub index: usize,
+    pub status: &'static str,
+}
+
 #[derive(Clone, Debug)]
 // The reactions projection (contract 1.16) makes `MessageUpserted` the large
 // variant. Events are transient and single-consumer on an in-process lane, so
@@ -1170,6 +1187,28 @@ pub enum HostSideEvent {
         conversation_id: String,
         message_id: String,
         error: String,
+    },
+    /// Contract 1.193 (§4.193): the primary device ANSWERED a backfill
+    /// request with the pointer/status arm — the official
+    /// `AttachmentBackfill.handleResponse` per-attachment three-state walk
+    /// (attachmentBackfill.preload.ts:286-327). Every resolved response now
+    /// reports its whole index-aligned face so the desktop can replay the
+    /// official per-entry outcomes: a pointer entry is `available` (CDN
+    /// material merged, a download in flight may be re-queued), `PENDING`
+    /// keeps waiting (the official timer stays armed), `TERMINAL_ERROR` is
+    /// `terminal` (the official `markAttachmentAsErrored` +
+    /// `showDownloadFailedToast`). Pre-1.193 the connector merged locators
+    /// silently, so the desktop could not distinguish "the phone is still
+    /// working" from "the phone gave up" and always burned the retry budget
+    /// into the Timeout face. Emitted only for a resolved target — an
+    /// unresolvable conversation/row stays the quiet warn (the official
+    /// `handleResponse` early returns, :131-140). The error arm keeps its
+    /// own event and never emits this one.
+    MessageAttachmentBackfillSettled {
+        account_id: String,
+        conversation_id: String,
+        message_id: String,
+        attachments: Vec<AttachmentBackfillSettledEntry>,
     },
     /// A view-once message was viewed and its bytes erased (contract 1.38):
     /// emitted exactly once per message on the first burn transition — sync
@@ -2019,7 +2058,30 @@ impl ConnectorService {
         accounts: &[(String, Option<String>)],
         proxy_group: &str,
     ) -> Result<Vec<AccountSummary>, ServiceError> {
-        for (number, aci) in accounts {
+        let with_capabilities: Vec<_> = accounts
+            .iter()
+            .map(|(number, aci)| (number.clone(), aci.clone(), None))
+            .collect();
+        self.sync_accounts_from_numbers_with_capabilities(&with_capabilities, proxy_group)
+    }
+
+    /// The capability-carrying variant (contract 1.194, §4.194): the engine's
+    /// live `listAccounts` answer may report each account's own-profile
+    /// `capabilities`; the summary keeps them for the host wire. The store
+    /// rows themselves never persist capability bits (they are a live read),
+    /// so the patch happens on the freshly listed summaries; an account
+    /// without a live answer keeps the absent key (honest unknown).
+    pub fn sync_accounts_from_numbers_with_capabilities(
+        &self,
+        accounts: &[(
+            String,
+            Option<String>,
+            Option<crate::store::AccountCapabilities>,
+        )],
+        proxy_group: &str,
+    ) -> Result<Vec<AccountSummary>, ServiceError> {
+        let mut capabilities_by_id = std::collections::HashMap::new();
+        for (number, aci, capabilities) in accounts {
             let summary = self
                 .store
                 .upsert_account_from_signal(number, None, proxy_group)?;
@@ -2027,8 +2089,17 @@ impl ConnectorService {
             if let Some(aci) = canonical.as_deref() {
                 self.store.set_account_aci(&summary.id, Some(aci))?;
             }
+            if let Some(capabilities) = capabilities.clone() {
+                capabilities_by_id.insert(summary.id, capabilities);
+            }
         }
-        Ok(self.store.list_accounts_in_group(proxy_group)?)
+        let mut rows = self.store.list_accounts_in_group(proxy_group)?;
+        for row in &mut rows {
+            if let Some(capabilities) = capabilities_by_id.get(&row.id) {
+                row.capabilities = Some(capabilities.clone());
+            }
+        }
+        Ok(rows)
     }
 
     pub fn list_accounts_in_group(
@@ -11449,9 +11520,10 @@ impl ConnectorService {
     }
 
     /// Consume the attachment-backfill response sync (contract revision
-    /// 1.175, §4.175): the primary device answered our
-    /// `requestAttachmentBackfill` with fresh transit pointers. The target's
-    /// conversation resolves through the message-request-response ladder
+    /// 1.175, §4.175; the settled face 1.193, §4.193): the primary device
+    /// answered our `requestAttachmentBackfill` with fresh transit pointers.
+    /// The target's conversation resolves through the
+    /// message-request-response ladder
     /// family (group leg keys directly; the service-id/e164 leg walks the
     /// ACI→peer-key candidates); the row resolves by its upstream sent
     /// stamp in either direction (the phone mirrors our own outgoing rows
@@ -11460,18 +11532,24 @@ impl ConnectorService {
     /// sender, one stamp, one row — the preference only breaks a
     /// pathological collision). The pointer faces merge into the row's
     /// empty live-locator slots ([`Store::merge_live_attachment_locators`]
-    /// — first face wins, never overwritten); the locator status entries
-    /// change nothing, the official `handleResponse` keep-as-is posture. No
-    /// host event rides the pointer arm: the desktop's bounded retry loop
-    /// re-asks `attachments.download` and the fresh locator face is what
-    /// answers. The ERROR arm is the phone's terminal answer (contract
+    /// — first face wins, never overwritten); the status entries change no
+    /// locator, the official `handleResponse` keep-as-is posture. The
+    /// pointer arm then reports the whole index-aligned face to the desktop
+    /// (`MessageAttachmentBackfillSettled` → wire
+    /// `message.attachmentBackfillSettled`): the official per-attachment
+    /// three-state walk (attachmentBackfill.preload.ts:286-327) — a pointer
+    /// is `available`, `PENDING` is `pending` (the official timer stays
+    /// armed), `TERMINAL_ERROR` is `terminal` (the official
+    /// `markAttachmentAsErrored` + toast), an unknown word converges to
+    /// `pending`. The ERROR arm is the phone's terminal answer (contract
     /// 1.192, §4.192): it resolves the same ladder and names the row to the
     /// desktop (`MessageAttachmentBackfillError` → wire
     /// `message.attachmentBackfillError`) so the retry bookkeeping settles
     /// into the official NotFound face instead of burning the budget into
-    /// the Timeout face. Every miss is warn-only quiet convergence — a
-    /// vanished conversation or row is not an error, the request side
-    /// already answered honestly.
+    /// the Timeout face; it never emits the settled event. Every miss is
+    /// warn-only quiet convergence — a vanished conversation or row is not
+    /// an error, the request side already answered honestly (the official
+    /// `handleResponse` early returns, :131-140).
     fn apply_sync_attachment_backfill_response(
         &mut self,
         account: &AccountRow,
@@ -11559,9 +11637,41 @@ impl ConnectorService {
                 error: error.to_string(),
             }]);
         }
-        self.store
-            .merge_live_attachment_locators(&account.id, &record.id, &response.locators)?;
-        Ok(Vec::new())
+        self.store.merge_live_attachment_locators(
+            &account.id,
+            &record.id,
+            &response.locator_faces(),
+        )?;
+        // Contract 1.193 (§4.193): the pointer/status arm reports the whole
+        // index-aligned face once the target resolves — the official
+        // `handleResponse` per-attachment walk (attachmentBackfill.preload
+        // .ts:286-327): pointer → available, PENDING → pending (the timer
+        // stays armed, :291-293 / :324-327), TERMINAL_ERROR → terminal
+        // (:294-301), an unknown word → pending (the official
+        // `missingCaseError` crash at :303 is not a face KT copies). An
+        // empty list still rides: the official `pendingCount === 0` branch
+        // cancels the request timer, and the desktop needs the same signal.
+        let attachments = response
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let status = match entry {
+                    BackfillEntry::Locator(_) => "available",
+                    BackfillEntry::Status(BackfillStatus::Terminal) => "terminal",
+                    BackfillEntry::Status(BackfillStatus::Pending | BackfillStatus::Unknown) => {
+                        "pending"
+                    }
+                };
+                AttachmentBackfillSettledEntry { index, status }
+            })
+            .collect();
+        Ok(vec![HostSideEvent::MessageAttachmentBackfillSettled {
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            message_id: record.id.clone(),
+            attachments,
+        }])
     }
 
     /// Consume one view-once open sync (contract revision 1.38, §4.37): find
@@ -18104,11 +18214,13 @@ mod tests {
         ));
     }
 
-    /// The backfill-response consume arm (contract revision 1.175, §4.175):
-    /// the primary's fresh transit pointers merge into the target row's
-    /// empty live-locator slots — the row the receive arm never filled (or
-    /// the optimistic outgoing row the echo could not overwrite) becomes
-    /// downloadable. The error arm changes nothing.
+    /// The backfill-response consume arm (contract revision 1.175, §4.175;
+    /// the settled face 1.193, §4.193): the primary's fresh transit pointers
+    /// merge into the target row's empty live-locator slots — the row the
+    /// receive arm never filled (or the optimistic outgoing row the echo
+    /// could not overwrite) becomes downloadable — and the resolved answer
+    /// reports its whole index-aligned face to the desktop. The error arm
+    /// changes nothing and emits only its own event.
     #[test]
     fn backfill_response_merges_locators_into_the_target_row() {
         let (_temp, mut service) = service();
@@ -18178,12 +18290,44 @@ mod tests {
             conversation_group_id: None,
             conversation_e164: Some("+15555550101".into()),
             error: None,
-            locators: vec![Some(face("cdn-a")), None],
+            entries: vec![
+                BackfillEntry::Locator(Some(face("cdn-a"))),
+                BackfillEntry::Status(BackfillStatus::Pending),
+            ],
         };
         let events = service
             .apply_sync_attachment_backfill_response(&account, &response)
             .unwrap();
-        assert!(events.is_empty(), "the merge mints no host event");
+        // Contract 1.193 (§4.193): the pointer arm now reports the resolved
+        // face — the pointer entry is available, the status entry pending.
+        let [event] = events.as_slice() else {
+            panic!("the pointer arm reports its settled face exactly once, got {events:?}");
+        };
+        let HostSideEvent::MessageAttachmentBackfillSettled {
+            account_id,
+            conversation_id,
+            message_id,
+            attachments,
+        } = event
+        else {
+            panic!("the pointer arm emits MessageAttachmentBackfillSettled, got {event:?}");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(conversation_id, &conversation.id);
+        assert_eq!(message_id, "m-backfill");
+        assert_eq!(
+            attachments,
+            &vec![
+                AttachmentBackfillSettledEntry {
+                    index: 0,
+                    status: "available",
+                },
+                AttachmentBackfillSettledEntry {
+                    index: 1,
+                    status: "pending",
+                },
+            ]
+        );
         let faces = service
             .store_ref()
             .live_attachment_locators(&account.id, "m-backfill")
@@ -18194,7 +18338,8 @@ mod tests {
 
         // The error arm (contract 1.192, §4.192): the phone's terminal answer
         // names the resolved row to the desktop (the official NotFound face)
-        // and never moves a face.
+        // and never moves a face. It never emits the settled event — the
+        // destructuring above already pins the single-event face.
         let response = crate::engine::SyncAttachmentBackfillResponse {
             author: "peer".into(),
             sent_timestamp: 1726999999000,
@@ -18202,7 +18347,7 @@ mod tests {
             conversation_group_id: None,
             conversation_e164: Some("+15555550101".into()),
             error: Some("MESSAGE_NOT_FOUND".into()),
-            locators: Vec::new(),
+            entries: Vec::new(),
         };
         let events = service
             .apply_sync_attachment_backfill_response(&account, &response)
@@ -18238,7 +18383,7 @@ mod tests {
             conversation_group_id: None,
             conversation_e164: Some("+15555550101".into()),
             error: Some("MESSAGE_NOT_FOUND".into()),
-            locators: Vec::new(),
+            entries: Vec::new(),
         };
         let events = service
             .apply_sync_attachment_backfill_response(&account, &response)
@@ -18246,6 +18391,172 @@ mod tests {
         assert!(
             events.is_empty(),
             "an unresolvable error target stays quiet (rows_by_sent_at misses)"
+        );
+    }
+
+    /// Contract 1.193 (§4.193): the pointer/status arm's settle face maps
+    /// every entry to its official word — pointer → `available`,
+    /// `TERMINAL_ERROR` → `terminal`, `PENDING` → `pending`, an unknown
+    /// status word → `pending` (the official `missingCaseError` crash at
+    /// attachmentBackfill.preload.ts:303 is not a face KT copies) — with the
+    /// wire index ascending and aligned to the remote list. An unresolvable
+    /// target stays the quiet warn: zero events, the official
+    /// `handleResponse` conversation/message-not-found early returns
+    /// (:131-140). An empty entry list still settles (the official
+    /// `pendingCount === 0` timer cancel, :324-327).
+    #[test]
+    fn attachment_backfill_settled_event_names_every_attachment_state() {
+        let (_temp, mut service) = service();
+        let summary = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let account = service
+            .store_ref()
+            .account_by_id(&summary.id)
+            .unwrap()
+            .expect("account row");
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let descriptor = |id: &str| NormalizedAttachment {
+            id: id.into(),
+            content_type: Some("image/png".into()),
+            filename: None,
+            size: Some(2048),
+            width: None,
+            height: None,
+            is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
+            locator: None,
+            waveform: None,
+            duration: None,
+        };
+        let mut row = expire_record_fixture(&account.id, &conversation.id, "m-states");
+        row.sent_at = 1726999999100;
+        row.attachments = vec![descriptor("att-a"), descriptor("att-b")];
+        service
+            .store_ref()
+            .insert_message(&row, None, None, true)
+            .unwrap();
+
+        let face = |cdn: &str| crate::store::HistoryAttachmentLocator {
+            key: Some("a2F0LWtleQ==".into()),
+            cdn_key: Some(cdn.into()),
+            cdn_number: Some(3),
+            upload_timestamp: Some(1700000000000),
+            digest: None,
+            plaintext_hash: None,
+        };
+        let response = crate::engine::SyncAttachmentBackfillResponse {
+            author: "peer".into(),
+            sent_timestamp: 1726999999100,
+            conversation_service_id: None,
+            conversation_group_id: None,
+            conversation_e164: Some("+15555550101".into()),
+            error: None,
+            entries: vec![
+                BackfillEntry::Locator(Some(face("cdn-a"))),
+                BackfillEntry::Status(BackfillStatus::Terminal),
+                BackfillEntry::Status(BackfillStatus::Unknown),
+                BackfillEntry::Locator(None),
+            ],
+        };
+        let events = service
+            .apply_sync_attachment_backfill_response(&account, &response)
+            .unwrap();
+        let [event] = events.as_slice() else {
+            panic!("the settled face rides exactly one event, got {events:?}");
+        };
+        let HostSideEvent::MessageAttachmentBackfillSettled {
+            account_id,
+            conversation_id,
+            message_id,
+            attachments,
+        } = event
+        else {
+            panic!("expected MessageAttachmentBackfillSettled, got {event:?}");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(conversation_id, &conversation.id);
+        assert_eq!(message_id, "m-states");
+        assert_eq!(
+            attachments,
+            &vec![
+                AttachmentBackfillSettledEntry {
+                    index: 0,
+                    status: "available",
+                },
+                AttachmentBackfillSettledEntry {
+                    index: 1,
+                    status: "terminal",
+                },
+                AttachmentBackfillSettledEntry {
+                    index: 2,
+                    status: "pending",
+                },
+                AttachmentBackfillSettledEntry {
+                    index: 3,
+                    status: "available",
+                },
+            ],
+            "index ascending, one entry per remote position, unknown folded to pending"
+        );
+        let faces = service
+            .store_ref()
+            .live_attachment_locators(&account.id, "m-states")
+            .unwrap();
+        assert_eq!(faces[0], face("cdn-a"));
+        assert_eq!(
+            faces[1],
+            crate::store::HistoryAttachmentLocator::default(),
+            "status entries never move a face"
+        );
+
+        // An empty list still settles: the official pendingCount === 0 branch
+        // cancels the request timer, and the desktop needs the same signal.
+        let response = crate::engine::SyncAttachmentBackfillResponse {
+            author: "peer".into(),
+            sent_timestamp: 1726999999100,
+            conversation_service_id: None,
+            conversation_group_id: None,
+            conversation_e164: Some("+15555550101".into()),
+            error: None,
+            entries: Vec::new(),
+        };
+        let events = service
+            .apply_sync_attachment_backfill_response(&account, &response)
+            .unwrap();
+        let [HostSideEvent::MessageAttachmentBackfillSettled { attachments, .. }] =
+            events.as_slice()
+        else {
+            panic!("the empty list settles too, got {events:?}");
+        };
+        assert!(attachments.is_empty());
+
+        // An unresolvable target (no row at that stamp) stays the quiet warn:
+        // zero events, the official handleResponse drop.
+        let response = crate::engine::SyncAttachmentBackfillResponse {
+            author: "peer".into(),
+            sent_timestamp: 1726999999999,
+            conversation_service_id: None,
+            conversation_group_id: None,
+            conversation_e164: Some("+15555550101".into()),
+            error: None,
+            entries: vec![BackfillEntry::Status(BackfillStatus::Terminal)],
+        };
+        let events = service
+            .apply_sync_attachment_backfill_response(&account, &response)
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "an unresolvable settle target stays quiet (rows_by_sent_at misses)"
         );
     }
 
@@ -18700,6 +19011,48 @@ mod tests {
             third.iter().filter(|account| account.aci.is_some()).count(),
             2
         );
+    }
+
+    /// Contract 1.194 (§4.194): the engine's live capability answer rides the
+    /// matching account summary and stays absent for an account the engine did
+    /// not answer for — the desktop gate reads `=== true`, so absent is the
+    /// honest unknown rather than a fabricated false.
+    #[test]
+    fn sync_accounts_carries_the_live_capability_bits_per_account() {
+        let (_temp, service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+
+        let rows = service
+            .sync_accounts_from_numbers_with_capabilities(
+                &[
+                    (
+                        "+15555550100".into(),
+                        None,
+                        Some(crate::store::AccountCapabilities {
+                            attachment_backfill: true,
+                        }),
+                    ),
+                    ("+15555550101".into(), None, None),
+                ],
+                group,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let with_caps = rows
+            .iter()
+            .find(|row| row.masked_address.ends_with("00"))
+            .expect("first account");
+        assert_eq!(
+            with_caps.capabilities,
+            Some(crate::store::AccountCapabilities {
+                attachment_backfill: true
+            })
+        );
+        let without_caps = rows
+            .iter()
+            .find(|row| row.masked_address.ends_with("01"))
+            .expect("second account");
+        assert_eq!(without_caps.capabilities, None);
     }
 
     #[test]

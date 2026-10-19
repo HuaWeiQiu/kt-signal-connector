@@ -1842,9 +1842,21 @@ impl RuntimeSupervisor {
                         .iter()
                         .filter_map(|item| {
                             let number = item.get("number")?.as_str()?;
+                            // Contract 1.194 (§4.194): the engine's own-profile
+                            // capabilities projection. Only the backfill bit the
+                            // desktop gate consumes rides; absent/ill-typed =
+                            // absent (honest unknown, never folded to false).
+                            let capabilities = item
+                                .get("capabilities")
+                                .and_then(|caps| caps.get("attachmentBackfill"))
+                                .and_then(Value::as_bool)
+                                .map(|attachment_backfill| crate::store::AccountCapabilities {
+                                    attachment_backfill,
+                                });
                             Some((
                                 number.to_string(),
                                 item.get("aci").and_then(Value::as_str).map(str::to_string),
+                                capabilities,
                             ))
                         })
                         .collect::<Vec<_>>()
@@ -1868,7 +1880,7 @@ impl RuntimeSupervisor {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&numbers, &self.group_id)?;
+            .sync_accounts_from_numbers_with_capabilities(&numbers, &self.group_id)?;
         // Contract 1.170 (§4.170): the ACI was just (re)written for these
         // accounts — fold each number-keyed memo shell into the canonical
         // ACI-keyed row and announce it.
@@ -2179,11 +2191,20 @@ impl RuntimeSupervisor {
             self.receive_ingress.clone(),
         )
         .await?;
+        let status = engine.status();
         let fresh = engine.clone();
         *slot = Some(engine);
         drop(slot);
         self.spawn_contacts_resync_with(fresh);
         self.spawn_history_import_pass();
+        if status.state == EngineState::Running {
+            // §4.179: every engine landing re-arms the reconciliation — a
+            // watchdog recovery (or link-cancel restart) is exactly the
+            // window that leaves unknown-outcome rows behind, so limiting
+            // the pass to `start()` would strand them until the next manual
+            // start. Best-effort, idempotent, warn-only.
+            self.spawn_unknown_outcome_reconcile();
+        }
         // §4.190 ⑥: a fresh engine (watchdog recovery included) re-fetches
         // the accounts' configuration — the readReceipts gate flag converges
         // on every landing.

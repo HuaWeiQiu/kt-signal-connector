@@ -87,18 +87,32 @@ const RECENT_REQUEST_IDS: usize = 128;
 const MAX_PENDING_HOST_REQUESTS: usize = 128;
 const MAX_PENDING_HOST_REQUESTS_PER_ACCOUNT: usize = 32;
 const MAX_PENDING_HOST_BYTES: usize = 176 * 1024 * 1024;
-/// Dispatch lane capacities (CONTROL/READ/SEND below). They hand-mirror the
-/// desktop client's `requestScheduler.ts` lane limits (optimization-plan
-/// §5.2 B2): a capacity change must be applied on both sides in the same
-/// change, or the two schedulers diverge. Lane membership per method lives
-/// in `methods::METHODS`.
+/// 每账号的 dispatch lane 容量（CONTROL/READ/SEND 三档）。它们与桌面
+/// `requestScheduler.ts` 的 lane 上限手工镜像（optimization-plan §5.2 B2）：
+/// 改容量必须两侧同一改动，否则两个调度器漂移。方法 → lane 的归属在
+/// `methods::METHODS`。
+///
+/// 为什么按账号而不是按连接器进程：官方模型是「一账号一客户端」——
+/// `AttachmentDownloadManager.preload.ts:104-115` 的并发预算和
+/// `JobManager.std.ts:156-176` 的单 job 队列都是按一个账号实例计量的。
+/// 旧的进程级 control 1 / read 4 / send 2 会让 A 账号的读占满配额后把
+/// 完全无关的 B 账号串行化（ADR 0005）。
 const CONTROL_CONCURRENCY: usize = 1;
-/// Per-group `link.finish` capacity (ADR 0001 R3): phone-approval waits for
-/// different groups never block each other, while a second concurrent finish
-/// inside one group is rejected instead of queueing.
+/// 单个 proxy group 的 `link.finish` 容量（ADR 0001 R3）：phone-approval
+/// 等待按组隔离，不同组互不阻塞，同组第二个并发 finish 直接拒绝。
 const LINK_WAIT_CONCURRENCY: usize = 1;
 const READ_CONCURRENCY: usize = 4;
 const SEND_CONCURRENCY: usize = 2;
+
+/// 全局兜底 = 每账号容量 × 典型账号数（ADR 0005）。它只防资源失控
+/// （N 个账号同时打满各自 lane 时给进程一个硬上界），不参与公平性：
+/// 账号之间的隔离由 per-account lane 负责，全局 permit 落到哪个账号
+/// 并不重要。这里取 4 个典型账号；账号数或并发超过这个规模时全局兜底
+/// 才开始限流，这是容量告警信号，而不是正常调度路径。
+const TYPICAL_ACCOUNT_COUNT: usize = 4;
+const GLOBAL_CONTROL_CONCURRENCY: usize = CONTROL_CONCURRENCY * TYPICAL_ACCOUNT_COUNT;
+const GLOBAL_READ_CONCURRENCY: usize = READ_CONCURRENCY * TYPICAL_ACCOUNT_COUNT;
+const GLOBAL_SEND_CONCURRENCY: usize = SEND_CONCURRENCY * TYPICAL_ACCOUNT_COUNT;
 /// Forensic floor and answer deadline for an admitted host dispatch
 /// (§4.166 forensic line, §4.168 bounded answer): every bounded dispatch
 /// budget has run out long before this — engine calls are timeout-capped at
@@ -200,8 +214,23 @@ struct DispatchCompletion {
     write_result: Result<(), HostError>,
 }
 
+/// 一个已准入 dispatch 的全部资源守卫，生命周期覆盖整个 dispatch：
+/// 提前 drop 任何一个都会让同账号请求交叠或丢掉全局上界。
+///
+/// 获取顺序固定为「账号互斥锁（仅 mutating）→ per-account lane → 全局
+/// 兜底」：先拿账号锁再拿配额，避免一个忙账号攥着全局 permit 等自己
+/// 的账号锁（旧的 acquire 注释已给出这个理由，per-account lane 之后
+/// 仍然成立）。
 struct HostDispatchPermit {
-    _lane: OwnedSemaphorePermit,
+    /// per-account（或 unscoped 桶）lane permit；`link.finish` 走
+    /// `_link_lane`，此项为 `None`。
+    _account_lane: Option<OwnedSemaphorePermit>,
+    /// 连接器全局兜底 permit；`link.finish` 豁免（它的等待窗口是人工
+    /// 手机审批，按组有界），不计入全局 control 配额。
+    _global_lane: Option<OwnedSemaphorePermit>,
+    /// `link.finish` 的 per-group lane（ADR 0001 R3），与 dispatch lane
+    /// 相互独立。
+    _link_lane: Option<OwnedSemaphorePermit>,
     _account: Option<OwnedMutexGuard<()>>,
     _deleting: Option<DeletingAccountGuard>,
 }
@@ -228,10 +257,18 @@ impl Drop for DeletingAccountGuard {
     }
 }
 
+/// per-account lane 的键：`None` 是「无账号上下文」共享的 unscoped 桶。
+type AccountLaneKey = (Option<String>, methods::Lane);
+
 struct HostDispatchLimits {
-    control: Arc<Semaphore>,
-    read: Arc<Semaphore>,
-    send: Arc<Semaphore>,
+    /// 全局兜底（per lane）：只做资源上界，不做账号间公平调度。
+    global_control: Arc<Semaphore>,
+    global_read: Arc<Semaphore>,
+    global_send: Arc<Semaphore>,
+    /// per-account lane：账号 + lane → 信号量。Weak-handle 纪律与
+    /// `send_accounts` / `link_lanes` 相同：permit 自身持有 Arc，最后
+    /// 一个 permit 释放后条目在下次 acquire 时回收。
+    account_lanes: Mutex<HashMap<AccountLaneKey, Weak<Semaphore>>>,
     send_accounts: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     /// One bounded lane per proxy group for `link.finish` (ADR 0001 R3).
     /// Same weak-handle discipline as `send_accounts`.
@@ -286,29 +323,79 @@ impl HostPendingBudget {
     }
 }
 
+/// 每账号 lane 的容量（与桌面 `requestScheduler.ts` 镜像，见上方常量注释）。
+const fn lane_capacity(lane: methods::Lane) -> usize {
+    match lane {
+        methods::Lane::Control => CONTROL_CONCURRENCY,
+        methods::Lane::Read => READ_CONCURRENCY,
+        methods::Lane::Send => SEND_CONCURRENCY,
+    }
+}
+
+/// 立即尝试取一个 lane permit；只有真正排队时才记一次等待。
+///
+/// ADR 0005 的观测面：per-account lane 上的排队是正常调度信号（同账号
+/// 并发），全局兜底上的排队才是容量告警。信号量永不关闭，所以慢路径
+/// 与旧 `acquire` 一样可以直接 unwrap。
+async fn acquire_lane(semaphore: Arc<Semaphore>, record_wait: fn()) -> OwnedSemaphorePermit {
+    match Arc::clone(&semaphore).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            record_wait();
+            semaphore.acquire_owned().await.unwrap()
+        }
+    }
+}
+
 impl HostDispatchLimits {
     fn new() -> Self {
         Self {
-            control: Arc::new(Semaphore::new(CONTROL_CONCURRENCY)),
-            read: Arc::new(Semaphore::new(READ_CONCURRENCY)),
-            send: Arc::new(Semaphore::new(SEND_CONCURRENCY)),
+            global_control: Arc::new(Semaphore::new(GLOBAL_CONTROL_CONCURRENCY)),
+            global_read: Arc::new(Semaphore::new(GLOBAL_READ_CONCURRENCY)),
+            global_send: Arc::new(Semaphore::new(GLOBAL_SEND_CONCURRENCY)),
+            account_lanes: Mutex::new(HashMap::new()),
             send_accounts: Mutex::new(HashMap::new()),
             link_lanes: Mutex::new(HashMap::new()),
             deleting_accounts: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
-    /// The global semaphore bounding one dispatch lane (capacities above;
-    /// lane membership per method in `methods::METHODS`).
-    fn lane_semaphore(&self, lane: methods::Lane) -> Arc<Semaphore> {
+    /// 全局兜底信号量（容量 = 每账号容量 × 典型账号数；lane 归属在
+    /// `methods::METHODS`）。它只在资源总量上兜底，不承担账号间公平性。
+    fn global_lane(&self, lane: methods::Lane) -> Arc<Semaphore> {
         match lane {
-            methods::Lane::Control => self.control.clone(),
-            methods::Lane::Read => self.read.clone(),
-            methods::Lane::Send => self.send.clone(),
+            methods::Lane::Control => self.global_control.clone(),
+            methods::Lane::Read => self.global_read.clone(),
+            methods::Lane::Send => self.global_send.clone(),
+        }
+    }
+
+    /// 取（或惰性创建）某账号在某条 lane 上的信号量。`account_id` 为
+    /// `None` 时落 unscoped 共享桶（同样 per-lane）：没有账号上下文
+    /// 的任务彼此之间仍要排队，只是不与任何账号争夺配额。
+    ///
+    /// Weak-handle 纪律照抄 `send_accounts` / `link_lanes`：permit 自己
+    /// 持有 Arc，条目在最后一个 permit 释放后于下次调用时被回收。
+    async fn account_lane(&self, account_id: Option<&str>, kind: methods::Lane) -> Arc<Semaphore> {
+        let key = (account_id.map(str::to_string), kind);
+        let mut lanes = self.account_lanes.lock().await;
+        lanes.retain(|_, lane| lane.strong_count() > 0);
+        if let Some(lane) = lanes.get(&key).and_then(Weak::upgrade) {
+            lane
+        } else {
+            let lane = Arc::new(Semaphore::new(lane_capacity(kind)));
+            lanes.insert(key, Arc::downgrade(&lane));
+            lane
         }
     }
 
     /// Acquire the dispatch permit for one host request.
+    ///
+    /// 配额模型（ADR 0005）：每个账号每条 lane 一套信号量（control 1 /
+    /// read 4 / send 2，与桌面 `requestScheduler.ts` 镜像），外加一组
+    /// 进程级兜底（control 4 / read 16 / send 8）。这样 A 账号占满自己的
+    /// read 时 B 账号仍能立刻 dispatch——旧实现只有进程级 read 4，
+    /// 无关账号会被无端串行化。
     ///
     /// Mutating, account-scoped methods (`messages.sendText`,
     /// `messages.remoteDelete`, `contacts.sync`, `accounts.deleteLocalData`;
@@ -368,16 +455,25 @@ impl HostDispatchLimits {
                     lock
                 }
             };
-            // Account order is acquired before global lane capacity so one busy
-            // account cannot occupy every lane permit while waiting on itself.
+            // 顺序固定：账号锁 → per-account lane → 全局兜底。先账号后
+            // 配额的旧理由仍然成立：一个忙账号不能一边攥着 permit 一边
+            // 等自己的账号锁。
             let account = account_lock.lock_owned().await;
-            let lane = self
-                .lane_semaphore(methods::lane(method))
-                .acquire_owned()
-                .await
-                .unwrap();
+            let kind = methods::lane(method);
+            let account_lane = acquire_lane(
+                self.account_lane(account_id, kind).await,
+                metrics::record_host_account_lane_wait,
+            )
+            .await;
+            let global_lane = acquire_lane(
+                self.global_lane(kind),
+                metrics::record_host_global_lane_wait,
+            )
+            .await;
             return Ok(HostDispatchPermit {
-                _lane: lane,
+                _account_lane: Some(account_lane),
+                _global_lane: Some(global_lane),
+                _link_lane: None,
                 _account: Some(account),
                 _deleting: deleting,
             });
@@ -415,20 +511,33 @@ impl HostDispatchLimits {
                     false,
                 )
             })?;
+            // `link.finish` 不占 dispatch lane 与全局兜底：它的等待窗口是
+            // 人工手机审批，按组有界（ADR 0001 R3）就已足够；计入全局
+            // control 会让一次待审批吃掉 1/4 的兜底配额。
             return Ok(HostDispatchPermit {
-                _lane: permit,
+                _account_lane: None,
+                _global_lane: None,
+                _link_lane: Some(permit),
                 _account: None,
                 _deleting: None,
             });
         }
 
-        let lane = self
-            .lane_semaphore(methods::lane(method))
-            .acquire_owned()
-            .await
-            .unwrap();
+        let kind = methods::lane(method);
+        let account_lane = acquire_lane(
+            self.account_lane(account_id, kind).await,
+            metrics::record_host_account_lane_wait,
+        )
+        .await;
+        let global_lane = acquire_lane(
+            self.global_lane(kind),
+            metrics::record_host_global_lane_wait,
+        )
+        .await;
         Ok(HostDispatchPermit {
-            _lane: lane,
+            _account_lane: Some(account_lane),
+            _global_lane: Some(global_lane),
+            _link_lane: None,
             _account: None,
             _deleting: None,
         })
@@ -4160,6 +4269,27 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
             });
             Ok(HostEvent::new("message.attachmentBackfillError", payload))
         }
+        HostSideEvent::MessageAttachmentBackfillSettled {
+            account_id,
+            conversation_id,
+            message_id,
+            attachments,
+        } => {
+            // Contract 1.193 (§4.193): the pointer/status answer's whole
+            // index-aligned face — one entry per remote attachment, index
+            // ascending, status one of available/pending/terminal (the
+            // official three-state walk, attachmentBackfill.preload
+            // .ts:286-327). The array is always serialized (an empty list
+            // is the official `pendingCount === 0` settle-and-cancel face),
+            // so the desktop merge is total.
+            let payload = json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "messageId": message_id,
+                "attachments": serde_json::to_value(&attachments).unwrap_or(json!([])),
+            });
+            Ok(HostEvent::new("message.attachmentBackfillSettled", payload))
+        }
         HostSideEvent::ConversationTyping {
             account_id,
             conversation_id,
@@ -4845,6 +4975,7 @@ mod tests {
     use super::*;
     use crate::auth::BootstrapSecret;
     use crate::engine::EngineConfig;
+    use crate::service::AttachmentBackfillSettledEntry;
     use crate::store::{Store, StoreKey};
     use crate::supervisor::RuntimeSupervisor;
 
@@ -5328,6 +5459,256 @@ mod tests {
             .acquire("link.finish", None, Some("default"))
             .await
             .unwrap();
+    }
+
+    /// ADR 0005：lane 配额按账号。A 占满自己的 read=4 时，B 的 read 必须
+    /// 立刻拿到；旧实现的进程级 read=4 会让 B 无端排在 A 后面。
+    #[tokio::test]
+    async fn read_lanes_are_per_account_so_a_busy_account_does_not_serialize_another() {
+        let limits = Arc::new(HostDispatchLimits::new());
+        let mut account_a = Vec::new();
+        for _ in 0..READ_CONCURRENCY {
+            account_a.push(
+                limits
+                    .acquire("messages.list", Some("account-a"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let account_b = timeout(
+            Duration::from_secs(1),
+            limits.acquire("messages.list", Some("account-b"), None),
+        )
+        .await
+        .expect("account-b's read must not queue behind a full account-a lane")
+        .unwrap();
+
+        // A 的四个 permit 仍在手里：A 的第五个读只能等，证明 B 的通行
+        // 不是因为 A 恰好释放了配额。
+        let fifth_a = timeout(
+            Duration::from_millis(50),
+            limits.acquire("messages.list", Some("account-a"), None),
+        )
+        .await;
+        assert!(
+            fifth_a.is_err(),
+            "account-a's fifth read still waits on its own lane"
+        );
+
+        drop(account_a.pop());
+        timeout(
+            Duration::from_secs(1),
+            limits.acquire("messages.list", Some("account-a"), None),
+        )
+        .await
+        .expect("account-a's fifth read proceeds once its lane drains one permit")
+        .unwrap();
+        drop(account_b);
+    }
+
+    /// 单账号 read 容量仍是 4：第 5 个请求停在该账号自己的 lane 上，
+    /// 不占全局兜底、也不影响别的账号。
+    #[tokio::test]
+    async fn a_fifth_read_on_one_account_waits_on_that_accounts_lane() {
+        let limits = Arc::new(HostDispatchLimits::new());
+        let mut held = Vec::new();
+        for _ in 0..READ_CONCURRENCY {
+            held.push(
+                limits
+                    .acquire("messages.list", Some("account-a"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let fifth = timeout(
+            Duration::from_millis(50),
+            limits.acquire("messages.list", Some("account-a"), None),
+        )
+        .await;
+        assert!(fifth.is_err(), "the fifth read on one account must wait");
+
+        drop(held.pop());
+        timeout(
+            Duration::from_secs(1),
+            limits.acquire("messages.list", Some("account-a"), None),
+        )
+        .await
+        .expect("one freed permit admits the fifth read")
+        .unwrap();
+    }
+
+    /// 全局兜底 read=16：四个账号各占满 4 个 read 后，第五个账号即使
+    /// 自己的 lane 全空，也只能等全局 permit。
+    #[tokio::test]
+    async fn the_global_read_backstop_bounds_many_accounts_at_sixteen() {
+        let limits = Arc::new(HostDispatchLimits::new());
+        let mut held = Vec::new();
+        for account in ["account-a", "account-b", "account-c", "account-d"] {
+            for _ in 0..READ_CONCURRENCY {
+                held.push(
+                    limits
+                        .acquire("messages.list", Some(account), None)
+                        .await
+                        .unwrap(),
+                );
+            }
+        }
+        assert_eq!(held.len(), GLOBAL_READ_CONCURRENCY);
+
+        let blocked = timeout(
+            Duration::from_millis(50),
+            limits.acquire("messages.list", Some("account-e"), None),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the 17th read waits on the global backstop even with a free account lane"
+        );
+
+        drop(held.pop());
+        timeout(
+            Duration::from_secs(1),
+            limits.acquire("messages.list", Some("account-e"), None),
+        )
+        .await
+        .expect("a freed global permit admits the waiting account")
+        .unwrap();
+    }
+
+    /// control 仍是每账号 1：同账号第二个 control 等待，不同账号各自可跑。
+    #[tokio::test]
+    async fn control_is_one_per_account_and_independent_across_accounts() {
+        let limits = Arc::new(HostDispatchLimits::new());
+        let account_a = limits
+            .acquire("runtime.status", Some("account-a"), None)
+            .await
+            .unwrap();
+
+        let second_a = timeout(
+            Duration::from_millis(50),
+            limits.acquire("runtime.status", Some("account-a"), None),
+        )
+        .await;
+        assert!(
+            second_a.is_err(),
+            "the second control request on one account waits"
+        );
+
+        let account_b = timeout(
+            Duration::from_secs(1),
+            limits.acquire("runtime.status", Some("account-b"), None),
+        )
+        .await
+        .expect("another account's control lane is free")
+        .unwrap();
+
+        drop(account_a);
+        timeout(
+            Duration::from_secs(1),
+            limits.acquire("runtime.status", Some("account-a"), None),
+        )
+        .await
+        .expect("the same-account control lane frees up after the permit drops")
+        .unwrap();
+        drop(account_b);
+    }
+
+    /// per-account lane 加入后，mutating 同账号仍严格串行：send lane 每账号
+    /// 有 2 个、全局 8 个，第二个同账号 sendText 之所以等待，只可能是
+    /// 账号互斥锁仍先于配额获取（既有 drain barrier 不回归）。
+    #[tokio::test]
+    async fn per_account_lanes_keep_same_account_mutations_serialized() {
+        let limits = Arc::new(HostDispatchLimits::new());
+        let send = limits
+            .acquire("messages.sendText", Some("account-a"), None)
+            .await
+            .unwrap();
+
+        let second = timeout(
+            Duration::from_millis(50),
+            limits.acquire("messages.sendText", Some("account-a"), None),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "same-account mutations stay strictly serialized"
+        );
+
+        let other = timeout(
+            Duration::from_secs(1),
+            limits.acquire("messages.sendText", Some("account-b"), None),
+        )
+        .await
+        .expect("another account's mutation is unaffected")
+        .unwrap();
+
+        drop(send);
+        timeout(
+            Duration::from_secs(1),
+            limits.acquire("messages.sendText", Some("account-a"), None),
+        )
+        .await
+        .expect("the next same-account mutation proceeds after the drain")
+        .unwrap();
+        drop(other);
+    }
+
+    /// 无账号上下文的任务落 unscoped 共享桶（per-lane），彼此排队；同时
+    /// 它们仍受全局兜底约束——unscoped 桶空着也必须等全局 permit。
+    #[tokio::test]
+    async fn unscoped_requests_share_one_bucket_and_respect_the_global_backstop() {
+        let limits = Arc::new(HostDispatchLimits::new());
+        let first = limits.acquire("accounts.list", None, None).await.unwrap();
+        let second = timeout(
+            Duration::from_millis(50),
+            limits.acquire("accounts.list", None, None),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "unscoped control requests share one bucket"
+        );
+        drop(first);
+        let second = timeout(
+            Duration::from_secs(1),
+            limits.acquire("accounts.list", None, None),
+        )
+        .await
+        .expect("the unscoped control lane frees up")
+        .unwrap();
+        drop(second);
+
+        // 全局 read 兜底被四个账号占满；unscoped read 的桶是空的，唯一
+        // 的等待原因只能是全局 permit。
+        let mut held = Vec::new();
+        for account in ["account-a", "account-b", "account-c", "account-d"] {
+            for _ in 0..READ_CONCURRENCY {
+                held.push(
+                    limits
+                        .acquire("messages.list", Some(account), None)
+                        .await
+                        .unwrap(),
+                );
+            }
+        }
+        let blocked = timeout(
+            Duration::from_millis(50),
+            limits.acquire("messages.list", None, None),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the unscoped read still respects the global read backstop"
+        );
+        drop(held.pop());
+        timeout(
+            Duration::from_secs(1),
+            limits.acquire("messages.list", None, None),
+        )
+        .await
+        .expect("a freed global permit admits the unscoped read")
+        .unwrap();
     }
 
     /// The account delete drain barrier: a delete marks the account, then waits
@@ -6017,6 +6398,63 @@ mod tests {
         assert_eq!(frame["data"]["conversationId"], "conv-1");
         assert_eq!(frame["data"]["messageId"], "msg-1");
         assert_eq!(frame["data"]["error"], "MESSAGE_NOT_FOUND");
+    }
+
+    /// Contract 1.193 (§4.193): the backfill settle frame —
+    /// `message.attachmentBackfillSettled` carries the resolved row trio
+    /// plus the index-aligned per-attachment face verbatim (index ascending,
+    /// the three official status words). The empty list still serializes
+    /// (the official `pendingCount === 0` cancel face), so a desktop merge
+    /// is total.
+    #[tokio::test]
+    async fn attachment_backfill_settled_event_names_every_attachment() {
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::MessageAttachmentBackfillSettled {
+                account_id: "acct-1".into(),
+                conversation_id: "conv-1".into(),
+                message_id: "msg-1".into(),
+                attachments: vec![
+                    AttachmentBackfillSettledEntry {
+                        index: 0,
+                        status: "available",
+                    },
+                    AttachmentBackfillSettledEntry {
+                        index: 1,
+                        status: "pending",
+                    },
+                    AttachmentBackfillSettledEntry {
+                        index: 2,
+                        status: "terminal",
+                    },
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["event"], "message.attachmentBackfillSettled");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["conversationId"], "conv-1");
+        assert_eq!(frame["data"]["messageId"], "msg-1");
+        assert_eq!(
+            frame["data"]["attachments"],
+            json!([
+                { "index": 0, "status": "available" },
+                { "index": 1, "status": "pending" },
+                { "index": 2, "status": "terminal" },
+            ])
+        );
+
+        let frame: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::MessageAttachmentBackfillSettled {
+                account_id: "acct-1".into(),
+                conversation_id: "conv-1".into(),
+                message_id: "msg-2".into(),
+                attachments: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frame["data"]["attachments"], json!([]));
     }
 
     /// Contract 1.134 (§4.117; the storage-pull face joins with 1.141,

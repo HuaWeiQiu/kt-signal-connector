@@ -7,9 +7,10 @@
 //! from this table. Adding a method is one row here plus its host dispatch
 //! arm and schema entry — not four parallel classification lists.
 
-/// Global dispatch lane that bounds a method's concurrency
-/// (`host::HostDispatchLimits`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Dispatch lane that bounds a method's concurrency
+/// (`host::HostDispatchLimits`): one semaphore set per account, plus a
+/// connector-wide backstop per lane (ADR 0005).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Lane {
     Control,
     Read,

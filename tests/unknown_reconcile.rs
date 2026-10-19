@@ -451,3 +451,99 @@ async fn reconcile_drains_a_backlog_across_batches_and_reruns_converge() {
 
     supervisor.shutdown().await.unwrap();
 }
+
+/// The automatic recovery landing is a reconcile trigger too: the watchdog
+/// restarts a faulted/restarted engine through `restart_engine`, and the
+/// unknown-outcome pass must re-arm on that landing instead of waiting for
+/// the next manual `start()`. A row left unknown by the startup pass (no
+/// engine truth there) settles only after the watchdog lands a fresh engine.
+#[tokio::test]
+async fn watchdog_restart_lands_and_reconciles_unknown_rows() {
+    let temp = TempDir::new().unwrap();
+    let store = test_store(temp.path());
+    let account = store
+        .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+        .unwrap();
+    let conversation = store
+        .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+        .unwrap();
+    seed_outgoing_row(
+        &store,
+        &account.id,
+        &conversation.id,
+        "req-restart",
+        "unknown",
+        now_ms() - 60_000,
+    );
+    // The startup pass gets an answer without the `dispatched` face, so it
+    // probes once and claims nothing. The marker is re-armed below for the
+    // restart landing this test is about.
+    arm_lookup_answer(&temp, "{}");
+
+    let mut config = config_for(&temp);
+    config.watchdog_interval = Duration::from_millis(50);
+    config.watchdog_min_restart_interval = Duration::ZERO;
+    let supervisor = Arc::new(RuntimeSupervisor::new(
+        config,
+        Arc::clone(&store),
+        DEFAULT_PROXY_GROUP_ID.to_string(),
+        None,
+    ));
+    supervisor.spawn_watchdog();
+    let pid_before = supervisor.start().await.unwrap().pid.unwrap();
+
+    // The startup pass fired (its probe is recorded) and claimed nothing.
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if !lookup_probes(&temp).is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the startup reconciliation probe must have fired");
+    // Let the single-row pass finish its answer handling before swapping the
+    // marker; a drained batch must not probe again on its own.
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        row_status(&store, &account.id, "req-restart"),
+        "unknown",
+        "without engine truth the startup pass must leave the row unknown"
+    );
+    assert_eq!(
+        lookup_probes(&temp).len(),
+        1,
+        "a drained startup pass must not re-probe"
+    );
+
+    // Arm the truth for the next landing, then make the watchdog restart the
+    // engine exactly once: two failed receive-liveness pings.
+    arm_lookup_answer(&temp, r#"{"dispatched": true}"#);
+    std::fs::write(marker_path(&temp, ".fixture-fail-user-status-count"), "2").unwrap();
+
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if row_status(&store, &account.id, "req-restart") == "sent" {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the watchdog landing must re-arm the reconciliation and settle the row");
+
+    assert_ne!(
+        supervisor.status().await.pid,
+        Some(pid_before),
+        "the settle must ride an actual engine restart"
+    );
+    assert!(
+        lookup_probes(&temp).len() >= 2,
+        "the restart landing must probe again: {:?}",
+        lookup_probes(&temp)
+    );
+    assert_eq!(row_status(&store, &account.id, "req-restart"), "sent");
+
+    supervisor.shutdown().await.unwrap();
+}

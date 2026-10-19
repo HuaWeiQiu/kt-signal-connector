@@ -4678,6 +4678,7 @@
             "message.statusChanged",
             "message.receiptsChanged",
             "message.attachmentBackfillError",
+            "message.attachmentBackfillSettled",
             "message.viewOnceOpened",
             "message.expired",
             "call.incoming",
@@ -5966,6 +5967,47 @@
                     "minLength": 1,
                     "maxLength": 64,
                     "description": "The response's bounded error word verbatim (MESSAGE_NOT_FOUND today; the bounded parse accepts any <=64-char word so a future proto word rides without a connector release)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "message.attachmentBackfillSettled" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "conversationId", "messageId", "attachments"],
+                "description": "Contract 1.193 (§4.193): the pointer/status answer for an attachment backfill request — the official AttachmentBackfill.handleResponse per-attachment three-state walk (attachmentBackfill.preload.ts:286-327), reported once per resolved target row. One entry per remote attachment, index ascending and aligned to the remote list: pointer → available (CDN material merged, an in-flight download may be re-queued, :305-315), Status.PENDING → pending (the attachment stays as is and the request timer stays armed, :291-293 / :324-327), Status.TERMINAL_ERROR → terminal (the official markAttachmentAsErrored + download-failed toast, :294-301). An unknown status word converges to pending — the official missingCaseError throw (:303) is a crash face the connector does not copy. An empty array still rides (the official pendingCount === 0 branch cancels the request timer, :324-327). Emitted only when the target resolves to a local conversation row; an unresolvable target stays the quiet warn (the official handleResponse conversation/message-not-found early returns, :131-140). The error arm keeps its own event and never emits this one. Account+conversation transient lane: nothing persists.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "conversationId": { "$ref": "#/$defs/opaqueId" },
+                  "messageId": { "$ref": "#/$defs/opaqueId" },
+                  "attachments": {
+                    "type": "array",
+                    "maxItems": 32,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["index", "status"],
+                      "properties": {
+                        "index": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "The attachment's position in the target message's attachment list (the official remoteAttachments.entries() index, attachmentBackfill.preload.ts:286)."
+                        },
+                        "status": {
+                          "enum": ["available", "pending", "terminal"],
+                          "description": "The connector's wire word for the official per-entry arm: pointer / Status.PENDING / Status.TERMINAL_ERROR. Unknown status words converge to pending (no crash face)."
+                        }
+                      }
+                    }
                   }
                 }
               }

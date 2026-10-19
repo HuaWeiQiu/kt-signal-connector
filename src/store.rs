@@ -569,6 +569,23 @@ pub struct AccountSummary {
     /// opaque local row id (which is random 32-hex, not an ACI).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aci: Option<String>,
+    /// Live capability bits for this account (contract 1.194, §4.194): the
+    /// engine's own-profile `capabilities` projection, forwarded verbatim.
+    /// Only bits the desktop's official-parity gates consume ride here — the
+    /// vendor `DeviceCapabilities` struct never crosses the wire. Absent key
+    /// = the connector holds no capability read for this account (engine
+    /// never answered / profile read failed): honest absence, never folded
+    /// to `false`. The desktop's backfill gate is `=== true`, so absence and
+    /// `false` behave alike while the raw fact stays distinguishable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<AccountCapabilities>,
+}
+
+/// One account's live capability bits (see [`AccountSummary::capabilities`]).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCapabilities {
+    pub attachment_backfill: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2293,6 +2310,7 @@ impl Store {
                     unread_count: row.get::<_, i64>(6)? as u32,
                     proxy_group: row.get(7)?,
                     aci: row.get(8)?,
+                    capabilities: None,
                 })
             })
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -2327,6 +2345,7 @@ impl Store {
                     unread_count: row.get::<_, i64>(6)? as u32,
                     proxy_group: row.get(7)?,
                     aci: row.get(8)?,
+                    capabilities: None,
                 })
             })
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -2443,6 +2462,7 @@ impl Store {
                         unread_count: row.get::<_, i64>(6)? as u32,
                         proxy_group: row.get(7)?,
                         aci: row.get(8)?,
+                        capabilities: None,
                     })
                 },
             )

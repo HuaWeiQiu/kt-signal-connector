@@ -73,6 +73,8 @@ static REQUESTS: [ClassMetrics; METHOD_CLASSES.len()] =
 static RECEIVE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG_RESTARTS: AtomicU64 = AtomicU64::new(0);
 static HOST_PENDING_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOST_ACCOUNT_LANE_WAITS: AtomicU64 = AtomicU64::new(0);
+static HOST_GLOBAL_LANE_WAITS: AtomicU64 = AtomicU64::new(0);
 static RECEIVE_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static DECRYPTION_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
@@ -137,6 +139,18 @@ pub fn receive_dropped_total() -> u64 {
     RECEIVE_DROPPED.load(Ordering::Relaxed)
 }
 
+/// 某次 dispatch 在它自己的 per-account lane 上排队了（ADR 0005）：同账号
+/// 并发是正常信号，持续增长说明单账号 lane 容量与桌面节奏不匹配。
+pub fn record_host_account_lane_wait() {
+    HOST_ACCOUNT_LANE_WAITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 某次 dispatch 在全局兜底 lane 上排队了（ADR 0005）：正常容量下应长期
+/// 为 0，增长意味着账号数或并发已超过「每账号容量 × 典型账号数」。
+pub fn record_host_global_lane_wait() {
+    HOST_GLOBAL_LANE_WAITS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Current number of admitted-but-unfinished host requests.
 pub fn set_host_pending(depth: usize) {
     HOST_PENDING_REQUESTS.store(depth as u64, Ordering::Relaxed);
@@ -167,6 +181,8 @@ pub fn log_snapshot() {
         receive_dropped_total = RECEIVE_DROPPED.load(Ordering::Relaxed),
         watchdog_restarts_total = WATCHDOG_RESTARTS.load(Ordering::Relaxed),
         host_pending_requests = HOST_PENDING_REQUESTS.load(Ordering::Relaxed),
+        host_account_lane_waits_total = HOST_ACCOUNT_LANE_WAITS.load(Ordering::Relaxed),
+        host_global_lane_waits_total = HOST_GLOBAL_LANE_WAITS.load(Ordering::Relaxed),
         receive_queue_depth = RECEIVE_QUEUE_DEPTH.load(Ordering::Relaxed),
         decryption_errors_total = DECRYPTION_ERRORS_TOTAL.load(Ordering::Relaxed),
         "connector metrics snapshot"

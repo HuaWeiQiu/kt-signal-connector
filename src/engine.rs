@@ -1352,22 +1352,26 @@ pub enum ControlReceive {
         deletes: SyncDeleteForMeProjection,
     },
     /// The engine's `syncMessage.attachmentBackfillResponse` projection
-    /// (contract revision 1.175, §4.175): the primary device answered our
-    /// backfill request (engine `requestAttachmentBackfill`, the official
-    /// `AttachmentBackfill.request` chain) — it re-uploaded the attachment
-    /// and returned fresh transit pointers for the target message. The
-    /// connector consumes the pointer faces into the row's schema-19 live
-    /// locator column (empty slots only; `status` entries and the error arm
-    /// change nothing, the official `handleResponse` keep-as-is posture),
-    /// so a later `attachments.download` walks the §4.54 transit CDN chain.
-    /// The target names the conversation in the official three-form shape
-    /// (exactly one leg survives the parse) and the message by author +
-    /// upstream sent stamp. A face whose target or conversation fails the
-    /// shape gates never reaches this variant — the projection parser
-    /// dropped it, and an envelope with nothing usable left keeps the plain
-    /// syncMessage skip. The `longText` entry is parsed and dropped: KT
-    /// long-text bodies ride the row's text column, so no locator column
-    /// exists for them (recorded §4.175).
+    /// (contract revision 1.175, §4.175; entry states 1.193, §4.193): the
+    /// primary device answered our backfill request (engine
+    /// `requestAttachmentBackfill`, the official `AttachmentBackfill.request`
+    /// chain) — it re-uploaded the attachment and returned fresh transit
+    /// pointers for the target message. The connector consumes the pointer
+    /// faces into the row's schema-19 live locator column (empty slots only;
+    /// `status` entries and the error arm change nothing, the official
+    /// `handleResponse` keep-as-is posture), so a later
+    /// `attachments.download` walks the §4.54 transit CDN chain. Every entry
+    /// keeps its official variant (`BackfillEntry`), and the service layer
+    /// reports the whole index-aligned face once the target resolves
+    /// (`message.attachmentBackfillSettled`). The target names the
+    /// conversation in the official three-form shape (exactly one leg
+    /// survives the parse) and the message by author + upstream sent stamp.
+    /// A face whose target or conversation fails the shape gates never
+    /// reaches this variant — the projection parser dropped it, and an
+    /// envelope with nothing usable left keeps the plain syncMessage skip.
+    /// The `longText` entry is parsed and dropped: KT long-text bodies ride
+    /// the row's text column, so no locator column exists for them (recorded
+    /// §4.175).
     SyncAttachmentBackfillResponse {
         response: SyncAttachmentBackfillResponse,
     },
@@ -1799,17 +1803,51 @@ pub struct SyncBlocked {
     pub group_ids: Vec<String>,
 }
 
+/// One status entry of the backfill response's attachment list (contract
+/// 1.193, §4.193): the official `AttachmentData.Status` two-state split the
+/// desktop acts on — `PENDING` keeps the attachment as is and leaves the
+/// request timer armed (attachmentBackfill.preload.ts:291-293), while
+/// `TERMINAL_ERROR` marks the attachment errored and raises the download
+/// toast (:294-301). Pre-1.193 both folded into `None` beside unparseable
+/// entries, so the connector could not tell "wait" from "the phone says
+/// never" — the exact distinction the settle event reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackfillStatus {
+    Pending,
+    Terminal,
+    /// A status word outside the pinned vocabulary (today the engine's
+    /// `UNKNOWN` projection for an unmapped proto enum value). The official
+    /// `missingCaseError` throw is a crash face KT does not copy: the
+    /// settle event folds this into `pending`, the non-crash convergence.
+    Unknown,
+}
+
+/// One index-aligned entry of the backfill response's attachment list
+/// (contract 1.193, §4.193): the official `AttachmentData` oneof, kept as
+/// two variants so the entry's whole meaning survives the parse. Index
+/// alignment stays structural — one vector element per remote entry, never
+/// a shifted row (the §4.175 posture).
+#[derive(Clone, Debug, PartialEq)]
+pub enum BackfillEntry {
+    /// A pointer entry (the official `'status' in entry` false arm,
+    /// attachmentBackfill.preload.ts:305-315). The locator face rides when
+    /// the pointer carried locator material; a locator-less pointer is
+    /// still an available attachment, so the variant keeps `None` instead
+    /// of collapsing into a status entry.
+    Locator(Option<crate::store::HistoryAttachmentLocator>),
+    /// A status entry (the official `'status' in entry` arm, :291-303).
+    Status(BackfillStatus),
+}
+
 /// The engine's `syncMessage.attachmentBackfillResponse` face (contract
-/// revision 1.175, §4.175): the official
+/// revision 1.175, §4.175; entries re-typed 1.193, §4.193): the official
 /// `SyncMessage.AttachmentBackfillResponse` projection, normalized. The
 /// target message rides author + upstream sent stamp; the conversation in
 /// the official three-form identity (exactly one leg set after the parse).
 /// The data face is either the error word (`MESSAGE_NOT_FOUND`/`UNKNOWN`)
-/// or the index-aligned locator entries — `Some(face)` where the primary
-/// returned a pointer with locator material, `None` where it returned a
-/// status entry (`PENDING`/`TERMINAL_ERROR`) or an unparseable entry, so
-/// the merge keeps the official index alignment (a status entry means
-/// "keep the attachment as is", never "shift the row").
+/// or the index-aligned entries — each entry keeps its official variant
+/// (pointer vs `PENDING`/`TERMINAL_ERROR` status) and an unparseable entry
+/// converges to `Status(Unknown)` rather than a shifted row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SyncAttachmentBackfillResponse {
     pub author: String,
@@ -1818,12 +1856,33 @@ pub struct SyncAttachmentBackfillResponse {
     pub conversation_group_id: Option<String>,
     pub conversation_e164: Option<String>,
     pub error: Option<String>,
-    pub locators: Vec<Option<crate::store::HistoryAttachmentLocator>>,
+    pub entries: Vec<BackfillEntry>,
+}
+
+impl SyncAttachmentBackfillResponse {
+    /// The pointer-face projection the §4.175 locator merge consumes
+    /// (contract 1.193, §4.193): one slot per entry, `Some(face)` only for
+    /// a pointer entry with locator material. Status entries project
+    /// `None` — the merge's keep-as-is face — so index alignment survives
+    /// the re-typing without changing what the store primitive sees.
+    pub fn locator_faces(&self) -> Vec<Option<crate::store::HistoryAttachmentLocator>> {
+        self.entries
+            .iter()
+            .map(|entry| match entry {
+                BackfillEntry::Locator(face) => face.clone(),
+                BackfillEntry::Status(_) => None,
+            })
+            .collect()
+    }
 }
 
 /// Protocol-side bounds for inbound control-plane data (§4.13).
 const MAX_QUOTE_TEXT_CHARS: usize = 128;
-pub(crate) const MAX_INBOUND_ATTACHMENTS: usize = 32;
+/// The per-message attachment ceiling, shared by the receive face and the
+/// backfill entry list (contract 1.193, §4.193). `pub` since the
+/// `message.attachmentBackfillSettled` array mirrors this parse bound (the
+/// schema-pairing test pins the two together).
+pub const MAX_INBOUND_ATTACHMENTS: usize = 32;
 const MAX_ATTACHMENT_ID_CHARS: usize = 128;
 /// The inbound filename bound (contract revision 1.184, §4.184): the sender's
 /// name rides verbatim up to this clamp — the clamp is boundedness insurance,
@@ -2183,9 +2242,10 @@ impl NormalizedReceive {
                         + change.new_e164.as_ref().map_or(0, String::len)
                 }
                 // The backfill response carries the bounded target identities
-                // plus one locator face per entry (each face bounded by the
-                // 1.56 caps family) — counted entry-wise so the queue budget
-                // stays honest (§4.13, §4.175).
+                // plus one locator face per pointer entry (each face bounded
+                // by the 1.56 caps family; status entries carry no heap) —
+                // counted entry-wise so the queue budget stays honest
+                // (§4.13, §4.175, §4.193).
                 Some(ControlReceive::SyncAttachmentBackfillResponse { response }) => {
                     std::mem::size_of::<SyncAttachmentBackfillResponse>()
                         + response.author.len()
@@ -2193,9 +2253,12 @@ impl NormalizedReceive {
                         + response.conversation_group_id.as_ref().map_or(0, String::len)
                         + response.conversation_e164.as_ref().map_or(0, String::len)
                         + response
-                            .locators
+                            .entries
                             .iter()
-                            .flatten()
+                            .filter_map(|entry| match entry {
+                                BackfillEntry::Locator(face) => face.as_ref(),
+                                BackfillEntry::Status(_) => None,
+                            })
                             .map(|face| {
                                 face.key.as_ref().map_or(0, String::len)
                                     + face.cdn_key.as_ref().map_or(0, String::len)
@@ -3268,10 +3331,22 @@ async fn handle_upstream_line(
         return Ok(());
     }
 
-    let id = object
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or(EngineError::Protocol)?;
+    // A response without a string `id` is not fatal. Two real shapes reach
+    // here: (a) the engine's own -32700 parse-error answer to an over-long
+    // inbound frame, which carries `"id": null` by JSON-RPC convention; (b) a
+    // malformed-but-valid-JSON line. Treating either as `EngineError::Protocol`
+    // faults the whole engine (the read loop's `Err` arm) and collapses every
+    // in-flight mutating request into `UnknownOutcome` — the 2026-10-19 4.4MB
+    // video incident: the engine kept running, the connector killed it. A
+    // single unroutable line must degrade to a warning; the request it might
+    // have answered is settled by its own bounded timeout, never by killing
+    // the engine.
+    let Some(id) = object.get("id").and_then(Value::as_str) else {
+        let _ = events.send(EngineEvent::ProtocolWarning {
+            kind: "responseWithoutId",
+        });
+        return Ok(());
+    };
     let Some(request) = pending.remove(id) else {
         let _ = events.send(EngineEvent::ProtocolWarning {
             kind: "unknownOrDuplicateResponseId",
@@ -3807,19 +3882,19 @@ fn normalized_sync_read_entries(value: Option<&Value>) -> Vec<SyncReadEntry> {
 }
 
 /// Bounded `syncMessage.attachmentBackfillResponse` face (contract revision
-/// 1.175, §4.175): the engine's projection of the official backfill
-/// response. The parse is all-or-nothing on the target (author + positive
-/// sent stamp + exactly one conversation leg — the official
-/// strictAssert-drop posture; a malformed target answers None so the
-/// envelope keeps the plain syncMessage skip, 宁缺勿错). The data face
-/// parses leniently per entry: the error arm rides its bounded word; the
-/// attachments arm keeps index alignment — a pointer entry contributes its
-/// locator face (`None` when the pointer carried no locator material), a
-/// status entry contributes `None` (keep-as-is), an unparseable entry
-/// contributes `None` too (never a shifted row). The `longText` entry is
-/// dropped on the floor deliberately: KT long-text bodies ride the row's
-/// text column, so no locator column exists to merge into (recorded
-/// §4.175).
+/// 1.175, §4.175; entry states 1.193, §4.193): the engine's projection of
+/// the official backfill response. The parse is all-or-nothing on the
+/// target (author + positive sent stamp + exactly one conversation leg —
+/// the official strictAssert-drop posture; a malformed target answers None
+/// so the envelope keeps the plain syncMessage skip, 宁缺勿错). The data
+/// face parses leniently per entry: the error arm rides its bounded word;
+/// the attachments arm keeps index alignment, and every entry keeps its
+/// official variant ([`BackfillEntry`]) — the pointer face with or without
+/// locator material, the `PENDING`/`TERMINAL_ERROR` status words, and an
+/// unparseable entry converged to `Status(Unknown)` (never a shifted row).
+/// The `longText` entry is dropped on the floor deliberately: KT long-text
+/// bodies ride the row's text column, so no locator column exists to merge
+/// into (recorded §4.175).
 fn normalized_sync_attachment_backfill_response(
     value: Option<&Value>,
 ) -> Option<SyncAttachmentBackfillResponse> {
@@ -3867,21 +3942,15 @@ fn normalized_sync_attachment_backfill_response(
                     .take(MAX_BACKFILL_ERROR_WORD_CHARS)
                     .collect::<String>(),
             ),
-            locators: Vec::new(),
+            entries: Vec::new(),
         });
     }
-    let locators = face
+    let entries = face
         .get("attachments")
         .and_then(Value::as_array)?
         .iter()
         .take(MAX_INBOUND_ATTACHMENTS)
-        .map(|entry| {
-            entry
-                .as_object()?
-                .get("attachment")
-                .and_then(|attachment| attachment.get("locator"))
-                .and_then(normalized_locator_face)
-        })
+        .map(normalized_backfill_entry)
         .collect();
     Some(SyncAttachmentBackfillResponse {
         author,
@@ -3890,8 +3959,39 @@ fn normalized_sync_attachment_backfill_response(
         conversation_group_id,
         conversation_e164,
         error: None,
-        locators,
+        entries,
     })
+}
+
+/// One index-aligned backfill entry (contract 1.193, §4.193): the engine
+/// projects the official `AttachmentData` oneof as `{status: "<WORD>"}` or
+/// `{attachment: {...}}` (kt-signal-engine `project_attachment_backfill_response`,
+/// `src/service/mod.rs:9602-9703`). The split is what the desktop acts on —
+/// a pointer merges CDN material, `PENDING` waits, `TERMINAL_ERROR` errors
+/// the attachment (attachmentBackfill.preload.ts:291-303) — so the parse
+/// never folds the two arms together. An entry outside the projection's
+/// shape (non-object, an `attachment` that is not an object, or no
+/// `status`/`attachment` key at all) converges to `Status(Unknown)`: the
+/// official `missingCaseError` crash is not a face KT copies, and the
+/// settle event maps `Unknown` to `pending` (the non-crash convergence).
+fn normalized_backfill_entry(entry: &Value) -> BackfillEntry {
+    let Some(object) = entry.as_object() else {
+        return BackfillEntry::Status(BackfillStatus::Unknown);
+    };
+    if let Some(attachment) = object.get("attachment") {
+        return match attachment.as_object() {
+            Some(attachment) => {
+                BackfillEntry::Locator(attachment.get("locator").and_then(normalized_locator_face))
+            }
+            None => BackfillEntry::Status(BackfillStatus::Unknown),
+        };
+    }
+    let status = match object.get("status").and_then(Value::as_str) {
+        Some("PENDING") => BackfillStatus::Pending,
+        Some("TERMINAL_ERROR") => BackfillStatus::Terminal,
+        _ => BackfillStatus::Unknown,
+    };
+    BackfillEntry::Status(status)
 }
 
 /// Bounded `syncMessage.deleteForMe` projection family (contract 1.102,
@@ -8392,6 +8492,54 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    /// 2026-10-19 incident pin: the engine answers an over-long inbound frame
+    /// with a JSON-RPC -32700 parse error carrying `"id": null` and keeps
+    /// running. That line must degrade to a warning — never `EngineError::
+    /// Protocol`, which faults the read loop and collapses every in-flight
+    /// mutating call to `UnknownOutcome` (the 4.4MB video send became
+    /// SEND_OUTCOME_UNKNOWN this way while the engine was healthy).
+    #[tokio::test]
+    async fn response_without_a_string_id_warns_instead_of_faulting_the_engine() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+        let (response_tx, mut response_rx) = oneshot::channel();
+        pending.insert(
+            "kt-1".to_string(),
+            PendingRequest {
+                class: CallClass::Mutating,
+                account: Some("+15555550100".to_string()),
+                response: response_tx,
+            },
+        );
+
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": { "code": -32700, "message": "Parse error" }
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .expect("a null-id response must not fault the read loop");
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            EngineEvent::ProtocolWarning {
+                kind: "responseWithoutId"
+            }
+        ));
+        assert!(
+            pending.contains_key("kt-1"),
+            "the unroutable line resolves nothing; the call settles by its own timeout"
+        );
+        assert!(
+            response_rx.try_recv().is_err(),
+            "no failure is injected into the waiting call"
+        );
+    }
+
     /// Contract 1.113 §4.94: the engine's unbound stop-ring notification
     /// replays onto the attributed AccountUnauthorized lane the unlink
     /// watcher already consumes — exactly one event, no warning.
@@ -10371,12 +10519,15 @@ mod tests {
     }
 
     /// The engine's `syncMessage.attachmentBackfillResponse` projection
-    /// (contract revision 1.175, §4.175) routes as the backfill control with
-    /// the target identities and the index-aligned locator entries: pointer
-    /// entries contribute their locator face, status entries and unparseable
-    /// entries contribute None (never a shifted row), the error arm rides its
-    /// word with no locators, and a target missing its author/stamp/
-    /// conversation falls through to the plain skip.
+    /// (contract revision 1.175, §4.175; entry states 1.193, §4.193) routes
+    /// as the backfill control with the target identities and the
+    /// index-aligned entries: every entry keeps its official variant —
+    /// pointer (with or without locator material) vs the `PENDING`/
+    /// `TERMINAL_ERROR` status words — an unknown status word and an
+    /// unparseable entry converge to `Status(Unknown)` without shifting the
+    /// row, the error arm rides its word with no entries, and a target
+    /// missing its author/stamp/conversation falls through to the plain
+    /// skip.
     #[test]
     fn sync_attachment_backfill_response_routes_target_and_entries() {
         let routing = |sync: serde_json::Value| {
@@ -10414,6 +10565,9 @@ mod tests {
                             },
                         },
                         { "attachment": { "id": "att-b", "contentType": "image/png" } },
+                        { "status": "TERMINAL_ERROR" },
+                        { "status": "SOME_FUTURE_WORD" },
+                        "not-an-entry",
                     ],
                 },
             }))
@@ -10426,18 +10580,50 @@ mod tests {
         assert!(response.conversation_service_id.is_none());
         assert!(response.conversation_e164.is_none());
         assert!(response.error.is_none());
-        // Index alignment: status → None, pointer → face, pointer without
-        // locator material → None.
-        assert_eq!(response.locators.len(), 3);
-        assert!(response.locators[0].is_none());
-        let face = response.locators[1].as_ref().expect("pointer face");
+        // Index alignment, one entry per remote position: PENDING keeps its
+        // status word (never folded into the pointer face), the pointers keep
+        // their locator material (a locator-less pointer stays a pointer),
+        // TERMINAL_ERROR keeps its own word, and the unknown/unparseable
+        // faces converge to Unknown in place.
+        assert_eq!(response.entries.len(), 6);
+        assert_eq!(
+            response.entries[0],
+            BackfillEntry::Status(BackfillStatus::Pending)
+        );
+        let BackfillEntry::Locator(Some(face)) = &response.entries[1] else {
+            panic!("pointer entry keeps its locator face");
+        };
         assert_eq!(face.key.as_deref(), Some("a2F0LWtleQ=="));
         assert_eq!(face.cdn_key.as_deref(), Some("cdn-a"));
         assert_eq!(face.cdn_number, Some(3));
-        assert!(response.locators[2].is_none());
+        assert_eq!(response.entries[2], BackfillEntry::Locator(None));
+        assert_eq!(
+            response.entries[3],
+            BackfillEntry::Status(BackfillStatus::Terminal)
+        );
+        assert_eq!(
+            response.entries[4],
+            BackfillEntry::Status(BackfillStatus::Unknown)
+        );
+        assert_eq!(
+            response.entries[5],
+            BackfillEntry::Status(BackfillStatus::Unknown)
+        );
+        // The store-facing projection keeps the §4.175 shape: only the
+        // locator-bearing pointer contributes a face.
+        let faces = response.locator_faces();
+        assert_eq!(faces.len(), 6);
+        assert!(faces[1].is_some());
+        assert!(
+            faces
+                .iter()
+                .enumerate()
+                .all(|(index, face)| index == 1 || face.is_none()),
+            "status and locator-less entries project None: {faces:?}"
+        );
         assert!(source.is_none(), "the envelope is our own account");
 
-        // The error arm: word rides, no locators.
+        // The error arm: word rides, no entries.
         let Some((ControlReceive::SyncAttachmentBackfillResponse { response }, _)) =
             routing(json!({
                 "attachmentBackfillResponse": {
@@ -10453,7 +10639,7 @@ mod tests {
             panic!("expected an error-arm backfill routing");
         };
         assert_eq!(response.error.as_deref(), Some("MESSAGE_NOT_FOUND"));
-        assert!(response.locators.is_empty());
+        assert!(response.entries.is_empty());
         assert_eq!(
             response.conversation_service_id.as_deref(),
             Some("11111111-1111-1111-1111-111111111111")

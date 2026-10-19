@@ -5,6 +5,36 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.194 (2026-10-20; §4.194 the account capability
+  face — `accounts.list` entries gain an optional
+  `capabilities: { attachmentBackfill }` forwarded from the engine's
+  own-profile read, live-read-only, absent = unknown — and the non-fatal
+  null-id response: a JSON-RPC parse-error answer carrying `"id": null`
+  degrades to a `responseWithoutId` protocol warning instead of faulting
+  the engine and collapsing in-flight mutating calls to unknown)
+- Contract revision: 1.193 (2026-10-20; §4.193 the backfill response
+  settled face: the `SyncAttachmentBackfillResponse` entry list stops
+  collapsing `PENDING` and `TERMINAL_ERROR` into `None` — the typed
+  `BackfillEntry` keeps the official `AttachmentData` oneof (pointer vs
+  status word) — and the resolved pointer/status answer reports its whole
+  index-aligned face to the desktop via the new transient event
+  `message.attachmentBackfillSettled`
+  ({accountId, conversationId, messageId, attachments:
+  [{index, status}]}, status one of `available` / `pending` / `terminal`).
+  The official `AttachmentBackfill.handleResponse`
+  (attachmentBackfill.preload.ts:190-330) acts per attachment — PENDING
+  keeps the row as is and leaves the request timer armed, TERMINAL_ERROR
+  marks the attachment errored and raises the download toast, a pointer
+  merges CDN material and may re-queue an in-flight download — and only a
+  zero pending count cancels the timer; pre-1.193 the connector merged
+  locators silently, so the desktop could not tell "the phone is still
+  working" from "the phone gave up" and always burned the retry budget
+  into the Timeout face. An unknown status word converges to `pending`
+  (the official `missingCaseError` throw is a crash face KT does not
+  copy); an unresolvable target stays the quiet warn (the official
+  conversation/message-not-found early returns); the 1.192 error arm is
+  unchanged and never emits this event.)
+
 - Contract revision: 1.191 (2026-10-19; §4.191 the backfill request author
   face regression fix: `prepare_request_attachment_backfill` no longer
   feeds the row's `sender_id` — the ingest privacy hash the protocol has
@@ -16634,6 +16664,133 @@ message id and the error word verbatim — plus the never-moves-a-face
 merge invariant and the unresolvable-target quiet drop),
 `attachment_backfill_error_event_names_the_row` (the wire frame: the
 event name and the four-key payload verbatim).
+
+### 4.193 The backfill response settled face: the per-attachment states reach the desktop (contract revision 1.193, 2026-10-20)
+
+The §4.175 consume arm has always merged the phone's fresh transit
+pointers and said nothing. That silence was safe while the desktop's
+only question was "is there a locator now", but it erases the official
+handler's per-attachment statement: `AttachmentBackfill.handleResponse`
+(attachmentBackfill.preload.ts:190-330) walks every entry of the
+response and acts on its state.
+
+**The official semantics.** `conversation == null` (:131-133) and
+`message == null` (:138-140) return early — an unmatchable answer is
+dropped, never a face. `clearTimeout` runs on any match (:146-149). The
+error arm (:151-165) is the §4.192 face and is unchanged. For the
+attachments arm the per-entry split (:286-315) is three-state:
+
+- `Status.PENDING` keeps the attachment as is and increments
+  `pendingCount` (:291-293) — the request timer stays armed.
+- `Status.TERMINAL_ERROR` replaces the attachment with
+  `markAttachmentAsErrored(existing, 'backfill-terminal-error')`
+  (:294-301), and `showDownloadFailedToast` fires at the end (:320-322).
+- A pointer entry merges its CDN material and, when the attachment is
+  currently downloading, adds its signature to the immediate
+  `queueAttachmentDownloads(..., source: BACKFILL, urgency: IMMEDIATE,
+  isManualDownload: true)` batch (:305-315, :345-354).
+- Any other status word is `missingCaseError` — a crash face (:303).
+
+Only `pendingCount === 0` deletes the pending request and cancels the
+timer (:324-327); a response with zero entries therefore settles
+immediately.
+
+**The connector face.** `SyncAttachmentBackfillResponse` stops folding
+the list into `Vec<Option<Locator>>`: each position is a typed
+`BackfillEntry` — `Locator(Option<HistoryAttachmentLocator>)` for a
+pointer (a locator-less pointer is still an available attachment, never
+a status) or `Status(Pending | Terminal | Unknown)` for a status entry.
+The parse (kt-signal-engine's `project_attachment_backfill_response`,
+`src/service/mod.rs:9602-9703`, emits `{status: "<WORD>"}` /
+`{attachment: {...}}` per entry) keeps index alignment; an unparseable
+entry converges to `Status(Unknown)` in place. The store-facing
+projection (`locator_faces`) reproduces the old `Vec<Option<Locator>>`
+shape for `merge_live_attachment_locators`, so the §4.175 merge
+semantics are unchanged.
+
+On a resolved target the pointer/status arm now emits
+`HostSideEvent::MessageAttachmentBackfillSettled` → wire
+`message.attachmentBackfillSettled`
+`{accountId, conversationId, messageId, attachments: [{index, status}]}`
+(index ascending, one entry per remote position). Status mapping:
+pointer → `available`, `PENDING` → `pending`, `TERMINAL_ERROR` →
+`terminal`, everything else (including the engine's `UNKNOWN`) →
+`pending`. The unknown fold is deliberate: the official
+`missingCaseError` throw is a crash face KT does not copy, and a
+non-crash wait face degrades exactly to the pre-1.193 world (the retry
+budget ends in the Timeout face) if the phone never settles. An empty
+list still rides — the official `pendingCount === 0` timer cancel is
+information the desktop needs. An unresolvable conversation/row stays
+the warn-only quiet drop (the official early returns); the §4.192 error
+arm keeps its own event and never emits this one.
+
+Boundary recorded: the response's `longText` entry keeps its §4.175
+disposition — parsed and dropped, because KT long-text bodies ride the
+row's text column and have no locator slot. It therefore contributes no
+array position and its official `pendingCount` contribution (:247-283)
+is not represented; the desktop's timer converges through the ordinary
+retry budget in that one arm. Extending the array with a body-attachment
+position would break the index-equals-attachment-position contract, so
+the drop is deliberate rather than an omission.
+
+Wire: additive event only (schema event enum + payload block; the
+schema-consistency gate pins the emission literal and the
+`MAX_INBOUND_ATTACHMENTS` array bound). Nothing persists; a missed event
+converges into the pre-1.193 retry-budget behavior. Desktop consumption
+half is the desktop's own contract (cancel the row's backfill timer on
+`pending`-free lists, mark terminal entries errored and toast).
+
+Tests: `sync_attachment_backfill_response_routes_target_and_entries`
+(the parse keeps all three states, index-aligned, unknown/unparseable
+folded to `Unknown`, and the locator projection keeps the §4.175 shape),
+`attachment_backfill_settled_event_names_every_attachment_state` (the
+service mapping available/terminal/pending/pending, ascending indices,
+the empty-list settle and the unresolvable-target quiet drop),
+`backfill_response_merges_locators_into_the_target_row` (the pointer arm
+now asserts its settled event; the error arm still emits only its own),
+`attachment_backfill_settled_event_names_every_attachment` (the wire
+frame: event name and payload verbatim, empty array serialized).
+
+### 4.194 The account capability face and the non-fatal null-id response (contract revision 1.194, 2026-10-20)
+
+Two boundary corrections, both official-semantics driven.
+
+**① `accounts.list` carries the live capability bits.** The desktop's
+official backfill gate is `ourConversation.capabilities?.attachmentBackfill
+=== true` (`ts/jobs/helpers/attachmentBackfill.preload.ts:57-72`), and those
+capabilities come from the account's own profile
+(`ts/services/profiles.preload.ts:713-718`). The engine reads its own
+profile and projects the single bit into `listAccounts` entries
+(`capabilities: { attachmentBackfill }`); this connector forwards it into
+the account summary as an optional object, and only that one bit — the
+vendor `DeviceCapabilities` struct never crosses the wire. The key is
+**absent** when the engine did not answer (no profile read / read failed /
+timeout): absence is the honest unknown, never folded to `false`. The
+desktop gate is `=== true`, so absence and `false` behave alike while the
+raw fact stays distinguishable. Capabilities are a live read: nothing is
+persisted, and a later `accounts.list` without the engine answer drops the
+key again. Wire shape: `accounts.list` entries gain optional
+`capabilities: { attachmentBackfill: boolean }` (contract revision 1.194).
+
+**② A response without a string `id` no longer faults the engine.** JSON-RPC
+answers an unparseable/over-long frame with `{"id": null, "error":
+{"code": -32700, ...}}` and keeps running. The reader previously mapped the
+missing string id to `EngineError::Protocol`, which set the read loop's
+terminal state to `Faulted` and collapsed every in-flight mutating request
+into `UnknownOutcome`. On 2026-10-19 a 4.4 MB video send (5.9 MB base64
+frame) tripped the engine's then-1 MiB inbound frame cap, the engine
+answered exactly that way and stayed healthy, and the connector killed it —
+the desktop surfaced `SEND_OUTCOME_UNKNOWN`. The id arm is now an
+`EngineEvent::ProtocolWarning { kind: "responseWithoutId" }` followed by a
+normal continue: the unroutable line resolves nothing, and any waiting call
+settles through its own bounded timeout. Framing errors (a genuinely
+malformed line, `PumpedLine::FramingError`) keep the fault semantics.
+
+Tests: `sync_accounts_carries_the_live_capability_bits_per_account` (the
+bit rides its own account, an unanswered account keeps the absent key),
+`response_without_a_string_id_warns_instead_of_faulting_the_engine` (the
+line returns `Ok`, emits the warning, leaves the pending call waiting, and
+injects no failure).
 
 ## 5. signal-cli Boundary
 
