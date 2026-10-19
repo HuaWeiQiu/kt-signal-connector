@@ -66,6 +66,21 @@
   their old shapes unchanged. D3's engine-side last-moments dump audit is
   recorded in `docs/last-moments-redaction-audit.md`; the engine worktree is
   outside this repository and the fix lands there.)
+=======
+- Contract revision: 1.200 (2026-10-20; §4.200 the pin backfill
+  semantics: the archive's `PinDetails` clocks are authoritative. The
+  engine history export emits `pinExpiry`
+  (`pinExpiresAtTimestamp` / `pinNeverExpires`) beside the existing
+  `pinnedAtTimestamp`; the connector import stores both verbatim and the
+  store applies the desktop `appendPinnedMessage` discipline — the same
+  target replaces only when the incoming `pinned_at` is strictly newer,
+  and a full queue keeps the newest three. Schema 32 rekeys
+  `conversation_pins` by `(account, conversation, target_sent_at)` so the
+  import (E.164) and live (ACI) spellings of one target converge instead
+  of fanning into two rows. The multi-device `sentMessage.pinMessage` /
+  `unpinMessage` / `adminDelete` echoes now route as outgoing controls
+  instead of falling through to the skip. Wire additive/internal; the
+  summary's `pinnedAt`/`expiresAt` values now carry the backup's clocks.)
 - Contract revision: 1.196 (2026-10-20; §4.196 the delete-for-me
   attachment arm: `syncMessage.deleteForMe.attachmentDeletes` — the
   official `handleDeleteForMeSync` fourth face
@@ -17368,6 +17383,66 @@ must land in the engine repository; they are not claimed as done here.
 **Boundary.** S1 (engine actor per account), D1/B5 (per-account store key),
 C3 (group pin authority), and the desktop-side purge/IPC items are not part
 of this batch and stay open in the audit table.
+=======
+### 4.200 The pin backfill clocks and the target-stamp key (contract revision 1.200, 2026-10-20)
+
+W6 traced the official pin model: it is a local derived table, never a
+group/server state. The backup's `PinDetails` is the import source
+(`protos/Backups.proto:494-500`), the desktop appends it into the local
+`pinnedMessages` table (`import.preload.ts:1922-1945`, flush order by
+`pinnedAt` ASC at `:391-406`), keeps at most three
+(`ts/util/pinnedMessages.dom.ts:7-9`), and the table's append rule is
+"insert when absent, replace only when `pinnedAt` is strictly newer, then
+truncate to the newest three by `pinnedAt` DESC"
+(`ts/sql/server/pinnedMessages.std.ts:126-144`, `:157-201`). Live
+pin/unpin rides the same modifier for peer and sync-sent faces
+(`ts/messageModifiers/PinnedMessages.preload.ts:48-143`, `:145-189`;
+`ts/background.preload.ts:3281-3295`, `:3468-3476`, admin delete
+`:3373-3389`). There is deliberately no server "list pins" face
+(`protos/Groups.proto:73-91`, `protos/SignalService.proto` carries only
+the three DataMessage arms), so neither repository grows one.
+
+**Engine export.** `history.rs` emits `pinExpiry` beside the existing
+`pinnedAtTimestamp`, verbatim from the proto oneof — either
+`{"pinExpiresAtTimestamp": <ms>}` or `{"pinNeverExpires": true}`. An
+absent oneof stays absent (proto only projects). No `Groups.proto` or
+presage `Group` field is added.
+
+**Connector import.** The importer keeps `pinnedAtTimestamp` as the pin's
+own clock and reads `pinExpiry.pinExpiresAtTimestamp` as the absolute
+deadline (`pinNeverExpires` or an older engine face without the key =
+forever). A present-but-armless `pinExpiry` is the official
+`strictAssert` malformed face, so the pin is dropped rather than
+invented into forever. The flush passes both clocks to the store; it
+never substitutes the connector clock for a backup pin.
+
+**Store.** Schema 32 rebuilds `conversation_pins` with
+`(account_id, conversation_id, target_sent_at)` as the primary key. The
+author string remains display metadata only: the same target may arrive
+spelled E.164 on the backup face and ACI on the live face, and the two
+must converge on one row. `append_conversation_pin` mirrors the official
+append: an older pin for the same target is ignored, a newer one
+replaces, and the receiver-side cap keeps the newest three by `pinned_at`
+(ties by older rowid). `clear_conversation_pin` addresses the target
+stamp, so an unpin/admin-delete whose author spelling differs still
+clears the right pin. The summary projection keeps its existing expiry
+gate (an expired timed pin stops rendering) and now shows the backup's
+`pinnedAt`/`expiresAt` values verbatim.
+
+**Sync-sent control.** The connector's `sync_sent_control` ladder gains
+the engine's `sentMessage.pinMessage`, `.unpinMessage`, and
+`.adminDelete` projections (the engine already folds the DataMessage
+faces there, `src/service/mod.rs:9204-9231`), so a phone-originated pin
+no longer falls through to the plain syncMessage skip. Malformed arms
+still fall through rather than inventing a target.
+
+Tests: engine history projects both `pinExpiry` arms (and absence);
+connector store covers older-pin non-replacement, fourth-pin eviction by
+`pinned_at`, the E.164/ACI import-live convergence, and the v31→v32
+schema rebuild; connector engine covers the sync-sent pin/unpin/
+adminDelete routes; the history import integration asserts the summary's
+`pinnedAt`/`expiresAt` equal the backup's `pinnedAtTimestamp` /
+`pinExpiresAtTimestamp`.
 
 ## 5. signal-cli Boundary
 
