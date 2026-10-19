@@ -5,6 +5,25 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.195 (2026-10-20; §4.195 the long-text backfill
+  state: the backfill response's sibling `longText` entry — officially the
+  same `AttachmentData` oneof beside `attachments`
+  (attachmentBackfill.preload.ts:247-283) — is no longer parsed and
+  dropped. The engine's projection already emits it (kt-signal-engine
+  `project_attachment_backfill_response`, `src/service/mod.rs:9744-9748`);
+  the connector now keeps it as
+  `SyncAttachmentBackfillResponse.long_text`, and the settled event adds
+  two optional booleans: `longTextPending` (`Status.PENDING` or an unknown
+  word — the official `pendingCount` contribution, :191 / :257-259) and
+  `longTextTerminal` (`Status.TERMINAL_ERROR`, :260-267). A pointer or an
+  absent key emits neither, so the pre-1.195 frame is byte-identical. KT
+  still has no body-attachment slot: the entry never joins the
+  index-aligned `attachments` array — the two booleans are its whole face.
+  An empty attachment list beside a pending long text now settles with
+  `longTextPending: true` instead of looking like the official
+  `pendingCount === 0` timer-cancel face. The response error arm
+  (`response.error`) is unchanged and still emits only
+  `message.attachmentBackfillError`.)
 - Contract revision: 1.194 (2026-10-20; §4.194 the account capability
   face — `accounts.list` entries gain an optional
   `capabilities: { attachmentBackfill }` forwarded from the engine's
@@ -16724,14 +16743,15 @@ information the desktop needs. An unresolvable conversation/row stays
 the warn-only quiet drop (the official early returns); the §4.192 error
 arm keeps its own event and never emits this one.
 
-Boundary recorded: the response's `longText` entry keeps its §4.175
-disposition — parsed and dropped, because KT long-text bodies ride the
-row's text column and have no locator slot. It therefore contributes no
-array position and its official `pendingCount` contribution (:247-283)
-is not represented; the desktop's timer converges through the ordinary
-retry budget in that one arm. Extending the array with a body-attachment
-position would break the index-equals-attachment-position contract, so
-the drop is deliberate rather than an omission.
+Boundary recorded: the response's `longText` entry contributes no array
+position — KT long-text bodies ride the row's text column and have no
+body-attachment slot. Extending the array with such a position would
+break the index-equals-attachment-position contract. This 1.193 section
+originally parsed and dropped the entry; **contract 1.195 (§4.195)
+supersedes that disposition for the state half**: the `longText` status
+now rides the settled event as `longTextPending` / `longTextTerminal`
+(the official `pendingCount` contribution, attachmentBackfill.preload
+.ts:191, :247-283), while the no-array-position rule above still holds.
 
 Wire: additive event only (schema event enum + payload block; the
 schema-consistency gate pins the emission literal and the
@@ -16791,6 +16811,71 @@ bit rides its own account, an unanswered account keeps the absent key),
 `response_without_a_string_id_warns_instead_of_faulting_the_engine` (the
 line returns `Ok`, emits the warning, leaves the pending call waiting, and
 injects no failure).
+
+### 4.195 The long-text backfill state reaches the settled event (contract revision 1.195, 2026-10-20)
+
+The backfill response carries two sibling data faces (official
+`SyncMessage.AttachmentBackfillResponse`): the `attachments` list and the
+single `longText` `AttachmentData` entry
+(`ts/jobs/helpers/attachmentBackfill.preload.ts:247-283`). The engine's
+projection has always emitted both (`project_attachment_backfill_response`,
+kt-signal-engine `src/service/mod.rs:9744-9748`: `{status: 'PENDING' |
+'TERMINAL_ERROR' | 'UNKNOWN'}` or `{attachment: {...}}`), but the connector
+parsed the list and dropped the sibling — so the official `pendingCount`
+contribution of a still-pending long-text body (:191, :257-259) was
+invisible to the desktop. The 1.193 timer contract only counts what the
+settled event says; an empty attachment list therefore looked like
+`pendingCount === 0`, and the desktop could cancel its request timer and
+surface the Timeout face while the primary device was still working on
+the long text.
+
+The parse now keeps the entry: `SyncAttachmentBackfillResponse.long_text:
+Option<BackfillEntry>` uses the same typed oneof as an attachment entry
+(pointer vs status word). An unknown status word converges to
+`Status(Unknown)` exactly like an attachment entry, and an explicit JSON
+null reads as absence (the engine omits the key).
+
+The settled event gains two optional booleans, carried only when true
+(the serde `skip_serializing_if` discipline; old hosts see the exact
+pre-1.195 frame):
+
+- `longTextPending`: the entry is `PENDING` or an unknown word. Unknown
+  folds to pending because the official `missingCaseError` throw
+  (attachmentBackfill.preload.ts:268) is a crash face KT does not copy;
+  the non-crash wait converges into the ordinary retry budget exactly as
+  pre-1.195.
+- `longTextTerminal`: the entry is `TERMINAL_ERROR` (:260-267) — the
+  official `markAttachmentAsErrored` + `showDownloadFailedToast` face.
+
+A pointer entry, an absent key, or the error arm (`response.error`)
+produces neither key. The settled event itself still fires on a resolved
+target even when `attachments` is empty and only the long-text state is
+present — that empty-list-plus-pending case is the whole point of this
+revision. The response error arm keeps its §4.192 behavior and never
+emits the settled event.
+
+Boundary recorded: KT rows have no body-attachment slot — long-text bodies
+ride the row's text column — so `longText` never joins the index-aligned
+`attachments` array and is never merged as a locator. The two booleans are
+its whole face. A pointer longText carries no mergeable state for KT and
+rides as neither key; if KT later grows a body-attachment slot, this
+section is where the array-position question reopens.
+
+Wire: additive event keys only (the schema payload block gains the two
+optional booleans under the existing `message.attachmentBackfillSettled`
+branch; the schema-consistency gate continues to pin the emission literal
+and the array bound). No new persistence; a missed event converges into
+the pre-1.195 retry-budget behavior.
+
+Tests: `sync_attachment_backfill_response_routes_target_and_entries` (the
+longText sibling parses PENDING / TERMINAL_ERROR / unknown / pointer /
+null / absent, and never joins the list),
+`attachment_backfill_settled_event_reports_long_text_state` (pending and
+unknown → the pending key only, terminal → the terminal key only, pointer
+and absence → neither, all beside an empty attachment list) and
+`attachment_backfill_settled_frame_reports_long_text_state` (the whole
+wire frame verbatim for both keys; the 1.193 test pins the key-free
+pre-1.195 frame).
 
 ## 5. signal-cli Boundary
 

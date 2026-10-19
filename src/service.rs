@@ -1195,7 +1195,8 @@ pub enum HostSideEvent {
     /// reports its whole index-aligned face so the desktop can replay the
     /// official per-entry outcomes: a pointer entry is `available` (CDN
     /// material merged, a download in flight may be re-queued), `PENDING`
-    /// keeps waiting (the official timer stays armed), `TERMINAL_ERROR` is
+    /// keeps the request entry waiting (the official `handleResponse`
+    /// already cleared the request timer at :146-148), `TERMINAL_ERROR` is
     /// `terminal` (the official `markAttachmentAsErrored` +
     /// `showDownloadFailedToast`). Pre-1.193 the connector merged locators
     /// silently, so the desktop could not distinguish "the phone is still
@@ -1209,6 +1210,21 @@ pub enum HostSideEvent {
         conversation_id: String,
         message_id: String,
         attachments: Vec<AttachmentBackfillSettledEntry>,
+        /// Contract 1.195 (§4.195): the official `response.longText` entry
+        /// is still `Status.PENDING` (attachmentBackfill.preload.ts:257-259).
+        /// The official `pendingCount` includes this entry (:191), so the
+        /// desktop must not cancel the request timer merely because the
+        /// index-aligned list settled. An unknown status word folds to
+        /// pending like its attachment sibling; no key on the wire unless
+        /// true (old hosts see the pre-1.195 frame).
+        long_text_pending: bool,
+        /// Contract 1.195 (§4.195): the official `longText` entry answered
+        /// `Status.TERMINAL_ERROR` (attachmentBackfill.preload.ts:260-267) —
+        /// the phone gave up on the long-text body, the official
+        /// markAttachmentAsErrored + download-failed toast face. Mutually
+        /// exclusive with `long_text_pending`; absent when the entry is a
+        /// pointer (nothing to report) or there is no `longText` key.
+        long_text_terminal: bool,
     },
     /// A view-once message was viewed and its bytes erased (contract 1.38):
     /// emitted exactly once per message on the first burn transition — sync
@@ -11520,8 +11536,9 @@ impl ConnectorService {
     }
 
     /// Consume the attachment-backfill response sync (contract revision
-    /// 1.175, §4.175; the settled face 1.193, §4.193): the primary device
-    /// answered our `requestAttachmentBackfill` with fresh transit pointers.
+    /// 1.175, §4.175; the settled face 1.193, §4.193; the `longText` state
+    /// 1.195, §4.195): the primary device answered our
+    /// `requestAttachmentBackfill` with fresh transit pointers.
     /// The target's conversation resolves through the
     /// message-request-response ladder
     /// family (group leg keys directly; the service-id/e164 leg walks the
@@ -11538,11 +11555,17 @@ impl ConnectorService {
     /// (`MessageAttachmentBackfillSettled` → wire
     /// `message.attachmentBackfillSettled`): the official per-attachment
     /// three-state walk (attachmentBackfill.preload.ts:286-327) — a pointer
-    /// is `available`, `PENDING` is `pending` (the official timer stays
-    /// armed), `TERMINAL_ERROR` is `terminal` (the official
+    /// is `available`, `PENDING` is `pending` (the request entry survives;
+    /// the official `handleResponse` already cleared the request timer at
+    /// attachmentBackfill.preload.ts:146-148), `TERMINAL_ERROR` is `terminal` (the official
     /// `markAttachmentAsErrored` + toast), an unknown word converges to
-    /// `pending`. The ERROR arm is the phone's terminal answer (contract
-    /// 1.192, §4.192): it resolves the same ladder and names the row to the
+    /// `pending`. The official `response.longText` arm (:247-283) owns no
+    /// index — KT has no body-attachment slot — so its state rides the two
+    /// optional booleans `longTextPending` / `longTextTerminal` instead
+    /// (contract 1.195, §4.195); a pending long-text body is exactly why an
+    /// empty attachment list still leaves the official timer armed
+    /// (`pendingCount`, :191). The ERROR arm is the phone's terminal answer
+    /// (contract 1.192, §4.192): it resolves the same ladder and names the row to the
     /// desktop (`MessageAttachmentBackfillError` → wire
     /// `message.attachmentBackfillError`) so the retry bookkeeping settles
     /// into the official NotFound face instead of burning the budget into
@@ -11651,6 +11674,22 @@ impl ConnectorService {
         // `missingCaseError` crash at :303 is not a face KT copies). An
         // empty list still rides: the official `pendingCount === 0` branch
         // cancels the request timer, and the desktop needs the same signal.
+        //
+        // Contract 1.195 (§4.195): the official `response.longText` arm
+        // (attachmentBackfill.preload.ts:247-283) contributes to that same
+        // `pendingCount` (:191, :257-259) but owns no index — KT rows carry
+        // no body-attachment slot. It rides two optional booleans: PENDING
+        // or an unknown word → pending (the same non-crash fold as an
+        // attachment entry), TERMINAL_ERROR → terminal (:260-267), pointer
+        // or absence → neither. This is why an empty `attachments` list can
+        // still leave the desktop's request timer armed.
+        let (long_text_pending, long_text_terminal) = match response.long_text.as_ref() {
+            Some(BackfillEntry::Status(BackfillStatus::Pending | BackfillStatus::Unknown)) => {
+                (true, false)
+            }
+            Some(BackfillEntry::Status(BackfillStatus::Terminal)) => (false, true),
+            Some(BackfillEntry::Locator(_)) | None => (false, false),
+        };
         let attachments = response
             .entries
             .iter()
@@ -11671,6 +11710,8 @@ impl ConnectorService {
             conversation_id: conversation.id.clone(),
             message_id: record.id.clone(),
             attachments,
+            long_text_pending,
+            long_text_terminal,
         }])
     }
 
@@ -18294,6 +18335,7 @@ mod tests {
                 BackfillEntry::Locator(Some(face("cdn-a"))),
                 BackfillEntry::Status(BackfillStatus::Pending),
             ],
+            long_text: None,
         };
         let events = service
             .apply_sync_attachment_backfill_response(&account, &response)
@@ -18308,6 +18350,8 @@ mod tests {
             conversation_id,
             message_id,
             attachments,
+            long_text_pending,
+            long_text_terminal,
         } = event
         else {
             panic!("the pointer arm emits MessageAttachmentBackfillSettled, got {event:?}");
@@ -18315,6 +18359,10 @@ mod tests {
         assert_eq!(account_id, &account.id);
         assert_eq!(conversation_id, &conversation.id);
         assert_eq!(message_id, "m-backfill");
+        assert!(
+            !*long_text_pending && !*long_text_terminal,
+            "no longText entry means no longText state"
+        );
         assert_eq!(
             attachments,
             &vec![
@@ -18348,6 +18396,7 @@ mod tests {
             conversation_e164: Some("+15555550101".into()),
             error: Some("MESSAGE_NOT_FOUND".into()),
             entries: Vec::new(),
+            long_text: None,
         };
         let events = service
             .apply_sync_attachment_backfill_response(&account, &response)
@@ -18384,6 +18433,7 @@ mod tests {
             conversation_e164: Some("+15555550101".into()),
             error: Some("MESSAGE_NOT_FOUND".into()),
             entries: Vec::new(),
+            long_text: None,
         };
         let events = service
             .apply_sync_attachment_backfill_response(&account, &response)
@@ -18467,6 +18517,7 @@ mod tests {
                 BackfillEntry::Status(BackfillStatus::Unknown),
                 BackfillEntry::Locator(None),
             ],
+            long_text: None,
         };
         let events = service
             .apply_sync_attachment_backfill_response(&account, &response)
@@ -18479,6 +18530,8 @@ mod tests {
             conversation_id,
             message_id,
             attachments,
+            long_text_pending,
+            long_text_terminal,
         } = event
         else {
             panic!("expected MessageAttachmentBackfillSettled, got {event:?}");
@@ -18486,6 +18539,10 @@ mod tests {
         assert_eq!(account_id, &account.id);
         assert_eq!(conversation_id, &conversation.id);
         assert_eq!(message_id, "m-states");
+        assert!(
+            !*long_text_pending && !*long_text_terminal,
+            "no longText entry means no longText state"
+        );
         assert_eq!(
             attachments,
             &vec![
@@ -18529,6 +18586,7 @@ mod tests {
             conversation_e164: Some("+15555550101".into()),
             error: None,
             entries: Vec::new(),
+            long_text: None,
         };
         let events = service
             .apply_sync_attachment_backfill_response(&account, &response)
@@ -18550,6 +18608,7 @@ mod tests {
             conversation_e164: Some("+15555550101".into()),
             error: None,
             entries: vec![BackfillEntry::Status(BackfillStatus::Terminal)],
+            long_text: None,
         };
         let events = service
             .apply_sync_attachment_backfill_response(&account, &response)
@@ -18558,6 +18617,101 @@ mod tests {
             events.is_empty(),
             "an unresolvable settle target stays quiet (rows_by_sent_at misses)"
         );
+    }
+
+    /// Contract 1.195 (§4.195): the official `response.longText` state
+    /// (attachmentBackfill.preload.ts:247-283) rides the settled event as two
+    /// optional booleans because KT has no body-attachment slot:
+    /// `PENDING`/an unknown word → `long_text_pending`, `TERMINAL_ERROR` →
+    /// `long_text_terminal`, a pointer or absence → both false. An empty
+    /// attachment list beside a longText state still settles — the official
+    /// `pendingCount` includes the long-text body (:191), which is exactly
+    /// the timer-arm signal the desktop needs.
+    #[test]
+    fn attachment_backfill_settled_event_reports_long_text_state() {
+        let (_temp, mut service) = service();
+        let summary = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let account = service
+            .store_ref()
+            .account_by_id(&summary.id)
+            .unwrap()
+            .expect("account row");
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut row = expire_record_fixture(&account.id, &conversation.id, "m-long-text");
+        row.sent_at = 1726999999200;
+        service
+            .store_ref()
+            .insert_message(&row, None, None, true)
+            .unwrap();
+
+        let apply = |service: &mut ConnectorService, long_text: Option<BackfillEntry>| {
+            let response = crate::engine::SyncAttachmentBackfillResponse {
+                author: "peer".into(),
+                sent_timestamp: 1726999999200,
+                conversation_service_id: None,
+                conversation_group_id: None,
+                conversation_e164: Some("+15555550101".into()),
+                error: None,
+                entries: Vec::new(),
+                long_text,
+            };
+            let events = service
+                .apply_sync_attachment_backfill_response(&account, &response)
+                .unwrap();
+            let [event] = events.as_slice() else {
+                panic!("the longText settle rides exactly one event, got {events:?}");
+            };
+            let HostSideEvent::MessageAttachmentBackfillSettled {
+                attachments,
+                long_text_pending,
+                long_text_terminal,
+                ..
+            } = event
+            else {
+                panic!("expected MessageAttachmentBackfillSettled, got {event:?}");
+            };
+            (attachments.clone(), *long_text_pending, *long_text_terminal)
+        };
+
+        // PENDING contributes to the official pendingCount: the attachment
+        // list is empty yet the long-text half is still pending.
+        assert_eq!(
+            apply(
+                &mut service,
+                Some(BackfillEntry::Status(BackfillStatus::Pending))
+            ),
+            (Vec::new(), true, false)
+        );
+        // An unknown status word folds to pending (the same non-crash face
+        // the attachment entries use).
+        assert_eq!(
+            apply(
+                &mut service,
+                Some(BackfillEntry::Status(BackfillStatus::Unknown))
+            ),
+            (Vec::new(), true, false)
+        );
+        // TERMINAL_ERROR is the terminal long-text face — the other key only.
+        assert_eq!(
+            apply(
+                &mut service,
+                Some(BackfillEntry::Status(BackfillStatus::Terminal))
+            ),
+            (Vec::new(), false, true)
+        );
+        // A pointer longText has nothing to wait on and nothing to report;
+        // absence is the same no-key face. Neither contributes a list entry.
+        assert_eq!(
+            apply(&mut service, Some(BackfillEntry::Locator(None))),
+            (Vec::new(), false, false)
+        );
+        assert_eq!(apply(&mut service, None), (Vec::new(), false, false));
     }
 
     /// attachments.requestBackfill prepare (contract revision 1.175, §4.175;

@@ -1369,9 +1369,11 @@ pub enum ControlReceive {
     /// A face whose target or conversation fails the shape gates never
     /// reaches this variant — the projection parser dropped it, and an
     /// envelope with nothing usable left keeps the plain syncMessage skip.
-    /// The `longText` entry is parsed and dropped: KT long-text bodies ride
-    /// the row's text column, so no locator column exists for them (recorded
-    /// §4.175).
+    /// The `longText` entry (contract 1.195, §4.195) rides typed as
+    /// `long_text` and never joins the index-aligned list: KT long-text
+    /// bodies ride the row's text column, so no body-attachment slot exists.
+    /// The service reports its official `pendingCount` state as two optional
+    /// booleans on the settled event.
     SyncAttachmentBackfillResponse {
         response: SyncAttachmentBackfillResponse,
     },
@@ -1847,7 +1849,9 @@ pub enum BackfillEntry {
 /// The data face is either the error word (`MESSAGE_NOT_FOUND`/`UNKNOWN`)
 /// or the index-aligned entries — each entry keeps its official variant
 /// (pointer vs `PENDING`/`TERMINAL_ERROR` status) and an unparseable entry
-/// converges to `Status(Unknown)` rather than a shifted row.
+/// converges to `Status(Unknown)` rather than a shifted row. Beside the
+/// list, `long_text` keeps the official sibling `AttachmentData` entry
+/// (contract 1.195, §4.195).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SyncAttachmentBackfillResponse {
     pub author: String,
@@ -1857,6 +1861,14 @@ pub struct SyncAttachmentBackfillResponse {
     pub conversation_e164: Option<String>,
     pub error: Option<String>,
     pub entries: Vec<BackfillEntry>,
+    /// The official `response.longText` entry (contract 1.195, §4.195;
+    /// attachmentBackfill.preload.ts:247-283). It keeps the same typed
+    /// oneof face as an attachment entry and contributes to the official
+    /// `pendingCount` (:257-259), but it never joins `entries`: KT
+    /// long-text bodies ride the row's text column, so no body-attachment
+    /// slot exists and the index-equals-attachment-position contract stays
+    /// intact.
+    pub long_text: Option<BackfillEntry>,
 }
 
 impl SyncAttachmentBackfillResponse {
@@ -3882,19 +3894,22 @@ fn normalized_sync_read_entries(value: Option<&Value>) -> Vec<SyncReadEntry> {
 }
 
 /// Bounded `syncMessage.attachmentBackfillResponse` face (contract revision
-/// 1.175, §4.175; entry states 1.193, §4.193): the engine's projection of
-/// the official backfill response. The parse is all-or-nothing on the
-/// target (author + positive sent stamp + exactly one conversation leg —
-/// the official strictAssert-drop posture; a malformed target answers None
-/// so the envelope keeps the plain syncMessage skip, 宁缺勿错). The data
-/// face parses leniently per entry: the error arm rides its bounded word;
-/// the attachments arm keeps index alignment, and every entry keeps its
-/// official variant ([`BackfillEntry`]) — the pointer face with or without
-/// locator material, the `PENDING`/`TERMINAL_ERROR` status words, and an
-/// unparseable entry converged to `Status(Unknown)` (never a shifted row).
-/// The `longText` entry is dropped on the floor deliberately: KT long-text
-/// bodies ride the row's text column, so no locator column exists to merge
-/// into (recorded §4.175).
+/// 1.175, §4.175; entry states 1.193, §4.193; `longText` state 1.195,
+/// §4.195): the engine's projection of the official backfill response. The
+/// parse is all-or-nothing on the target (author + positive sent stamp +
+/// exactly one conversation leg — the official strictAssert-drop posture; a
+/// malformed target answers None so the envelope keeps the plain
+/// syncMessage skip, 宁缺勿错). The data face parses leniently per entry:
+/// the error arm rides its bounded word; the attachments arm keeps index
+/// alignment, and every entry keeps its official variant
+/// ([`BackfillEntry`]) — the pointer face with or without locator material,
+/// the `PENDING`/`TERMINAL_ERROR` status words, and an unparseable entry
+/// converged to `Status(Unknown)` (never a shifted row). The sibling
+/// `longText` entry (the official `response.longText` arm,
+/// attachmentBackfill.preload.ts:247-283) parses through the same helper
+/// into `long_text`; it never joins `entries` because KT long-text bodies
+/// ride the row's text column, so no body-attachment slot exists and the
+/// index-equals-position contract stays intact.
 fn normalized_sync_attachment_backfill_response(
     value: Option<&Value>,
 ) -> Option<SyncAttachmentBackfillResponse> {
@@ -3943,6 +3958,10 @@ fn normalized_sync_attachment_backfill_response(
                     .collect::<String>(),
             ),
             entries: Vec::new(),
+            // The error arm carries no data face — the engine emits no
+            // `longText` beside an `error` word, and the settled event never
+            // fires on this arm (§4.192).
+            long_text: None,
         });
     }
     let entries = face
@@ -3952,6 +3971,12 @@ fn normalized_sync_attachment_backfill_response(
         .take(MAX_INBOUND_ATTACHMENTS)
         .map(normalized_backfill_entry)
         .collect();
+    // An explicit JSON null is absence, not an unparseable entry: the engine
+    // omits the key when the phone sent no long-text body.
+    let long_text = face
+        .get("longText")
+        .filter(|value| !value.is_null())
+        .map(normalized_backfill_entry);
     Some(SyncAttachmentBackfillResponse {
         author,
         sent_timestamp,
@@ -3960,6 +3985,7 @@ fn normalized_sync_attachment_backfill_response(
         conversation_e164,
         error: None,
         entries,
+        long_text,
     })
 }
 
@@ -10519,15 +10545,17 @@ mod tests {
     }
 
     /// The engine's `syncMessage.attachmentBackfillResponse` projection
-    /// (contract revision 1.175, §4.175; entry states 1.193, §4.193) routes
-    /// as the backfill control with the target identities and the
-    /// index-aligned entries: every entry keeps its official variant —
-    /// pointer (with or without locator material) vs the `PENDING`/
-    /// `TERMINAL_ERROR` status words — an unknown status word and an
-    /// unparseable entry converge to `Status(Unknown)` without shifting the
-    /// row, the error arm rides its word with no entries, and a target
-    /// missing its author/stamp/conversation falls through to the plain
-    /// skip.
+    /// (contract revision 1.175, §4.175; entry states 1.193, §4.193; the
+    /// `longText` sibling 1.195, §4.195) routes as the backfill control with
+    /// the target identities and the index-aligned entries: every entry
+    /// keeps its official variant — pointer (with or without locator
+    /// material) vs the `PENDING`/`TERMINAL_ERROR` status words — an unknown
+    /// status word and an unparseable entry converge to `Status(Unknown)`
+    /// without shifting the row, the error arm rides its word with no
+    /// entries, and a target missing its author/stamp/conversation falls
+    /// through to the plain skip. The sibling `longText` entry keeps the
+    /// same typed oneof in its own slot, never joining the index-aligned
+    /// list.
     #[test]
     fn sync_attachment_backfill_response_routes_target_and_entries() {
         let routing = |sync: serde_json::Value| {
@@ -10569,6 +10597,8 @@ mod tests {
                         { "status": "SOME_FUTURE_WORD" },
                         "not-an-entry",
                     ],
+                    // Contract 1.195 (§4.195): the sibling longText entry.
+                    "longText": { "status": "PENDING" },
                 },
             }))
         else {
@@ -10580,6 +10610,13 @@ mod tests {
         assert!(response.conversation_service_id.is_none());
         assert!(response.conversation_e164.is_none());
         assert!(response.error.is_none());
+        // Contract 1.195 (§4.195): the longText sibling keeps its typed state
+        // in its own slot and contributes no array position (the entry count
+        // below stays six).
+        assert_eq!(
+            response.long_text,
+            Some(BackfillEntry::Status(BackfillStatus::Pending))
+        );
         // Index alignment, one entry per remote position: PENDING keeps its
         // status word (never folded into the pointer face), the pointers keep
         // their locator material (a locator-less pointer stays a pointer),
@@ -10640,10 +10677,66 @@ mod tests {
         };
         assert_eq!(response.error.as_deref(), Some("MESSAGE_NOT_FOUND"));
         assert!(response.entries.is_empty());
+        assert!(
+            response.long_text.is_none(),
+            "the error arm has no data face"
+        );
         assert_eq!(
             response.conversation_service_id.as_deref(),
             Some("11111111-1111-1111-1111-111111111111")
         );
+
+        // Contract 1.195 (§4.195): the longText sibling parses through the
+        // same oneof — TERMINAL_ERROR keeps its word, an unknown word
+        // converges to Unknown, a pointer keeps its (possibly locator-less)
+        // face, and an explicit null is absence. An empty attachment list
+        // beside a longText state is the arm the service must still settle.
+        let long_text_routing = |long_text: serde_json::Value| {
+            let Some((ControlReceive::SyncAttachmentBackfillResponse { response }, _)) =
+                routing(json!({
+                    "attachmentBackfillResponse": {
+                        "targetMessage": {
+                            "author": "22222222-2222-2222-2222-222222222222",
+                            "sentTimestamp": 1726999999000u64,
+                        },
+                        "targetConversation": { "groupId": "Z3JvdXA=" },
+                        "attachments": [],
+                        "longText": long_text,
+                    },
+                }))
+            else {
+                panic!("expected a longText backfill routing");
+            };
+            response
+        };
+        assert_eq!(
+            long_text_routing(json!({ "status": "TERMINAL_ERROR" })).long_text,
+            Some(BackfillEntry::Status(BackfillStatus::Terminal))
+        );
+        assert_eq!(
+            long_text_routing(json!({ "status": "SOME_FUTURE_WORD" })).long_text,
+            Some(BackfillEntry::Status(BackfillStatus::Unknown))
+        );
+        assert_eq!(
+            long_text_routing(json!({ "attachment": { "id": "body" } })).long_text,
+            Some(BackfillEntry::Locator(None))
+        );
+        assert!(long_text_routing(json!(null)).long_text.is_none());
+        let Some((ControlReceive::SyncAttachmentBackfillResponse { response }, _)) =
+            routing(json!({
+                "attachmentBackfillResponse": {
+                    "targetMessage": {
+                        "author": "22222222-2222-2222-2222-222222222222",
+                        "sentTimestamp": 1726999999000u64,
+                    },
+                    "targetConversation": { "groupId": "Z3JvdXA=" },
+                    "attachments": [],
+                },
+            }))
+        else {
+            panic!("expected a no-longText backfill routing");
+        };
+        assert!(response.long_text.is_none(), "an absent key is no state");
 
         // Malformed targets fall through to the plain skip: no author, no
         // stamp, no conversation leg.

@@ -6008,6 +6008,14 @@
                         }
                       }
                     }
+                  },
+                  "longTextPending": {
+                    "type": "boolean",
+                    "description": "Contract 1.195 (§4.195): the official response.longText entry is Status.PENDING (attachmentBackfill.preload.ts:257-259) — the phone is still working on the long-text body and the official pendingCount keeps the request timer armed (:191, :324-327). Serialized only when true; the key is absent for a pointer longText, a TERMINAL_ERROR entry, or no longText at all (the pre-1.195 frame byte-for-byte). Deliberately not folded into attachments: KT long-text bodies ride the row's text column, so longText has no body-attachment slot and no array position."
+                  },
+                  "longTextTerminal": {
+                    "type": "boolean",
+                    "description": "Contract 1.195 (§4.195): the official response.longText entry is Status.TERMINAL_ERROR (attachmentBackfill.preload.ts:260-267) — the phone gave up on the long-text body, the official markAttachmentAsErrored + download-failed toast face. Serialized only when true and mutually exclusive with longTextPending; absent for a pointer longText, a PENDING entry, or no longText at all (the pre-1.195 frame byte-for-byte)."
                   }
                 }
               }

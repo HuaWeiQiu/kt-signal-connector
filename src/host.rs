@@ -4274,6 +4274,8 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
             conversation_id,
             message_id,
             attachments,
+            long_text_pending,
+            long_text_terminal,
         } => {
             // Contract 1.193 (§4.193): the pointer/status answer's whole
             // index-aligned face — one entry per remote attachment, index
@@ -4282,12 +4284,29 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
             // .ts:286-327). The array is always serialized (an empty list
             // is the official `pendingCount === 0` settle-and-cancel face),
             // so the desktop merge is total.
-            let payload = json!({
+            //
+            // Contract 1.195 (§4.195): the official `response.longText`
+            // state rides two optional booleans — the official
+            // `pendingCount` includes a pending long-text body
+            // (attachmentBackfill.preload.ts:247-259), so an empty
+            // attachment list does not by itself settle the request entry —
+            // the desktop keeps its window bookkeeping. The request timer
+            // itself is already disarmed on any response (:146-148).
+            // Both keys stay absent when the entry is a pointer or absent
+            // (the pre-1.195 frame byte-for-byte); a true value is the only
+            // serialized form (the serde `skip_serializing_if` discipline).
+            let mut payload = json!({
                 "accountId": account_id,
                 "conversationId": conversation_id,
                 "messageId": message_id,
                 "attachments": serde_json::to_value(&attachments).unwrap_or(json!([])),
             });
+            if long_text_pending {
+                payload["longTextPending"] = json!(true);
+            }
+            if long_text_terminal {
+                payload["longTextTerminal"] = json!(true);
+            }
             Ok(HostEvent::new("message.attachmentBackfillSettled", payload))
         }
         HostSideEvent::ConversationTyping {
@@ -6405,7 +6424,8 @@ mod tests {
     /// plus the index-aligned per-attachment face verbatim (index ascending,
     /// the three official status words). The empty list still serializes
     /// (the official `pendingCount === 0` cancel face), so a desktop merge
-    /// is total.
+    /// is total. Contract 1.195 (§4.195): a pointer or absent longText keeps
+    /// both optional state keys absent — the pre-1.195 frame byte-for-byte.
     #[tokio::test]
     async fn attachment_backfill_settled_event_names_every_attachment() {
         let frame: Value = serde_json::to_value(
@@ -6427,6 +6447,8 @@ mod tests {
                         status: "terminal",
                     },
                 ],
+                long_text_pending: false,
+                long_text_terminal: false,
             })
             .unwrap(),
         )
@@ -6443,6 +6465,11 @@ mod tests {
                 { "index": 2, "status": "terminal" },
             ])
         );
+        assert!(
+            frame["data"].get("longTextPending").is_none()
+                && frame["data"].get("longTextTerminal").is_none(),
+            "no longText state means no keys: {frame}"
+        );
 
         let frame: Value = serde_json::to_value(
             host_event_frame(HostSideEvent::MessageAttachmentBackfillSettled {
@@ -6450,11 +6477,83 @@ mod tests {
                 conversation_id: "conv-1".into(),
                 message_id: "msg-2".into(),
                 attachments: Vec::new(),
+                long_text_pending: false,
+                long_text_terminal: false,
             })
             .unwrap(),
         )
         .unwrap();
         assert_eq!(frame["data"]["attachments"], json!([]));
+        assert!(
+            frame["data"].get("longTextPending").is_none()
+                && frame["data"].get("longTextTerminal").is_none(),
+            "the empty attach list alone stays key-free: {frame}"
+        );
+    }
+
+    /// Contract 1.195 (§4.195): the official `response.longText` state rides
+    /// two optional booleans on the settled frame — `longTextPending` for
+    /// `Status.PENDING` (attachmentBackfill.preload.ts:257-259; the official
+    /// `pendingCount` keeps the timer armed, :191, :324-327) and
+    /// `longTextTerminal` for `Status.TERMINAL_ERROR` (:260-267). The
+    /// assertion is the whole frame verbatim: one key at a time, no other
+    /// payload change, and an empty attachment list still rides (KT has no
+    /// body-attachment slot).
+    #[tokio::test]
+    async fn attachment_backfill_settled_frame_reports_long_text_state() {
+        let pending: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::MessageAttachmentBackfillSettled {
+                account_id: "acct-1".into(),
+                conversation_id: "conv-1".into(),
+                message_id: "msg-1".into(),
+                attachments: Vec::new(),
+                long_text_pending: true,
+                long_text_terminal: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pending,
+            json!({
+                "apiVersion": "1.0",
+                "event": "message.attachmentBackfillSettled",
+                "data": {
+                    "accountId": "acct-1",
+                    "conversationId": "conv-1",
+                    "messageId": "msg-1",
+                    "attachments": [],
+                    "longTextPending": true,
+                },
+            })
+        );
+
+        let terminal: Value = serde_json::to_value(
+            host_event_frame(HostSideEvent::MessageAttachmentBackfillSettled {
+                account_id: "acct-1".into(),
+                conversation_id: "conv-1".into(),
+                message_id: "msg-2".into(),
+                attachments: Vec::new(),
+                long_text_pending: false,
+                long_text_terminal: true,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            terminal,
+            json!({
+                "apiVersion": "1.0",
+                "event": "message.attachmentBackfillSettled",
+                "data": {
+                    "accountId": "acct-1",
+                    "conversationId": "conv-1",
+                    "messageId": "msg-2",
+                    "attachments": [],
+                    "longTextTerminal": true,
+                },
+            })
+        );
     }
 
     /// Contract 1.134 (§4.117; the storage-pull face joins with 1.141,
