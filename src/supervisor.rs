@@ -10316,6 +10316,7 @@ mod tests {
             .unwrap();
         let expired_at = crate::link::now_ms() - 400 * 24 * 60 * 60 * 1_000;
         let mut expired = MessageRecord {
+            author_aci: None,
             id: "expired".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -10522,6 +10523,7 @@ mod tests {
         store
             .insert_message(
                 &MessageRecord {
+                    author_aci: None,
                     id: "m-shell-1".into(),
                     account_id: account.id.clone(),
                     conversation_id: shell.id.clone(),
@@ -11842,6 +11844,7 @@ mod tests {
         deadline_ms: u64,
     ) -> MessageRecord {
         MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
             conversation_id: conversation_id.into(),
@@ -13349,6 +13352,7 @@ mod tests {
             .unwrap();
         let seed = |id: &str, sent_at: u64, conversation_id: &str| {
             let record = crate::store::MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation_id.to_string(),
@@ -13499,6 +13503,7 @@ mod tests {
             .unwrap();
         let seed = |id: &str, sent_at: u64, conversation_id: &str| {
             let record = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation_id.to_string(),

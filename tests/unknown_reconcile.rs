@@ -94,6 +94,7 @@ fn seed_outgoing_row(
 ) -> String {
     let id = stable_hash_id(&[account_id, conversation_id, "outgoing", request]);
     let record = MessageRecord {
+        author_aci: None,
         id: id.clone(),
         account_id: account_id.to_string(),
         conversation_id: conversation_id.to_string(),

@@ -93,6 +93,7 @@ fn seed_direct_history(store: &Store, account_id: &str) {
         .ensure_conversation(account_id, "direct", ALICE_E164, "Alice Contact")
         .unwrap();
     let incoming = MessageRecord {
+        author_aci: None,
         id: "m-in".into(),
         account_id: account_id.into(),
         conversation_id: conversation.id.clone(),

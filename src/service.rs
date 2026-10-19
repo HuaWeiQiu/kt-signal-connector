@@ -3171,6 +3171,7 @@ impl ConnectorService {
             client_request_id,
         ]);
         let pending = MessageRecord {
+            author_aci: None,
             id: pending_id.clone(),
             account_id: account_id.to_string(),
             conversation_id: conversation.id.clone(),
@@ -3285,6 +3286,7 @@ impl ConnectorService {
         let pending_id =
             stable_hash_id(&[account_id, conversation_id, "outgoing", client_request_id]);
         let pending = MessageRecord {
+            author_aci: None,
             id: pending_id.clone(),
             account_id: account_id.to_string(),
             conversation_id: conversation_id.to_string(),
@@ -8350,16 +8352,22 @@ impl ConnectorService {
         })
     }
 
-    /// attachments.requestBackfill (contract revision 1.175, §4.175) — the
-    /// request half of the official attachment-backfill loop: the desktop
-    /// hit an honest media miss (`attachments.download`'s no-pointer face)
-    /// and asks the primary device for fresh transit pointers. Same row
-    /// addressing as `attachments.download`; the resolution derives the
-    /// official target triple — the conversation identity (direct peer key
-    /// or group master key) and the addressable message (author = the
-    /// row's sender, the account's own number for outgoing rows; sent stamp
-    /// = the row's upstream `sent_at`). Everything is validated before any
-    /// engine traffic: the id ladder, the row's direction-agnostic
+    /// attachments.requestBackfill (contract revision 1.175, §4.175; author
+    /// faces widened by 1.191, §4.191) — the request half of the official
+    /// attachment-backfill loop: the desktop hit an honest media miss
+    /// (`attachments.download`'s no-pointer face) and asks the primary device
+    /// for fresh transit pointers. Same row addressing as
+    /// `attachments.download`; the resolution derives the official target
+    /// triple — the conversation identity (direct peer key or group master
+    /// key) and the addressable message (author = the protocol identity:
+    /// the account's own number for outgoing rows, the §4.37-captured peer
+    /// identity ladder — ACI first, the peer key itself second — on direct
+    /// rows, and the ingest-captured member ACI on group rows, where a
+    /// capture-less row answers INVALID_REQUEST rather than feeding the
+    /// engine an author it must refuse; the row's `sender_id` privacy hash
+    /// never rides this seat, the 1.175 regression §4.191 documents; sent
+    /// stamp = the row's upstream `sent_at`). Everything is validated before
+    /// any engine traffic: the id ladder, the row's direction-agnostic
     /// presence, and a positive upstream stamp (a 0-stamp row never went
     /// upstream and cannot be backfilled). The engine's
     /// `requestAttachmentBackfill` carries the protocol half; the response
@@ -8386,13 +8394,37 @@ impl ConnectorService {
         }
         let author = match message.direction {
             "outgoing" => account.signal_account.clone(),
-            _ => {
-                if message.sender_id.is_empty() {
-                    conversation.peer_key.clone()
-                } else {
-                    message.sender_id.clone()
+            _ if conversation.kind == "group" => {
+                // Contract 1.191 (§4.191): the group arm needs the member ACI,
+                // and only the ingest capture carries it — the conversation's
+                // peer key addresses the group, not the member, so no ladder
+                // can invent the answer. A pre-1.191 row (no capture) answers
+                // honestly INVALID_REQUEST here instead of spending an engine
+                // call on an author the engine must refuse — the row's
+                // `sender_id` is the ingest privacy hash, a local-only face
+                // the engine's `resolve_author_aci` rejects on all three of
+                // its arms, and the 1.175 batch fed it to this seat verbatim.
+                match message.author_aci.as_deref().filter(|aci| !aci.is_empty()) {
+                    Some(aci) => aci.to_string(),
+                    None => {
+                        return Err(ServiceError::Api(ApiError::new(
+                            "INVALID_REQUEST",
+                            "message author has no resolvable protocol identity",
+                            false,
+                        )));
+                    }
                 }
             }
+            // Direct rows: the author IS the peer — the §4.37 capture ladder
+            // first (the ACI the envelope revealed for this peer key), the
+            // peer key itself second (E.164 and UUID-shaped keys are both
+            // resolvable faces for the engine's `resolve_author_aci`). The
+            // row's `sender_id` hash is never consulted in this seat.
+            _ => self
+                .store
+                .aci_for_peer_key(&account.id, &conversation.peer_key)?
+                .filter(|aci| !aci.is_empty())
+                .unwrap_or_else(|| conversation.peer_key.clone()),
         };
         let mut prepared = json!({
             "account": account.signal_account,
@@ -9222,6 +9254,18 @@ impl ConnectorService {
                 .store_conversation_report_token(&account.id, &conversation.id, token)?;
         }
         let mut message = MessageRecord {
+            // Contract 1.191 (§4.191): the incoming author's protocol identity
+            // — the envelope's `sourceUuid` member ACI, verbatim. Outgoing
+            // rows name the account itself (its number is the protocol face),
+            // system rows name nobody; both stay NULL. This is the face the
+            // backfill request arm resolves on group rows — the row's
+            // `sender_id` is the ingest privacy hash and never leaves the
+            // store in that seat.
+            author_aci: if direction == "incoming" {
+                receive.source_uuid.clone()
+            } else {
+                None
+            },
             id: message_id,
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
@@ -9761,6 +9805,7 @@ impl ConnectorService {
             ..Default::default()
         };
         let message = MessageRecord {
+            author_aci: None,
             id: message_id,
             account_id: account_id.to_string(),
             conversation_id: conversation_id.to_string(),
@@ -10051,6 +10096,7 @@ impl ConnectorService {
             }
             let sent_at = receive.timestamp.unwrap_or(0);
             let record = MessageRecord {
+                author_aci: None,
                 id: stable_hash_id(&["signal-story-sync", &account.id, &sent_at.to_string()]),
                 account_id: account.id.clone(),
                 conversation_id: String::new(),
@@ -10934,6 +10980,7 @@ impl ConnectorService {
                     .as_ref()
                     .map(|text| text.len().min(u32::MAX as usize) as u32);
                 let message = MessageRecord {
+                    author_aci: None,
                     id: message_id,
                     account_id: account.id.clone(),
                     conversation_id: conversation.id.clone(),
@@ -17606,6 +17653,7 @@ mod tests {
     /// `server_guid` stays None until the test stamps one.
     fn expire_record_fixture(account_id: &str, conversation_id: &str, id: &str) -> MessageRecord {
         MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
             conversation_id: conversation_id.into(),
@@ -17857,11 +17905,15 @@ mod tests {
         assert_eq!(faces[0], face("cdn-a"), "error arm never moves a face");
     }
 
-    /// attachments.requestBackfill prepare (contract revision 1.175, §4.175):
-    /// the official target triple derives from the resolved row — direct leg
-    /// carries the peer key with the row's sender as author, an outgoing row
-    /// names the account itself, the group leg carries the master key, and a
-    /// zero-stamp row fails closed before any engine traffic.
+    /// attachments.requestBackfill prepare (contract revision 1.175, §4.175;
+    /// author faces widened by 1.191, §4.191): the official target triple
+    /// derives from the resolved row — a direct leg carries the peer key with
+    /// the protocol identity ladder as author (the captured ACI first, the
+    /// peer key itself second), an outgoing row names the account itself, the
+    /// group leg carries the master key with the captured member ACI as
+    /// author (a capture-less pre-1.191 row refuses honestly), and a
+    /// zero-stamp row fails closed before any engine traffic. The ingest
+    /// privacy hash never rides the author seat in any arm.
     #[test]
     fn prepare_request_attachment_backfill_derives_the_official_target() {
         let (_temp, service) = service();
@@ -17892,11 +17944,16 @@ mod tests {
             .unwrap();
         let mut group_row = expire_record_fixture(&account.id, &group.id, "m-group");
         group_row.sent_at = 1726999999002;
+        group_row.author_aci = Some("9d4f1c58-11aa-4c0e-9a4e-5b6a7c8d9e0f".into());
         service
             .store_ref()
             .insert_message(&group_row, None, None, true)
             .unwrap();
 
+        // The direct leg: no §4.37 identity captured yet, so the ladder falls
+        // to the peer key itself — the E.164 face the engine resolves through
+        // its own-number/contacts arms. The ingest hash ("peer") never
+        // appears.
         let prepared = service
             .prepare_request_attachment_backfill(&AttachmentBackfillRequestParams {
                 account_id: account.id.clone(),
@@ -17906,9 +17963,31 @@ mod tests {
             .unwrap();
         assert_eq!(prepared["account"], json!("+15555550100"));
         assert_eq!(prepared["recipient"], json!("+15555550101"));
-        assert_eq!(prepared["author"], json!("peer"));
+        assert_eq!(prepared["author"], json!("+15555550101"));
         assert_eq!(prepared["sentTimestamp"], json!(1726999999000u64));
         assert!(prepared.get("groupId").is_none());
+
+        // The ladder's first arm: the §4.37 capture names the peer's ACI and
+        // the backfill sends it verbatim (the engine's service-id arm).
+        service
+            .store_ref()
+            .upsert_peer_identity(
+                &account.id,
+                "f00dfeed-22bb-4d1f-8b5f-6c7d8e9f0a1b",
+                "+15555550101",
+            )
+            .unwrap();
+        let prepared = service
+            .prepare_request_attachment_backfill(&AttachmentBackfillRequestParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                message_id: "m-in".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            prepared["author"],
+            json!("f00dfeed-22bb-4d1f-8b5f-6c7d8e9f0a1b")
+        );
 
         // The outgoing row names the account itself as the author.
         let prepared = service
@@ -17921,7 +18000,9 @@ mod tests {
         assert_eq!(prepared["author"], json!("+15555550100"));
         assert_eq!(prepared["sentTimestamp"], json!(1726999999001u64));
 
-        // The group leg rides the master key.
+        // The group leg rides the master key with the captured member ACI as
+        // the author — the row-level §4.191 capture, the only face that names
+        // a group member.
         let prepared = service
             .prepare_request_attachment_backfill(&AttachmentBackfillRequestParams {
                 account_id: account.id.clone(),
@@ -17930,7 +18011,32 @@ mod tests {
             })
             .unwrap();
         assert_eq!(prepared["groupId"], json!("ZmFrZS1ncm91cA=="));
+        assert_eq!(
+            prepared["author"],
+            json!("9d4f1c58-11aa-4c0e-9a4e-5b6a7c8d9e0f")
+        );
         assert!(prepared.get("recipient").is_none());
+
+        // A pre-1.191 group row (no capture) answers honestly instead of
+        // spending an engine call on an author the engine must refuse — the
+        // row's `sender_id` hash is not an identity the protocol speaks.
+        let mut uncaptured = expire_record_fixture(&account.id, &group.id, "m-group-legacy");
+        uncaptured.sent_at = 1726999999003;
+        uncaptured.author_aci = None;
+        service
+            .store_ref()
+            .insert_message(&uncaptured, None, None, true)
+            .unwrap();
+        let refused =
+            service.prepare_request_attachment_backfill(&AttachmentBackfillRequestParams {
+                account_id: account.id.clone(),
+                conversation_id: group.id.clone(),
+                message_id: "m-group-legacy".into(),
+            });
+        assert!(
+            matches!(refused, Err(ServiceError::Api(ref error)) if error.code == "INVALID_REQUEST"),
+            "a capture-less group row refuses before any engine traffic"
+        );
 
         // The id ladder still runs first.
         let unknown =
@@ -17962,6 +18068,83 @@ mod tests {
         ));
     }
 
+    /// §4.191: the receive arm captures the envelope's `sourceUuid` onto the
+    /// row (the member ACI — the author's protocol identity), and the
+    /// backfill request for that landed group row names it verbatim. The
+    /// row's `sender_id` ingest hash never appears in the prepared frame,
+    /// and the direct receive captures its peer identity the same way.
+    #[test]
+    fn group_receive_captures_the_member_aci_and_the_backfill_names_it() {
+        let (_temp, mut service) = service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let member_aci = "c3b07a1e-55cc-4a44-9e11-8a2b3c4d5e6f";
+        let receive = NormalizedReceive {
+            timestamp: Some(1726999999004),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: Some(member_aci.to_string()),
+            peer_name: Some("Peer".into()),
+            group_id: Some("ZmFrZS1ncm91cA==".into()),
+            text: Some("photo".into()),
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+        };
+        let events = service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let landed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) => Some(record.clone()),
+                _ => None,
+            })
+            .expect("the group row lands");
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cA==", "Group")
+            .unwrap();
+        let row = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(row.author_aci.as_deref(), Some(member_aci));
+
+        let prepared = service
+            .prepare_request_attachment_backfill(&AttachmentBackfillRequestParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                message_id: row.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(prepared["author"], json!(member_aci));
+        assert_eq!(prepared["groupId"], json!("ZmFrZS1ncm91cA=="));
+        assert_eq!(prepared["sentTimestamp"], json!(1726999999004u64));
+        assert_ne!(
+            prepared["author"],
+            json!(row.sender_id),
+            "the ingest hash never rides the author seat"
+        );
+        assert_ne!(prepared["author"], json!(landed.sender_id));
+    }
     #[test]
     fn cancelled_link_cannot_complete_or_create_an_account() {
         let (_temp, mut service) = service();
@@ -24901,6 +25084,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "group-one", "group")
             .unwrap();
         let base = |id: &str, conversation_id: &str, direction: &'static str| MessageRecord {
+            author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
             conversation_id: conversation_id.into(),
@@ -31786,6 +31970,7 @@ mod tests {
             .unwrap();
         let seed = |id: &str, sent_at: u64| {
             let record = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -32224,6 +32409,7 @@ mod tests {
             .unwrap();
         let seed = |conversation_id: &str, id: &str, sent_at: u64, direction: &'static str| {
             let record = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation_id.into(),
@@ -32429,6 +32615,7 @@ mod tests {
             .unwrap();
         let seed = |conversation_id: &str, id: &str, sent_at: u64| {
             let record = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation_id.into(),
@@ -33338,6 +33525,7 @@ mod tests {
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let seed = |id: &str, sent_at: u64, direction: &'static str, conv: &str| {
             let record = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conv.to_string(),
@@ -33463,6 +33651,7 @@ mod tests {
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let seed = |service: &ConnectorService, id: &str, sent_at: u64, conv: &str| {
             let record = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conv.to_string(),
@@ -33581,6 +33770,7 @@ mod tests {
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let seed = |service: &ConnectorService, conv: &str, id: &str, sent_at: u64| {
             let record = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conv.to_string(),
@@ -33720,6 +33910,7 @@ mod tests {
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let seed = |service: &ConnectorService, id: &str, sent_at: u64| {
             let record = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -33824,6 +34015,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0y", "Group 2")
             .unwrap();
         let record = MessageRecord {
+            author_aci: None,
             id: "sg1".into(),
             account_id: account.id.clone(),
             conversation_id: group.id.clone(),
@@ -33894,6 +34086,7 @@ mod tests {
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let seed = |service: &ConnectorService, id: &str, sent_at: u64| {
             let record = MessageRecord {
+                author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
@@ -33997,6 +34190,7 @@ mod tests {
         // A second sent row, seeded directly (seed_outgoing_sent's fixed
         // clientRequestId makes it a one-shot per conversation).
         let second = MessageRecord {
+            author_aci: None,
             id: "m-401".into(),
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),

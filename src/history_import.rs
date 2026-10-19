@@ -711,6 +711,7 @@ impl<'a> Importer<'a> {
             .and_then(Value::as_u64)
             .filter(|value| *value > 0);
         let record = MessageRecord {
+            author_aci: None,
             id: message_id,
             account_id: self.account_id.to_string(),
             conversation_id: chat.conversation_id.clone(),
@@ -886,6 +887,7 @@ impl<'a> Importer<'a> {
             "已更新消息定时消失：已关闭".to_string()
         };
         let record = MessageRecord {
+            author_aci: None,
             id: message_id,
             account_id: self.account_id.to_string(),
             conversation_id: chat.conversation_id.clone(),
@@ -991,6 +993,7 @@ impl<'a> Importer<'a> {
         ]);
         let text = "群聊信息已更新".to_string();
         let record = MessageRecord {
+            author_aci: None,
             id: message_id,
             account_id: self.account_id.to_string(),
             conversation_id: chat.conversation_id.clone(),
@@ -2858,6 +2861,7 @@ mod tests {
         // sender hash before the import ran.
         let live_sender = stable_hash_id(&[&account.id, "direct", ALICE_ACI]);
         let live = MessageRecord {
+            author_aci: None,
             id: stable_hash_id(&[
                 "signal-message-v2",
                 &account.id,
