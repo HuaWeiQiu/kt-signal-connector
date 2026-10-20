@@ -257,7 +257,8 @@ async fn wait_for_needle_rows(
 }
 
 fn hit_text(row: &Value) -> &str {
-    row["text"].as_str().unwrap()
+    // 契约 1.212（审计 P4）：正文 wire 键已对齐官方 body（原 text）。
+    row["body"].as_str().unwrap()
 }
 
 /// The scoped face rides the wire: the scope filters the same newest-first

@@ -331,7 +331,8 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     )
     .await;
     assert_eq!(messages["result"]["items"].as_array().unwrap().len(), 1);
-    assert_eq!(messages["result"]["items"][0]["text"], "private text");
+    // 契约 1.212（审计 P4）：正文 wire 键已对齐官方 body（原 text）。
+    assert_eq!(messages["result"]["items"][0]["body"], "private text");
     assert_eq!(messages["result"]["items"][0]["direction"], "incoming");
 
     let sent = request(
@@ -347,7 +348,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     )
     .await;
     assert_eq!(sent["result"]["status"], "sent");
-    assert_eq!(sent["result"]["text"], "hello from kt");
+    assert_eq!(sent["result"]["body"], "hello from kt");
     assert_eq!(sent["result"]["clientRequestId"], "client-req-1");
     let message_id = sent["result"]["id"].as_str().unwrap().to_string();
 
@@ -513,7 +514,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|message| message["text"] == "[slow-host-test]")
+        .filter(|message| message["body"] == "[slow-host-test]")
         .map(|message| message["status"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert!(slow_statuses.contains(&"sent"));
@@ -1443,7 +1444,7 @@ async fn receive_delivers_host_events_and_get_text_returns_the_full_body() {
     let message = &upserted["data"];
     assert_eq!(message["accountId"], account_id);
     assert_eq!(message["direction"], "incoming");
-    assert_eq!(message["text"], "private text");
+    assert_eq!(message["body"], "private text");
     assert_eq!(message["status"], "delivered");
     // attachments was removed from MessageRecord in optimization-plan Phase 2
     // (the engine runs signal-cli with --ignore-attachments); the field must
@@ -3925,7 +3926,7 @@ async fn live_poll_create_vote_terminate_land_the_history_shape() {
     assert_eq!(create_row["direction"], "incoming");
     assert_eq!(create_row["sentAt"], 600);
     assert!(
-        create_row.get("text").is_none() || create_row["text"].is_null(),
+        create_row.get("body").is_none() || create_row["body"].is_null(),
         "poll creates carry no body"
     );
     // The wire face is the §4.38 history chain's exact keys: the defaults
@@ -5260,7 +5261,7 @@ async fn pin_family_round_trips_pinned_state_and_admin_delete_tombstone() {
     let tombstone = upserted.unwrap()["data"].clone();
     assert_eq!(tombstone["adminDeleted"], json!(true));
     assert_eq!(tombstone["status"], json!("delivered"));
-    assert_eq!(tombstone["text"], json!("group pin target"));
+    assert_eq!(tombstone["body"], json!("group pin target"));
     assert_eq!(
         unpinned_change.unwrap()["data"]["id"],
         group_row["id"].clone()
@@ -7512,7 +7513,7 @@ async fn groups_update_quit_round_trip_and_guards() {
         .find(|row| row["isGroupUpdate"] == true)
         .expect("the bodyless update must land a system row");
     assert_eq!(update_row["direction"], "system");
-    assert_eq!(update_row["text"], "群聊信息已更新");
+    assert_eq!(update_row["body"], "群聊信息已更新");
     assert_eq!(update_row["groupName"], "Renamed Fixture");
 
     // The wired quit face (1.115): the resolved group row dispatches
@@ -15547,7 +15548,7 @@ async fn multi_attachment_send_merges_entries_into_one_upstream_message() {
         }),
     )
     .await;
-    assert_eq!(sent["result"]["text"], "two files", "{sent}");
+    assert_eq!(sent["result"]["body"], "two files", "{sent}");
     let descriptors = sent["result"]["attachments"].as_array().unwrap();
     assert_eq!(descriptors.len(), 2);
     assert_eq!(descriptors[0]["filename"], "notes.txt");

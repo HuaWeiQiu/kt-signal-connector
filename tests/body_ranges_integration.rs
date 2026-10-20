@@ -362,9 +362,10 @@ async fn body_ranges_receive_round_trips_to_every_wire_face() {
         }
     }
     assert_eq!(rows.len(), 4, "all four receives must land as rows");
+    // 契约 1.212（审计 P4）：正文 wire 键已对齐官方 `body`（原 `text`）。
     let by_text = |needle: &str| {
         rows.iter()
-            .find(|row| row["text"] == needle)
+            .find(|row| row["body"] == needle)
             .unwrap_or_else(|| panic!("the {needle} row must be listed"))
             .clone()
     };
