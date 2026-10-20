@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 33;
+const SCHEMA_VERSION: i64 = 34;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -11091,6 +11091,47 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         conn.execute(&sql, [])
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
+    if current < 34 {
+        // Contract 1.201 cleanup, corrected scope. The 33 pass only removed empty
+        // direct rows keyed by another account's own number or ACI. On the real
+        // device that caught 1 of 4 phantom rows: the rest were keyed by the other
+        // account's **contacts** (8fc7f3b1 / c9bf3cad), which never appear in
+        // `accounts`, so no cross-account predicate could see them.
+        //
+        // The correct rule is the protocol's own: in Signal a direct thread exists
+        // only once a message does, so an empty direct conversation is not a chat —
+        // it is the artefact. This pass removes every such row except the account's
+        // own Note-to-Self conversation (peer key == its number or canonical ACI).
+        // Group rows are structural and are never touched.
+        let has_aci_34 = table_has_column(conn, "accounts", "aci")?;
+        let self_leg = if has_aci_34 {
+            "OR (a.aci IS NOT NULL AND conversations.peer_key = a.aci)"
+        } else {
+            ""
+        };
+        // Guard: an orphan row (no accounts row at all) is left alone — without
+        // the account we cannot tell whether the peer key is the account's own,
+        // and this cleanup must never invent a decision it cannot prove.
+        let sql = format!(
+            "DELETE FROM conversations
+              WHERE kind='direct'
+                AND EXISTS (
+                  SELECT 1 FROM accounts a WHERE a.id = conversations.account_id
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM messages m
+                   WHERE m.conversation_id = conversations.id
+                     AND m.account_id = conversations.account_id
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM accounts a
+                   WHERE a.id = conversations.account_id
+                     AND (conversations.peer_key = a.signal_account {self_leg})
+                )"
+        );
+        conn.execute(&sql, [])
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -15470,7 +15511,7 @@ mod tests {
              );
              INSERT INTO accounts VALUES('a1', '+15555550100', '+1555***00', 'ready');
              INSERT INTO conversations
-               VALUES('c1', 'a1', 'direct', '+15555550101', NULL, 0, 0, 0, NULL, NULL, NULL);
+               VALUES('c1', 'a1', 'direct', '+15555550100', NULL, 0, 0, 0, NULL, NULL, NULL);
              CREATE TABLE conversation_pins (
                account_id TEXT NOT NULL,
                conversation_id TEXT NOT NULL,
@@ -15570,7 +15611,7 @@ mod tests {
              );
              INSERT INTO accounts VALUES('a1', '+15555550100', '+1555***00', 'ready');
              INSERT INTO conversations
-               VALUES('c1', 'a1', 'direct', '+15555550101', NULL, 0, 0, 0, NULL, NULL, NULL);
+               VALUES('c1', 'a1', 'direct', '+15555550100', NULL, 0, 0, 0, NULL, NULL, NULL);
              CREATE TABLE conversation_pins (
                account_id TEXT NOT NULL,
                conversation_id TEXT NOT NULL,
@@ -18739,7 +18780,7 @@ mod tests {
     /// exactly those, keeping every row that has a message, every group row and
     /// the Note-to-Self skeleton.
     #[test]
-    fn schema_33_deletes_phantom_direct_conversations_only() {
+    fn schema_33_and_34_delete_empty_direct_conversations_only() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
@@ -18777,6 +18818,17 @@ mod tests {
                 "direct",
                 "b1d73c45-8225-4421-bcf8-7b2f57442865",
                 "bx y",
+            )
+            .unwrap();
+        // The kind the 33 pass missed: an empty direct row keyed by the other
+        // account contact ACI - never present in `accounts`, so only the
+        // protocol rule ("no message, no thread") can recognize it.
+        let phantom_c = store
+            .ensure_conversation(
+                &account.id,
+                "direct",
+                "8fc7f3b1-c017-4c89-b55c-d106dfaa2fe2",
+                "菲菲 林",
             )
             .unwrap();
         // Rewind the schema marker so the migration runs on reopen.
@@ -18823,7 +18875,18 @@ mod tests {
                 .is_none(),
             "the phantom row must be gone"
         );
-        let _ = (group, memo, phantom_a, phantom_b);
+        assert!(
+            reopened
+                .conversation_by_peer(
+                    &account.id,
+                    "direct",
+                    "8fc7f3b1-c017-4c89-b55c-d106dfaa2fe2"
+                )
+                .unwrap()
+                .is_none(),
+            "an empty direct row keyed by a foreign contact ACI must be gone too"
+        );
+        let _ = (group, memo, phantom_a, phantom_b, phantom_c);
     }
 
     /// **P0 regression (cross-account crosstalk, 2026-10-20).** Two accounts on
