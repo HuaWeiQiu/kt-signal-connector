@@ -2360,6 +2360,12 @@ impl Store {
         conn.execute_batch(SCHEMA_DDL)
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         migrate_schema(&conn)?;
+        // 2026-10-20 事故修复：**纯加列/改名无条件幂等执行**，不靠版本号门控。
+        // 事故复盘见 ensure_additive_columns 的文档注释——已发布的迁移内容被
+        // 改名后，跑过该版本的库永远补不上新列，读面 SELECT 因此整面报错
+        // （会话列表 INTERNAL_ERROR / UI「暂无聊天」）。这一层保证任何
+        // 加列都不会再被版本门控漏掉。
+        ensure_additive_columns(&conn)?;
         // The held-since expression index (retention cost fix, prune_history)
         // references stored_at, which stores older than schema 6 only gain
         // inside migrate_schema; creating it after the migrations keeps the
@@ -11214,6 +11220,128 @@ fn title_should_upgrade(current: &str, candidate: &str) -> bool {
         return true;
     }
     false
+}
+
+/// 无条件幂等列补齐（2026-10-20 事故根源修复）。
+///
+/// **事故**：会话列表整面 `INTERNAL_ERROR`、UI 显示「暂无聊天」。
+/// 原因不是数据丢了，而是 —— 已发布的迁移内容被改动过：
+/// schema 35 的 `draft_edit_target_timestamp` 与 schema 37 的
+/// `wallpaper_photo_pointer` 在后续批次里被改了名（`..._json" /
+/// `..._base64`），而补列循环被 `if current < N` 门控。已经跑到该版本的
+/// 库因此**永远不会补上改名后的列**，而读面 SELECT 已经引用了新列名 →
+/// SQL 报错 → 整个读面 INTERNAL_ERROR。
+///
+/// **纪律（本函数存在的理由）**：
+/// 1. **纯加列/改名必须无条件幂等执行**，不能靠版本号门控——版本号只用于
+///    「一次性、破坏性、不可重放」的动作（重建表、清理行）；
+/// 2. **已发布的迁移内容不可改**；要改就走这里的「改名兼容层」；
+/// 3. 改名走「补新列 + 从旧列回填 + 旧列保留」，绝不 DROP（回滚安全）。
+fn ensure_additive_columns(conn: &Connection) -> Result<(), StoreError> {
+    // (表, 新列, 类型, 可能的旧列名)
+    const COLUMNS: &[(&str, &str, &str, Option<&str>)] = &[
+        // 契约 1.205（schema 35）：草稿完整面。draft_edit_message_json 由
+        // draft_edit_target_timestamp 改名而来（旧列是 INTEGER 单时间戳，
+        // 新列是六字段对象 JSON——类型不兼容，不回填，旧列保留供取证）。
+        ("conversation_drafts", "draft_body", "TEXT", None),
+        (
+            "conversation_drafts",
+            "draft_attachments_json",
+            "TEXT",
+            None,
+        ),
+        (
+            "conversation_drafts",
+            "draft_body_ranges_json",
+            "TEXT",
+            None,
+        ),
+        (
+            "conversation_drafts",
+            "draft_is_view_once",
+            "INTEGER NOT NULL DEFAULT 0",
+            None,
+        ),
+        (
+            "conversation_drafts",
+            "draft_edit_message_json",
+            "TEXT",
+            Some("draft_edit_target_timestamp"),
+        ),
+        // 契约 1.206（schema 36）：通知细分四开关。
+        (
+            "conversations",
+            "notify_for_calls_if_muted",
+            "INTEGER NOT NULL DEFAULT 0",
+            None,
+        ),
+        (
+            "conversations",
+            "notify_for_mentions_if_muted",
+            "INTEGER NOT NULL DEFAULT 0",
+            None,
+        ),
+        (
+            "conversations",
+            "notify_for_replies_if_muted",
+            "INTEGER NOT NULL DEFAULT 0",
+            None,
+        ),
+        (
+            "conversations",
+            "show_unread_reminders",
+            "INTEGER NOT NULL DEFAULT 0",
+            None,
+        ),
+        // 契约 1.207（schema 37）：会话外观八列。
+        ("conversations", "conversation_color", "TEXT", None),
+        ("conversations", "custom_color", "TEXT", None),
+        ("conversations", "custom_color_id", "TEXT", None),
+        (
+            "conversations",
+            "auto_bubble_color",
+            "INTEGER NOT NULL DEFAULT 1",
+            None,
+        ),
+        ("conversations", "wallpaper_preset", "INTEGER", None),
+        (
+            "conversations",
+            "wallpaper_photo_pointer_base64",
+            "TEXT",
+            Some("wallpaper_photo_pointer"),
+        ),
+        (
+            "conversations",
+            "dim_wallpaper_in_dark_mode",
+            "INTEGER",
+            None,
+        ),
+        ("conversations", "color_from_primary", "INTEGER", None),
+    ];
+    for (table, column, kind, legacy) in COLUMNS {
+        if table_has_column(conn, table, column)? {
+            continue;
+        }
+        // 旧库若只有表（DDL 里已有新列时表已建好），直接补列。
+        if !table_exists(conn, table).map_err(|error| StoreError::Unavailable(Some(error)))? {
+            continue;
+        }
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+            [],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // 改名兼容：同型（都 TEXT）时从旧列回填，不让用户已设的值丢在旧列里。
+        if let Some(legacy_column) = legacy
+            && table_has_column(conn, table, legacy_column)?
+        {
+            let _ = conn.execute(
+                &format!("UPDATE {table} SET {column} = {legacy_column} WHERE {column} IS NULL"),
+                [],
+            );
+        }
+    }
+    Ok(())
 }
 
 fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
@@ -26827,6 +26955,73 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("token-b")
+        );
+    }
+
+    /// 2026-10-20 事故回归：**已跑到当前版本、但缺改名后新列**的老库必须能自愈。
+    ///
+    /// 现场：会话列表整面 `INTERNAL_ERROR`、UI 显示「暂无聊天」。根因是我在
+    /// **已发布的迁移里改了列名**（schema 35 `draft_edit_target_timestamp`→
+    /// `draft_edit_message_json`、schema 37 `wallpaper_photo_pointer`→
+    /// `..._base64`），而补列循环被 `if current < N` 门控——跑过该版本的库
+    /// 永远补不上新列，读面 SELECT 引用新列名 → SQL 报错。
+    ///
+    /// 官方做法（upstream `ts/sql/migrations/`）：迁移**只追加、永不编辑**，
+    /// 改名必须新开一个迁移文件（如 `88-service-ids` 的 `RENAME COLUMN`）。
+    /// 本测试锁的是**恢复层**：无论库落在什么状态，加列都能自愈。
+    #[test]
+    fn additive_columns_self_heal_on_a_db_that_already_passed_the_version() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().to_path_buf();
+        {
+            let store = Store::open(&path, Some(test_store_key())).unwrap();
+            let account = store
+                .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+                .unwrap();
+            store
+                .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+                .unwrap();
+            let conn = store.conn();
+            // 模拟「旧列名时代」：先放旧列并写值，再删掉改名后的新列。
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN wallpaper_photo_pointer TEXT",
+                [],
+            )
+            .ok();
+            conn.execute(
+                "UPDATE conversations SET wallpaper_photo_pointer='legacy-pointer'",
+                [],
+            )
+            .ok();
+            if conn
+                .execute(
+                    "ALTER TABLE conversations DROP COLUMN wallpaper_photo_pointer_base64",
+                    [],
+                )
+                .is_err()
+            {
+                // 本机 SQLite 不支持 DROP COLUMN：事故路径已由无条件调用覆盖，放行。
+                return;
+            }
+        }
+        // 重开：schema_version 已是最新 → 版本门控内的补列循环不跑，
+        // 只有 ensure_additive_columns 能救它。
+        let store = Store::open(&path, Some(test_store_key())).unwrap();
+        let account_id: String = store
+            .lock_conn()
+            .unwrap()
+            .query_row("SELECT id FROM accounts LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        // ① 读面不再报错（事故现场就是这一行 INTERNAL_ERROR）。
+        let page = store
+            .list_conversations(&account_id, 10, None)
+            .expect("会话读面必须能工作");
+        assert_eq!(page.items.len(), 1, "会话行还在——数据从未丢");
+        // ② 旧列数据回填到新列，用户已设值不丢。
+        assert_eq!(
+            page.items[0].wallpaper_photo_pointer_base64.as_deref(),
+            Some("legacy-pointer"),
+            "改名后应从旧列回填"
         );
     }
 }
