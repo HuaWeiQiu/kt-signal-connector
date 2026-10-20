@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 35;
+const SCHEMA_VERSION: i64 = 36;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -209,6 +209,14 @@ CREATE TABLE IF NOT EXISTS conversations (
   muted INTEGER NOT NULL DEFAULT 0,
   pinned INTEGER NOT NULL DEFAULT 0,
   expire_timer_seconds INTEGER,
+  -- 契约 1.206（M5）：通知细分。官方 ConversationAttributesType 有四个独立开关
+  -- （notifyForCallsIfMuted / notifyForMentionsIfMuted / notifyForRepliesIfMuted /
+  -- showUnreadReminders）；KT 只有单一 muted 布尔——静音后「@我 / 回复我 / 来电」
+  -- 是否仍提醒无法表达。
+  notify_for_calls_if_muted INTEGER NOT NULL DEFAULT 0,
+  notify_for_mentions_if_muted INTEGER NOT NULL DEFAULT 0,
+  notify_for_replies_if_muted INTEGER NOT NULL DEFAULT 0,
+  show_unread_reminders INTEGER NOT NULL DEFAULT 0,
   mrr_factors_json TEXT,
   read_watermark_ms INTEGER,
   report_spam_token TEXT,
@@ -717,6 +725,15 @@ pub struct ConversationSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_watermark_ms: Option<u64>,
     pub muted: bool,
+    /// 契约 1.206（M5）：通知细分四开关——官方 `notifyForCallsIfMuted` /
+    /// `notifyForMentionsIfMuted` / `notifyForRepliesIfMuted` /
+    /// `showUnreadReminders` 对位。旧版只有 `muted` 一个布尔，静音后
+    /// 「@我 / 回复我 / 来电」是否仍提醒无从表达。恒序列化（裸 bool，
+    /// muted/pinned 同纪律）：两种取值都有意义。
+    pub notify_for_calls_if_muted: bool,
+    pub notify_for_mentions_if_muted: bool,
+    pub notify_for_replies_if_muted: bool,
+    pub show_unread_reminders: bool,
     pub pinned: bool,
     /// Contract 1.33: the conversation's current pinned message, projected
     /// from `conversation_pins` so a reloaded window renders the pin bar
@@ -3797,7 +3814,9 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
                         unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key,
-                        mrr_factors_json, read_watermark_ms
+                        mrr_factors_json, read_watermark_ms,
+                        notify_for_calls_if_muted, notify_for_mentions_if_muted,
+                        notify_for_replies_if_muted, show_unread_reminders
                  FROM conversations
                  WHERE account_id=?1
                    AND (
@@ -3858,6 +3877,11 @@ impl Store {
                         unread_mentions: row.get::<_, i64>(7)? as u32,
                         read_watermark_ms: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
                         muted: row.get::<_, i64>(8)? != 0,
+                        // 契约 1.206（M5）：通知细分四开关（裸 bool，恒序列化）。
+                        notify_for_calls_if_muted: row.get::<_, i64>(14)? != 0,
+                        notify_for_mentions_if_muted: row.get::<_, i64>(15)? != 0,
+                        notify_for_replies_if_muted: row.get::<_, i64>(16)? != 0,
+                        show_unread_reminders: row.get::<_, i64>(17)? != 0,
                         pinned: row.get::<_, i64>(9)? != 0,
                         pinned_message: None,
                         pinned_messages: Vec::new(),
@@ -5932,6 +5956,70 @@ impl Store {
         Ok(true)
     }
 
+    /// 契约 1.206（M5）：写入会话的通知细分四开关——官方
+    /// `notifyForCallsIfMuted` / `notifyForMentionsIfMuted` /
+    /// `notifyForRepliesIfMuted` / `showUnreadReminders` 对位。
+    ///
+    /// 与 `muted` 正交：muted 是总闸，这四个是「静音之后仍要提醒什么」。
+    /// 全部显式传值（不做部分更新——官方四个字段也是整体覆盖语义）。
+    /// 返回是否命中会话（未命中 → 调用方答 CONVERSATION_NOT_FOUND）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_conversation_notification_prefs(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        notify_for_calls_if_muted: bool,
+        notify_for_mentions_if_muted: bool,
+        notify_for_replies_if_muted: bool,
+        show_unread_reminders: bool,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let changed = conn
+            .execute(
+                "UPDATE conversations SET
+                    notify_for_calls_if_muted=?3,
+                    notify_for_mentions_if_muted=?4,
+                    notify_for_replies_if_muted=?5,
+                    show_unread_reminders=?6
+                  WHERE id=?1 AND account_id=?2",
+                params![
+                    conversation_id,
+                    account_id,
+                    i64::from(notify_for_calls_if_muted),
+                    i64::from(notify_for_mentions_if_muted),
+                    i64::from(notify_for_replies_if_muted),
+                    i64::from(show_unread_reminders),
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed > 0)
+    }
+
+    /// 契约 1.206（M5）：读回通知细分四开关。
+    /// 未命中的会话答 None（缺席 = 未知，不发明默认值）。
+    pub fn conversation_notification_prefs(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<(bool, bool, bool, bool)>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT notify_for_calls_if_muted, notify_for_mentions_if_muted,
+                        notify_for_replies_if_muted, show_unread_reminders
+                   FROM conversations WHERE id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? != 0,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, i64>(3)? != 0,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
     /// 契约 1.205（M5）：保存草稿的**完整面**——官方 ConversationAttributesType
     /// 的 draft / draftAttachments / draftBodyRanges / draftIsViewOnce /
     /// draftEditMessage 五字段对位。
@@ -9254,7 +9342,9 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
                         unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key,
-                        mrr_factors_json, read_watermark_ms
+                        mrr_factors_json, read_watermark_ms,
+                        notify_for_calls_if_muted, notify_for_mentions_if_muted,
+                        notify_for_replies_if_muted, show_unread_reminders
                  FROM conversations WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
                 |row| {
@@ -9290,6 +9380,11 @@ impl Store {
                         unread_mentions: row.get::<_, i64>(7)? as u32,
                         read_watermark_ms: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
                         muted: row.get::<_, i64>(8)? != 0,
+                        // 契约 1.206（M5）：通知细分四开关（裸 bool，恒序列化）。
+                        notify_for_calls_if_muted: row.get::<_, i64>(14)? != 0,
+                        notify_for_mentions_if_muted: row.get::<_, i64>(15)? != 0,
+                        notify_for_replies_if_muted: row.get::<_, i64>(16)? != 0,
+                        show_unread_reminders: row.get::<_, i64>(17)? != 0,
                         pinned: row.get::<_, i64>(9)? != 0,
                         pinned_message: None,
                         pinned_messages: Vec::new(),
@@ -11425,6 +11520,26 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         conn.execute(&sql, [])
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
+    if current < 36 {
+        // 契约 1.206（M5）：conversations 补通知细分四开关——官方
+        // notifyForCallsIfMuted / notifyForMentionsIfMuted /
+        // notifyForRepliesIfMuted / showUnreadReminders 对位。老库只有
+        // 单一 muted，静音后「@我 / 回复我 / 来电」是否仍提醒无从表达。
+        for (column, kind) in [
+            ("notify_for_calls_if_muted", "INTEGER NOT NULL DEFAULT 0"),
+            ("notify_for_mentions_if_muted", "INTEGER NOT NULL DEFAULT 0"),
+            ("notify_for_replies_if_muted", "INTEGER NOT NULL DEFAULT 0"),
+            ("show_unread_reminders", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !table_has_column(conn, "conversations", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE conversations ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+    }
     if current < 35 {
         // 契约 1.205（M5）：conversation_drafts 补草稿完整面——官方
         // ConversationAttributesType 的 draft / draftAttachments / draftBodyRanges /
@@ -12095,6 +12210,80 @@ mod tests {
             .unwrap();
     }
 
+    /// 契约 1.206（M5）：通知细分四开关——与 muted 正交（muted 是总闸，
+    /// 这四个是「静音之后仍要提醒什么」）。官方 ConversationAttributesType 同形。
+    #[test]
+    fn conversation_notification_prefs_round_trip() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        // 默认全 false（DDL 缺省，不发明 true）。
+        assert_eq!(
+            store
+                .conversation_notification_prefs(&account.id, &conversation.id)
+                .unwrap(),
+            Some((false, false, false, false))
+        );
+
+        // 打开「mentions + replies」（最常用组合：群静音但 @我/回复我要响）。
+        assert!(
+            store
+                .set_conversation_notification_prefs(
+                    &account.id,
+                    &conversation.id,
+                    false,
+                    true,
+                    true,
+                    false,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .conversation_notification_prefs(&account.id, &conversation.id)
+                .unwrap(),
+            Some((false, true, true, false))
+        );
+
+        // 整体覆盖（不做部分更新）：翻成 calls + reminders。
+        assert!(
+            store
+                .set_conversation_notification_prefs(
+                    &account.id,
+                    &conversation.id,
+                    true,
+                    false,
+                    false,
+                    true,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .conversation_notification_prefs(&account.id, &conversation.id)
+                .unwrap(),
+            Some((true, false, false, true))
+        );
+
+        // 未命中会话：写答 false、读答 None（缺席 = 未知）。
+        assert!(!store
+            .set_conversation_notification_prefs(
+                &account.id, "missing", true, true, true, true,
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .conversation_notification_prefs(&account.id, "missing")
+                .unwrap(),
+            None
+        );
+    }
     /// 契约 1.205（M5）：草稿完整面持久化——官方 ConversationAttributesType 的
     /// draft/draftAttachments/draftBodyRanges/draftIsViewOnce/draftEditMessage
     /// 五字段。此前只存时间戳（正文仅活在桌面本地，跨设备/重装即丢）。
