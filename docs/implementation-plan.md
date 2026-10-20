@@ -67,21 +67,33 @@
   recorded in `docs/last-moments-redaction-audit.md`; the engine worktree is
   outside this repository and the fix lands there.)
 =======
-  §4.215 **`bodyAttachment` is deferred, not forgotten.** The official
-  client carries long-message bodies as `dataMessage.bodyAttachment`
-  (`AttachmentPointer`, `contentType: LONG_MESSAGE`) beside a `body`
-  preview. The proto pinned for this build (`libsignal-service-rs`
-  `7aa4909`) has **no `bodyAttachment` field on `DataMessage`** — its
-  full list is body/attachments/quote/contact/preview/sticker/reaction/
-  delete/payment. So the receive face cannot project it and the send
-  face cannot emit it at this pin: any local projection would not
-  compile. Closing this needs a **proto pin upgrade (or a vendored
-  field) first** — an ADR-level protocol dependency change — followed by
-  the engine projection, a connector storage face, and the desktop
-  download flow. Meanwhile KT's outbound long-text already works through
-  the generic attachment array (`text/plain` / `message.txt`), which an
-  official peer renders as an ordinary text attachment rather than the
-  official long-message affordance — interoperable, differently shaped.
+  §4.215 **Long text (`bodyAttachment`) — corrected finding.**（本条目为**纯记档**。）
+
+  **更正**：先前记档说「被 proto pin 阻塞」是**错的**。`bodyAttachment` 不是
+  wire 字段——官方 `handleDataMessage.preload.ts:503` 的 `dataMessage` 是
+  `upgradeMessageSchema(...)`（官方自有消息模型）。真实机制是：
+
+  | 面 | 官方 | 位置 |
+  |---|---|---|
+  | MIME | `LONG_MESSAGE = 'text/x-signal-plain'` | `ts/types/MIME.std.ts:34` |
+  | 发送 | 长文本作为**普通附件**用该 contentType | `ts/types/Message2.preload.ts:1029` |
+  | 渲染 | 按 contentType 把附件剔出文件条、正文重建 | `ts/state/selectors/message.preload.ts:351` |
+  | 阈值 | body 2 KiB / 附件上限 64 KiB | `ts/util/longAttachment.std.ts:7-8` |
+  | 本地 | 长正文写盘成 bodyAttachment（toVersion13） | `Message2.preload.ts:1012-1038` |
+
+  因此**不需要 proto pin 升级**。KT 的阈值本就与官方一致
+  （2 KiB 预览 + 64 KiB 上限），缺口只在桌面侧两处：
+
+  1. 出站 contentType 曾是 `text/plain`，官方是 `text/x-signal-plain`
+     → **已修**（`shared/signalTextLimit.ts` 的 `SIGNAL_LONG_TEXT_CONTENT_TYPE`，
+     注释带官方行号；`signalOptimisticSendComponent.spec.ts` 断言同步锁该 MIME）。
+     旧值的后果：官方对端把我们的长消息当普通 txt 文件。
+  2. **接收侧尚未识别**该 MIME（也不识别 KT 自己历史发出的 `text/plain`+
+     `message.txt`）→ 官方发来的长消息被当文件显示、正文不重建。属桌面单仓
+     待办，不涉 connector/engine。
+
+  教训记档：判定「协议阻塞」前必须**追到字段的写入方**——只 grep 一层就下结论
+  会把客户端机制误判成协议依赖变更。
 - Contract revision: 1.213 (2026-10-20; §4.213 the identity-key ledger, and
   §4.214 the read-status mapping — two **documentation-only** entries from
   the projection audit (`SIGNAL-PROJECTION-DRIFT-AUDIT.md`). No wire or
@@ -102,22 +114,48 @@
   stays `authorAci`. Renaming either is out of scope — the ledger exists
   so the two concepts are never conflated again.
 
-  §4.214 **Read status.** Official `MessageAttributesType` carries
-  `readAt` + `readStatus` (`unread`/`read`/`viewed`, monotonic, incoming
-  rows only) + `seenStatus`. KT expresses the same semantics with
-  existing fields and deliberately adds no derived enum:
-  - `readStatus === Viewed` ≡ `viewed_at` present (the row's own doc
-    already anchors this: `messages.markViewed` set it, the official
-    `isVoiceMessagePlayed` predicate is exactly this test);
-  - `readStatus === Read`/`Unread` ≡ `sent_at` at/below vs above the
-    conversation's `read_watermark_ms` (absent watermark ⇒ `read`, the
-    official `migrateLegacyReadStatus` legacy-`unread`-absent rule);
-  - `readAt` ≡ `read_at`;
-  - `seenStatus` has **no data face** in KT (we never record the
-    last-seen indicator) — it stays absent rather than guessed.
-  A derived enum field was prototyped and rejected: 45+ struct-literal
-  sites for zero new information. Consumers derive from these three
-  fields using the rules above.
+  §4.214 **Read status.**（本条目为**纯记档**，零 wire 零 schema 变更。）
+
+  *官方字段与枚举（逐行取证）*：
+
+  | 官方 | 位置 | 值/形状 |
+  |---|---|---|
+  | `readStatus?: ReadStatus` | `ts/model-types.d.ts:321`（消息面）、`:153`（导出面） | 枚举 |
+  | `readAt?: number` | `ts/model-types.d.ts:320` | 毫秒时间戳 |
+  | `seenStatus?: SeenStatus` | `ts/model-types.d.ts:323` | 枚举 |
+  | `ReadStatus` | `ts/messages/MessageReadStatus.std.ts:13-17` | `Unread=1` / `Read=0` / `Viewed=2` |
+  | `SeenStatus` | `ts/MessageSeenStatus.std.ts:12-16` | `NotApplicable=0` / `Unseen=1` / `Seen=2` |
+
+  **注意 `Unread=1 / Read=0` 是反直觉的**——官方文件注释解释：历史上曾有
+  一个叫 `unread` 的布尔字段，所以 Unread 对应 1、Read 对应 0，且**已持久化
+  不可改**。任何消费方都不得假定「数值大 = 更靠后」。
+
+  *单调性*：`maxReadStatus`（同文件 `:25`）用 `STATUS_NUMBERS` 映射
+  （Unread→0 / Read→1 / Viewed→2）比较大小，语义单调：Unread → Read → Viewed，
+  **绝不倒退**。`SeenStatus` 有同构的 `maxSeenStatus`。
+
+  *推导规则（官方两处先例）*：
+
+  - `ts/messages/migrateLegacyReadStatus.std.ts:8-19`——`legacyUnread ? Unread : Read`；
+    **`unread` 位缺席即 Read**（这是「无数据默认已读」的官方依据）；
+  - `ts/util/handleEditMessage.preload.ts:283-287`——`isOutgoing ? Read : Unread`
+    （编辑消息时入站标 Unread，以便补发已读回执）；
+  - `ts/util/isVoiceMessagePlayed.std.ts:34-35`——`isIncoming && readStatus === Viewed`
+    即「本机播过这条语音」。
+
+  *KT 的等价表达（有意不加派生枚举）*：
+
+  | 官方 | KT 等价 | 依据 |
+  |---|---|---|
+  | `readStatus === Viewed` | `viewed_at` 在场 | 行注释已锚定（`messages.markViewed` 写入），与 `isVoiceMessagePlayed` 判据同义 |
+  | `readStatus === Read` | 出站行；或入站且 `sent_at <= read_watermark_ms`；或入站且水位缺席 | 官方 `migrateLegacyReadStatus` 的「缺席即 Read」同判 |
+  | `readStatus === Unread` | 入站且 `sent_at > read_watermark_ms` | 水位即「读到这里」 |
+  | `readAt` | `read_at` | 字段同名同义 |
+  | `seenStatus` | **无数据面 → 恒缺席** | KT 不记录「最后已见指示线」位置，按「缺席 = 未知」纪律不猜 |
+
+  *为何不加派生字段*：原型实现过 `read_status` 枚举字段，需触及 45+ 处
+  `MessageRecord` 结构体字面量（含测试夹具），换来的信息量为零——上述三件
+  既有数据已能完整表达三态。故撤回，改为本条目记档消费规则。
 - Contract revision: 1.209 (2026-10-20; §4.209 the group roster
   projection: an official conversation carries `membersV2`
   (`model-types.d.ts`), the client's single source for member lists,
