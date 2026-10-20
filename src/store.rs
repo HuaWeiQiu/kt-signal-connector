@@ -1698,7 +1698,19 @@ pub struct MessageRecord {
     pub sent_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub received_at: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// 契约 1.212（审计 P4）：消息正文。
+    ///
+    /// **wire 键名对齐官方 `body`**（`MessageAttributesType.body`，
+    /// `model-types.d.ts:247`）——官方全项目统一 `body`，配套
+    /// `bodyRanges`/`bodyAttachment`。KT 历史上叫 `text`，是最大的命名漂移。
+    ///
+    /// 这里用 **serde rename 而非改 Rust 字段名**：wire 面回官方名，
+    /// 同时避免 40+ 处结构体字面量 + 138 处桌面消费点的机械改动。
+    /// 桌面在**单一入口**做 `body ?? text` 归一化（兼容 pre-1.212 连接器）。
+    ///
+    /// 注：`text_bytes`/`text_truncated`/`text_retrievable` 三个伴生键是
+    /// KT 自己的截断机制（官方无对应字段），**保持原样不冒充官方字段**。
+    #[serde(rename = "body", skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_bytes: Option<u32>,
