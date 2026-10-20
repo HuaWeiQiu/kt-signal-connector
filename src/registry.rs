@@ -694,6 +694,20 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// 契约 1.204（M4b）：以锚点为中心取窗（三段返回）。
+    pub async fn list_messages_around(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        anchor_message_id: String,
+        limit: u32,
+    ) -> Result<Page<MessageRecord>, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .list_messages_around(account_id, conversation_id, anchor_message_id, limit)
+            .await
+    }
+
     pub async fn list_adjacent_media(
         &self,
         account_id: String,

@@ -2667,6 +2667,25 @@ impl ConnectorService {
         store_list_messages(&self.store, account_id, conversation_id, limit, before)
     }
 
+    /// 契约 1.204（M4b）：以锚点为中心取窗（older/anchor/newer 三段）。
+    pub fn list_messages_around(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        anchor_message_id: &str,
+        limit: u32,
+    ) -> Result<Page<MessageRecord>, ServiceError> {
+        if self.store.account_by_id(account_id)?.is_none() {
+            return Err(ServiceError::Store(StoreError::AccountNotFound));
+        }
+        Ok(self.store.list_messages_around(
+            account_id,
+            conversation_id,
+            anchor_message_id,
+            limit,
+        )?)
+    }
+
     pub fn list_adjacent_media(
         &self,
         account_id: &str,
@@ -14989,6 +15008,17 @@ pub struct MessagesAdjacentMediaParams {
     pub conversation_id: String,
     pub anchor_message_id: String,
     pub direction: MessagesAdjacentMediaDirection,
+    pub limit: u32,
+}
+
+/// 契约 1.204（M4b）：以锚点为中心取窗的请求参数——官方
+/// `getConversationRangeCenteredOnMessage` 对位。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesAroundParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub anchor_message_id: String,
     pub limit: u32,
 }
 

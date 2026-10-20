@@ -4028,6 +4028,131 @@ impl Store {
         Ok(Page { items, next_cursor })
     }
 
+    /// 以某条消息为中心取窗（契约 1.204 / M4b）：官方
+    /// `getConversationRangeCenteredOnMessage`（conversations.preload.ts:1734-1758）对位。
+    ///
+    /// 官方打开会话时，若存在 `oldestUnseen`，**一次往返**取「锚前一半 + 锚 + 锚后一半」；
+    /// 没有这一步就要「先拉最新页 → 再回头补到锚」，多一次往返且中间态空窗。
+    ///
+    /// 返回 `(older, anchor, newer)`：
+    /// - `older`：严格早于锚的 `limit/2` 条，**升序**（旧→新）；
+    /// - `anchor`：锚行本身（不在本地/已删 → `InvalidCursor`，不猜）；
+    /// - `newer`：严格晚于锚的 `limit - limit/2 - 1` 条，**升序**。
+    ///
+    /// 总条数 ≤ `limit`；任一侧不足时按实际返回（不补假行）。
+    pub fn list_messages_around(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        anchor_id: &str,
+        limit: u32,
+    ) -> Result<Page<MessageRecord>, StoreError> {
+        let limit = limit.clamp(3, MAX_PAGE_LIMIT);
+        // 锚行先定位（无本地行 = 调用方拿了个陈旧 id，诚实拒，不重新锚定）。
+        let anchor_sent_at: i64 = self
+            .lock_conn()?
+            .query_row(
+                "SELECT sent_at FROM messages
+                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                params![anchor_id, account_id, conversation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .ok_or(StoreError::InvalidCursor)?;
+        let older_limit = limit / 2;
+        let newer_limit = limit.saturating_sub(older_limit).saturating_sub(1);
+        // 三段各自取数：锚前（DESC 取完再反转）/ 锚 / 锚后（ASC 直取）。
+        let mut older: Vec<MessageRecord> = {
+            let conn = self.read_conn()?;
+            let mut stmt = conn
+                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                     FROM messages
+                     WHERE account_id=?1 AND conversation_id=?2
+                       AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
+                     ORDER BY sent_at DESC, id DESC
+                     LIMIT ?5")
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        account_id,
+                        conversation_id,
+                        anchor_sent_at,
+                        anchor_id,
+                        older_limit as i64
+                    ],
+                    message_record_from_row,
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+        };
+        older.reverse(); // 升序（旧→新），与窗口合并口径一致。
+        let anchor: MessageRecord = {
+            let conn = self.read_conn()?;
+            conn.query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci FROM messages WHERE id=?1 AND account_id=?2",
+                params![anchor_id, account_id],
+                message_record_from_row,
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+        };
+        let mut newer: Vec<MessageRecord> = {
+            let conn = self.read_conn()?;
+            let mut stmt = conn
+                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                     FROM messages
+                     WHERE account_id=?1 AND conversation_id=?2
+                       AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
+                     ORDER BY sent_at ASC, id ASC
+                     LIMIT ?5")
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        account_id,
+                        conversation_id,
+                        anchor_sent_at,
+                        anchor_id,
+                        newer_limit as i64
+                    ],
+                    message_record_from_row,
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+        };
+        // 三段的附件/反应/编辑/引用面按既有纪律统一补齐（与 messages.list 同源）。
+        let mut anchor_vec = vec![anchor];
+        self.attach_reactions(account_id, &mut older)?;
+        self.attach_reactions(account_id, &mut newer)?;
+        self.attach_reactions(account_id, &mut anchor_vec)?;
+        self.attach_edits(account_id, &mut older)?;
+        self.attach_edits(account_id, &mut newer)?;
+        self.attach_edits(account_id, &mut anchor_vec)?;
+        self.attach_outgoing_quotes(account_id, &mut older)?;
+        self.attach_outgoing_quotes(account_id, &mut newer)?;
+        self.attach_outgoing_quotes(account_id, &mut anchor_vec)?;
+        self.attach_quote_snapshot_ids(account_id, &mut older)?;
+        self.attach_quote_snapshot_ids(account_id, &mut newer)?;
+        self.attach_quote_snapshot_ids(account_id, &mut anchor_vec)?;
+        let anchor = anchor_vec.pop().expect("anchor present");
+        // 合并成 messages.list 同形的升序 Page：older → anchor → newer。
+        // next_cursor = older 侧是否还有更早（older 取满额即可能还有）。
+        let older_has_more = older.len() as u32 == older_limit;
+        let next_cursor = if older_has_more {
+            older
+                .first()
+                .map(|row| encode_message_cursor(account_id, conversation_id, row))
+        } else {
+            None
+        };
+        let mut items = older;
+        items.push(anchor);
+        items.extend(newer);
+        Ok(Page { items, next_cursor })
+    }
     /// Adjacent visual-media probe (contract 1.93, §4.76): the messages next
     /// to an anchor in one direction that carry at least one visual-media
     /// attachment — an `image/*` or `video/*` content type, the desktop
@@ -4311,6 +4436,32 @@ impl Store {
         Ok(first)
     }
 
+    /// Test-only: plant one message row at a specific `sent_at` so ordering
+    /// tests (centered windows, pagination) have deterministic sort keys.
+    #[cfg(test)]
+    pub(crate) fn seed_message_row_for_test_at(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        sent_at: i64,
+    ) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "INSERT OR IGNORE INTO messages(
+                    id, account_id, conversation_id, direction, sender_id, sent_at,
+                    received_at, stored_at, body, body_bytes, body_truncated, status
+                 ) VALUES(?1, ?2, ?3, 'incoming', ?4, ?5, ?5, ?5, '', 0, 0, 'sent')",
+                params![
+                    format!("seed-{conversation_id}-{sent_at}"),
+                    account_id,
+                    conversation_id,
+                    conversation_id,
+                    sent_at
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
     /// Test-only: plant one message row straight into a conversation so the
     /// schema-33 cleanup test can distinguish "has history" from "phantom".
     #[cfg(test)]
@@ -11814,6 +11965,49 @@ mod tests {
             .unwrap();
     }
 
+    /// 契约 1.204（M4b）：以锚点为中心取窗——官方
+    /// `getConversationRangeCenteredOnMessage` 对位。验证三段的边界语义：
+    /// 升序、锚在位、两侧按 limit 均分、锚缺席诚实拒。
+    #[test]
+    fn list_messages_around_centers_on_the_anchor() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        // 造 20 条：t=1..=20（升序），锚定在 t=10。
+        for tick in 1..=20i64 {
+            store
+                .seed_message_row_for_test_at(&account.id, &conversation.id, tick)
+                .unwrap();
+        }
+        let anchor_id = format!("seed-{}-10", conversation.id);
+        let page = store
+            .list_messages_around(&account.id, &conversation.id, &anchor_id, 9)
+            .unwrap();
+        // limit=9 → older 4 / anchor 1 / newer 4 = 9 行，升序排列。
+        assert_eq!(page.items.len(), 9, "三段合计不超过 limit");
+        let sent: Vec<i64> = page.items.iter().map(|row| row.sent_at as i64).collect();
+        assert_eq!(
+            sent,
+            vec![6, 7, 8, 9, 10, 11, 12, 13, 14],
+            "锚在正中且整体升序"
+        );
+        assert!(
+            page.items.iter().any(|row| row.id == anchor_id),
+            "锚行本身在窗口内"
+        );
+        // older 取满额 → next_cursor 指向更早一侧。
+        assert!(page.next_cursor.is_some(), "older 满额时游标存在");
+        // 锚不在本地/已删 → 诚实拒（不重新锚定）。
+        assert!(matches!(
+            store.list_messages_around(&account.id, &conversation.id, "missing", 9),
+            Err(StoreError::InvalidCursor)
+        ));
+    }
     /// 契约 1.203（§4.203）：会话命名梯材料——systemName 取通讯录 title、
     /// username 取 contacts.extra；掩码/占位不算材料；全 miss 三键皆缺席。
     /// 断言面走 serde（wire 形状即契约），不用结构体字段直读。
@@ -11851,28 +12045,35 @@ mod tests {
             .unwrap();
 
         let page = store.list_conversations(&account.id, 10, None).unwrap();
-        // ConversationSummary 不投影 peer_key（wire 面不含），按 title 定位。
-        let by_title = |title: &str| {
+        // 定位用**协议标识**而非 title：ConversationSummary 不投影存储层的
+        // peer_key，而是把它归一化成 e164 / serviceId / groupId 三个语义字段
+        //（契约 1.138 §4.129）。用 title 定位等于绕过协议投影——本轮自纠。
+        let by_e164 = |e164: &str| {
             page.items
                 .iter()
-                .find(|row| row.title == title)
+                .find(|row| row.e164.as_deref() == Some(e164))
                 .map(|row| serde_json::to_value(row).unwrap())
-                .expect("row present")
+                .unwrap_or_else(|| panic!("row for {e164} present"))
         };
 
-        let alice = by_title("Alice");
+        let alice = by_e164("+15555550101");
         assert_eq!(alice["systemName"], serde_json::json!("Alice"));
         assert_eq!(alice["username"], serde_json::json!("alice.01"));
         // profile 名由桌面三源链补，connector 侧恒缺席。
         assert!(alice.get("profileName").is_none());
 
         // 掩码占位不是材料：systemName 不出现。
-        let masked = by_title("8fc***e2");
-        assert!(masked.get("systemName").is_none());
+        let masked = by_e164("+15555550102");
+        assert!(
+            masked.get("systemName").is_none(),
+            "掩码 title 不是命名材料"
+        );
         assert!(masked.get("username").is_none());
+        // 掩码值仍原样留在 title 面（呈现层自行降级）。
+        assert_eq!(masked["title"], serde_json::json!("8fc***e2"));
 
         // 无 contacts 行：两键都缺席（缺席 = 未知）。
-        let ghost = by_title("ghost");
+        let ghost = by_e164("+15555550103");
         assert!(ghost.get("systemName").is_none());
         assert!(ghost.get("username").is_none());
         // title 面语义零变化（旧消费者逐字不变）。

@@ -52,7 +52,7 @@ use crate::service::{
     HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
     LinkSessionParams, LinkStartParams, MessageGetByClientRequestIdParams,
     MessageGetReceiptsParams, MessageGetTextParams, MessageRequestParams,
-    MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
+    MessagesAdjacentMediaParams, MessagesAroundParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams,
     MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams, MessagesEditParams,
     MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
@@ -2238,6 +2238,45 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             Err(_) => HostResponse::failure(
                 request_id,
                 reject_probe("messages.list", "params", "invalid messages.list params"),
+            ),
+        },
+        // 契约 1.204（M4b）：以锚点为中心取窗——官方
+        // getConversationRangeCenteredOnMessage 对位。一次往返拿「锚前 + 锚 + 锚后」，
+        // 取代「先拉最新页再补到锚」的两段式（省一次往返、消除中间态空窗）。
+        // 返回与 messages.list 同形的升序 Page（items 含锚行本身）。
+        "messages.around" => match serde_json::from_value::<MessagesAroundParams>(request.params) {
+            Ok(params) if (3..=MAX_PAGE_LIMIT).contains(&params.limit) => {
+                match runtime
+                    .list_messages_around(
+                        params.account_id,
+                        params.conversation_id,
+                        params.anchor_message_id,
+                        params.limit,
+                    )
+                    .await
+                {
+                    Ok(page) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(page).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                }
+            }
+            Ok(_) => HostResponse::failure(
+                request_id,
+                reject_probe(
+                    "messages.around",
+                    "limit",
+                    "limit must be between 3 and 200",
+                ),
+            ),
+            Err(_) => HostResponse::failure(
+                request_id,
+                reject_probe(
+                    "messages.around",
+                    "params",
+                    "invalid messages.around params",
+                ),
             ),
         },
         // Adjacent visual-media probe (contract revision 1.93, §4.76): the
