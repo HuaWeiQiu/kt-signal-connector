@@ -1729,7 +1729,18 @@ pub struct MessageRecord {
     /// outgoing rows (the account's own number is the protocol face there),
     /// system rows, pre-1.191 rows, and history-import rows (the archive face
     /// carries no member identity — never backfilled, §4.191).
-    #[serde(skip)]
+    ///
+    /// Contract 1.202 (§4.202): also projected onto the host wire as the
+    /// additive `authorAci` key — the **protocol identity** the desktop's
+    /// name sources are keyed by. `senderId` remains the store-level ingest
+    /// privacy hash (a 64-hex digest the protocol never speaks), so resolving
+    /// a display name from it can never match; official parity is
+    /// `getSourceServiceId` (ts/state/selectors/message.preload.ts:257),
+    /// which returns the envelope ACI for incoming rows. Absent (not null)
+    /// on outgoing/system/pre-1.191 rows: an absent key is "no protocol
+    /// identity captured", never a guessed one. Internal history-import rows
+    /// keep it NULL and therefore project no key either.
+    #[serde(rename = "authorAci", skip_serializing_if = "Option::is_none")]
     pub author_aci: Option<String>,
     /// The own-story sync transcript bit (contract 1.160, §4.158): true only
     /// on the event-only row face the multi-device
