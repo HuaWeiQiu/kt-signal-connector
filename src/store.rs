@@ -226,7 +226,10 @@ CREATE TABLE IF NOT EXISTS conversations (
   custom_color_id TEXT,
   auto_bubble_color INTEGER NOT NULL DEFAULT 1,
   wallpaper_preset INTEGER,
-  wallpaper_photo_pointer TEXT,
+  -- 契约 1.207：官方字段名是 wallpaperPhotoPointerBase64（**带 Base64**，
+  -- 语义是「base64 编码的指针」）——列名与 wire 键都保留该语义，去掉后缀
+  -- 会让消费方当原文用（审计项 #5）。
+  wallpaper_photo_pointer_base64 TEXT,
   dim_wallpaper_in_dark_mode INTEGER,
   color_from_primary INTEGER,
   mrr_factors_json TEXT,
@@ -364,7 +367,11 @@ CREATE TABLE IF NOT EXISTS conversation_drafts (
   draft_attachments_json TEXT,
   draft_body_ranges_json TEXT,
   draft_is_view_once INTEGER NOT NULL DEFAULT 0,
-  draft_edit_target_timestamp INTEGER,
+  -- 契约 1.205：官方 DraftEditMessageType 是**六字段对象**（editHistoryLength /
+  -- attachmentThumbnail / bodyRanges / body / preview / targetMessageId,
+  -- model-types.d.ts:347-353）。只存 targetMessageId 会造成「看起来支持、实际
+  -- 只支持 1/6」的中间态（审计项 #6）——整对象按 JSON 原文存。
+  draft_edit_message_json TEXT,
   PRIMARY KEY(account_id, conversation_id),
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
   FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
@@ -685,9 +692,6 @@ pub struct ConversationSummary {
     /// 数组冒充「已知且为空」。有界：`MAX_GROUP_MEMBERS`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub members: Option<Vec<ConversationMember>>,
-    /// 契约 1.209：服务端捕获的成员计数（官方 `memberCount`）。缺席同上。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub member_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_preview: Option<String>,
     /// Contract 1.23: attachment category noun for the desktop list preview —
@@ -764,16 +768,22 @@ pub struct ConversationSummary {
     /// 存官方词表原值（不解释、不归一化）；None = 未设置（不发明缺省）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_color: Option<String>,
+    /// 官方 `customColor` 是**结构体**（`Colors.std.ts:82-86`）：
+    /// `{start:{hue,saturation,lightness?}, end?, deg?}`——不是字符串。
+    /// 用 JSON 透传原文（审计项 #4：类型必须与官方一致，消费方才塞得进模型）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub custom_color: Option<String>,
+    pub custom_color: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_color_id: Option<String>,
     /// 官方缺省 true（跟随系统气泡色）——恒序列化，两种取值都有意义。
     pub auto_bubble_color: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallpaper_preset: Option<i64>,
+    /// 官方 `wallpaperPhotoPointerBase64`——**base64 编码**的壁纸指针，
+    /// 键名保留 Base64 后缀（审计项 #5：去后缀会让消费方当原文用）。
+    #[serde(rename = "wallpaperPhotoPointerBase64")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub wallpaper_photo_pointer: Option<String>,
+    pub wallpaper_photo_pointer_base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dim_wallpaper_in_dark_mode: Option<bool>,
     /// Contract 1.33: the conversation's current pinned message, projected
@@ -3859,7 +3869,7 @@ impl Store {
                         notify_for_calls_if_muted, notify_for_mentions_if_muted,
                         notify_for_replies_if_muted, show_unread_reminders,
                         conversation_color, custom_color, custom_color_id, auto_bubble_color,
-                        wallpaper_preset, wallpaper_photo_pointer, dim_wallpaper_in_dark_mode,
+                        wallpaper_preset, wallpaper_photo_pointer_base64, dim_wallpaper_in_dark_mode,
                         color_from_primary
                  FROM conversations
                  WHERE account_id=?1
@@ -3912,8 +3922,7 @@ impl Store {
                         system_name,
                         profile_name: None,
                         username,
-                        members: roster.as_ref().map(|(members, _)| members.clone()),
-                        member_count: roster.as_ref().map(|(_, count)| *count),
+                        members: roster.clone(),
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
                         last_message_direction: None,
@@ -3932,11 +3941,14 @@ impl Store {
                         show_unread_reminders: row.get::<_, i64>(17)? != 0,
                         // 契约 1.207（M5）：会话外观（None = 未设置，不发明缺省）。
                         conversation_color: row.get(18)?,
-                        custom_color: row.get(19)?,
+                        // customColor 官方是结构体：列里存 JSON 原文，读时解析。
+                        custom_color: row
+                            .get::<_, Option<String>>(19)?
+                            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok()),
                         custom_color_id: row.get(20)?,
                         auto_bubble_color: row.get::<_, i64>(21)? != 0,
                         wallpaper_preset: row.get(22)?,
-                        wallpaper_photo_pointer: row.get(23)?,
+                        wallpaper_photo_pointer_base64: row.get(23)?,
                         dim_wallpaper_in_dark_mode: row
                             .get::<_, Option<i64>>(24)?
                             .map(|value| value != 0),
@@ -6063,11 +6075,12 @@ impl Store {
         account_id: &str,
         conversation_id: &str,
         conversation_color: Option<&str>,
-        custom_color: Option<&str>,
+        // 官方 customColor 是结构体（Colors.std.ts:82-86）——收 Value 而非字符串。
+        custom_color: Option<&Value>,
         custom_color_id: Option<&str>,
         auto_bubble_color: bool,
         wallpaper_preset: Option<i64>,
-        wallpaper_photo_pointer: Option<&str>,
+        wallpaper_photo_pointer_base64: Option<&str>,
         dim_wallpaper_in_dark_mode: Option<bool>,
     ) -> Result<bool, StoreError> {
         let conn = self.lock_conn()?;
@@ -6076,17 +6089,18 @@ impl Store {
                 "UPDATE conversations SET
                     conversation_color=?3, custom_color=?4, custom_color_id=?5,
                     auto_bubble_color=?6, wallpaper_preset=?7,
-                    wallpaper_photo_pointer=?8, dim_wallpaper_in_dark_mode=?9
+                    wallpaper_photo_pointer_base64=?8, dim_wallpaper_in_dark_mode=?9
                   WHERE id=?1 AND account_id=?2",
                 params![
                     conversation_id,
                     account_id,
                     conversation_color,
-                    custom_color,
+                    // 结构体按 JSON 原文落列（读侧解析回 Value）。
+                    custom_color.map(|value| value.to_string()),
                     custom_color_id,
                     i64::from(auto_bubble_color),
                     wallpaper_preset,
-                    wallpaper_photo_pointer,
+                    wallpaper_photo_pointer_base64,
                     dim_wallpaper_in_dark_mode.map(i64::from),
                 ],
             )
@@ -6103,7 +6117,8 @@ impl Store {
     ) -> Result<
         Option<(
             Option<String>,
-            Option<String>,
+            // customColor 官方是结构体：读侧解析回 Value。
+            Option<Value>,
             Option<String>,
             bool,
             Option<i64>,
@@ -6115,14 +6130,15 @@ impl Store {
         self.lock_conn()?
             .query_row(
                 "SELECT conversation_color, custom_color, custom_color_id,
-                        auto_bubble_color, wallpaper_preset, wallpaper_photo_pointer,
-                        dim_wallpaper_in_dark_mode
+                        auto_bubble_color, wallpaper_preset,
+                        wallpaper_photo_pointer_base64, dim_wallpaper_in_dark_mode
                    FROM conversations WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
                 |row| {
                     Ok((
                         row.get(0)?,
-                        row.get(1)?,
+                        row.get::<_, Option<String>>(1)?
+                            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok()),
                         row.get(2)?,
                         row.get::<_, i64>(3)? != 0,
                         row.get(4)?,
@@ -6216,7 +6232,8 @@ impl Store {
         draft_attachments_json: Option<&str>,
         draft_body_ranges_json: Option<&str>,
         draft_is_view_once: bool,
-        draft_edit_target_timestamp: Option<u64>,
+        // 官方 DraftEditMessageType 整对象（六字段）——不是单个 target id。
+        draft_edit_message: Option<&Value>,
     ) -> Result<bool, StoreError> {
         let conn = self.lock_conn()?;
         let addressed: Option<i64> = conn
@@ -6234,7 +6251,7 @@ impl Store {
             "INSERT INTO conversation_drafts(
                 account_id, conversation_id, draft_timestamp, draft_body,
                 draft_attachments_json, draft_body_ranges_json,
-                draft_is_view_once, draft_edit_target_timestamp
+                draft_is_view_once, draft_edit_message_json
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(account_id, conversation_id) DO UPDATE SET
                draft_timestamp=excluded.draft_timestamp,
@@ -6242,7 +6259,7 @@ impl Store {
                draft_attachments_json=excluded.draft_attachments_json,
                draft_body_ranges_json=excluded.draft_body_ranges_json,
                draft_is_view_once=excluded.draft_is_view_once,
-               draft_edit_target_timestamp=excluded.draft_edit_target_timestamp",
+               draft_edit_message_json=excluded.draft_edit_message_json",
             params![
                 account_id,
                 conversation_id,
@@ -6251,7 +6268,7 @@ impl Store {
                 draft_attachments_json,
                 draft_body_ranges_json,
                 i64::from(draft_is_view_once),
-                draft_edit_target_timestamp.map(|value| value as i64),
+                draft_edit_message.map(|value| value.to_string()),
             ],
         )
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -6272,7 +6289,8 @@ impl Store {
             Option<String>,
             Option<String>,
             bool,
-            Option<u64>,
+            // 官方 DraftEditMessageType 整对象（六字段）。
+            Option<Value>,
         )>,
         StoreError,
     > {
@@ -6280,7 +6298,7 @@ impl Store {
             .query_row(
                 "SELECT draft_timestamp, draft_body, draft_attachments_json,
                         draft_body_ranges_json, draft_is_view_once,
-                        draft_edit_target_timestamp
+                        draft_edit_message_json
                    FROM conversation_drafts WHERE account_id=?1 AND conversation_id=?2",
                 params![account_id, conversation_id],
                 |row| {
@@ -6290,7 +6308,8 @@ impl Store {
                         row.get(2)?,
                         row.get(3)?,
                         row.get::<_, i64>(4)? != 0,
-                        row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                        row.get::<_, Option<String>>(5)?
+                            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok()),
                     ))
                 },
             )
@@ -9524,7 +9543,7 @@ impl Store {
                         notify_for_calls_if_muted, notify_for_mentions_if_muted,
                         notify_for_replies_if_muted, show_unread_reminders,
                         conversation_color, custom_color, custom_color_id, auto_bubble_color,
-                        wallpaper_preset, wallpaper_photo_pointer, dim_wallpaper_in_dark_mode,
+                        wallpaper_preset, wallpaper_photo_pointer_base64, dim_wallpaper_in_dark_mode,
                         color_from_primary
                  FROM conversations WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
@@ -9552,8 +9571,7 @@ impl Store {
                         system_name,
                         profile_name: None,
                         username,
-                        members: roster.as_ref().map(|(members, _)| members.clone()),
-                        member_count: roster.as_ref().map(|(_, count)| *count),
+                        members: roster.clone(),
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
                         last_message_direction: None,
@@ -9572,11 +9590,14 @@ impl Store {
                         show_unread_reminders: row.get::<_, i64>(17)? != 0,
                         // 契约 1.207（M5）：会话外观（None = 未设置，不发明缺省）。
                         conversation_color: row.get(18)?,
-                        custom_color: row.get(19)?,
+                        // customColor 官方是结构体：列里存 JSON 原文，读时解析。
+                        custom_color: row
+                            .get::<_, Option<String>>(19)?
+                            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok()),
                         custom_color_id: row.get(20)?,
                         auto_bubble_color: row.get::<_, i64>(21)? != 0,
                         wallpaper_preset: row.get(22)?,
-                        wallpaper_photo_pointer: row.get(23)?,
+                        wallpaper_photo_pointer_base64: row.get(23)?,
                         dim_wallpaper_in_dark_mode: row
                             .get::<_, Option<i64>>(24)?
                             .map(|value| value != 0),
@@ -11028,11 +11049,22 @@ fn prepare_state_dir(path: &Path) -> Result<(), StoreError> {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationMember {
-    pub id: String,
+    /// 官方 `GroupV2MemberType.aci`——成员协议身份（颜色表与 @ 候选的键）。
+    pub aci: String,
+    /// 官方 `GroupV2MemberType.role`：`unknown` / `default` / `administrator`
+    /// （proto `Member.Role` 三档）。捕获无 role 时缺席（不发明 default）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub uuid: Option<String>,
+    pub role: Option<&'static str>,
+    /// 官方 `GroupV2MemberType.joinedAtVersion`——加入时的群版本号。
+    /// 捕获无该键时缺席（不发明 0）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub joined_at_version: Option<u32>,
+    /// 官方 `GroupV2MemberType.labelString`——管理员给的成员标签文本。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_string: Option<String>,
+    /// 官方 `GroupV2MemberType.labelEmoji`——成员标签表情。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_emoji: Option<String>,
 }
 
 /// 契约 1.209：读该群的 captured 名册（`contacts.extra.members`）。
@@ -11047,7 +11079,7 @@ fn conversation_roster(
     account_id: &str,
     kind: &str,
     peer_key: &str,
-) -> Option<(Vec<ConversationMember>, u32)> {
+) -> Option<Vec<ConversationMember>> {
     if kind != "group" {
         return None;
     }
@@ -11067,10 +11099,17 @@ fn conversation_roster(
         .take(crate::service::MAX_GROUP_MEMBERS)
         .filter_map(|entry| {
             let object = entry.as_object()?;
-            let id = object.get("id").and_then(Value::as_str)?.trim();
-            if id.is_empty() {
-                return None;
-            }
+            // 官方 GroupV2MemberType.aci 是唯一必填身份键。捕获侧历史上
+            // 存的是 `id`（号码或 UUID 拼写）与 `uuid`（ACI）——按
+            // 「uuid 优先、id 兜底」映射到 aci 一列，**不再向 wire 透出
+            // 捕获的内部拼写**（capture shape ≠ protocol shape）。
+            let aci = ["uuid", "id"].iter().find_map(|key| {
+                object
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })?;
             let text = |key: &str| {
                 object
                     .get(key)
@@ -11079,19 +11118,36 @@ fn conversation_roster(
                     .filter(|value| !value.is_empty())
                     .map(str::to_owned)
             };
+            // role 官方三档（proto Member.Role）；捕获里可能是字符串或数字。
+            let role = object.get("role").and_then(|value| {
+                if let Some(text) = value.as_str() {
+                    return match text.trim().to_ascii_lowercase().as_str() {
+                        "administrator" => Some("administrator"),
+                        "default" => Some("default"),
+                        "unknown" => Some("unknown"),
+                        _ => None,
+                    };
+                }
+                match value.as_u64()? {
+                    2 => Some("administrator"),
+                    1 => Some("default"),
+                    0 => Some("unknown"),
+                    _ => None,
+                }
+            });
             Some(ConversationMember {
-                id: id.to_owned(),
-                uuid: text("uuid"),
-                name: text("name"),
+                aci: aci.to_owned(),
+                role,
+                joined_at_version: object
+                    .get("joinedAtVersion")
+                    .and_then(Value::as_u64)
+                    .map(|value| value.min(u32::MAX as u64) as u32),
+                label_string: text("labelString"),
+                label_emoji: text("labelEmoji"),
             })
         })
         .collect();
-    let member_count = parsed
-        .get("memberCount")
-        .and_then(Value::as_u64)
-        .map(|value| value.min(u32::MAX as u64) as u32)
-        .unwrap_or(members.len() as u32);
-    Some((members, member_count))
+    Some(members)
 }
 
 /// 会话命名梯（契约 1.203 / §4.203）：从 `contacts` 缓存读该 peer 的命名材料。
@@ -11802,7 +11858,7 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             ("custom_color_id", "TEXT"),
             ("auto_bubble_color", "INTEGER NOT NULL DEFAULT 1"),
             ("wallpaper_preset", "INTEGER"),
-            ("wallpaper_photo_pointer", "TEXT"),
+            ("wallpaper_photo_pointer_base64", "TEXT"),
             ("dim_wallpaper_in_dark_mode", "INTEGER"),
             ("color_from_primary", "INTEGER"),
         ] {
@@ -11845,7 +11901,7 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             ("draft_attachments_json", "TEXT"),
             ("draft_body_ranges_json", "TEXT"),
             ("draft_is_view_once", "INTEGER NOT NULL DEFAULT 0"),
-            ("draft_edit_target_timestamp", "INTEGER"),
+            ("draft_edit_message_json", "TEXT"),
         ] {
             if !table_has_column(conn, "conversation_drafts", column)? {
                 conn.execute(
@@ -12525,18 +12581,23 @@ mod tests {
             Some((None, None, None, true, None, None, None))
         );
 
-        // 写入自定义色 + 壁纸预设 + 深色变暗。
+        // 写入自定义色（官方 CustomColorType 结构体）+ 壁纸预设 + 深色变暗。
+        let custom = serde_json::json!({
+            "start": { "hue": 210, "saturation": 60, "lightness": 40 },
+            "end": { "hue": 220, "saturation": 55 },
+            "deg": 135
+        });
         assert!(
             store
                 .set_conversation_appearance(
                     &account.id,
                     &conversation.id,
-                    Some("BLUE"),
-                    Some("#1a2b3c"),
+                    Some("custom"),
+                    Some(&custom),
                     Some("custom-7"),
                     false,
                     Some(3),
-                    Some("pointer-abc"),
+                    Some("cG9pbnRlci1hYmM="),
                     Some(true),
                 )
                 .unwrap()
@@ -12546,12 +12607,13 @@ mod tests {
                 .conversation_appearance(&account.id, &conversation.id)
                 .unwrap(),
             Some((
-                Some("BLUE".to_owned()),
-                Some("#1a2b3c".to_owned()),
+                Some("custom".to_owned()),
+                // customColor 是结构体：往返必须保持对象形状（不是字符串）。
+                Some(custom.clone()),
                 Some("custom-7".to_owned()),
                 false,
                 Some(3),
-                Some("pointer-abc".to_owned()),
+                Some("cG9pbnRlci1hYmM=".to_owned()),
                 Some(true),
             ))
         );
@@ -12779,7 +12841,11 @@ mod tests {
                 Some(r#"[{"id":"a1"}]"#),
                 Some(r#"[{"start":0,"length":2}]"#),
                 true,
-                Some(1_699_999_000_000),
+                Some(&serde_json::json!({
+                    "editHistoryLength": 2,
+                    "body": "改过的内容",
+                    "targetMessageId": "msg-target-1"
+                })),
             )
             .unwrap();
         assert!(saved, "会话存在 → 保存成功");
@@ -12793,7 +12859,15 @@ mod tests {
         assert_eq!(attachments.as_deref(), Some(r#"[{"id":"a1"}]"#));
         assert_eq!(ranges.as_deref(), Some(r#"[{"start":0,"length":2}]"#));
         assert!(view_once, "viewOnce 位持久化");
-        assert_eq!(edit_target, Some(1_699_999_000_000), "编辑目标时间戳");
+        // 官方 DraftEditMessageType 是六字段对象：往返必须保持完整形状，
+        // 而不是只留一个 target id（审计项 #6）。
+        let edit_target = edit_target.expect("edit message present");
+        assert_eq!(edit_target["editHistoryLength"], serde_json::json!(2));
+        assert_eq!(edit_target["body"], serde_json::json!("改过的内容"));
+        assert_eq!(
+            edit_target["targetMessageId"],
+            serde_json::json!("msg-target-1")
+        );
 
         // 覆盖写：正文清空但时间戳推进（官方 draftChanged 语义）。
         store
@@ -12885,14 +12959,14 @@ mod tests {
         let account = store
             .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
-        // ① 有完整名册的群（uuid + name 都在）。
+        // ① 有完整官方五字段名册的群（aci/role/joinedAtVersion/labelString/labelEmoji）。
         store
             .upsert_contact(
                 &account.id,
                 "group",
                 "group-key-a",
                 "Team A",
-                Some(r#"{"memberCount":2,"members":[{"id":"+15555550101","uuid":"aci-1","name":"Alice"},{"id":"+15555550102","uuid":"aci-2"}]}"#),
+                Some(r#"{"members":[{"uuid":"aci-1","role":"administrator","joinedAtVersion":7,"labelString":"lead","labelEmoji":"⭐"},{"uuid":"aci-2","role":1}]}"#),
                 10,
             )
             .unwrap();
@@ -12935,25 +13009,36 @@ mod tests {
                 .expect("row present")
         };
 
-        // ① 完整名册：成员逐字段投影，memberCount 取捕获值。
+        // ① 完整名册：按官方 GroupV2MemberType 五字段投影。
         let a = by_title("Team A");
         let members = a["members"].as_array().expect("members array");
         assert_eq!(members.len(), 2);
-        assert_eq!(members[0]["id"], serde_json::json!("+15555550101"));
-        assert_eq!(members[0]["uuid"], serde_json::json!("aci-1"));
-        assert_eq!(members[0]["name"], serde_json::json!("Alice"));
-        // 第二成员无 name → 键缺席（不是空串）。
-        assert!(members[1].get("name").is_none());
-        assert_eq!(a["memberCount"], serde_json::json!(2));
+        // aci 是唯一必填身份键（uuid 优先映射）。
+        assert_eq!(members[0]["aci"], serde_json::json!("aci-1"));
+        assert_eq!(members[0]["role"], serde_json::json!("administrator"));
+        assert_eq!(members[0]["joinedAtVersion"], serde_json::json!(7));
+        assert_eq!(members[0]["labelString"], serde_json::json!("lead"));
+        assert_eq!(members[0]["labelEmoji"], serde_json::json!("⭐"));
+        // 第二成员：role 用 proto 数字 1 → 归一化成 "default"；
+        // 其余三键捕获没有 → 缺席（不发明）。
+        assert_eq!(members[1]["aci"], serde_json::json!("aci-2"));
+        assert_eq!(members[1]["role"], serde_json::json!("default"));
+        assert!(members[1].get("joinedAtVersion").is_none());
+        assert!(members[1].get("labelString").is_none());
+        assert!(members[1].get("labelEmoji").is_none());
+        // 官方无 memberCount 字段——本项目不自造（审计项 #1）。
+        assert!(
+            a.get("memberCount").is_none(),
+            "memberCount 是自造字段，已删"
+        );
 
         // ② 空名册：照实给空数组（捕获说了零成员）。
         let b = by_title("Team B");
         assert_eq!(b["members"].as_array().map(|items| items.len()), Some(0));
 
-        // ③ 无 extra：名册未知 → 两键都缺席（不回空数组冒充已知为空）。
+        // ③ 无 extra：名册未知 → members 键缺席（不回空数组冒充已知为空）。
         let c = by_title("Team C");
         assert!(c.get("members").is_none(), "无名册必须缺席");
-        assert!(c.get("memberCount").is_none());
 
         // ④ 直聊行恒不带名册。
         let direct = by_title("Peer");
