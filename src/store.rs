@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 34;
+const SCHEMA_VERSION: i64 = 35;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -337,6 +337,14 @@ CREATE TABLE IF NOT EXISTS conversation_drafts (
   account_id TEXT NOT NULL,
   conversation_id TEXT NOT NULL,
   draft_timestamp INTEGER NOT NULL,
+  -- 契约 1.205（M5）：草稿的完整面。官方 ConversationAttributesType 带
+  -- draft / draftAttachments / draftBodyRanges / draftIsViewOnce / draftEditMessage
+  -- 五个字段；本表此前**只存时间戳**，正文只活在桌面本地——跨设备/重装即丢。
+  draft_body TEXT,
+  draft_attachments_json TEXT,
+  draft_body_ranges_json TEXT,
+  draft_is_view_once INTEGER NOT NULL DEFAULT 0,
+  draft_edit_target_timestamp INTEGER,
   PRIMARY KEY(account_id, conversation_id),
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
   FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
@@ -5924,6 +5932,105 @@ impl Store {
         Ok(true)
     }
 
+    /// 契约 1.205（M5）：保存草稿的**完整面**——官方 ConversationAttributesType
+    /// 的 draft / draftAttachments / draftBodyRanges / draftIsViewOnce /
+    /// draftEditMessage 五字段对位。
+    ///
+    /// 与 `save_conversation_draft`（body-free，只记时钟）并存而非替换：
+    /// 旧方法保持原有纪律（桌面自己保管正文），本方法供**需要跨设备/重装
+    /// 不丢**的场景显式调用。正文面全部可选——传 None 就是「该面没有内容」，
+    /// 与缺席同义（no-null 纪律）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_conversation_draft_full(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        draft_timestamp: u64,
+        draft_body: Option<&str>,
+        draft_attachments_json: Option<&str>,
+        draft_body_ranges_json: Option<&str>,
+        draft_is_view_once: bool,
+        draft_edit_target_timestamp: Option<u64>,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let addressed: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM conversations WHERE id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if addressed.is_none() {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO conversation_drafts(
+                account_id, conversation_id, draft_timestamp, draft_body,
+                draft_attachments_json, draft_body_ranges_json,
+                draft_is_view_once, draft_edit_target_timestamp
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(account_id, conversation_id) DO UPDATE SET
+               draft_timestamp=excluded.draft_timestamp,
+               draft_body=excluded.draft_body,
+               draft_attachments_json=excluded.draft_attachments_json,
+               draft_body_ranges_json=excluded.draft_body_ranges_json,
+               draft_is_view_once=excluded.draft_is_view_once,
+               draft_edit_target_timestamp=excluded.draft_edit_target_timestamp",
+            params![
+                account_id,
+                conversation_id,
+                draft_timestamp as i64,
+                draft_body,
+                draft_attachments_json,
+                draft_body_ranges_json,
+                i64::from(draft_is_view_once),
+                draft_edit_target_timestamp.map(|value| value as i64),
+            ],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(true)
+    }
+
+    /// 契约 1.205（M5）：读回草稿完整面——(timestamp, body, attachmentsJson,
+    /// bodyRangesJson, isViewOnce, editTargetTimestamp)。无草稿 → None。
+    #[allow(clippy::type_complexity)]
+    pub fn conversation_draft_full(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<
+        Option<(
+            u64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<u64>,
+        )>,
+        StoreError,
+    > {
+        self.lock_conn()?
+            .query_row(
+                "SELECT draft_timestamp, draft_body, draft_attachments_json,
+                        draft_body_ranges_json, draft_is_view_once,
+                        draft_edit_target_timestamp
+                   FROM conversation_drafts WHERE account_id=?1 AND conversation_id=?2",
+                params![account_id, conversation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get::<_, i64>(4)? != 0,
+                        row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
     /// Contract 1.138 (§4.130): clear the conversation's draft stamp — the
     /// official DraftRepository's delete, body-free like the save. Idempotent:
     /// clearing a conversation with no draft still answers whether the
@@ -11318,6 +11425,27 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         conn.execute(&sql, [])
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
+    if current < 35 {
+        // 契约 1.205（M5）：conversation_drafts 补草稿完整面——官方
+        // ConversationAttributesType 的 draft / draftAttachments / draftBodyRanges /
+        // draftIsViewOnce / draftEditMessage 五字段对位。老库只存时间戳，正文仅
+        // 活在桌面本地；补列后草稿才真正持久化（跨设备/重装不丢）。
+        for (column, kind) in [
+            ("draft_body", "TEXT"),
+            ("draft_attachments_json", "TEXT"),
+            ("draft_body_ranges_json", "TEXT"),
+            ("draft_is_view_once", "INTEGER NOT NULL DEFAULT 0"),
+            ("draft_edit_target_timestamp", "INTEGER"),
+        ] {
+            if !table_has_column(conn, "conversation_drafts", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE conversation_drafts ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+    }
     if current < 34 {
         // Contract 1.201 cleanup, corrected scope. The 33 pass only removed empty
         // direct rows keyed by another account's own number or ACI. On the real
@@ -11379,6 +11507,8 @@ fn table_has_column(
         "messages" => "PRAGMA table_info(messages)",
         "message_events" => "PRAGMA table_info(message_events)",
         "history_import_stage_chats" => "PRAGMA table_info(history_import_stage_chats)",
+        // 契约 1.205（M5）：草稿完整面的补列迁移需要探测本表。
+        "conversation_drafts" => "PRAGMA table_info(conversation_drafts)",
         _ => return Err(StoreError::Unavailable(None)),
     };
     let mut stmt = conn
@@ -11965,6 +12095,91 @@ mod tests {
             .unwrap();
     }
 
+    /// 契约 1.205（M5）：草稿完整面持久化——官方 ConversationAttributesType 的
+    /// draft/draftAttachments/draftBodyRanges/draftIsViewOnce/draftEditMessage
+    /// 五字段。此前只存时间戳（正文仅活在桌面本地，跨设备/重装即丢）。
+    #[test]
+    fn conversation_draft_persists_the_full_surface() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        // 无草稿时读面为 None（缺席不发明）。
+        assert!(
+            store
+                .conversation_draft_full(&account.id, &conversation.id)
+                .unwrap()
+                .is_none()
+        );
+
+        // 全字段写入。
+        let saved = store
+            .save_conversation_draft_full(
+                &account.id,
+                &conversation.id,
+                1_700_000_000_000,
+                Some("写了一半的话"),
+                Some(r#"[{"id":"a1"}]"#),
+                Some(r#"[{"start":0,"length":2}]"#),
+                true,
+                Some(1_699_999_000_000),
+            )
+            .unwrap();
+        assert!(saved, "会话存在 → 保存成功");
+
+        let (ts, body, attachments, ranges, view_once, edit_target) = store
+            .conversation_draft_full(&account.id, &conversation.id)
+            .unwrap()
+            .expect("draft present");
+        assert_eq!(ts, 1_700_000_000_000, "时间戳原样往返");
+        assert_eq!(body.as_deref(), Some("写了一半的话"), "正文持久化");
+        assert_eq!(attachments.as_deref(), Some(r#"[{"id":"a1"}]"#));
+        assert_eq!(ranges.as_deref(), Some(r#"[{"start":0,"length":2}]"#));
+        assert!(view_once, "viewOnce 位持久化");
+        assert_eq!(edit_target, Some(1_699_999_000_000), "编辑目标时间戳");
+
+        // 覆盖写：正文清空但时间戳推进（官方 draftChanged 语义）。
+        store
+            .save_conversation_draft_full(
+                &account.id,
+                &conversation.id,
+                1_700_000_100_000,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        let (ts, body, _, _, view_once, _) = store
+            .conversation_draft_full(&account.id, &conversation.id)
+            .unwrap()
+            .expect("draft still present");
+        assert_eq!(ts, 1_700_000_100_000, "时间戳推进");
+        assert!(body.is_none(), "正文清空");
+        assert!(!view_once, "viewOnce 复位");
+
+        // 不存在的会话 → false（调用方答 CONVERSATION_NOT_FOUND）。
+        assert!(
+            !store
+                .save_conversation_draft_full(
+                    &account.id,
+                    "missing-conversation",
+                    1,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap()
+        );
+    }
     /// 契约 1.204（M4b）：以锚点为中心取窗——官方
     /// `getConversationRangeCenteredOnMessage` 对位。验证三段的边界语义：
     /// 升序、锚在位、两侧按 limit 均分、锚缺席诚实拒。
