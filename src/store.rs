@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 36;
+const SCHEMA_VERSION: i64 = 37;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -217,6 +217,18 @@ CREATE TABLE IF NOT EXISTS conversations (
   notify_for_mentions_if_muted INTEGER NOT NULL DEFAULT 0,
   notify_for_replies_if_muted INTEGER NOT NULL DEFAULT 0,
   show_unread_reminders INTEGER NOT NULL DEFAULT 0,
+  -- 契约 1.207（M5）：会话外观。官方 ConversationAttributesType 八字段
+  -- （color / colorFromPrimary / conversationColor / customColor / customColorId /
+  -- autoBubbleColor / wallpaperPreset / dimWallpaperInDarkMode）。KT 此前全缺——
+  -- 桌面每次重算派生色，用户自定义无家可归、跨设备不同步。存官方词表原值。
+  conversation_color TEXT,
+  custom_color TEXT,
+  custom_color_id TEXT,
+  auto_bubble_color INTEGER NOT NULL DEFAULT 1,
+  wallpaper_preset INTEGER,
+  wallpaper_photo_pointer TEXT,
+  dim_wallpaper_in_dark_mode INTEGER,
+  color_from_primary INTEGER,
   mrr_factors_json TEXT,
   read_watermark_ms INTEGER,
   report_spam_token TEXT,
@@ -735,6 +747,24 @@ pub struct ConversationSummary {
     pub notify_for_replies_if_muted: bool,
     pub show_unread_reminders: bool,
     pub pinned: bool,
+    /// 契约 1.207（M5）：会话外观——官方 color / conversationColor /
+    /// customColor / customColorId / autoBubbleColor / wallpaperPreset /
+    /// wallpaperPhotoPointerBase64 / dimWallpaperInDarkMode 对位。
+    /// 存官方词表原值（不解释、不归一化）；None = 未设置（不发明缺省）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_color_id: Option<String>,
+    /// 官方缺省 true（跟随系统气泡色）——恒序列化，两种取值都有意义。
+    pub auto_bubble_color: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallpaper_preset: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallpaper_photo_pointer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dim_wallpaper_in_dark_mode: Option<bool>,
     /// Contract 1.33: the conversation's current pinned message, projected
     /// from `conversation_pins` so a reloaded window renders the pin bar
     /// without replaying events. Absent when nothing is pinned, the pin
@@ -3816,7 +3846,10 @@ impl Store {
                         unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key,
                         mrr_factors_json, read_watermark_ms,
                         notify_for_calls_if_muted, notify_for_mentions_if_muted,
-                        notify_for_replies_if_muted, show_unread_reminders
+                        notify_for_replies_if_muted, show_unread_reminders,
+                        conversation_color, custom_color, custom_color_id, auto_bubble_color,
+                        wallpaper_preset, wallpaper_photo_pointer, dim_wallpaper_in_dark_mode,
+                        color_from_primary
                  FROM conversations
                  WHERE account_id=?1
                    AND (
@@ -3882,6 +3915,16 @@ impl Store {
                         notify_for_mentions_if_muted: row.get::<_, i64>(15)? != 0,
                         notify_for_replies_if_muted: row.get::<_, i64>(16)? != 0,
                         show_unread_reminders: row.get::<_, i64>(17)? != 0,
+                        // 契约 1.207（M5）：会话外观（None = 未设置，不发明缺省）。
+                        conversation_color: row.get(18)?,
+                        custom_color: row.get(19)?,
+                        custom_color_id: row.get(20)?,
+                        auto_bubble_color: row.get::<_, i64>(21)? != 0,
+                        wallpaper_preset: row.get(22)?,
+                        wallpaper_photo_pointer: row.get(23)?,
+                        dim_wallpaper_in_dark_mode: row
+                            .get::<_, Option<i64>>(24)?
+                            .map(|value| value != 0),
                         pinned: row.get::<_, i64>(9)? != 0,
                         pinned_message: None,
                         pinned_messages: Vec::new(),
@@ -5956,6 +5999,87 @@ impl Store {
         Ok(true)
     }
 
+    /// 契约 1.207（M5）：写入会话外观——官方八个字段对位。
+    ///
+    /// 全量覆盖语义（官方整体写这四个 appearance 属性）；None = 清除该面。
+    /// 返回是否命中会话（未命中 → 调用方答 CONVERSATION_NOT_FOUND）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_conversation_appearance(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        conversation_color: Option<&str>,
+        custom_color: Option<&str>,
+        custom_color_id: Option<&str>,
+        auto_bubble_color: bool,
+        wallpaper_preset: Option<i64>,
+        wallpaper_photo_pointer: Option<&str>,
+        dim_wallpaper_in_dark_mode: Option<bool>,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let changed = conn
+            .execute(
+                "UPDATE conversations SET
+                    conversation_color=?3, custom_color=?4, custom_color_id=?5,
+                    auto_bubble_color=?6, wallpaper_preset=?7,
+                    wallpaper_photo_pointer=?8, dim_wallpaper_in_dark_mode=?9
+                  WHERE id=?1 AND account_id=?2",
+                params![
+                    conversation_id,
+                    account_id,
+                    conversation_color,
+                    custom_color,
+                    custom_color_id,
+                    i64::from(auto_bubble_color),
+                    wallpaper_preset,
+                    wallpaper_photo_pointer,
+                    dim_wallpaper_in_dark_mode.map(i64::from),
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed > 0)
+    }
+
+    /// 契约 1.207（M5）：读回会话外观。未命中答 None（缺席 = 未知）。
+    #[allow(clippy::type_complexity)]
+    pub fn conversation_appearance(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<
+        Option<(
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<i64>,
+            Option<String>,
+            Option<bool>,
+        )>,
+        StoreError,
+    > {
+        self.lock_conn()?
+            .query_row(
+                "SELECT conversation_color, custom_color, custom_color_id,
+                        auto_bubble_color, wallpaper_preset, wallpaper_photo_pointer,
+                        dim_wallpaper_in_dark_mode
+                   FROM conversations WHERE id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
     /// 契约 1.206（M5）：写入会话的通知细分四开关——官方
     /// `notifyForCallsIfMuted` / `notifyForMentionsIfMuted` /
     /// `notifyForRepliesIfMuted` / `showUnreadReminders` 对位。
@@ -9344,7 +9468,10 @@ impl Store {
                         unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key,
                         mrr_factors_json, read_watermark_ms,
                         notify_for_calls_if_muted, notify_for_mentions_if_muted,
-                        notify_for_replies_if_muted, show_unread_reminders
+                        notify_for_replies_if_muted, show_unread_reminders,
+                        conversation_color, custom_color, custom_color_id, auto_bubble_color,
+                        wallpaper_preset, wallpaper_photo_pointer, dim_wallpaper_in_dark_mode,
+                        color_from_primary
                  FROM conversations WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
                 |row| {
@@ -9385,6 +9512,16 @@ impl Store {
                         notify_for_mentions_if_muted: row.get::<_, i64>(15)? != 0,
                         notify_for_replies_if_muted: row.get::<_, i64>(16)? != 0,
                         show_unread_reminders: row.get::<_, i64>(17)? != 0,
+                        // 契约 1.207（M5）：会话外观（None = 未设置，不发明缺省）。
+                        conversation_color: row.get(18)?,
+                        custom_color: row.get(19)?,
+                        custom_color_id: row.get(20)?,
+                        auto_bubble_color: row.get::<_, i64>(21)? != 0,
+                        wallpaper_preset: row.get(22)?,
+                        wallpaper_photo_pointer: row.get(23)?,
+                        dim_wallpaper_in_dark_mode: row
+                            .get::<_, Option<i64>>(24)?
+                            .map(|value| value != 0),
                         pinned: row.get::<_, i64>(9)? != 0,
                         pinned_message: None,
                         pinned_messages: Vec::new(),
@@ -11520,6 +11657,31 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         conn.execute(&sql, [])
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
+    if current < 37 {
+        // 契约 1.207（M5）：conversations 补会话外观八列——官方 color /
+        // colorFromPrimary / conversationColor / customColor / customColorId /
+        // autoBubbleColor / wallpaperPreset / dimWallpaperInDarkMode 对位。
+        // auto_bubble_color 官方缺省 true（跟随系统气泡色）故 DEFAULT 1；
+        // 其余 NULL（无自定义 = 无值，不发明）。
+        for (column, kind) in [
+            ("conversation_color", "TEXT"),
+            ("custom_color", "TEXT"),
+            ("custom_color_id", "TEXT"),
+            ("auto_bubble_color", "INTEGER NOT NULL DEFAULT 1"),
+            ("wallpaper_preset", "INTEGER"),
+            ("wallpaper_photo_pointer", "TEXT"),
+            ("dim_wallpaper_in_dark_mode", "INTEGER"),
+            ("color_from_primary", "INTEGER"),
+        ] {
+            if !table_has_column(conn, "conversations", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE conversations ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+    }
     if current < 36 {
         // 契约 1.206（M5）：conversations 补通知细分四开关——官方
         // notifyForCallsIfMuted / notifyForMentionsIfMuted /
@@ -12210,6 +12372,103 @@ mod tests {
             .unwrap();
     }
 
+    /// 契约 1.207（M5）：会话外观八字段——官方 ConversationAttributesType 对位。
+    #[test]
+    fn conversation_appearance_round_trip() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        // 默认：外观全 None，但 autoBubbleColor 缺省 true（官方缺省）。
+        assert_eq!(
+            store
+                .conversation_appearance(&account.id, &conversation.id)
+                .unwrap(),
+            Some((None, None, None, true, None, None, None))
+        );
+
+        // 写入自定义色 + 壁纸预设 + 深色变暗。
+        assert!(
+            store
+                .set_conversation_appearance(
+                    &account.id,
+                    &conversation.id,
+                    Some("BLUE"),
+                    Some("#1a2b3c"),
+                    Some("custom-7"),
+                    false,
+                    Some(3),
+                    Some("pointer-abc"),
+                    Some(true),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .conversation_appearance(&account.id, &conversation.id)
+                .unwrap(),
+            Some((
+                Some("BLUE".to_owned()),
+                Some("#1a2b3c".to_owned()),
+                Some("custom-7".to_owned()),
+                false,
+                Some(3),
+                Some("pointer-abc".to_owned()),
+                Some(true),
+            ))
+        );
+
+        // 全量覆盖清空：None 全部生效（不是部分更新）。
+        assert!(
+            store
+                .set_conversation_appearance(
+                    &account.id,
+                    &conversation.id,
+                    None,
+                    None,
+                    None,
+                    true,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .conversation_appearance(&account.id, &conversation.id)
+                .unwrap(),
+            Some((None, None, None, true, None, None, None))
+        );
+
+        // 未命中会话：写答 false、读答 None。
+        assert!(
+            !store
+                .set_conversation_appearance(
+                    &account.id,
+                    "missing",
+                    Some("RED"),
+                    None,
+                    None,
+                    true,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .conversation_appearance(&account.id, "missing")
+                .unwrap(),
+            None
+        );
+    }
     /// 契约 1.206（M5）：通知细分四开关——与 muted 正交（muted 是总闸，
     /// 这四个是「静音之后仍要提醒什么」）。官方 ConversationAttributesType 同形。
     #[test]
