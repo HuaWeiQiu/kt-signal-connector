@@ -67,6 +67,24 @@
   recorded in `docs/last-moments-redaction-audit.md`; the engine worktree is
   outside this repository and the fix lands there.)
 =======
+- Contract revision: 1.209 (2026-10-20; §4.209 the group roster
+  projection: an official conversation carries `membersV2`
+  (`model-types.d.ts`), the client's single source for member lists,
+  permission ladders, @-mention candidates, the naming ladder's third
+  rung and the session colour table (`conversations.dom.ts:1168-1183`
+  sorts exactly `membersV2`). KT captured the roster inside the
+  `contacts` row's `extra` JSON (`{memberCount, members:[{id,uuid,name?}]}`,
+  the §4.50 appendix), so the desktop had to open a second read face to
+  see it and the colour/naming consumers ran without it. This revision
+  projects the roster **on `conversations.list`** as an optional
+  `members` array plus `memberCount`, additively: each entry carries
+  `id` (the stored identity spelling), optional `uuid` (the ACI the
+  colour table and mention candidates key on) and optional `name`.
+  **Absent means the store holds no roster** (a pre-1.209 sync, a
+  malformed capture, or a direct conversation) — never an empty array
+  pretending to be known, never a guessed member. Bounded by
+  `MAX_GROUP_MEMBERS` (the same cap the capture takes). Wire additive;
+  no schema change (the material already lives in `contacts.extra`).
 - Contract revision: 1.203 (2026-10-20; §4.203 the conversation naming
   ladder: an official conversation carries the **full naming chain**
   (`systemGivenName` / `nicknameGivenName` / `profileName` / `username`)

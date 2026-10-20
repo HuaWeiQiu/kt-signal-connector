@@ -677,6 +677,17 @@ pub struct ConversationSummary {
     pub profile_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// 契约 1.209（§4.209）：群名册——官方 `membersV2` 的投影。
+    /// 客户端的成员列表、权限梯、@ 候选、命名梯第三源、**颜色表排序**全吃
+    /// 这一份（官方 `conversations.dom.ts:1168-1183` 只对 `membersV2` 排序）。
+    ///
+    /// **缺席 = 名册未知**（pre-1.209 同步、捕获损坏、或直聊行）——绝不回空
+    /// 数组冒充「已知且为空」。有界：`MAX_GROUP_MEMBERS`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<ConversationMember>>,
+    /// 契约 1.209：服务端捕获的成员计数（官方 `memberCount`）。缺席同上。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_preview: Option<String>,
     /// Contract 1.23: attachment category noun for the desktop list preview —
@@ -3891,6 +3902,8 @@ impl Store {
                     // 契约 1.203：命名梯材料（缺席 = 未知，绝不猜）。
                     let (system_name, username) =
                         conversation_naming_material(&conn, account_id, kind, &peer_key);
+                    // 契约 1.209：群名册（官方 membersV2 投影；缺席 = 未知）。
+                    let roster = conversation_roster(&conn, account_id, kind, &peer_key);
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
@@ -3899,6 +3912,8 @@ impl Store {
                         system_name,
                         profile_name: None,
                         username,
+                        members: roster.as_ref().map(|(members, _)| members.clone()),
+                        member_count: roster.as_ref().map(|(_, count)| *count),
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
                         last_message_direction: None,
@@ -9527,6 +9542,8 @@ impl Store {
                     // 契约 1.203：命名梯材料（缺席 = 未知，绝不猜）。
                     let (system_name, username) =
                         conversation_naming_material(&conn, account_id, kind, &peer_key);
+                    // 契约 1.209：群名册（官方 membersV2 投影；缺席 = 未知）。
+                    let roster = conversation_roster(&conn, account_id, kind, &peer_key);
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
@@ -9535,6 +9552,8 @@ impl Store {
                         system_name,
                         profile_name: None,
                         username,
+                        members: roster.as_ref().map(|(members, _)| members.clone()),
+                        member_count: roster.as_ref().map(|(_, count)| *count),
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
                         last_message_direction: None,
@@ -10998,6 +11017,81 @@ fn prepare_state_dir(path: &Path) -> Result<(), StoreError> {
             .map_err(|error| StoreError::InvalidStateDir(Some(error)))?;
     }
     Ok(())
+}
+
+/// 会话名册成员（契约 1.209 / §4.209）：官方 `membersV2` 的投影面。
+///
+/// 三键全部来自 `contacts.extra` 的 `members` 捕获，不推导：
+/// - `id`：捕获里存的身份拼写（号码或 UUID）；
+/// - `uuid`：ACI（颜色表与 @ 候选的键），捕获无该键时缺席；
+/// - `name`：捕获随行的名字，无则缺席。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationMember {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// 契约 1.209：读该群的 captured 名册（`contacts.extra.members`）。
+///
+/// 返回 `(members, memberCount)`；下列情形一律 `None`（**缺席 = 名册未知**，
+/// 绝不回空数组冒充「已知且为空」）：非群行、无 contacts 行、extra 无
+/// `members` 键、JSON 解析失败。捕获明确给空数组时照实返回。
+///
+/// 有界：按 `MAX_GROUP_MEMBERS` 截断（与捕获侧同一个帽子）。
+fn conversation_roster(
+    conn: &Connection,
+    account_id: &str,
+    kind: &str,
+    peer_key: &str,
+) -> Option<(Vec<ConversationMember>, u32)> {
+    if kind != "group" {
+        return None;
+    }
+    // query_row 返回 Result<Option<String>>（行内列可为 NULL）→ .ok() 收敛读取
+    // 失败，?? 展开两层：无行 / 列 NULL 都归 None（名册未知）。
+    let extra: Option<String> = conn
+        .query_row(
+            "SELECT extra FROM contacts WHERE account_id=?1 AND kind='group' AND peer_key=?2",
+            params![account_id, peer_key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()?;
+    let parsed = serde_json::from_str::<Value>(extra.as_deref()?).ok()?;
+    let raw_members = parsed.get("members")?.as_array()?;
+    let members: Vec<ConversationMember> = raw_members
+        .iter()
+        .take(crate::service::MAX_GROUP_MEMBERS)
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let id = object.get("id").and_then(Value::as_str)?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let text = |key: &str| {
+                object
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            };
+            Some(ConversationMember {
+                id: id.to_owned(),
+                uuid: text("uuid"),
+                name: text("name"),
+            })
+        })
+        .collect();
+    let member_count = parsed
+        .get("memberCount")
+        .and_then(Value::as_u64)
+        .map(|value| value.min(u32::MAX as u64) as u32)
+        .unwrap_or(members.len() as u32);
+    Some((members, member_count))
 }
 
 /// 会话命名梯（契约 1.203 / §4.203）：从 `contacts` 缓存读该 peer 的命名材料。
@@ -12780,6 +12874,90 @@ mod tests {
             store.list_messages_around(&account.id, &conversation.id, "missing", 9),
             Err(StoreError::InvalidCursor)
         ));
+    }
+
+    /// 契约 1.209（§4.209）：群名册投影——官方 membersV2 对位。
+    /// 核心纪律：**缺席 = 名册未知**，绝不回空数组冒充「已知且为空」。
+    #[test]
+    fn conversation_summary_projects_the_group_roster() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        // ① 有完整名册的群（uuid + name 都在）。
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "group-key-a",
+                "Team A",
+                Some(r#"{"memberCount":2,"members":[{"id":"+15555550101","uuid":"aci-1","name":"Alice"},{"id":"+15555550102","uuid":"aci-2"}]}"#),
+                10,
+            )
+            .unwrap();
+        // ② 有成员字段但为空的群（捕获明确说「零成员」——照实返回空数组）。
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "group-key-b",
+                "Team B",
+                Some(r#"{"members":[]}"#),
+                10,
+            )
+            .unwrap();
+        // ③ 无 extra 的群（名册未知）。
+        store
+            .upsert_contact(&account.id, "group", "group-key-c", "Team C", None, 10)
+            .unwrap();
+
+        store
+            .ensure_conversation(&account.id, "group", "group-key-a", "Team A")
+            .unwrap();
+        store
+            .ensure_conversation(&account.id, "group", "group-key-b", "Team B")
+            .unwrap();
+        store
+            .ensure_conversation(&account.id, "group", "group-key-c", "Team C")
+            .unwrap();
+        // ④ 直聊行（永不带名册）。
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550109", "Peer")
+            .unwrap();
+
+        let page = store.list_conversations(&account.id, 20, None).unwrap();
+        let by_title = |title: &str| {
+            page.items
+                .iter()
+                .find(|row| row.title == title)
+                .map(|row| serde_json::to_value(row).unwrap())
+                .expect("row present")
+        };
+
+        // ① 完整名册：成员逐字段投影，memberCount 取捕获值。
+        let a = by_title("Team A");
+        let members = a["members"].as_array().expect("members array");
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0]["id"], serde_json::json!("+15555550101"));
+        assert_eq!(members[0]["uuid"], serde_json::json!("aci-1"));
+        assert_eq!(members[0]["name"], serde_json::json!("Alice"));
+        // 第二成员无 name → 键缺席（不是空串）。
+        assert!(members[1].get("name").is_none());
+        assert_eq!(a["memberCount"], serde_json::json!(2));
+
+        // ② 空名册：照实给空数组（捕获说了零成员）。
+        let b = by_title("Team B");
+        assert_eq!(b["members"].as_array().map(|items| items.len()), Some(0));
+
+        // ③ 无 extra：名册未知 → 两键都缺席（不回空数组冒充已知为空）。
+        let c = by_title("Team C");
+        assert!(c.get("members").is_none(), "无名册必须缺席");
+        assert!(c.get("memberCount").is_none());
+
+        // ④ 直聊行恒不带名册。
+        let direct = by_title("Peer");
+        assert!(direct.get("members").is_none());
     }
     /// 契约 1.203（§4.203）：会话命名梯材料——systemName 取通讯录 title、
     /// username 取 contacts.extra；掩码/占位不算材料；全 miss 三键皆缺席。
