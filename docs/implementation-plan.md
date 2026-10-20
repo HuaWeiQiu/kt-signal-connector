@@ -67,6 +67,57 @@
   recorded in `docs/last-moments-redaction-audit.md`; the engine worktree is
   outside this repository and the fix lands there.)
 =======
+  §4.215 **`bodyAttachment` is deferred, not forgotten.** The official
+  client carries long-message bodies as `dataMessage.bodyAttachment`
+  (`AttachmentPointer`, `contentType: LONG_MESSAGE`) beside a `body`
+  preview. The proto pinned for this build (`libsignal-service-rs`
+  `7aa4909`) has **no `bodyAttachment` field on `DataMessage`** — its
+  full list is body/attachments/quote/contact/preview/sticker/reaction/
+  delete/payment. So the receive face cannot project it and the send
+  face cannot emit it at this pin: any local projection would not
+  compile. Closing this needs a **proto pin upgrade (or a vendored
+  field) first** — an ADR-level protocol dependency change — followed by
+  the engine projection, a connector storage face, and the desktop
+  download flow. Meanwhile KT's outbound long-text already works through
+  the generic attachment array (`text/plain` / `message.txt`), which an
+  official peer renders as an ordinary text attachment rather than the
+  official long-message affordance — interoperable, differently shaped.
+- Contract revision: 1.213 (2026-10-20; §4.213 the identity-key ledger, and
+  §4.214 the read-status mapping — two **documentation-only** entries from
+  the projection audit (`SIGNAL-PROJECTION-DRIFT-AUDIT.md`). No wire or
+  schema change in either.
+
+  §4.213 **Identity keys across the four layers.** The official client has
+  exactly one author identity: `sourceServiceId` (ACI) beside the legacy
+  `source` (E.164). KT spells the same idea four ways:
+  `sourceUuid` (engine envelope) → `author_aci` (store column) →
+  `authorAci` (wire) — with the store-level `sender_id` privacy hash
+  running alongside as a *different* concept (the §4.202 category
+  confusion). This entry fixes the vocabulary so new consumers stop
+  guessing: **`authorAci` ≡ official `sourceServiceId`** (protocol
+  identity, the name-lookup key), and **`senderId` ≡ the store's local
+  ingest hash** (row identity only — never a name key, never a colour
+  key, never deduped against `authorAci`). Producers keep their existing
+  spellings (engine `sourceUuid`, column `author_aci`); the wire face
+  stays `authorAci`. Renaming either is out of scope — the ledger exists
+  so the two concepts are never conflated again.
+
+  §4.214 **Read status.** Official `MessageAttributesType` carries
+  `readAt` + `readStatus` (`unread`/`read`/`viewed`, monotonic, incoming
+  rows only) + `seenStatus`. KT expresses the same semantics with
+  existing fields and deliberately adds no derived enum:
+  - `readStatus === Viewed` ≡ `viewed_at` present (the row's own doc
+    already anchors this: `messages.markViewed` set it, the official
+    `isVoiceMessagePlayed` predicate is exactly this test);
+  - `readStatus === Read`/`Unread` ≡ `sent_at` at/below vs above the
+    conversation's `read_watermark_ms` (absent watermark ⇒ `read`, the
+    official `migrateLegacyReadStatus` legacy-`unread`-absent rule);
+  - `readAt` ≡ `read_at`;
+  - `seenStatus` has **no data face** in KT (we never record the
+    last-seen indicator) — it stays absent rather than guessed.
+  A derived enum field was prototyped and rejected: 45+ struct-literal
+  sites for zero new information. Consumers derive from these three
+  fields using the rules above.
 - Contract revision: 1.209 (2026-10-20; §4.209 the group roster
   projection: an official conversation carries `membersV2`
   (`model-types.d.ts`), the client's single source for member lists,
