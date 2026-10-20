@@ -4228,6 +4228,45 @@ impl Store {
         items.extend(newer);
         Ok(Page { items, next_cursor })
     }
+
+    /// 以「最旧未读」为中心取窗（契约 1.208 / M4b-2）：官方
+    /// `getConversationRangeCenteredOnMessage(metrics.oldestUnseen)` 的直接对位。
+    ///
+    /// 与 `list_messages_around` 的差别：锚不是调用方给的消息 id，而是由
+    /// **已读水位**推导——最旧未读 = 该会话第一条 `sent_at > watermark` 的入站行。
+    /// 桌面只持有 unreadCount 与 watermark、没有锚 id，这条路径让它**一次往返**
+    /// 就到锚（官方正是如此：metrics.oldestUnseen 由 store 侧算好再交给加载臂）。
+    ///
+    /// 无未读（无 watermark / 无超水位入站行）→ `Ok(None)`，调用方回落取最新页——
+    /// 不发明锚点。
+    pub fn list_messages_around_oldest_unread(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        limit: u32,
+    ) -> Result<Option<Page<MessageRecord>>, StoreError> {
+        let anchor_id: Option<String> = self
+            .read_conn()?
+            .query_row(
+                "SELECT m.id FROM messages m
+                   JOIN conversations c
+                     ON c.id = m.conversation_id AND c.account_id = m.account_id
+                  WHERE m.account_id=?1 AND m.conversation_id=?2
+                    AND m.direction = 'incoming'
+                    AND m.sent_at > COALESCE(c.read_watermark_ms, 0)
+                  ORDER BY m.sent_at ASC, m.id ASC
+                  LIMIT 1",
+                params![account_id, conversation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some(anchor_id) = anchor_id else {
+            return Ok(None);
+        };
+        self.list_messages_around(account_id, conversation_id, &anchor_id, limit)
+            .map(Some)
+    }
     /// Adjacent visual-media probe (contract 1.93, §4.76): the messages next
     /// to an anchor in one direction that carry at least one visual-media
     /// attachment — an `image/*` or `video/*` content type, the desktop
@@ -12541,6 +12580,77 @@ mod tests {
                 .conversation_notification_prefs(&account.id, "missing")
                 .unwrap(),
             None
+        );
+    }
+
+    /// 契约 1.208（M4b-2）：按已读水位自动锚定最旧未读——官方
+    /// `metrics.oldestUnseen` 路径。无水位的未读面必须回落 None（不发明锚点）。
+    #[test]
+    fn list_messages_around_oldest_unread_derives_from_watermark() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        // 20 条入站，sent_at 用毫秒刻度（t=1000,2000..20000）——与
+        // read_watermark_ms 同单位，避免刻度错配。
+        for tick in 1..=20i64 {
+            store
+                .seed_message_row_for_test_at(&account.id, &conversation.id, tick * 1000)
+                .unwrap();
+        }
+
+        // 无水印（全部未读）→ 最旧未读 = t=1，窗口从它开始、只有 newer 侧。
+        let page = store
+            .list_messages_around_oldest_unread(&account.id, &conversation.id, 5)
+            .unwrap()
+            .expect("未读面存在");
+        assert_eq!(
+            page.items.first().map(|row| row.sent_at as i64),
+            Some(1000),
+            "锚在最旧（t=1s），older 侧为空"
+        );
+        // 锚在最旧 → older 侧取不到（0 条），窗口只有 actor + newer(limit-1)
+        // 里实际存在的条数。limit=5 → newer 目标 2 条，共 3 行。
+        // 这是官方同姿：任一侧不足时按实际返回，不补假行。
+        assert_eq!(page.items.len(), 3, "older 侧空 → 窗口只有锚 + newer");
+
+        // 水印推到 t=15 → 最旧未读 = t=16，窗口居中。
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET read_watermark_ms=?2 WHERE id=?1",
+                params![conversation.id, 15_000i64],
+            )
+            .unwrap();
+        let page = store
+            .list_messages_around_oldest_unread(&account.id, &conversation.id, 5)
+            .unwrap()
+            .expect("仍有未读");
+        let anchor_at = page
+            .items
+            .iter()
+            .position(|row| row.sent_at as i64 > 15_000)
+            .expect("窗口含超水位行");
+        assert!(anchor_at <= 2, "锚应在窗口中段（older 侧 2 条）");
+
+        // 水印推到 20（全部已读）→ 无未读，答 None。
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET read_watermark_ms=?2 WHERE id=?1",
+                params![conversation.id, 20_000i64],
+            )
+            .unwrap();
+        assert!(
+            store
+                .list_messages_around_oldest_unread(&account.id, &conversation.id, 5)
+                .unwrap()
+                .is_none(),
+            "全部已读 → None（不发明锚点）"
         );
     }
     /// 契约 1.205（M5）：草稿完整面持久化——官方 ConversationAttributesType 的

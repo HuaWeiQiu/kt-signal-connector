@@ -699,9 +699,9 @@ impl ProxyGroupRuntime {
         &self,
         account_id: String,
         conversation_id: String,
-        anchor_message_id: String,
+        anchor_message_id: Option<String>,
         limit: u32,
-    ) -> Result<Page<MessageRecord>, ServiceError> {
+    ) -> Result<Option<Page<MessageRecord>>, ServiceError> {
         let slot = self.slot_for_account(&account_id).await?;
         slot.supervisor
             .list_messages_around(account_id, conversation_id, anchor_message_id, limit)

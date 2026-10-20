@@ -2886,20 +2886,27 @@ impl RuntimeSupervisor {
         &self,
         account_id: String,
         conversation_id: String,
-        anchor_message_id: String,
+        anchor_message_id: Option<String>,
         limit: u32,
-    ) -> Result<Page<MessageRecord>, ServiceError> {
+    ) -> Result<Option<Page<MessageRecord>>, ServiceError> {
         let store = Arc::clone(&self.store);
         blocking_service(move || {
             if store.account_by_id(&account_id)?.is_none() {
                 return Err(crate::store::StoreError::AccountNotFound.into());
             }
-            Ok(store.list_messages_around(
-                &account_id,
-                &conversation_id,
-                &anchor_message_id,
-                limit,
-            )?)
+            match anchor_message_id {
+                Some(anchor) => Ok(Some(store.list_messages_around(
+                    &account_id,
+                    &conversation_id,
+                    &anchor,
+                    limit,
+                )?)),
+                None => Ok(store.list_messages_around_oldest_unread(
+                    &account_id,
+                    &conversation_id,
+                    limit,
+                )?),
+            }
         })
         .await
     }

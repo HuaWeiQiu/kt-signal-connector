@@ -2255,9 +2255,12 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     )
                     .await
                 {
+                    // 无未读时 page 为 None → 显式回 null，桌面据此回落取最新页
+                    // （不发明锚点，契约 1.208）。
                     Ok(page) => HostResponse::success(
                         request_id,
-                        serde_json::to_value(page).unwrap_or(Value::Null),
+                        page.map(|page| serde_json::to_value(page).unwrap_or(Value::Null))
+                            .unwrap_or(Value::Null),
                     ),
                     Err(error) => HostResponse::failure(request_id, error.into_api()),
                 }

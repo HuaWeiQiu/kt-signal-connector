@@ -2672,18 +2672,27 @@ impl ConnectorService {
         &self,
         account_id: &str,
         conversation_id: &str,
-        anchor_message_id: &str,
+        anchor_message_id: Option<&str>,
         limit: u32,
-    ) -> Result<Page<MessageRecord>, ServiceError> {
+    ) -> Result<Option<Page<MessageRecord>>, ServiceError> {
         if self.store.account_by_id(account_id)?.is_none() {
             return Err(ServiceError::Store(StoreError::AccountNotFound));
         }
-        Ok(self.store.list_messages_around(
-            account_id,
-            conversation_id,
-            anchor_message_id,
-            limit,
-        )?)
+        match anchor_message_id {
+            Some(anchor) => Ok(Some(self.store.list_messages_around(
+                account_id,
+                conversation_id,
+                anchor,
+                limit,
+            )?)),
+            // 无锚点 id → 按已读水位推导最旧未读（官方 metrics.oldestUnseen 臂）；
+            // 无未读则 None，调用方回落最新页。
+            None => Ok(self.store.list_messages_around_oldest_unread(
+                account_id,
+                conversation_id,
+                limit,
+            )?),
+        }
     }
 
     pub fn list_adjacent_media(
@@ -15018,7 +15027,9 @@ pub struct MessagesAdjacentMediaParams {
 pub struct MessagesAroundParams {
     pub account_id: String,
     pub conversation_id: String,
-    pub anchor_message_id: String,
+    /// 契约 1.208（M4b-2）：锚消息 id。**缺席 = 按已读水位自动锚定最旧未读**
+    /// （官方 `metrics.oldestUnseen` 路径）；无未读时调用方拿到 null 并回落取最新页。
+    pub anchor_message_id: Option<String>,
     pub limit: u32,
 }
 
