@@ -67,6 +67,26 @@
   recorded in `docs/last-moments-redaction-audit.md`; the engine worktree is
   outside this repository and the fix lands there.)
 =======
+- Contract revision: 1.202 (2026-10-20; §4.202 the author-identity
+  projection: the row's `senderId` is the **store-level ingest privacy
+  hash**, while every name source the desktop holds (contacts, profiles,
+  group roster) is keyed by the **protocol identity** — a 64-hex digest the
+  protocol has never spoken. The §4.191 diagnosis named this exact category
+  confusion ("the store-level row identity was read as if it were the
+  wire-level protocol identity") but only fixed the attachment-backfill
+  seat. This revision finishes it for the author face: the envelope's
+  `sourceUuid` member ACI, captured on incoming rows since §4.191 as
+  `messages.author_aci`, is now projected onto the host wire as an additive
+  `authorAci` key. `senderId` keeps its existing value and meaning (the
+  local row identity used for dedup, optimistic-row matching and the author
+  colour hash) so every existing consumer is untouched; the desktop resolves
+  a display name against `authorAci` first and falls back to `senderId`.
+  Official parity: `getSourceServiceId` (ts/state/selectors/message.preload.ts:257)
+  returns the envelope ACI for incoming rows and feeds `getContact`
+  (`:297`) keyed by that ACI — the official client never hashes the author
+  identity. The key is absent on outgoing rows (the account's own number is
+  the protocol face there), system rows and pre-1.191 rows — absent, never
+  a guessed identity. Wire additive.
 - Contract revision: 1.201 (2026-10-20; §6.5 amendment / §4.201 the
   cross-account crosstalk fix: **a contacts sync never creates a
   conversation.** The §6.5 skeleton materialization — added in 1.14 so a
