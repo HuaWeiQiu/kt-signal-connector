@@ -633,6 +633,22 @@ pub struct ConversationSummary {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub title: String,
+    /// Contract 1.203 (§4.203): the naming ladder, additively projected so
+    /// the desktop can resolve a title the way the official client does
+    /// (`getTitle.preload.ts:52-66`: nickname → system → profile → number →
+    /// username). Before this revision every rung collapsed into `title`,
+    /// so a phone-renamed contact beat a richer profile name and a
+    /// username-only peer rendered as the unknown placeholder.
+    ///
+    /// Each key is **absent** when the store holds no material for it —
+    /// absent means "unknown", never a guess. `title` keeps its current
+    /// meaning and value, so pre-1.203 consumers are byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_preview: Option<String>,
     /// Contract 1.23: attachment category noun for the desktop list preview —
@@ -3812,11 +3828,17 @@ impl Store {
                     // terminal answer).
                     let identifiers =
                         conversation_identifiers_lossy(&conn, account_id, kind, &peer_key);
+                    // 契约 1.203：命名梯材料（缺席 = 未知，绝不猜）。
+                    let (system_name, username) =
+                        conversation_naming_material(&conn, account_id, kind, &peer_key);
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
                         kind,
                         title: row.get(3)?,
+                        system_name,
+                        profile_name: None,
+                        username,
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
                         last_message_direction: None,
@@ -8988,11 +9010,17 @@ impl Store {
                     // terminal answer).
                     let identifiers =
                         conversation_identifiers_lossy(&conn, account_id, kind, &peer_key);
+                    // 契约 1.203：命名梯材料（缺席 = 未知，绝不猜）。
+                    let (system_name, username) =
+                        conversation_naming_material(&conn, account_id, kind, &peer_key);
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
                         kind,
                         title: row.get(3)?,
+                        system_name,
+                        profile_name: None,
+                        username,
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
                         last_message_direction: None,
@@ -10443,6 +10471,43 @@ fn prepare_state_dir(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// 会话命名梯（契约 1.203 / §4.203）：从 `contacts` 缓存读该 peer 的命名材料。
+///
+/// 只搬「源侧确实有值」的材料：
+/// - `systemName` = contacts 行 title（通讯录同步面给的名字，官方 `getSystemName`
+///   对位）；掩码形（`8fc***e2`）与占位词不是材料；
+/// - `username` = contacts.extra 的 `username`（契约 1.176 已捕获并做预算闸）；
+/// - `profileName` 本函数不填——profile 在引擎侧 presage `profiles` 表，connector
+///   无从读，由桌面 `resolveSenderName` 三源链补同一级。
+///
+/// 全 miss → 两键都不出现（缺席 = 未知，绝不猜，§4.203 纪律）。
+fn conversation_naming_material(
+    conn: &Connection,
+    account_id: &str,
+    kind: &str,
+    peer_key: &str,
+) -> (Option<String>, Option<String>) {
+    let contact_kind = if kind == "group" { "group" } else { "contact" };
+    let row = conn
+        .query_row(
+            "SELECT title, extra FROM contacts
+              WHERE account_id=?1 AND kind=?2 AND peer_key=?3",
+            params![account_id, contact_kind, peer_key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional();
+    let Ok(Some((title, extra))) = row else {
+        return (None, None);
+    };
+    let trimmed = title.trim();
+    // 掩码形 / 占位词不是名字材料（与 title_should_upgrade 同判）。
+    let system_name = (!trimmed.is_empty()
+        && !trimmed.contains("***")
+        && trimmed != "group"
+        && trimmed != "contact")
+        .then(|| trimmed.to_owned());
+    (system_name, extra_username(extra.as_deref()))
+}
 /// Prefer real display names over masked peer ids / placeholders.
 fn title_should_upgrade(current: &str, candidate: &str) -> bool {
     let cand = candidate.trim();
@@ -11749,6 +11814,70 @@ mod tests {
             .unwrap();
     }
 
+    /// 契约 1.203（§4.203）：会话命名梯材料——systemName 取通讯录 title、
+    /// username 取 contacts.extra；掩码/占位不算材料；全 miss 三键皆缺席。
+    /// 断言面走 serde（wire 形状即契约），不用结构体字段直读。
+    #[test]
+    fn conversation_summary_projects_the_naming_ladder_additively() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        // ① 有通讯录名 + username 的联系人。
+        store
+            .upsert_contact(
+                &account.id,
+                "contact",
+                "+15555550101",
+                "Alice",
+                Some(r#"{"username":"alice.01"}"#),
+                10,
+            )
+            .unwrap();
+        // ② 只有掩码占位的联系人（不是材料）。
+        store
+            .upsert_contact(&account.id, "contact", "+15555550102", "8fc***e2", None, 10)
+            .unwrap();
+        // ③ 无 contacts 行的陌生人。
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Alice")
+            .unwrap();
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "8fc***e2")
+            .unwrap();
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550103", "ghost")
+            .unwrap();
+
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        // ConversationSummary 不投影 peer_key（wire 面不含），按 title 定位。
+        let by_title = |title: &str| {
+            page.items
+                .iter()
+                .find(|row| row.title == title)
+                .map(|row| serde_json::to_value(row).unwrap())
+                .expect("row present")
+        };
+
+        let alice = by_title("Alice");
+        assert_eq!(alice["systemName"], serde_json::json!("Alice"));
+        assert_eq!(alice["username"], serde_json::json!("alice.01"));
+        // profile 名由桌面三源链补，connector 侧恒缺席。
+        assert!(alice.get("profileName").is_none());
+
+        // 掩码占位不是材料：systemName 不出现。
+        let masked = by_title("8fc***e2");
+        assert!(masked.get("systemName").is_none());
+        assert!(masked.get("username").is_none());
+
+        // 无 contacts 行：两键都缺席（缺席 = 未知）。
+        let ghost = by_title("ghost");
+        assert!(ghost.get("systemName").is_none());
+        assert!(ghost.get("username").is_none());
+        // title 面语义零变化（旧消费者逐字不变）。
+        assert_eq!(ghost["title"], serde_json::json!("ghost"));
+    }
     /// Read one row's §4.123 face: (status, first_send_attempted_at,
     /// retry_attempt_count, next_attempt_at).
     fn retry_face(store: &Store, id: &str) -> (String, Option<i64>, i64, Option<i64>) {

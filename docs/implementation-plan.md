@@ -67,6 +67,23 @@
   recorded in `docs/last-moments-redaction-audit.md`; the engine worktree is
   outside this repository and the fix lands there.)
 =======
+- Contract revision: 1.203 (2026-10-20; §4.203 the conversation naming
+  ladder: an official conversation carries the **full naming chain**
+  (`systemGivenName` / `nicknameGivenName` / `profileName` / `username`)
+  and the client resolves a title through it
+  (`ts/util/getTitle.preload.ts:52-66`: nickname → system → profile →
+  number → username → unknown placeholder). KT kept one
+  `conversations.title` string, so the client could never express *which*
+  rung a title came from: a contact renamed on the phone wins over a richer
+  profile name, and a peer known only by username renders as the unknown
+  placeholder. This revision projects the ladder additively on
+  `conversations.list`: optional `systemName`, `profileName` and
+  `username` keys beside the existing `title` (**each absent when the
+  store holds no material — absent is 'unknown', never a guess**).
+  `title` keeps its current meaning and value, so existing consumers are
+  untouched; the desktop renders the ladder when the keys are present and
+  falls back to `title` otherwise. Wire additive; no schema change (the
+  material already lives in `contacts`/`profiles`).
 - Contract revision: 1.202 (2026-10-20; §4.202 the author-identity
   projection: the row's `senderId` is the **store-level ingest privacy
   hash**, while every name source the desktop holds (contacts, profiles,
