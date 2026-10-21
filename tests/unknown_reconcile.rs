@@ -94,6 +94,7 @@ fn seed_outgoing_row(
 ) -> String {
     let id = stable_hash_id(&[account_id, conversation_id, "outgoing", request]);
     let record = MessageRecord {
+        required_protocol_version: None,
         author_aci: None,
         id: id.clone(),
         account_id: account_id.to_string(),
@@ -483,6 +484,10 @@ async fn watchdog_restart_lands_and_reconciles_unknown_rows() {
     let mut config = config_for(&temp);
     config.watchdog_interval = Duration::from_millis(50);
     config.watchdog_min_restart_interval = Duration::ZERO;
+    // The restart under test is the first of its episode (immediate); keep any
+    // retry immediate too so the test never depends on the production
+    // ten-second liveness backoff.
+    config.watchdog_liveness_backoff_base = Duration::ZERO;
     let supervisor = Arc::new(RuntimeSupervisor::new(
         config,
         Arc::clone(&store),

@@ -72,6 +72,15 @@ const RECEIVE_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Slack over the child graceful-exit budget after which an unanswered
 /// shutdown request is considered stuck and the child is killed directly.
 const SHUTDOWN_TIMEOUT_MARGIN: Duration = Duration::from_secs(2);
+/// Default graceful-exit budget handed to the engine before the connector
+/// escalates to SIGKILL (the total wait is this plus the margin above). The
+/// engine's own pipeline drain grace is 10 s, so the pre-pool 3 s budget
+/// truncated a legitimate graceful stop into a hard kill under a slow disk or
+/// a large receive backlog. Ten seconds aligns the two and yields the 12 s
+/// connector-side budget the per-account engine pool documents (design
+/// §6.2/§6.6); a single-slot stop still finishes in milliseconds in the
+/// healthy case.
+pub const DEFAULT_ENGINE_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
 const MAX_INBOUND_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 /// Receive routing ids (account, source, group id). These ids become stored
@@ -91,6 +100,19 @@ const MAX_REPORTING_TOKEN_CHARS: usize = 128;
 const STDERR_QUEUE_CAPACITY: usize = 64;
 const STDERR_LINE_LIMIT: usize = 4 * 1024;
 
+/// Receive-liveness restart backoff base. The first restart of a failure
+/// episode is immediate; retries then wait `base`, `2 * base`, `4 * base`, …
+/// capped at `WATCHDOG_LIVENESS_BACKOFF_CAP`. Ten seconds is the deliberate
+/// difference between a dead receive WebSocket (retry while a user is still
+/// waiting) and a genuinely dead network (back off). It must never borrow the
+/// five-minute anti-storm window (`watchdog_min_restart_interval`): using that
+/// as the retry base left users connected "once every five minutes".
+pub const WATCHDOG_LIVENESS_BACKOFF_BASE: Duration = Duration::from_secs(10);
+/// Ceiling on the receive-liveness restart backoff (three minutes): fast
+/// enough to heal a wedged receive path, slow enough that an unreachable
+/// upstream cannot turn the watchdog into a restart storm.
+pub const WATCHDOG_LIVENESS_BACKOFF_CAP: Duration = Duration::from_secs(180);
+
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub executable: PathBuf,
@@ -108,7 +130,18 @@ pub struct EngineConfig {
     pub receive_enqueue_timeout: Duration,
     pub resource_sample_interval: Duration,
     pub watchdog_interval: Duration,
+    /// Anti-storm window between failure episodes: a trigger-free gap longer
+    /// than this resets the watchdog's restart schedule, so only one fresh
+    /// "immediate" restart can begin per window. It deliberately does NOT
+    /// pace retries — receive-liveness retries use
+    /// `watchdog_liveness_backoff_base`, so a dead receive path is retried in
+    /// seconds rather than once every five minutes.
     pub watchdog_min_restart_interval: Duration,
+    /// Receive-liveness retry backoff base (`WATCHDOG_LIVENESS_BACKOFF_BASE`):
+    /// the first restart is immediate, later ones double from here up to
+    /// `WATCHDOG_LIVENESS_BACKOFF_CAP`. A zero value (integration tests) keeps
+    /// every retry immediate; production keeps the ten-second default.
+    pub watchdog_liveness_backoff_base: Duration,
     /// Disappearing-message sweep cadence (contract 1.42, §4.41): how often
     /// each group's supervisor looks for rows whose timer ran out. The
     /// launcher may tighten it (integration tests); production keeps the
@@ -132,11 +165,12 @@ impl EngineConfig {
             line_limit: DEFAULT_UPSTREAM_LINE_LIMIT,
             history_cdn_base: None,
             request_timeout: Duration::from_secs(15),
-            shutdown_grace: Duration::from_secs(3),
+            shutdown_grace: DEFAULT_ENGINE_SHUTDOWN_GRACE,
             receive_enqueue_timeout: RECEIVE_ENQUEUE_TIMEOUT,
             resource_sample_interval: Duration::from_secs(30),
             watchdog_interval: Duration::from_secs(30),
             watchdog_min_restart_interval: Duration::from_secs(300),
+            watchdog_liveness_backoff_base: WATCHDOG_LIVENESS_BACKOFF_BASE,
             expire_sweep_interval: Duration::from_secs(30),
         }
     }
@@ -274,6 +308,14 @@ pub enum EngineError {
         /// (`UPSTREAM_ERROR`) stays byte for byte. `None` — including every
         /// shape-hostile message — keeps the pre-1.167 log shape.
         cause: Option<String>,
+        /// The numeric JSON-RPC error code the engine answered (`-32603` for
+        /// its plain internal-error face, `-1` for the generic upstream
+        /// face). Internal attribution only: it reaches neither the host wire
+        /// answer nor a log line. The receive-liveness probe uses it to tell
+        /// the engine's unknown-account face (-32603) from an engine-wide
+        /// failure, because that face's message text is not part of the
+        /// pinned contract.
+        code: Option<i64>,
     },
     #[error("engine rejected the device credentials")]
     Unauthorized,
@@ -324,7 +366,9 @@ pub enum EngineError {
 impl EngineError {
     /// Log-safe variant classification: the variants are deliberately
     /// content-free, and logs carry this class rather than any detail.
-    fn class(&self) -> &'static str {
+    /// Crate-visible so the supervisor's liveness probe can log the class of
+    /// the error it attributes to a candidate account without any detail.
+    pub(crate) fn class(&self) -> &'static str {
         match self {
             EngineError::StartFailed => "start_failed",
             EngineError::NotRunning => "not_running",
@@ -451,6 +495,13 @@ pub enum EngineEvent {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedReceive {
+    /// 契约 §4.220：engine 产出的 requiredProtocolVersion（service/mod.rs:9594）。
+    /// 高于本端支持版本时对端可能无法完整解析该消息。缺席 = 未声明。
+    #[serde(
+        rename = "requiredProtocolVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub required_protocol_version: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<u64>,
     pub content_kind: &'static str,
@@ -2864,6 +2915,39 @@ impl EngineHandle {
     /// the child directly instead of waiting forever. The kill is the same
     /// forced-stop step `stop_child` falls back to after its grace period;
     /// the actor then observes the closed pipes and unwinds on its own.
+    /// Forcefully kill the child without waiting for its graceful exit.
+    /// Used at a pool budget deadline, where the shutdown future may still be
+    /// parked in the actor/writer and a dropped future would leave the child
+    /// alive through the actor's own handle clone.
+    pub async fn force_kill(&self) -> std::io::Result<()> {
+        // Never wait for the child mutex here: the actor may hold it while
+        // parked on a stalled stdin write, which is exactly the state a pool
+        // budget deadline has to break. The pid signal is lock-free.
+        #[cfg(unix)]
+        if let Some(pid) = self.status().pid {
+            let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            let child = Arc::clone(&self.child);
+            tokio::spawn(async move {
+                let mut child = child.lock().await;
+                let _ = child.start_kill();
+            });
+            return Ok(());
+        }
+        #[allow(unreachable_code)]
+        Ok(())
+    }
+
     pub async fn shutdown(&self) -> Result<(), EngineError> {
         if self.is_terminal() {
             return Ok(());
@@ -2907,7 +2991,9 @@ fn log_engine_call_failure(
     error: &EngineError,
 ) {
     let cause = match error {
-        EngineError::Upstream { cause: Some(cause) } => Some(cause.as_str()),
+        EngineError::Upstream {
+            cause: Some(cause), ..
+        } => Some(cause.as_str()),
         _ => None,
     };
     match cause {
@@ -3617,8 +3703,14 @@ async fn handle_upstream_line(
             // class-shaped one — rides the error log-only (bounded) so the
             // field can attribute the failure; the wire answer stays the
             // plain upstream face.
-            let cause = upstream_error_cause(object.get("error"));
-            let _ = request.response.send(Err(EngineError::Upstream { cause }));
+            let error_object = object.get("error");
+            let cause = upstream_error_cause(error_object);
+            let code = error_object
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_i64);
+            let _ = request
+                .response
+                .send(Err(EngineError::Upstream { cause, code }));
         }
     } else {
         let result = object.get("result").cloned().unwrap_or(Value::Null);
@@ -5092,7 +5184,11 @@ fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
     entries
         .iter()
         .take(MAX_INBOUND_ATTACHMENTS)
-        .filter_map(|entry| entry.as_object().and_then(normalized_attachment))
+        .filter_map(|entry| {
+            entry
+                .as_object()
+                .and_then(|object| normalized_attachment_inner(object, false))
+        })
         .collect()
 }
 
@@ -5115,13 +5211,33 @@ fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
 /// [`sanitize_inbound_filename`] — the official's own two filters only, the
 /// length rewrite retired.
 fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<NormalizedAttachment> {
+    normalized_attachment_inner(object, true)
+}
+
+/// The shared attachment parser. `require_id` is the strict face for
+/// metadata-only pointer slots (quote thumbnails, sticker data, contact
+/// avatars) — an id-less pointer there has nothing addressable and drops. The
+/// message-attachment list parses relaxed: the engine's live projection always
+/// emits an `id` key but leaves it empty when the pointer carries no
+/// `client_uuid`, and the archive export omits the key entirely. Dropping the
+/// whole descriptor over a missing synthetic id would discard contentType /
+/// size / locator metadata the engine did give, so the receive arm assigns a
+/// deterministic id after the row identity is known
+/// (`fill_missing_attachment_ids`).
+fn normalized_attachment_inner(
+    object: &serde_json::Map<String, Value>,
+    require_id: bool,
+) -> Option<NormalizedAttachment> {
     const MAX_LOCATOR_BASE64_CHARS: usize = 512;
     let id = object
         .get("id")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.chars().take(MAX_ATTACHMENT_ID_CHARS).collect::<String>())?;
+        .map(|s| s.chars().take(MAX_ATTACHMENT_ID_CHARS).collect::<String>())
+        .unwrap_or_default();
+    if require_id && id.is_empty() {
+        return None;
+    }
     let content_type = object
         .get("contentType")
         .and_then(Value::as_str)
@@ -6844,6 +6960,16 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         .filter(|s| !s.is_empty() && s.chars().count() <= MAX_REPORTING_TOKEN_CHARS)
         .map(str::to_string);
 
+    // 契约 §4.220：engine 在接收信封上投影 `requiredProtocolVersion`
+    //（service/mod.rs:9594）。高于本端支持版本时对端可能无法完整解析该消息。
+    // 解析纪律与紧邻的 serverTimestamp 同形：只认有限正整数，0 与越界折 None
+    //（缺席 = 未声明，不发明值）。
+    let required_protocol_version = envelope
+        .get("requiredProtocolVersion")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0 && *value <= u64::from(u32::MAX))
+        .map(|value| value as u32);
+
     let make = |timestamp: Option<u64>,
                 content_kind: &'static str,
                 direction: &'static str,
@@ -6854,6 +6980,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 attachments: Vec<NormalizedAttachment>,
                 rich: Option<NormalizedRich>,
                 control: Option<ControlReceive>| NormalizedReceive {
+        required_protocol_version,
         timestamp,
         content_kind,
         direction,
@@ -7682,6 +7809,19 @@ mod tests {
         assert!(!config.media_ingest);
     }
 
+    /// Design §6.2/§6.6 (F6): the connector's graceful-stop wait must cover
+    /// the engine's 10 s pipeline drain, or a legitimate shutdown is truncated
+    /// into SIGKILL. The total budget is grace + margin = 12 s.
+    #[test]
+    fn default_shutdown_budget_covers_the_engine_pipeline_grace() {
+        let config = EngineConfig::new(PathBuf::from("/bin/kt-engine"), PathBuf::from("/data"));
+        assert_eq!(config.shutdown_grace, Duration::from_secs(10));
+        assert_eq!(
+            config.shutdown_grace + SHUTDOWN_TIMEOUT_MARGIN,
+            Duration::from_secs(12)
+        );
+    }
+
     #[test]
     fn engine_args_match_the_launcher_shape() {
         let expected: Vec<std::ffi::OsString> = [
@@ -7785,6 +7925,7 @@ mod tests {
     async fn receive_queue_enforces_byte_budget_and_releases_it_on_consume() {
         let (ingress, mut receives) = receive_channel();
         let receive = || NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(42),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -7835,6 +7976,7 @@ mod tests {
         let (mut ingress, mut receives) = receive_channel();
         ingress.enqueue_timeout = Duration::from_millis(50);
         let receive = |account: &str| NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(42),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -7903,6 +8045,7 @@ mod tests {
         ingress.enqueue_timeout = Duration::from_millis(50);
         let text = "a".repeat(100 * 1024);
         let receive = |account: &str| NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(42),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -8386,6 +8529,7 @@ mod tests {
         let (mut ingress, mut receives) = receive_channel();
         ingress.enqueue_timeout = Duration::from_millis(50);
         let receive = || NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(42),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -8439,6 +8583,7 @@ mod tests {
 
         // Fill the byte budget so the next receive cannot be admitted.
         let filler = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(42),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -8625,7 +8770,10 @@ mod tests {
 
         assert_eq!(
             response_rx.await.unwrap(),
-            Err(EngineError::Upstream { cause: None })
+            Err(EngineError::Upstream {
+                cause: None,
+                code: Some(-1)
+            })
         );
         assert!(event_rx.try_recv().is_err());
     }
@@ -8663,7 +8811,8 @@ mod tests {
         assert_eq!(
             response_rx.await.unwrap(),
             Err(EngineError::Upstream {
-                cause: Some("(UserErrorException)".to_string())
+                cause: Some("(UserErrorException)".to_string()),
+                code: Some(-1)
             })
         );
         assert!(event_rx.try_recv().is_err());
@@ -8759,6 +8908,7 @@ mod tests {
                 2480,
                 &EngineError::Upstream {
                     cause: Some("(UnregisteredUserException)".to_string()),
+                    code: None,
                 },
             )
         });
@@ -8776,6 +8926,7 @@ mod tests {
                 2480,
                 &EngineError::Upstream {
                     cause: Some(bounded_cause.clone()),
+                    code: None,
                 },
             )
         });
@@ -8790,7 +8941,10 @@ mod tests {
         for error in [
             EngineError::Timeout,
             EngineError::UnknownOutcome,
-            EngineError::Upstream { cause: None },
+            EngineError::Upstream {
+                cause: None,
+                code: None,
+            },
         ] {
             let output = captured_log(|| log_engine_call_failure("send", "mutating", 2500, &error));
             assert!(output.contains("engine call failed"));
@@ -8834,7 +8988,8 @@ mod tests {
         assert_eq!(
             response_rx.await.unwrap(),
             Err(EngineError::Upstream {
-                cause: Some("(UnregisteredUserException)".to_string())
+                cause: Some("(UnregisteredUserException)".to_string()),
+                code: Some(-32603)
             })
         );
         assert!(event_rx.try_recv().is_err());
@@ -8861,7 +9016,10 @@ mod tests {
 
         assert_eq!(
             response_rx.await.unwrap(),
-            Err(EngineError::Upstream { cause: None })
+            Err(EngineError::Upstream {
+                cause: None,
+                code: Some(-32603)
+            })
         );
         assert!(event_rx.try_recv().is_err());
     }
@@ -9519,12 +9677,18 @@ mod tests {
                 "message": "SOME_FUTURE_ENGINE_CODE"
             }))
             .await,
-            Err(EngineError::Upstream { cause: None })
+            Err(EngineError::Upstream {
+                cause: None,
+                code: Some(-1)
+            })
         );
         // Ordinary JSON-RPC error shape (unrelated message): plain Upstream.
         assert_eq!(
             classify(json!({ "code": -1, "message": "fixture malformed" })).await,
-            Err(EngineError::Upstream { cause: None })
+            Err(EngineError::Upstream {
+                cause: None,
+                code: Some(-1)
+            })
         );
     }
 
@@ -10404,6 +10568,57 @@ mod tests {
         let round_trip = serde_json::to_value(legacy).unwrap();
         assert!(round_trip.get("waveform").is_none());
         assert!(round_trip.get("duration").is_none());
+    }
+
+    /// A message attachment without a usable engine id keeps its metadata
+    /// and locator (the live projection emits an empty id when the pointer
+    /// has no client_uuid; the archive export omits the key entirely). The
+    /// strict id requirement stays for metadata-only pointer slots — an
+    /// id-less quote thumbnail / sticker pointer still drops whole.
+    #[test]
+    fn message_attachments_without_engine_ids_keep_metadata() {
+        let parsed = normalize_receive_fields(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "dataMessage": {
+                    "attachments": [{
+                        "contentType": "image/png",
+                        "filename": "restored.png",
+                        "size": 12,
+                        "locator": {
+                            "key": "q83vLNoechoM6CiZ+hr3P5ePE3YGAibLE4bAl1jv20Y=",
+                            "cdnKey": "restored",
+                            "cdnNumber": 0,
+                            "uploadTimestamp": 1_700_000_000_000u64,
+                            "plaintextHash": "a".repeat(64),
+                        }
+                    }]
+                },
+            },
+        }))
+        .unwrap();
+        assert_eq!(parsed.attachments.len(), 1, "metadata survives an empty id");
+        let descriptor = &parsed.attachments[0];
+        assert_eq!(descriptor.id, "", "the receive arm fills the synthetic id");
+        assert_eq!(descriptor.content_type.as_deref(), Some("image/png"));
+        assert_eq!(descriptor.filename.as_deref(), Some("restored.png"));
+        assert_eq!(descriptor.size, Some(12));
+        assert!(
+            descriptor.locator.is_some(),
+            "the transit face survives with the metadata"
+        );
+
+        // The strict face is unchanged: an id-less metadata-only pointer has
+        // no addressable handle and still answers None.
+        assert!(
+            normalized_attachment(
+                json!({"contentType": "image/png", "size": 12})
+                    .as_object()
+                    .unwrap()
+            )
+            .is_none()
+        );
     }
 
     /// The engine's P14 rich faces (contract 1.107, §4.88) parse per-key:

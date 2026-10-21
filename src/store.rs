@@ -176,6 +176,19 @@ fn has_attachment_descriptors(attachments_json: Option<&str>) -> bool {
         .unwrap_or(true)
 }
 
+/// True only for a column that is absent or a well-formed empty array. A
+/// malformed cell answers false: the repair path must never overwrite bytes
+/// it cannot read (the §4.11 fail-closed posture).
+fn attachments_json_is_empty(attachments_json: Option<&str>) -> bool {
+    let Some(json) = attachments_json else {
+        return true;
+    };
+    serde_json::from_str::<Value>(json)
+        .ok()
+        .and_then(|value| value.as_array().map(Vec::is_empty))
+        .unwrap_or(false)
+}
+
 /// The full schema DDL, shared by `Store::open` and test fixtures so a test
 /// store can never drift from the production schema.
 const SCHEMA_DDL: &str = "
@@ -517,6 +530,14 @@ pub enum StoreError {
     OperationConflict,
     #[error("pagination cursor is invalid")]
     InvalidCursor,
+    /// messages.markRead / messages.syncRead message-granular target
+    /// (contract revision 1.216, §4.216): the named row is not a message of
+    /// the addressed account+conversation, so the read position has no
+    /// honest target to advance to. Kept distinct from `MessageNotFound`
+    /// (a general row lookup) because the read face answers INVALID_REQUEST
+    /// — the caller named a bad target — instead of a NOT_FOUND lookup.
+    #[error("read watermark target is not a message of the conversation")]
+    ReadWatermarkTargetInvalid,
     /// Fail closed (optimization-plan Phase 3): existing plaintext history is
     /// never opened for serving without a store key to encrypt it with.
     #[error(
@@ -535,6 +556,12 @@ pub enum StoreError {
     /// classified message is log-safe; the cause stays in the source chain.
     #[error("plaintext store migration to encrypted storage failed")]
     MigrationFailed(#[source] Option<Box<dyn std::error::Error + Send + Sync + 'static>>),
+    /// Engine-pool S1: the per-account layout is inconsistent (a migration or
+    /// linking step did not land). Startup fails closed instead of serving a
+    /// half-migrated pool; the message names opaque account ids and counts,
+    /// never numbers, ACIs, or paths.
+    #[error("engine pool state is invalid: {0}")]
+    EnginePoolInvalid(String),
 }
 
 impl StoreError {
@@ -550,10 +577,12 @@ impl StoreError {
             StoreError::MessageNotFound => "message_not_found",
             StoreError::OperationConflict => "operation_conflict",
             StoreError::InvalidCursor => "invalid_cursor",
+            StoreError::ReadWatermarkTargetInvalid => "read_watermark_target_invalid",
             StoreError::PlaintextStoreRequiresKey => "plaintext_store_requires_key",
             StoreError::StoreKeyRequired => "store_key_required",
             StoreError::StoreKeyRejected => "store_key_rejected",
             StoreError::MigrationFailed(_) => "migration_failed",
+            StoreError::EnginePoolInvalid(_) => "engine_pool_invalid",
         }
     }
 }
@@ -1678,6 +1707,10 @@ pub struct UnknownSendRow {
 #[serde(rename_all = "camelCase")]
 pub struct MessageRecord {
     pub id: String,
+    /// 契约 §4.220：接收信封投影的 requiredProtocolVersion（engine service/mod.rs）。
+    /// 只由实时接收路径写真实值；其余构造路径一律 None，不得伪造。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_protocol_version: Option<u32>,
     pub account_id: String,
     pub conversation_id: String,
     pub direction: &'static str,
@@ -2484,6 +2517,24 @@ impl Store {
         linked_at: Option<u64>,
         proxy_group: &str,
     ) -> Result<AccountSummary, StoreError> {
+        self.upsert_account_from_signal_with_id(signal_account, linked_at, proxy_group, None)
+    }
+
+    /// The pre-provisioned-id variant (engine-pool design §5.3): a per-account
+    /// engine slot fixes its opaque account id before the link starts, because
+    /// the id names the engine data directory the child process was already
+    /// launched with. The first commit of that number therefore inserts the
+    /// row under the caller's id instead of a fresh random one; a known number
+    /// keeps its existing row exactly like the plain form (the binding stays
+    /// immutable, and the pre-allocated id is discarded). Passing None is
+    /// byte-for-byte the pre-pool behavior.
+    pub fn upsert_account_from_signal_with_id(
+        &self,
+        signal_account: &str,
+        linked_at: Option<u64>,
+        proxy_group: &str,
+        preferred_id: Option<&str>,
+    ) -> Result<AccountSummary, StoreError> {
         if let Some(existing) = self.account_by_signal(signal_account)? {
             // The proxy-group binding is fixed at link time and immutable for
             // the life of the link (ADR 0001 R3): a re-sync of a known number
@@ -2499,7 +2550,7 @@ impl Store {
                 .account_summary(&existing.id)?
                 .ok_or(StoreError::AccountNotFound);
         }
-        let id = random_id();
+        let id = preferred_id.map(str::to_string).unwrap_or_else(random_id);
         let masked = mask_address(signal_account);
         self.lock_conn()?
             .execute(
@@ -2593,6 +2644,30 @@ impl Store {
     /// Accounts bound to one proxy group, in the same order as
     /// [`Store::list_accounts`]. The per-group fallback view used when that
     /// group's engine cannot answer.
+    /// Every account row (id, signal number, proxy group), ordered by id.
+    /// The engine-pool migration/consistency pass reads this; nothing on the
+    /// host wire exposes the numbers it carries.
+    pub fn list_all_account_rows(&self) -> Result<Vec<AccountRow>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut statement = conn
+            .prepare("SELECT id, signal_account, proxy_group FROM accounts ORDER BY id")
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(AccountRow {
+                    id: row.get(0)?,
+                    signal_account: row.get(1)?,
+                    proxy_group: row.get(2)?,
+                })
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut accounts = Vec::new();
+        for row in rows {
+            accounts.push(row.map_err(|error| StoreError::Unavailable(Some(error)))?);
+        }
+        Ok(accounts)
+    }
+
     pub fn list_accounts_in_group(
         &self,
         proxy_group: &str,
@@ -2714,6 +2789,42 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Every liveness-probe candidate bound to one proxy group, ordered like
+    /// [`Store::list_accounts_in_group`] (newest link first, never-linked rows
+    /// last). Each entry carries the opaque row id — the only account identity
+    /// the watchdog logs — beside the signal number, which rides into engine
+    /// call params and nowhere else.
+    ///
+    /// This is the full connector-side view, deliberately unfiltered: the
+    /// watchdog intersects it with the engine's own listAccounts answer before
+    /// pinging, because a store row the engine does not serve answers its
+    /// plain -32603 in milliseconds (the stale-row incident). The ordering
+    /// here is only a tie-break inside the verified intersection.
+    pub fn signal_account_candidates_in_group(
+        &self,
+        proxy_group: &str,
+    ) -> Result<Vec<AccountRow>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, signal_account, proxy_group FROM accounts
+                 WHERE proxy_group=?1
+                 ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![proxy_group], |row| {
+                Ok(AccountRow {
+                    id: row.get(0)?,
+                    signal_account: row.get(1)?,
+                    proxy_group: row.get(2)?,
+                })
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
@@ -4742,6 +4853,18 @@ impl Store {
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         if inserted == 0 {
+            // The row identity already landed (a live echo, a re-receive, or
+            // a history-import row). The insert is `INSERT OR IGNORE`, so
+            // the incoming descriptors were silently dropped; merge them into
+            // the existing row's empty positions instead (post-relink repair:
+            // the restored row may carry no descriptors while the live echo
+            // does).
+            Self::merge_attachment_faces_in(
+                &transaction,
+                &message.account_id,
+                &message.id,
+                &message.attachments,
+            )?;
             transaction
                 .commit()
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -4920,6 +5043,57 @@ impl Store {
             params![account_id, conversation_id, sent_at],
         )
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// The read-position watermark's message-granular advance (contract
+    /// revision 1.216, §4.216 — the official `markConversationRead` with a
+    /// message target): the read legs accept an optional `messageId` naming
+    /// ONE row of the addressed account+conversation, and the watermark
+    /// moves to that row's `sent_at` — not to the conversation's newest
+    /// row. Same monotonic max-fold as the other write seams: an older
+    /// target never rewinds the position.
+    ///
+    /// The lookup IS the target validation: a missing row, a row owned by
+    /// another account/conversation, and a row with no honest clock
+    /// (`sent_at <= 0`) all answer
+    /// [`StoreError::ReadWatermarkTargetInvalid`] and leave the watermark
+    /// untouched — the caller maps that to a deterministic INVALID_REQUEST,
+    /// never a silent advance. The position itself is never echoed or
+    /// logged (content-free diagnostics only).
+    pub fn advance_read_watermark_to_message(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        let sent_at: Option<i64> = conn
+            .query_row(
+                "SELECT sent_at FROM messages
+                 WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                params![message_id, account_id, conversation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some(sent_at) = sent_at.filter(|value| *value > 0) else {
+            return Err(StoreError::ReadWatermarkTargetInvalid);
+        };
+        let updated = conn
+            .execute(
+                "UPDATE conversations
+                 SET read_watermark_ms = MAX(COALESCE(read_watermark_ms, 0), ?3)
+                 WHERE id=?2 AND account_id=?1",
+                params![account_id, conversation_id, sent_at],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // The message row's own FK names a conversation; a missing row here
+        // can only mean the conversation was erased between the two
+        // statements (account deletion races the read legs).
+        if updated != 1 {
+            return Err(StoreError::ConversationNotFound);
+        }
         Ok(())
     }
 
@@ -7023,6 +7197,134 @@ impl Store {
         .unwrap_or_else(|| Ok(Vec::new()))
     }
 
+    /// Merge descriptors and their locator faces into an existing row
+    /// (connector-side defense, post-relink history rows): the history import
+    /// may store a row before its attachment descriptors are known (the
+    /// cloud-restore archive is built from the connector's text-only backup
+    /// artifact), and a later live receive of the same Signal message is
+    /// rejected by the row identity check. This primitive fills only empty
+    /// positions / locator slots, never overwrites an authoritative face, and
+    /// keeps the two index-aligned columns in one transaction. A malformed
+    /// either column is left untouched (fail closed, never clobbered); an
+    /// absent row answers Ok(false).
+    pub fn merge_live_attachment_faces(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        incoming: &[crate::engine::NormalizedAttachment],
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let changed =
+            Self::merge_attachment_faces_in(&transaction, account_id, message_id, incoming)?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed)
+    }
+
+    /// The transaction-bound body of `Self::merge_live_attachment_faces`,
+    /// shared by the public method and the duplicate-insert arm.
+    fn merge_attachment_faces_in(
+        transaction: &Connection,
+        account_id: &str,
+        message_id: &str,
+        incoming: &[crate::engine::NormalizedAttachment],
+    ) -> Result<bool, StoreError> {
+        // An empty list is the honest plain row; nothing to repair. An empty
+        // descriptor id is not addressable on the wire, so it is never stored
+        // as a repair (the receive arm fills a deterministic synthetic id
+        // before this primitive sees it).
+        if incoming.is_empty() || incoming.iter().any(|descriptor| descriptor.id.is_empty()) {
+            return Ok(false);
+        }
+        let row: Option<(Option<String>, Option<String>)> = transaction
+            .query_row(
+                "SELECT attachments_json, live_attachment_locators
+                   FROM messages WHERE account_id=?1 AND id=?2",
+                params![account_id, message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some((attachments_json, locators_json)) = row else {
+            return Ok(false);
+        };
+        let mut descriptors: Vec<crate::engine::NormalizedAttachment> =
+            match attachments_json.as_deref() {
+                None => Vec::new(),
+                Some(json) => match serde_json::from_str(json) {
+                    Ok(descriptors) => descriptors,
+                    Err(_) => return Ok(false),
+                },
+            };
+        let mut faces: Vec<HistoryAttachmentLocator> = match locators_json.as_deref() {
+            None => Vec::new(),
+            Some(json) => match serde_json::from_str(json) {
+                Ok(faces) => faces,
+                Err(_) => return Ok(false),
+            },
+        };
+        let default_face = HistoryAttachmentLocator::default();
+        let mut changed = false;
+        for (index, candidate) in incoming.iter().enumerate() {
+            // The full incoming list is index-aligned with the sender's
+            // message. A shorter stored list extends only when the incoming
+            // position itself is a real descriptor; a stored non-empty slot is
+            // authoritative (first face wins, the §4.175 discipline).
+            if descriptors.len() <= index {
+                descriptors.push(candidate.clone());
+                changed = true;
+            } else if descriptors[index].id.is_empty() {
+                descriptors[index] = candidate.clone();
+                changed = true;
+            }
+            let Some(candidate_face) = candidate
+                .locator
+                .as_ref()
+                .filter(|face| *face != &default_face)
+            else {
+                continue;
+            };
+            if faces.len() <= index {
+                faces.resize(index + 1, default_face.clone());
+                changed = true;
+            }
+            if faces[index] == default_face {
+                faces[index] = candidate_face.clone();
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(false);
+        }
+        let attachments_json = if descriptors.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&descriptors).map_err(|error| {
+                StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(error.into())))
+            })?)
+        };
+        let locators_json = if faces.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&faces).map_err(|error| {
+                StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(error.into())))
+            })?)
+        };
+        transaction
+            .execute(
+                "UPDATE messages
+                    SET attachments_json=?3, live_attachment_locators=?4
+                  WHERE account_id=?1 AND id=?2",
+                params![account_id, message_id, attachments_json, locators_json],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(true)
+    }
+
     /// Merge new live-receive locator faces into one row's schema-19 column,
     /// filling only the slots that are still empty (contract revision 1.175,
     /// §4.175): the optimistic outgoing row predates its sent-sync echo and
@@ -7399,7 +7701,7 @@ impl Store {
                 None => "IN (?5)",
             };
             let sql = format!(
-                "SELECT 1 FROM messages
+                "SELECT id, attachments_json FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3
                    AND sent_at=?4 AND sender_id {sender_clause}
                  LIMIT 1"
@@ -7407,7 +7709,7 @@ impl Store {
             let mut stmt = transaction
                 .prepare(&sql)
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
-            let exists = {
+            let existing = {
                 let sent_at = record.sent_at as i64;
                 let mut all_params: Vec<&dyn rusqlite::ToSql> = vec![
                     &record.account_id,
@@ -7419,13 +7721,41 @@ impl Store {
                 if let Some(alt) = &row.alt_sender_id {
                     all_params.push(alt);
                 }
-                stmt.query_row(all_params.as_slice(), |_| Ok(()))
-                    .optional()
-                    .map_err(|error| StoreError::Unavailable(Some(error)))?
-                    .is_some()
+                stmt.query_row(all_params.as_slice(), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .optional()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
             };
-            if exists {
+            if let Some((existing_id, existing_attachments)) = existing {
                 outcome.duplicates += 1;
+                // Post-relink repair: a row restored from the text-only backup
+                // artifact exists before the live echo / archive copy carries
+                // the descriptors. The identity dedupe must not leave the row
+                // permanently descriptor-less — fill an empty descriptor cell
+                // from this well-formed archive row (never overwrite a
+                // populated one, never touch a malformed cell).
+                if !record.attachments.is_empty()
+                    && attachments_json_is_empty(existing_attachments.as_deref())
+                {
+                    let attachments_json =
+                        serde_json::to_string(&record.attachments).map_err(|error| {
+                            StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(
+                                error.into(),
+                            )))
+                        })?;
+                    let locators_json = (!row.locators.is_empty()).then(|| {
+                        serde_json::to_string(&row.locators).expect("attachment locators json")
+                    });
+                    transaction
+                        .execute(
+                            "UPDATE messages
+                                SET attachments_json=?2, attachment_locators=?3
+                              WHERE id=?1",
+                            params![existing_id, attachments_json, locators_json],
+                        )
+                        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                }
                 continue;
             }
             let inserted = transaction
@@ -12554,6 +12884,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
     let attachments_json: Option<String> = row.get(14)?;
     let rich_json: Option<String> = row.get(15)?;
     Ok(MessageRecord {
+        required_protocol_version: None,
         id: row.get(0)?,
         account_id: row.get(1)?,
         conversation_id: row.get(2)?,
@@ -12642,6 +12973,7 @@ mod tests {
         next_attempt_at: Option<u64>,
     ) {
         let record = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
@@ -14169,6 +14501,7 @@ mod tests {
         sent_at: u64,
     ) {
         let record = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
@@ -15220,6 +15553,7 @@ mod tests {
         sent_at: u64,
     ) -> MessageRecord {
         MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
@@ -15287,6 +15621,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "m1".into(),
             account_id: account.id.clone(),
@@ -15362,6 +15697,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -15546,6 +15882,7 @@ mod tests {
                    rich: Option<NormalizedRich>|
          -> MessageRecord {
             MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -15757,6 +16094,7 @@ mod tests {
             duration: None,
         };
         let row = |id: &str, sent_at: u64, media: bool| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -15878,6 +16216,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -16017,6 +16356,7 @@ mod tests {
         let now = now_ms();
         let seed = |store: &Store, id: &str, sent_at: u64| {
             let record = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -16487,6 +16827,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -16610,6 +16951,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -16812,6 +17154,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -17316,6 +17659,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
             .unwrap();
         let base = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -17423,6 +17767,7 @@ mod tests {
              attachments: Vec<crate::engine::NormalizedAttachment>| {
                 clock += 1;
                 let message = MessageRecord {
+                    required_protocol_version: None,
                     author_aci: None,
                     id: format!("m{clock}"),
                     account_id: account.id.clone(),
@@ -17564,6 +17909,7 @@ mod tests {
                     sent_at: u64,
                     text: Option<&str>| {
             let message = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -17766,6 +18112,7 @@ mod tests {
             .unwrap();
         let push = |id: &str, status: &'static str, sent_at: u64| {
             let message = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -17874,6 +18221,7 @@ mod tests {
             .unwrap();
         let push = |id: &str, authors: &[&str], increment_unread: bool| {
             let message = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -18003,6 +18351,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
         let plain = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "m1".into(),
             account_id: account.id.clone(),
@@ -18109,6 +18458,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "pending".into(),
             account_id: account.id.clone(),
@@ -18219,6 +18569,7 @@ mod tests {
             )
             .unwrap();
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "atomic-message".into(),
             account_id: account.id.clone(),
@@ -18297,6 +18648,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "unread-message".into(),
             account_id: account.id.clone(),
@@ -18380,6 +18732,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "system-message".into(),
             account_id: account.id.clone(),
@@ -18448,6 +18801,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "contended".into(),
             account_id: account.id.clone(),
@@ -18531,6 +18885,7 @@ mod tests {
             .unwrap();
         let row = |store: &Store, id: &str, sender: &str| {
             let message = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -18631,6 +18986,7 @@ mod tests {
             .unwrap();
         let row = |store: &Store, id: &str, status: &'static str| {
             let message = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -18737,6 +19093,7 @@ mod tests {
                    sent_at: u64,
                    status: &'static str| {
             let message = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -18849,6 +19206,7 @@ mod tests {
             (&same_time, "same-time-message", 20),
         ] {
             let message = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -18935,6 +19293,7 @@ mod tests {
         ));
 
         let changed = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "newer-message-2".into(),
             account_id: account.id.clone(),
@@ -18996,6 +19355,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "other-peer", "Other peer")
             .unwrap();
         let other_message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "other-message".into(),
             account_id: account.id.clone(),
@@ -19099,6 +19459,7 @@ mod tests {
             .unwrap();
         let hit = |id: &str, conversation_id: &str, sent_at: u64, text: &str| {
             let mut message = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -19204,6 +19565,7 @@ mod tests {
         .enumerate()
         {
             let message = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: format!("row-{index}"),
                 account_id: account.id.clone(),
@@ -19314,6 +19676,7 @@ mod tests {
             .unwrap();
         let hit = |id: &str, conversation_id: &str, sent_at: u64, text: &str| {
             let message = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -19416,6 +19779,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "delete-message".into(),
             account_id: account.id.clone(),
@@ -19565,6 +19929,7 @@ mod tests {
             .upsert_contact(&survivor.id, "contact", "+15555550103", "Bob", None, 10)
             .unwrap();
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "receipt-message".into(),
             account_id: doomed.id.clone(),
@@ -19940,6 +20305,46 @@ mod tests {
         assert_eq!(
             store.any_signal_account_number_in_group("missing").unwrap(),
             None
+        );
+    }
+
+    /// The watchdog's candidate view: every group row (not just the first)
+    /// beside its opaque id, newest link first — the stale-row incident's
+    /// shape, where the old row was inserted first and the live one second.
+    #[test]
+    fn signal_account_candidates_are_group_scoped_and_newest_first() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let stale = store
+            .upsert_account_from_signal("+15555550199", Some(9), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let live = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .upsert_account_from_signal("+15555550101", Some(5), "team-a")
+            .unwrap();
+
+        let candidates = store
+            .signal_account_candidates_in_group(DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        // Newest linked_at first: the stale row outranks the live one, which
+        // is exactly why the engine cross-check (not this order) is the gate.
+        assert_eq!(candidates[0].id, stale.id);
+        assert_eq!(candidates[0].signal_account, "+15555550199");
+        assert_eq!(candidates[1].id, live.id);
+        assert_eq!(candidates[1].signal_account, "+15555550100");
+        assert!(
+            candidates
+                .iter()
+                .all(|row| row.proxy_group == DEFAULT_PROXY_GROUP_ID)
+        );
+        assert!(
+            store
+                .signal_account_candidates_in_group("missing")
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -20641,6 +21046,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "kept".into(),
             account_id: account.id.clone(),
@@ -20722,6 +21128,7 @@ mod tests {
         let now = 40 * 365 * 24 * 60 * 60 * 1_000;
         let day = 24 * 60 * 60 * 1_000;
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "before-upgrade".into(),
             account_id: account.id.clone(),
@@ -20826,6 +21233,7 @@ mod tests {
             .map(|(index, age)| {
                 let id = format!("message-{index}");
                 let message = MessageRecord {
+                    required_protocol_version: None,
                     author_aci: None,
                     id: id.clone(),
                     account_id: account.id.clone(),
@@ -20984,6 +21392,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "in-flight".into(),
             account_id: account.id.clone(),
@@ -21088,6 +21497,7 @@ mod tests {
                     direction: &'static str,
                     sent_at: u64| {
             let record = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account_id.to_string(),
@@ -21236,6 +21646,7 @@ mod tests {
             .unwrap();
         let sent_at = now_ms() - 60_000;
         let record = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "reconcile-row".into(),
             account_id: account.id.clone(),
@@ -21348,6 +21759,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550102", "contact")
             .unwrap();
         let recent = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "recent".into(),
             account_id: account.id.clone(),
@@ -21426,6 +21838,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "kept".into(),
             account_id: account.id.clone(),
@@ -21507,6 +21920,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "unread-incoming".into(),
             account_id: account.id.clone(),
@@ -22148,6 +22562,7 @@ mod tests {
         sent_at: u64,
     ) {
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: message_id.into(),
             account_id: account_id.to_string(),
@@ -22204,6 +22619,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "m-edited".into(),
             account_id: account.id.clone(),
@@ -22465,6 +22881,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550199", "peer")
             .unwrap();
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "m-own".into(),
             account_id: account.id.clone(),
@@ -22737,6 +23154,7 @@ mod tests {
             .unwrap();
         let base =
             |id: &str, conversation_id: &str, direction: &'static str, rich: bool| MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -22852,6 +23270,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "m-view".into(),
             account_id: account.id.clone(),
@@ -22948,6 +23367,7 @@ mod tests {
 
     fn expire_record(id: &str, account_id: &str, conversation_id: &str) -> MessageRecord {
         MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
@@ -23356,6 +23776,104 @@ mod tests {
             .merge_live_attachment_locators(&account.id, "m-absent", &[Some(face("cdn-x"))])
             .unwrap();
         assert!(!changed);
+    }
+
+    /// Post-relink descriptor repair: a row restored from the text-only
+    /// backup artifact carries no `attachments_json`; a later live echo /
+    /// re-run with the same Signal identity must fill the descriptor and its
+    /// locator instead of being swallowed by the identity dedupe. Both the
+    /// public merge and the duplicate `insert_message` arm converge on the
+    /// same empty-position-only write.
+    #[test]
+    fn duplicate_insert_and_merge_repair_missing_attachment_descriptors() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550107", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550108", "Peer")
+            .unwrap();
+        let face = crate::store::HistoryAttachmentLocator {
+            key: Some("a2F0LWtleQ==".into()),
+            cdn_key: Some("cdn-repair".into()),
+            cdn_number: Some(3),
+            upload_timestamp: Some(1_700_000_000_000),
+            digest: Some("ZGl-nonsense".into()),
+            plaintext_hash: None,
+        };
+        let descriptor = |id: &str| crate::engine::NormalizedAttachment {
+            id: id.into(),
+            content_type: Some("image/jpeg".into()),
+            filename: Some("restored.jpg".into()),
+            size: Some(2048),
+            width: None,
+            height: None,
+            is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
+            locator: Some(face.clone()),
+            waveform: None,
+            duration: None,
+        };
+
+        // The public merge fills an empty row.
+        let mut restored = expire_record("m-repair", &account.id, &conversation.id);
+        restored.attachments = Vec::new();
+        store
+            .insert_message(&restored, None, Some("restored"), true)
+            .unwrap();
+        assert!(
+            store
+                .merge_live_attachment_faces(&account.id, "m-repair", &[descriptor("att-live")])
+                .unwrap()
+        );
+        let stored = store
+            .message_by_id(&account.id, &conversation.id, "m-repair")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attachments.len(), 1);
+        assert_eq!(stored.attachments[0].id, "att-live");
+        let faces = store
+            .live_attachment_locators(&account.id, "m-repair")
+            .unwrap();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0], face);
+        // First face wins: a second repair never moves the stored descriptor.
+        assert!(
+            !store
+                .merge_live_attachment_faces(&account.id, "m-repair", &[descriptor("att-other")])
+                .unwrap()
+        );
+        let stored = store
+            .message_by_id(&account.id, &conversation.id, "m-repair")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attachments[0].id, "att-live");
+
+        // The duplicate `insert_message` arm performs the same repair.
+        let mut duplicate = expire_record("m-repair-insert", &account.id, &conversation.id);
+        duplicate.attachments = Vec::new();
+        store
+            .insert_message(&duplicate, None, Some("plain"), true)
+            .unwrap();
+        duplicate.attachments = vec![descriptor("att-echo")];
+        assert!(!store.insert_message(&duplicate, None, None, true).unwrap());
+        let stored = store
+            .message_by_id(&account.id, &conversation.id, "m-repair-insert")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attachments.len(), 1);
+        assert_eq!(stored.attachments[0].id, "att-echo");
+        let faces = store
+            .live_attachment_locators(&account.id, "m-repair-insert")
+            .unwrap();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0], face);
     }
 
     /// `remove_message_attachment_at` (contract 1.196, §4.196): the
@@ -23915,6 +24433,7 @@ mod tests {
         sent_at: u64,
     ) -> MessageRecord {
         MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
@@ -24271,6 +24790,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, status: &'static str| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -24421,6 +24941,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550201", "contact")
             .unwrap();
         let record = |id: &str, conversation_id: &str, sent_at: u64| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -24587,6 +25108,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550303", "contact")
             .unwrap();
         let record = |id: &str, conversation_id: &str| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -24701,6 +25223,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAta2V5", "Group")
             .unwrap();
         let record = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "m-cascade-600".into(),
             account_id: account.id.clone(),
@@ -24804,6 +25327,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAta2V5", "Group")
             .unwrap();
         let record = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "m-seed-700".into(),
             account_id: account.id.clone(),
@@ -24988,6 +25512,40 @@ mod tests {
         );
     }
 
+    /// Engine-pool design §5.3: the per-account slot fixes the opaque
+    /// account id before the link finishes, so the first commit must insert
+    /// the row under that id. A re-sync of the same number keeps the existing
+    /// row and never renames it (the binding/identity is immutable).
+    #[test]
+    fn upsert_honors_a_preallocated_account_id_and_never_renames_a_row() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let reserved = "0123456789abcdef0123456789abcdef";
+        let account = store
+            .upsert_account_from_signal_with_id(
+                "+15555550177",
+                Some(7),
+                DEFAULT_PROXY_GROUP_ID,
+                Some(reserved),
+            )
+            .unwrap();
+        assert_eq!(account.id, reserved);
+        assert_eq!(account.proxy_group, DEFAULT_PROXY_GROUP_ID);
+
+        // A later plain sync of the same number updates that row in place.
+        let again = store
+            .upsert_account_from_signal("+15555550177", None, DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(again.id, reserved);
+
+        // The plain form still mints a fresh opaque id for a new number.
+        let other = store
+            .upsert_account_from_signal("+15555550178", Some(8), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_ne!(other.id, reserved);
+        assert_eq!(other.id.len(), 32);
+    }
+
     /// `stamp_incoming_viewed` (contract 1.94, §4.77): the local
     /// markViewed half — first stamp wins, only incoming rows qualify, the
     /// selection is exactly the given ids.
@@ -25002,6 +25560,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -25111,6 +25670,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -25225,6 +25785,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -25987,6 +26548,7 @@ mod tests {
         let insert_poll =
             |store: &Store, id: &str, sender: &str, sent_at: u64, status: &'static str| {
                 let message = MessageRecord {
+                    required_protocol_version: None,
                     author_aci: None,
                     id: id.into(),
                     account_id: account.id.clone(),
@@ -26189,6 +26751,7 @@ mod tests {
                       status: &'static str,
                       rich: Option<NormalizedRich>| {
             let message = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -26376,6 +26939,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAtcG9sbA==", "Polls")
             .unwrap();
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "poll-capped".into(),
             account_id: account.id.clone(),
@@ -26624,6 +27188,7 @@ mod tests {
 
         let row =
             |id: &str, direction: &'static str, sender_id: &str, sent_at: u64| MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -26839,6 +27404,7 @@ mod tests {
         assert_eq!(summary_watermark(), None);
 
         let row = |id: &str, direction: &'static str, sent_at: u64| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -26910,6 +27476,116 @@ mod tests {
             .advance_read_watermark_to(&account.id, &conversation.id, 35)
             .unwrap();
         assert_eq!(summary_watermark(), Some(35));
+    }
+
+    /// Contract revision 1.216 (§4.216): the message-granular watermark
+    /// advance resolves the target inside the addressed account+conversation,
+    /// folds with the same monotonic MAX, and refuses a foreign/unknown/clock-
+    /// less target with the discriminable `ReadWatermarkTargetInvalid` while
+    /// leaving the position untouched.
+    #[test]
+    fn read_watermark_to_message_validates_the_target_and_never_rewinds() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let other = store
+            .ensure_conversation(&account.id, "direct", "+15555550103", "Other")
+            .unwrap();
+        let zero_clock = store
+            .ensure_conversation(&account.id, "direct", "+15555550104", "Clockless")
+            .unwrap();
+        store
+            .seed_message_row_for_test_at(&account.id, &conversation.id, 10_000)
+            .unwrap();
+        store
+            .seed_message_row_for_test_at(&account.id, &conversation.id, 20_000)
+            .unwrap();
+        store
+            .seed_message_row_for_test_at(&account.id, &other.id, 30_000)
+            .unwrap();
+        store
+            .seed_message_row_for_test_at(&account.id, &zero_clock.id, 0)
+            .unwrap();
+
+        let watermark = |conversation_id: &str| {
+            store
+                .conversation_summary(&account.id, conversation_id)
+                .unwrap()
+                .unwrap()
+                .read_watermark_ms
+        };
+        let row_id =
+            |conversation_id: &str, sent_at: i64| format!("seed-{conversation_id}-{sent_at}");
+
+        // A clock-less target is not an honest read position: the NULL
+        // watermark must stay absent, never coerce to 0 ("read everything
+        // before the epoch").
+        assert!(matches!(
+            store.advance_read_watermark_to_message(
+                &account.id,
+                &zero_clock.id,
+                &row_id(&zero_clock.id, 0)
+            ),
+            Err(StoreError::ReadWatermarkTargetInvalid)
+        ));
+        assert_eq!(watermark(&zero_clock.id), None);
+
+        // The explicit target lands on THAT row, not the newest one.
+        store
+            .advance_read_watermark_to_message(
+                &account.id,
+                &conversation.id,
+                &row_id(&conversation.id, 20_000),
+            )
+            .unwrap();
+        assert_eq!(watermark(&conversation.id), Some(20_000));
+
+        // An older target folds with MAX and never rewinds.
+        store
+            .advance_read_watermark_to_message(
+                &account.id,
+                &conversation.id,
+                &row_id(&conversation.id, 10_000),
+            )
+            .unwrap();
+        assert_eq!(watermark(&conversation.id), Some(20_000));
+
+        // A row of ANOTHER conversation is not a target of this one: the
+        // store answers the discriminable error and the position is intact.
+        assert!(matches!(
+            store.advance_read_watermark_to_message(
+                &account.id,
+                &conversation.id,
+                &row_id(&other.id, 30_000)
+            ),
+            Err(StoreError::ReadWatermarkTargetInvalid)
+        ));
+        assert_eq!(watermark(&conversation.id), Some(20_000));
+
+        // Unknown id / wrong account answer the same error, never a silent
+        // advance.
+        assert!(matches!(
+            store.advance_read_watermark_to_message(
+                &account.id,
+                &conversation.id,
+                "message-that-does-not-exist"
+            ),
+            Err(StoreError::ReadWatermarkTargetInvalid)
+        ));
+        assert!(matches!(
+            store.advance_read_watermark_to_message(
+                "account-that-does-not-exist",
+                &conversation.id,
+                &row_id(&conversation.id, 10_000)
+            ),
+            Err(StoreError::ReadWatermarkTargetInvalid)
+        ));
+        assert_eq!(watermark(&conversation.id), Some(20_000));
     }
 
     #[test]

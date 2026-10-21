@@ -411,6 +411,16 @@ impl ServiceError {
             ServiceError::Store(StoreError::MessageNotFound) => {
                 ApiError::new("MESSAGE_NOT_FOUND", "message was not found", false)
             }
+            // Contract revision 1.216, §4.216: an explicit read target that
+            // names no message of the addressed account+conversation is a
+            // caller mistake, not a missing-resource lookup — the request
+            // must fail closed instead of advancing the watermark past what
+            // the caller actually read.
+            ServiceError::Store(StoreError::ReadWatermarkTargetInvalid) => ApiError::new(
+                "INVALID_REQUEST",
+                "messageId does not name a message of this conversation",
+                false,
+            ),
             ServiceError::Store(StoreError::OperationConflict) => ApiError::new(
                 "INVALID_REQUEST",
                 "account delete operation conflicts with existing state",
@@ -2085,6 +2095,13 @@ pub struct ConnectorService {
     /// Media ingest backing (ADR 0004); `None` keeps every media method on
     /// the pre-PoC `CAPABILITY_UNAVAILABLE` answer.
     media: Option<MediaIngest>,
+    /// The pre-provisioned opaque id of a per-account engine slot
+    /// (engine-pool design §5.3). Receive ingestion can materialize an account
+    /// row **before** `link.finish` commits it (the engine emits its
+    /// post-link receive concurrently); without this hint that row would get a
+    /// random id and the commit would disagree with the slot id. `None` is
+    /// every legacy group service, byte-for-byte the pre-pool behavior.
+    preferred_account_id: Option<String>,
 }
 
 impl ConnectorService {
@@ -2097,6 +2114,18 @@ impl ConnectorService {
     /// process-wide: `readChunk`/`closeHandle` carry no accountId on the
     /// wire, so all groups must resolve handles from one table.
     pub fn with_media(store: Arc<Store>, media: Option<MediaIngest>) -> Self {
+        Self::with_media_and_account(store, media, None)
+    }
+
+    /// Launcher entry for a per-account engine slot: carries the slot's
+    /// pre-provisioned account id into every account-materializing path
+    /// (receive ingestion included), so the id is fixed before the link
+    /// commits.
+    pub fn with_media_and_account(
+        store: Arc<Store>,
+        media: Option<MediaIngest>,
+        preferred_account_id: Option<String>,
+    ) -> Self {
         Self {
             store,
             link: None,
@@ -2104,6 +2133,7 @@ impl ConnectorService {
             early_controls: Vec::new(),
             early_receipts: Vec::new(),
             media,
+            preferred_account_id,
         }
     }
 
@@ -2148,6 +2178,25 @@ impl ConnectorService {
         )],
         proxy_group: &str,
     ) -> Result<Vec<AccountSummary>, ServiceError> {
+        self.sync_accounts_from_numbers_with_capabilities_and_id(accounts, proxy_group, None)
+    }
+
+    /// The pre-provisioned-id variant (engine-pool design §5.3): a
+    /// per-account engine's first listAccounts after a link whose commit did
+    /// not land yet (crash window) must still persist the row under the slot's
+    /// pre-allocated id, or the slot's own account would be unreachable by
+    /// id. Only the INSERT path consults the hint; the update path is
+    /// unchanged.
+    pub fn sync_accounts_from_numbers_with_capabilities_and_id(
+        &self,
+        accounts: &[(
+            String,
+            Option<String>,
+            Option<crate::store::AccountCapabilities>,
+        )],
+        proxy_group: &str,
+        preferred_account_id: Option<&str>,
+    ) -> Result<Vec<AccountSummary>, ServiceError> {
         let mut capabilities_by_id = std::collections::HashMap::new();
         for (number, aci, capabilities) in accounts {
             // [KT 适配] Never re-adopt a number whose local-data delete has
@@ -2164,9 +2213,12 @@ impl ConnectorService {
             {
                 continue;
             }
-            let summary = self
-                .store
-                .upsert_account_from_signal(number, None, proxy_group)?;
+            let summary = self.store.upsert_account_from_signal_with_id(
+                number,
+                None,
+                proxy_group,
+                preferred_account_id,
+            )?;
             let canonical = aci.as_deref().and_then(crate::store::canonical_aci);
             if let Some(aci) = canonical.as_deref() {
                 self.store.set_account_aci(&summary.id, Some(aci))?;
@@ -2332,6 +2384,23 @@ impl ConnectorService {
         proxy_group: &str,
         aci: Option<&str>,
     ) -> Result<AccountSummary, ServiceError> {
+        self.complete_link_session_with_id(link_session_id, number, proxy_group, aci, None)
+    }
+
+    /// The pre-provisioned-id variant (engine-pool design §5.3): a
+    /// per-account engine slot already owns the opaque account id that names
+    /// its data directory, so the commit must insert the row under that id.
+    /// A number that is already linked keeps its row (relink/immutable
+    /// binding), and the pre-allocated id is then reported as a mismatch by
+    /// the caller rather than silently rewritten here.
+    pub fn complete_link_session_with_id(
+        &mut self,
+        link_session_id: &str,
+        number: &str,
+        proxy_group: &str,
+        aci: Option<&str>,
+        preferred_account_id: Option<&str>,
+    ) -> Result<AccountSummary, ServiceError> {
         let _ = self.require_active_link(link_session_id)?;
         // [KT 适配] Relink gate (§9.10 item 7): an unfinished local-data delete
         // for this number keeps the old account row in place. Committing a
@@ -2356,9 +2425,12 @@ impl ConnectorService {
         let _ = self.take_link_session(link_session_id)?;
         // The binding is fixed here, at link.finish success, and immutable for
         // the life of the account (ADR 0001 R3).
-        let summary = self
-            .store
-            .upsert_account_from_signal(number, Some(now_ms()), proxy_group)?;
+        let summary = self.store.upsert_account_from_signal_with_id(
+            number,
+            Some(now_ms()),
+            proxy_group,
+            preferred_account_id,
+        )?;
         // Contract 1.142 (§4.138): persist the engine's own-ACI answer when
         // the finishLink face carried one; a face without the key — or with a
         // value that does not parse as an ACI — leaves any stored identity in
@@ -2444,6 +2516,16 @@ impl ConnectorService {
         proxy_group: &str,
     ) -> Result<Option<String>, ServiceError> {
         Ok(self.store.any_signal_account_number_in_group(proxy_group)?)
+    }
+
+    /// Every liveness-probe candidate of this group (opaque row id beside
+    /// signal number, newest link first). Store-only: the watchdog cross-
+    /// checks the engine's own account list before using one as a probe.
+    pub fn signal_account_candidates_in_group(
+        &self,
+        proxy_group: &str,
+    ) -> Result<Vec<AccountRow>, ServiceError> {
+        Ok(self.store.signal_account_candidates_in_group(proxy_group)?)
     }
 
     /// Signal number of any linked account, used as the watchdog ping target.
@@ -3458,6 +3540,7 @@ impl ConnectorService {
             client_request_id,
         ]);
         let pending = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: pending_id.clone(),
             account_id: account_id.to_string(),
@@ -3573,6 +3656,7 @@ impl ConnectorService {
         let pending_id =
             stable_hash_id(&[account_id, conversation_id, "outgoing", client_request_id]);
         let pending = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: pending_id.clone(),
             account_id: account_id.to_string(),
@@ -8171,6 +8255,7 @@ impl ConnectorService {
         account_id: &str,
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
+        read_message_id: Option<&str>,
     ) -> Result<PreparedReceipts, ServiceError> {
         let prepared = self.prepare_receipt(
             account_id,
@@ -8181,15 +8266,11 @@ impl ConnectorService {
         // The read-position watermark's local-first advance (B-27, 水位制):
         // the official markConversationRead flips local read state before
         // any receipt rides, so the stamp lands at prepare time and never
-        // waits for the fan-out's confirmation. Best-effort — a store hiccup
-        // costs the durable divider re-derivation once, never the receipt
-        // legs themselves.
-        if let Err(error) = self
-            .store
-            .advance_read_watermark_latest(account_id, conversation_id)
-        {
-            tracing::warn!(error_class = error.class(), "read watermark advance failed");
-        }
+        // waits for the fan-out's confirmation. Contract revision 1.216
+        // (§4.216): an explicit messageId makes that advance message-
+        // granular and fallible; the absent form keeps the pre-1.216
+        // best-effort whole-conversation behavior.
+        self.advance_read_watermark(account_id, conversation_id, read_message_id)?;
         Ok(prepared)
     }
 
@@ -8236,6 +8317,7 @@ impl ConnectorService {
         account_id: &str,
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
+        read_message_id: Option<&str>,
     ) -> Result<PreparedReceipts, ServiceError> {
         let prepared = self.prepare_receipt(
             account_id,
@@ -8248,14 +8330,98 @@ impl ConnectorService {
         // read-receipts flag never gates it), so this is the watermark's
         // primary write seam — the §4.89 "zero local writes" discipline gains
         // exactly this one deliberate exception, the read-position authority
-        // the 水位制 ruling stores here.
-        if let Err(error) = self
-            .store
-            .advance_read_watermark_latest(account_id, conversation_id)
-        {
-            tracing::warn!(error_class = error.class(), "read watermark advance failed");
-        }
+        // the 水位制 ruling stores here. The §4.216 message target applies
+        // here identically.
+        self.advance_read_watermark(account_id, conversation_id, read_message_id)?;
         Ok(prepared)
+    }
+
+    /// The read legs' shared watermark write seam (B-27, 水位制; the
+    /// message-granular target added by contract revision 1.216, §4.216).
+    ///
+    /// With an explicit `messageId` the target is the caller's assertion,
+    /// not a hint: its shape and its membership are validated here, the
+    /// advance is **fallible**, and a bad target fails the whole request
+    /// (INVALID_REQUEST via `StoreError::ReadWatermarkTargetInvalid`)
+    /// instead of silently falling back to the newest position. A store
+    /// failure on this leg is equally propagated — the caller asked for a
+    /// precise read position and must not be told it landed when it did not.
+    ///
+    /// Without a target the pre-1.216 behavior is byte-identical: advance
+    /// to the conversation's newest incoming row, best-effort (a store
+    /// hiccup costs the durable divider re-derivation once, never the
+    /// receipt legs themselves).
+    ///
+    /// Observability (contract revision 1.216): the counters split
+    /// byMessage / byLatest and the rejection/store-failure classes, and
+    /// the log line carries the source and the error class only — never the
+    /// message id, the conversation id, or any row content.
+    fn advance_read_watermark(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        read_message_id: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let Some(message_id) = read_message_id else {
+            return match self
+                .store
+                .advance_read_watermark_latest(account_id, conversation_id)
+            {
+                Ok(()) => {
+                    crate::metrics::record_read_watermark_by_latest();
+                    Ok(())
+                }
+                Err(error) => {
+                    crate::metrics::record_read_watermark_store_failure();
+                    tracing::warn!(
+                        source = "byLatest",
+                        error_class = error.class(),
+                        "read watermark advance failed"
+                    );
+                    Ok(())
+                }
+            };
+        };
+        // Shape before lookup: an empty/over-bound id is a caller mistake
+        // with a precise message, and it must never reach the store.
+        if let Err(error) = validate_opaque_id(message_id, "messageId") {
+            crate::metrics::record_read_watermark_target_rejected();
+            // A caller mistake is observable at info level; only a store
+            // fault below warrants a warning.
+            tracing::info!(
+                source = "byMessage",
+                error_class = "invalid_shape",
+                "read watermark target rejected"
+            );
+            return Err(error);
+        }
+        match self
+            .store
+            .advance_read_watermark_to_message(account_id, conversation_id, message_id)
+        {
+            Ok(()) => {
+                crate::metrics::record_read_watermark_by_message();
+                Ok(())
+            }
+            Err(error @ StoreError::ReadWatermarkTargetInvalid) => {
+                crate::metrics::record_read_watermark_target_rejected();
+                tracing::info!(
+                    source = "byMessage",
+                    error_class = error.class(),
+                    "read watermark target rejected"
+                );
+                Err(error.into())
+            }
+            Err(error) => {
+                crate::metrics::record_read_watermark_store_failure();
+                tracing::warn!(
+                    source = "byMessage",
+                    error_class = error.class(),
+                    "read watermark advance failed"
+                );
+                Err(error.into())
+            }
+        }
     }
 
     /// messages.syncViewed (contract revision 1.108, §4.89): identical
@@ -9567,9 +9733,12 @@ impl ConnectorService {
                 }
             }
         };
-        let account = self
-            .store
-            .upsert_account_from_signal(&signal_account, None, owner_group)?;
+        let account = self.store.upsert_account_from_signal_with_id(
+            &signal_account,
+            None,
+            owner_group,
+            self.preferred_account_id.as_deref(),
+        )?;
         // Contract 1.76 (§4.67): a story reply rides a regular dataMessage
         // (`dataMessage.storyReply`) and lands as a conversation row. The
         // same stories-disabled gate the story envelope itself faces drops
@@ -9617,22 +9786,27 @@ impl ConnectorService {
         // §4.91: the flush key the landed row's sender projects — captured
         // before the record consumes `sender_id` by move.
         let flush_sender_id = sender_id.clone();
-        if self
-            .store
-            .message_by_signal_identity(
-                &account.id,
-                &conversation.id,
-                direction,
-                sent_at,
-                &sender_id,
-                if direction == "outgoing" {
-                    "self"
-                } else {
-                    &legacy_sender_id
-                },
-            )?
-            .is_some()
-        {
+        if let Some(existing) = self.store.message_by_signal_identity(
+            &account.id,
+            &conversation.id,
+            direction,
+            sent_at,
+            &sender_id,
+            if direction == "outgoing" {
+                "self"
+            } else {
+                &legacy_sender_id
+            },
+        )? {
+            // The row identity already landed. This replay must still
+            // converge its attachment faces: the row may be a post-relink
+            // restore copy with no descriptors, while this envelope carries
+            // them (or the newer locators). Merge into empty positions only —
+            // the existing face is authoritative and never moved.
+            let mut attachments = receive.attachments.clone();
+            fill_missing_attachment_ids(&existing.id, &mut attachments);
+            self.store
+                .merge_live_attachment_faces(&account.id, &existing.id, &attachments)?;
             return Ok(Vec::new());
         }
         let message_id = stable_hash_id(&[
@@ -9736,6 +9910,7 @@ impl ConnectorService {
                 .store_conversation_report_token(&account.id, &conversation.id, token)?;
         }
         let mut message = MessageRecord {
+            required_protocol_version: receive.required_protocol_version,
             // Contract 1.191 (§4.191): the incoming author's protocol identity
             // — the envelope's `sourceUuid` member ACI, verbatim. Outgoing
             // rows name the account itself (its number is the protocol face),
@@ -9810,6 +9985,7 @@ impl ConnectorService {
             is_story: false,
             story_message: None,
         };
+        fill_missing_attachment_ids(&message.id, &mut message.attachments);
         let preview = message
             .text
             .as_deref()
@@ -9819,22 +9995,10 @@ impl ConnectorService {
             self.store
                 .insert_message(&message, None, preview.as_deref(), increment_unread)?;
         if !inserted {
-            // Contract revision 1.175 (§4.175): the row already exists — the
-            // optimistic outgoing row predates its sent-sync echo, and
-            // `INSERT OR IGNORE` dropped the echo's transit locator faces.
-            // Merge them into the existing row's empty live-locator slots so
-            // the outgoing echo's pointer face becomes downloadable (the
-            // first face wins; a row the receive arm already stored locators
-            // for is never moved).
-            self.store.merge_live_attachment_locators(
-                &account.id,
-                &message.id,
-                &message
-                    .attachments
-                    .iter()
-                    .map(|descriptor| descriptor.locator.clone())
-                    .collect::<Vec<_>>(),
-            )?;
+            // A race lost to the identity check above: `insert_message`'s
+            // duplicate arm merged this envelope's descriptor/locator faces
+            // into the existing row (empty positions only), so the event
+            // stays silent exactly like the early duplicate path.
             return Ok(Vec::new());
         }
         // §4.91: the row just landed — apply any edit/remoteDelete that
@@ -10492,6 +10656,7 @@ impl ConnectorService {
             ..Default::default()
         };
         let message = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: message_id,
             account_id: account_id.to_string(),
@@ -10783,6 +10948,7 @@ impl ConnectorService {
             }
             let sent_at = receive.timestamp.unwrap_or(0);
             let record = MessageRecord {
+                required_protocol_version: receive.required_protocol_version,
                 author_aci: None,
                 id: stable_hash_id(&["signal-story-sync", &account.id, &sent_at.to_string()]),
                 account_id: account.id.clone(),
@@ -11602,6 +11768,7 @@ impl ConnectorService {
                     .as_ref()
                     .map(|text| text.len().min(u32::MAX as usize) as u32);
                 let message = MessageRecord {
+                    required_protocol_version: None,
                     author_aci: None,
                     id: message_id,
                     account_id: account.id.clone(),
@@ -16409,6 +16576,15 @@ pub struct MessagesMarkReadParams {
     pub account_id: String,
     pub conversation_id: String,
     pub message_ids: Option<Vec<String>>,
+    /// Contract revision 1.216, §4.216: optional message-granular read
+    /// position. Present = the conversation watermark advances to THIS
+    /// row's `sent_at` (the official `markConversationRead` message
+    /// target), validated against the addressed account+conversation; a
+    /// target that does not resolve answers INVALID_REQUEST without moving
+    /// the watermark. Absent = the pre-1.216 whole-conversation behavior
+    /// (advance to the newest incoming row). Independent of `messageIds`,
+    /// which still governs which rows ride the receipt fan-out.
+    pub message_id: Option<String>,
 }
 
 /// messages.markViewed params: identical shape to
@@ -16431,6 +16607,10 @@ pub struct MessagesSyncReadParams {
     pub account_id: String,
     pub conversation_id: String,
     pub message_ids: Option<Vec<String>>,
+    /// Contract revision 1.216, §4.216: identical message-granular read
+    /// position to [`MessagesMarkReadParams::message_id`] — the self-sync
+    /// face keeps the read-face addressing byte-identical.
+    pub message_id: Option<String>,
 }
 
 /// messages.syncViewed params: identical shape to
@@ -17570,6 +17750,21 @@ fn status_change_events(updated: Option<(MessageRecord, bool)>) -> Vec<HostSideE
     }
 }
 
+/// Give every engine descriptor that arrived without a stable id a
+/// deterministic local handle. The engine's live projection emits an `id`
+/// key that is empty when the pointer carries no `client_uuid`; the archive
+/// export omits the key entirely. The row identity is known by the time this
+/// runs, so the synthetic id is as stable as the history importer's
+/// (`history-attachment` precedent) and every later replay computes the same
+/// value. Non-empty engine ids are never rewritten.
+fn fill_missing_attachment_ids(message_id: &str, attachments: &mut [NormalizedAttachment]) {
+    for (index, descriptor) in attachments.iter_mut().enumerate() {
+        if descriptor.id.is_empty() {
+            descriptor.id = stable_hash_id(&["live-attachment", message_id, &index.to_string()]);
+        }
+    }
+}
+
 fn project_message_for_host(mut message: MessageRecord) -> MessageRecord {
     let Some(text) = message.text.as_deref() else {
         return message;
@@ -18586,6 +18781,7 @@ mod tests {
     /// `server_guid` stays None until the test stamps one.
     fn expire_record_fixture(account_id: &str, conversation_id: &str, id: &str) -> MessageRecord {
         MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
@@ -19366,6 +19562,7 @@ mod tests {
             .unwrap();
         let member_aci = "c3b07a1e-55cc-4a44-9e11-8a2b3c4d5e6f";
         let receive = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1726999999004),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -20796,6 +20993,7 @@ mod tests {
         let events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(10),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -20871,6 +21069,7 @@ mod tests {
         let events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(11),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -21496,7 +21695,10 @@ mod tests {
         };
         let enrollable = [
             EngineError::ServerUnavailable,
-            EngineError::Upstream { cause: None },
+            EngineError::Upstream {
+                cause: None,
+                code: None,
+            },
         ];
         for (index, error) in enrollable.iter().enumerate() {
             let request = format!("req-enroll-{index}");
@@ -21630,7 +21832,10 @@ mod tests {
             SendRetrySchedule::Backoff
         );
         assert_eq!(
-            ConnectorService::auto_retry_schedule(&EngineError::Upstream { cause: None }),
+            ConnectorService::auto_retry_schedule(&EngineError::Upstream {
+                cause: None,
+                code: None,
+            }),
             SendRetrySchedule::Backoff
         );
         for error in [
@@ -22496,6 +22701,7 @@ mod tests {
             PreparedSend::Existing(_) => panic!("new client request must dispatch"),
         };
         let sync_receive = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(99),
             content_kind: "syncMessage",
             direction: "outgoing",
@@ -22638,6 +22844,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let receive = |source: &str, text: &str| NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(200),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -22713,6 +22920,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let receive = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(200),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -22821,6 +23029,7 @@ mod tests {
         let mention_receive =
             |timestamp: u64, direction: &'static str, mention: crate::engine::NormalizedMention| {
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(timestamp),
                     content_kind: "dataMessage",
                     direction,
@@ -22977,6 +23186,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let receive = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(200),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -23007,6 +23217,7 @@ mod tests {
                 .is_empty()
         );
         let group_landing = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(300),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -23129,6 +23340,7 @@ mod tests {
     fn receive_without_signal_timestamp_has_no_persistence_side_effects() {
         let (_temp, mut service) = service();
         let receive = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: None,
             content_kind: "dataMessage",
             direction: "incoming",
@@ -23433,6 +23645,7 @@ mod tests {
         let events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(777),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -23655,6 +23868,7 @@ mod tests {
         let group_events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(900),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -23863,6 +24077,7 @@ mod tests {
         let events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(50),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -23991,6 +24206,7 @@ mod tests {
         let events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(50),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -24133,6 +24349,7 @@ mod tests {
         let group_events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(900),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -24785,6 +25002,7 @@ mod tests {
         let events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(50),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -24938,6 +25156,7 @@ mod tests {
         let group_events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(900),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -25125,6 +25344,7 @@ mod tests {
         let events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(50),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -25675,6 +25895,7 @@ mod tests {
         let _events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(10),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -26507,6 +26728,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "group-one", "group")
             .unwrap();
         let base = |id: &str, conversation_id: &str, direction: &'static str| MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account.id.clone(),
@@ -29796,6 +30018,7 @@ mod tests {
         let (account, conversation) = linked_account_and_conversation(&mut service);
 
         let receive = crate::engine::NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1727000000000),
             content_kind: "control",
             direction: "incoming",
@@ -29864,6 +30087,7 @@ mod tests {
 
         let receive = |source: Option<&str>, control: crate::engine::ControlReceive| {
             crate::engine::NormalizedReceive {
+                required_protocol_version: None,
                 timestamp: Some(1727000000000),
                 content_kind: "control",
                 direction: "incoming",
@@ -31575,6 +31799,7 @@ mod tests {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let story_receive = crate::engine::NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1727000000000),
             content_kind: "storyMessage",
             direction: "incoming",
@@ -31604,6 +31829,7 @@ mod tests {
             server_timestamp: None,
         };
         let story_reply_receive = crate::engine::NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1727000001000),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -32135,6 +32361,7 @@ mod tests {
         // The buffer still converges: the late original lands and the
         // buffered delete applies through the unchanged §4.91 flush.
         let original = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(700),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -32410,6 +32637,7 @@ mod tests {
         let (_temp, mut service) = service();
         let (_account, _conversation) = linked_account_and_conversation(&mut service);
         let receive = crate::engine::NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1727000002000),
             content_kind: "storyMessage",
             direction: "incoming",
@@ -33467,6 +33695,7 @@ mod tests {
     /// Builds a control-carrying receive addressed to this account/peer.
     fn control_receive(account: &str, source: &str, control: ControlReceive) -> NormalizedReceive {
         NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(500),
             content_kind: "control",
             direction: "control",
@@ -33568,6 +33797,7 @@ mod tests {
             .unwrap();
         let seed = |id: &str, sent_at: u64| {
             let record = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -33749,16 +33979,152 @@ mod tests {
 
         // messages.markRead prepare: stamps to the newest INCOMING row.
         service
-            .prepare_mark_read(&account.id, &conversation.id, None)
+            .prepare_mark_read(&account.id, &conversation.id, None, None)
             .unwrap();
         assert_eq!(watermark(), Some(30));
 
         // messages.syncRead prepare: same fold, never rewinds below 30 even
         // when the selection addresses only the older row.
         service
-            .prepare_sync_read(&account.id, &conversation.id, Some(vec!["m-in".into()]))
+            .prepare_sync_read(
+                &account.id,
+                &conversation.id,
+                Some(vec!["m-in".into()]),
+                None,
+            )
             .unwrap();
         assert_eq!(watermark(), Some(30));
+    }
+
+    /// Contract revision 1.216 (§4.216): an explicit `messageId` advances
+    /// the read watermark to THAT row's `sent_at` (markRead and syncRead
+    /// alike), never to the conversation's newest incoming row; the absent
+    /// form keeps the pre-1.216 newest-incoming regression; a target owned by
+    /// another conversation, an unknown id, and a shape-invalid id all answer
+    /// INVALID_REQUEST with the watermark untouched; an older target folds
+    /// with MAX and never rewinds.
+    #[test]
+    fn read_legs_advance_the_watermark_to_an_explicit_message() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let other = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550104", "Other")
+            .unwrap();
+
+        let seed = |id: &str, direction: &'static str, sent_at: u64, conv: &str| {
+            let mut record = expire_record_fixture(&account.id, conv, id);
+            record.direction = direction;
+            record.sent_at = sent_at;
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, None, true)
+                    .unwrap()
+            );
+        };
+        seed("m-in", "incoming", 10, &conversation.id);
+        seed("m-in-2", "incoming", 30, &conversation.id);
+        seed("m-out", "outgoing", 40, &conversation.id);
+        seed("o-in", "incoming", 50, &other.id);
+
+        let watermark = || {
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .read_watermark_ms
+        };
+        // The wire mapping lives in `into_api` (the store verdict is a
+        // discriminable error the host projects to INVALID_REQUEST).
+        let expect_invalid_request = |result: Result<PreparedReceipts, ServiceError>| match result {
+            Err(error) => {
+                let api = error.into_api();
+                assert_eq!(api.code, "INVALID_REQUEST", "{api:?}");
+                assert!(!api.retryable);
+            }
+            Ok(_) => panic!("expected INVALID_REQUEST, got a prepared receipt"),
+        };
+
+        let (by_message_before, by_latest_before, rejected_before, store_before) =
+            crate::metrics::read_watermark_counters();
+
+        // markRead at the OLDER row: the watermark lands on 10, not on the
+        // newest incoming 30 — the message-granular contract.
+        service
+            .prepare_mark_read(&account.id, &conversation.id, None, Some("m-in"))
+            .unwrap();
+        assert_eq!(watermark(), Some(10));
+
+        // syncRead carries the same target semantics.
+        service
+            .prepare_sync_read(&account.id, &conversation.id, None, Some("m-in-2"))
+            .unwrap();
+        assert_eq!(watermark(), Some(30));
+
+        // Regression: absent messageId keeps the whole-conversation form —
+        // newest INCOMING row (the outgoing 40 is above the read domain).
+        service
+            .prepare_mark_read(&account.id, &conversation.id, None, None)
+            .unwrap();
+        assert_eq!(watermark(), Some(30));
+
+        // An older explicit target folds with MAX: no rewind.
+        service
+            .prepare_sync_read(&account.id, &conversation.id, None, Some("m-in"))
+            .unwrap();
+        assert_eq!(watermark(), Some(30));
+
+        // A row of ANOTHER conversation is not a target of this one.
+        expect_invalid_request(service.prepare_mark_read(
+            &account.id,
+            &conversation.id,
+            None,
+            Some("o-in"),
+        ));
+        assert_eq!(watermark(), Some(30));
+
+        // An unknown id on the self-sync face: the same deterministic
+        // refusal, no silent advance.
+        expect_invalid_request(service.prepare_sync_read(
+            &account.id,
+            &conversation.id,
+            None,
+            Some("m-missing"),
+        ));
+        assert_eq!(watermark(), Some(30));
+
+        // A shape-invalid id fails before any store work.
+        expect_invalid_request(service.prepare_mark_read(
+            &account.id,
+            &conversation.id,
+            None,
+            Some(""),
+        ));
+        assert_eq!(watermark(), Some(30));
+
+        // Observability split: the successful explicit advances count as
+        // byMessage, the absent one as byLatest, the three refusals as
+        // target rejections — and no store failure was claimed.
+        let (by_message_after, by_latest_after, rejected_after, store_after) =
+            crate::metrics::read_watermark_counters();
+        assert!(
+            by_message_after >= by_message_before + 3,
+            "explicit advances must be counted by message"
+        );
+        assert!(
+            by_latest_after > by_latest_before,
+            "the absent form must be counted by latest"
+        );
+        assert!(
+            rejected_after >= rejected_before + 3,
+            "every refused target must be counted"
+        );
+        assert_eq!(
+            store_after, store_before,
+            "a target verdict is not a store failure"
+        );
     }
 
     /// §4.186 (B-27): the remote read-sync receive folds the MATCHED rows'
@@ -33912,6 +34278,7 @@ mod tests {
             .remove(0);
 
         let receive = |token: Option<&str>, timestamp: u64| NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(timestamp),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -34007,6 +34374,7 @@ mod tests {
             .unwrap();
         let seed = |conversation_id: &str, id: &str, sent_at: u64, direction: &'static str| {
             let record = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -34244,6 +34612,7 @@ mod tests {
         attachments: Vec<NormalizedAttachment>,
     ) {
         let record = MessageRecord {
+            required_protocol_version: None,
             author_aci: author_aci.map(str::to_string),
             id: id.into(),
             account_id: account_id.into(),
@@ -34597,6 +34966,7 @@ mod tests {
             .unwrap();
         let seed = |conversation_id: &str, id: &str, sent_at: u64| {
             let record = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -35508,6 +35878,7 @@ mod tests {
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let seed = |id: &str, sent_at: u64, direction: &'static str, conv: &str| {
             let record = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -35567,7 +35938,7 @@ mod tests {
         seed("m2", now + 1, "incoming", &conversation.id);
 
         let absent = service
-            .prepare_mark_read(&account.id, &conversation.id, None)
+            .prepare_mark_read(&account.id, &conversation.id, None, None)
             .unwrap();
         assert_eq!(absent.account_id, account.id);
         assert_eq!(absent.conversation_id, conversation.id);
@@ -35597,7 +35968,7 @@ mod tests {
             .unwrap();
         seed("g1", now + 4, "incoming", &group.id);
         let group_receipts = service
-            .prepare_mark_read(&account.id, &group.id, None)
+            .prepare_mark_read(&account.id, &group.id, None, None)
             .unwrap();
         assert!(
             group_receipts.groups.is_empty(),
@@ -35609,6 +35980,7 @@ mod tests {
                 &account.id,
                 &conversation.id,
                 Some((0..600).map(|index| format!("junk-{index}")).collect()),
+                None,
             )
             .unwrap();
         assert!(truncated.groups.is_empty(), "truncation drops unknown ids");
@@ -35634,6 +36006,7 @@ mod tests {
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let seed = |service: &ConnectorService, id: &str, sent_at: u64, conv: &str| {
             let record = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -35731,7 +36104,7 @@ mod tests {
         // markRead has no `read_at` stamp: the desktop owns its read state
         // (the §4.163 issuance ledger is a separate column, not this one).
         let read = service
-            .prepare_mark_read(&account.id, &conversation.id, None)
+            .prepare_mark_read(&account.id, &conversation.id, None, None)
             .unwrap();
         assert!(!read.groups.is_empty());
         let before = stored(&service, &conversation.id, "m1").read_at;
@@ -35753,6 +36126,7 @@ mod tests {
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let seed = |service: &ConnectorService, conv: &str, id: &str, sent_at: u64| {
             let record = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -35812,14 +36186,14 @@ mod tests {
         // A confirmed fan-out closes the ledger: the same absent-mode trigger
         // re-supplies nothing.
         let first = service
-            .prepare_mark_read(&account.id, &conversation.id, None)
+            .prepare_mark_read(&account.id, &conversation.id, None, None)
             .unwrap();
         assert_eq!(first.row_ids, ["m1", "m2", "m3"]);
         assert_eq!(first.groups.len(), 1);
         assert_eq!(first.groups[0].timestamps, [now, now + 1, now + 2]);
         service.complete_mark_read(&first).unwrap();
         let resupplied = service
-            .prepare_mark_read(&account.id, &conversation.id, None)
+            .prepare_mark_read(&account.id, &conversation.id, None, None)
             .unwrap();
         assert!(
             resupplied.groups.is_empty() && resupplied.row_ids.is_empty(),
@@ -35844,12 +36218,12 @@ mod tests {
         seed(&service, &failed_conversation.id, "f1", now);
         seed(&service, &failed_conversation.id, "f2", now + 1);
         let unconfirmed = service
-            .prepare_mark_read(&account.id, &failed_conversation.id, None)
+            .prepare_mark_read(&account.id, &failed_conversation.id, None, None)
             .unwrap();
         assert_eq!(unconfirmed.row_ids, ["f1", "f2"]);
         // (no complete_mark_read — the send failed upstream)
         let retry = service
-            .prepare_mark_read(&account.id, &failed_conversation.id, None)
+            .prepare_mark_read(&account.id, &failed_conversation.id, None, None)
             .unwrap();
         assert_eq!(
             retry.row_ids, unconfirmed.row_ids,
@@ -35871,7 +36245,7 @@ mod tests {
         // The self-sync read face carries no ledger: it still selects the
         // rows the peer face already issued.
         let sync = service
-            .prepare_sync_read(&account.id, &conversation.id, None)
+            .prepare_sync_read(&account.id, &conversation.id, None, None)
             .unwrap();
         assert_eq!(
             sync.row_ids,
@@ -35893,6 +36267,7 @@ mod tests {
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let seed = |service: &ConnectorService, id: &str, sent_at: u64| {
             let record = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -35944,7 +36319,7 @@ mod tests {
         // syncRead: the peer group with ascending timestamps, no local
         // stamps on either face of the rows.
         let sync_read = service
-            .prepare_sync_read(&account.id, &conversation.id, None)
+            .prepare_sync_read(&account.id, &conversation.id, None, None)
             .unwrap();
         assert_eq!(sync_read.groups.len(), 1);
         assert_eq!(sync_read.groups[0].recipient, conversation.peer_key);
@@ -35998,6 +36373,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0y", "Group 2")
             .unwrap();
         let record = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "sg1".into(),
             account_id: account.id.clone(),
@@ -36042,7 +36418,7 @@ mod tests {
                 .unwrap()
         );
         let group_sync = service
-            .prepare_sync_read(&account.id, &group.id, None)
+            .prepare_sync_read(&account.id, &group.id, None, None)
             .unwrap();
         assert!(group_sync.groups.is_empty());
         let group_viewed = service
@@ -36069,6 +36445,7 @@ mod tests {
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let seed = |service: &ConnectorService, id: &str, sent_at: u64| {
             let record = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -36143,7 +36520,7 @@ mod tests {
         // The absent markRead selection carries every fresh row regardless
         // of stamp (the store tracks no read state) and never the overage.
         let read = service
-            .prepare_mark_read(&account.id, &conversation.id, None)
+            .prepare_mark_read(&account.id, &conversation.id, None, None)
             .unwrap();
         assert_eq!(read.groups.len(), 1);
         assert_eq!(read.groups[0].timestamps, vec![now + 1, now + 2]);
@@ -36179,6 +36556,7 @@ mod tests {
         // A second sent row, seeded directly (seed_outgoing_sent's fixed
         // clientRequestId makes it a one-shot per conversation).
         let second = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "m-401".into(),
             account_id: account.id.clone(),
@@ -36724,6 +37102,7 @@ mod tests {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let incoming = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(300),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -36792,6 +37171,7 @@ mod tests {
             .unwrap();
         let seed_row = |service: &mut ConnectorService, source: &str| {
             let incoming = NormalizedReceive {
+                required_protocol_version: None,
                 timestamp: Some(700),
                 content_kind: "dataMessage",
                 direction: "incoming",
@@ -36920,6 +37300,7 @@ mod tests {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let original = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(500),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -36995,6 +37376,7 @@ mod tests {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let original = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(310),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -37101,6 +37483,7 @@ mod tests {
         let (account, _conversation) = linked_account_and_conversation(&mut service);
 
         let create = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1000),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -37260,6 +37643,7 @@ mod tests {
         );
 
         let create = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1000),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -37330,6 +37714,7 @@ mod tests {
         let (account, _conversation) = linked_account_and_conversation(&mut service);
 
         let create = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1000),
             content_kind: "syncMessage",
             direction: "outgoing",
@@ -37427,6 +37812,7 @@ mod tests {
         let (account, _conversation) = linked_account_and_conversation(&mut service);
 
         let create = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1000),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -37516,6 +37902,7 @@ mod tests {
         // The own sent echo on the account's own outgoing poll mints the
         // self-flagged notice (the you-branch copy material).
         let own_create = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(2000),
             content_kind: "syncMessage",
             direction: "outgoing",
@@ -37613,6 +38000,7 @@ mod tests {
         );
 
         let create = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1000),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -37696,6 +38084,7 @@ mod tests {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let original = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(310),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -37779,6 +38168,7 @@ mod tests {
         assert!(early.is_empty(), "an early delete is buffered, not applied");
 
         let original = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(500),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -37868,6 +38258,7 @@ mod tests {
         );
 
         let original = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(510),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -37954,6 +38345,7 @@ mod tests {
 
         let seed_row = |service: &mut ConnectorService, source: &str| {
             let incoming = NormalizedReceive {
+                required_protocol_version: None,
                 timestamp: Some(600),
                 content_kind: "dataMessage",
                 direction: "incoming",
@@ -38187,6 +38579,7 @@ mod tests {
         service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(401),
                     content_kind: "dataMessage",
                     direction: "incoming",
@@ -38433,6 +38826,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAta2V5", "Group")
             .unwrap();
         let row = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "m-group-400".into(),
             account_id: account.id.clone(),
@@ -38594,6 +38988,7 @@ mod tests {
             .set_account_read_receipts(&account.id, Some(false))
             .unwrap();
         let second = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "m-gate-401".into(),
             account_id: account.id.clone(),
@@ -38697,6 +39092,7 @@ mod tests {
         let events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(450),
                     content_kind: "dataMessage",
                     direction: "outgoing",
@@ -38762,6 +39158,7 @@ mod tests {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let original = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(310),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -38909,6 +39306,7 @@ mod tests {
 
         // An incoming row is not editable by us.
         let incoming = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(440),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -38956,6 +39354,7 @@ mod tests {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let receive = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(360),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -39066,6 +39465,7 @@ mod tests {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let receive = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(400),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -39156,6 +39556,125 @@ mod tests {
         assert_eq!(stored_rich.previews[0].date, Some(1_600_000_000_000));
     }
 
+    /// Post-relink defense: the restored row arrives with no descriptors;
+    /// the later live echo of the same message must repair them (synthetic id
+    /// included, because the engine emits an empty id for a pointer without a
+    /// client uuid). The repaired row must then pass the exact
+    /// `attachments.download` descriptor lookup instead of answering the
+    /// INVALID_REQUEST miss.
+    #[test]
+    fn duplicate_live_receive_repairs_restored_attachment_descriptors() {
+        let (_temp, mut service) = media_service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let peer_sender = crate::ids::stable_hash_id(&[&account.id, "direct", "+15555550101"]);
+        let mut restored =
+            expire_record_fixture(&account.id, &conversation.id, "m-restored-attachment");
+        restored.sender_id = peer_sender.clone();
+        restored.sent_at = 700;
+        service
+            .store_ref()
+            .insert_message(&restored, None, Some("body"), false)
+            .unwrap();
+        // The reported failure, reproduced deterministically: the restored
+        // row resolves and the index is legal, but the descriptor cell is
+        // empty, so the download guard answers the exact miss.
+        let miss = service
+            .prepare_attachment_download(&account.id, &conversation.id, "m-restored-attachment", 0)
+            .unwrap_err()
+            .into_api();
+        assert_eq!(miss.code, "INVALID_REQUEST");
+        assert_eq!(
+            miss.message,
+            "attachmentIndex does not name an attachment of this message"
+        );
+
+        let face = crate::store::HistoryAttachmentLocator {
+            key: Some("q83vLNoechoM6CiZ+hr3P5ePE3YGAibLE4bAl1jv20Y=".into()),
+            cdn_key: Some("live-restored".into()),
+            cdn_number: Some(0),
+            upload_timestamp: Some(1_700_000_000_000),
+            digest: Some("ZGl-nonsense".into()),
+            plaintext_hash: None,
+        };
+        let receive = NormalizedReceive {
+            required_protocol_version: None,
+            timestamp: Some(700),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            quote: None,
+            attachments: vec![NormalizedAttachment {
+                id: String::new(),
+                content_type: Some("image/png".into()),
+                filename: Some("restored.png".into()),
+                size: Some(12),
+                width: None,
+                height: None,
+                is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
+                locator: Some(face.clone()),
+                waveform: None,
+                duration: None,
+            }],
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+        };
+        let events = service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(events.is_empty(), "the duplicate stays event-silent");
+
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, "m-restored-attachment")
+            .unwrap()
+            .expect("restored row");
+        assert_eq!(row.attachments.len(), 1, "descriptor repaired");
+        assert_eq!(
+            row.attachments[0].id,
+            crate::ids::stable_hash_id(&["live-attachment", "m-restored-attachment", "0"])
+        );
+        let prepared = service
+            .prepare_attachment_download(&account.id, &conversation.id, "m-restored-attachment", 0)
+            .expect("the descriptor resolves instead of the miss");
+        let PreparedHistoryDownload::Ready {
+            locator,
+            descriptor_size,
+            ..
+        } = prepared
+        else {
+            panic!("an un-downloaded pointer answers the ready arm");
+        };
+        assert_eq!(descriptor_size, Some(12));
+        assert_eq!(locator, face);
+    }
+
     /// §4.178 live face: the receive arm resolves the just-landed row's
     /// quote snapshot against the store BEFORE the upsert event mints, so
     /// the desktop's jump and warning strip see the same answer a later
@@ -39178,6 +39697,7 @@ mod tests {
             .unwrap();
 
         let mut receive = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(500),
             content_kind: "dataMessage",
             direction: "incoming",
@@ -39256,6 +39776,7 @@ mod tests {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
         let receive = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(500),
             content_kind: "syncMessage",
             direction: "outgoing",
@@ -40204,6 +40725,7 @@ mod tests {
     fn ingest_timer_change_mirrors_state_and_lands_a_nonsweeping_row() {
         let (_temp, mut service) = service();
         let timer_change = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1727000000000),
             content_kind: "dataMessage",
             direction: "system",
@@ -41674,6 +42196,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "group-id-1", "group")
             .unwrap();
         let group_update = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1727000000000),
             content_kind: "dataMessage",
             direction: "system",
@@ -41822,6 +42345,7 @@ mod tests {
             .unwrap();
 
         let group_timer = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1727000000000),
             content_kind: "control",
             direction: "control",
@@ -41997,6 +42521,7 @@ mod tests {
             .unwrap();
 
         let receive = |editor: Option<&str>, timestamp: u64| NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(timestamp),
             content_kind: "control",
             direction: "control",
@@ -42212,6 +42737,7 @@ mod tests {
         let events = service
             .ingest_receive(
                 NormalizedReceive {
+                    required_protocol_version: None,
                     timestamp: Some(1727000000000),
                     content_kind: "control",
                     direction: "control",
@@ -42273,6 +42799,7 @@ mod tests {
             .insert_message(&incoming, None, None, false)
             .unwrap();
         let base = NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1727000000000),
             content_kind: "control",
             direction: "incoming",
@@ -42557,6 +43084,7 @@ mod tests {
     /// independent of the shared helper's defaults.
     fn base_shape_for_unknown_test() -> NormalizedReceive {
         NormalizedReceive {
+            required_protocol_version: None,
             timestamp: Some(1727000000000),
             content_kind: "control",
             direction: "incoming",
@@ -42580,5 +43108,60 @@ mod tests {
             expire_start_at: None,
             control: None,
         }
+    }
+
+    /// Engine-pool §5.3: a per-account slot's post-link receive can land
+    /// BEFORE the link commit (the engine emits it as soon as finishLink
+    /// answers). The service must materialize that account under the slot's
+    /// pre-allocated id, never a random one — otherwise the commit later
+    /// finds a foreign row and the slot is rolled back as
+    /// ACCOUNT_ALREADY_LINKED.
+    #[test]
+    fn receive_ingest_pins_the_preallocated_slot_account_id() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap());
+        let slot_id = "0123456789abcdef0123456789abcdef";
+        let mut service = ConnectorService::with_media_and_account(
+            Arc::clone(&store),
+            None,
+            Some(slot_id.to_string()),
+        );
+        let receive = NormalizedReceive {
+            timestamp: Some(1727000000900),
+            content_kind: "data",
+            direction: "incoming",
+            account: Some("+15555550199".into()),
+            text: Some("received before the link commit".into()),
+            ..base_shape_for_unknown_test()
+        };
+        service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let row = store
+            .account_by_signal("+15555550199")
+            .unwrap()
+            .expect("the receive materializes the account row");
+        assert_eq!(row.id, slot_id, "the slot id is fixed before the commit");
+
+        // A legacy service (no preferred id) keeps the pre-pool random id.
+        let mut legacy_service = ConnectorService::with_media(Arc::clone(&store), None);
+        let legacy_receive = NormalizedReceive {
+            timestamp: Some(1727000000901),
+            content_kind: "data",
+            direction: "incoming",
+            account: Some("+15555550198".into()),
+            text: Some("legacy".into()),
+            ..base_shape_for_unknown_test()
+        };
+        legacy_service
+            .ingest_receive(legacy_receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let legacy_row = store
+            .account_by_signal("+15555550198")
+            .unwrap()
+            .expect("legacy row");
+        assert_eq!(legacy_row.id.len(), 32);
+        assert_ne!(legacy_row.id, slot_id);
     }
 }

@@ -737,6 +737,7 @@ impl<'a> Importer<'a> {
             .and_then(Value::as_u64)
             .filter(|value| *value > 0);
         let record = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: message_id,
             account_id: self.account_id.to_string(),
@@ -923,6 +924,7 @@ impl<'a> Importer<'a> {
             "已更新消息定时消失：已关闭".to_string()
         };
         let record = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: message_id,
             account_id: self.account_id.to_string(),
@@ -1029,6 +1031,7 @@ impl<'a> Importer<'a> {
         ]);
         let text = "群聊信息已更新".to_string();
         let record = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: message_id,
             account_id: self.account_id.to_string(),
@@ -2942,6 +2945,7 @@ mod tests {
         // sender hash before the import ran.
         let live_sender = stable_hash_id(&[&account.id, "direct", ALICE_ACI]);
         let live = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: stable_hash_id(&[
                 "signal-message-v2",
@@ -3015,6 +3019,125 @@ mod tests {
                 .unwrap()
                 .unread_count,
             1
+        );
+    }
+
+    /// Post-relink repair: the text-only backup artifact restores a row with
+    /// no attachment descriptors, then the archive copy of the same Signal
+    /// message (or a live echo that already landed) carries them. Identity
+    /// dedupe must not leave the row descriptor-less — the import fills the
+    /// empty attachments/locator cells while leaving the existing body alone.
+    #[test]
+    fn duplicate_import_repairs_a_restored_rows_missing_attachments() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", ALICE_E164, "8fc***01")
+            .unwrap();
+        // The restore copy: same identity, body present, no descriptors.
+        let live_sender = stable_hash_id(&[&account.id, "direct", ALICE_E164]);
+        let restored = MessageRecord {
+            required_protocol_version: None,
+            author_aci: None,
+            id: stable_hash_id(&[
+                "signal-message-v2",
+                &account.id,
+                &conversation.id,
+                "incoming",
+                "1000",
+                &live_sender,
+            ]),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: live_sender,
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 1000,
+            received_at: Some(1),
+            text: Some("restored body".into()),
+            text_bytes: Some(13),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            admin_deleted: false,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        assert!(
+            store
+                .insert_message(&restored, None, Some("restored body"), true)
+                .unwrap()
+        );
+
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming", "text": "restored body",
+                    "attachments": [{
+                        "contentType": "image/png", "fileName": "restored.png", "size": 12,
+                        "locator": {
+                            "key": "q83vLNoechoM6CiZ+hr3P5ePE3YGAibLE4bAl1jv20Y=",
+                            "cdnKey": "restored-cdn", "cdnNumber": 0,
+                            "uploadTimestamp": 1_700_000_000_000_u64,
+                            "plaintextHash": "a".repeat(64)
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+        );
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        assert_eq!(counters.imported, 0, "the row identity already exists");
+        assert_eq!(counters.skipped_messages, 1);
+        let row = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation.id,
+                "incoming",
+                1000,
+                &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+            )
+            .unwrap()
+            .expect("restored row");
+        assert_eq!(row.text.as_deref(), Some("restored body"), "body untouched");
+        assert_eq!(row.attachments.len(), 1, "descriptor repaired");
+        assert_eq!(row.attachments[0].filename.as_deref(), Some("restored.png"));
+        let faces = store
+            .history_attachment_locators(&account.id, &row.id)
+            .unwrap();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(
+            faces[0].key.as_deref(),
+            Some("q83vLNoechoM6CiZ+hr3P5ePE3YGAibLE4bAl1jv20Y=")
         );
     }
 

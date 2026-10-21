@@ -13,8 +13,10 @@ use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 
 use crate::engine::{
     CallClass, EngineConfig, EngineError, EngineEvent, EngineHandle, EngineState, EngineStatus,
-    NormalizedReceive, QueuedReceive, ReceiveIngress, event_channel, receive_channel,
+    NormalizedReceive, QueuedReceive, ReceiveIngress, WATCHDOG_LIVENESS_BACKOFF_CAP, event_channel,
+    receive_channel,
 };
+use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
@@ -75,9 +77,31 @@ const LINK_FINISH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const RECEIVE_STORE_RETRY_MIN: Duration = Duration::from_millis(100);
 const RECEIVE_STORE_RETRY_MAX: Duration = Duration::from_secs(5);
 const WATCHDOG_PING_TIMEOUT: Duration = Duration::from_secs(15);
+/// Consecutive receive-liveness ping failures that escalate to a real restart.
+/// One timeout is noise (a slow tick can starve a read-only call); two in a
+/// row mean the receive path is not answering and throttling must not turn
+/// that into "wait for the next window forever".
 const WATCHDOG_MAX_PING_FAILURES: u32 = 2;
-/// Maximum deferred (pending) restarts per failure episode before giving up.
-const WATCHDOG_MAX_PENDING_RETRIES: u32 = 3;
+/// Budget for the per-tick engine account cross-check (`listAccounts`): only
+/// an account the engine itself lists may serve as a liveness probe. A short
+/// budget keeps the tick responsive; when it expires the tick falls back to
+/// the connector-known candidates, so a slow engine never silently disables
+/// liveness (that would weaken the restart boundary, not tighten it).
+const WATCHDOG_ACCOUNT_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Candidate accounts one tick probes before giving up. A legal group holds at
+/// most `MAX_ACCOUNTS_PER_ENGINE`, so this only bounds a pathological store.
+/// Continuing past a refusal is only ever justified by the engine's *fast*
+/// plain upstream error (an unknown account answers -32603 in milliseconds);
+/// a timeout or any engine-level variant stops the series. Whatever the cap
+/// leaves unprobed is reached on a later tick, because the refused prefix is
+/// excluded as it is walked.
+const WATCHDOG_PING_ATTEMPT_LIMIT: usize = MAX_ACCOUNTS_PER_ENGINE;
+/// How long a `getUserStatus` refusal keeps an account out of the liveness
+/// candidate set. The exclusion stops a per-tick -32603 series, but it must
+/// not blind liveness for the engine's whole lifetime: after this window the
+/// account is probed again, and a refusal that was actually transient heals
+/// without an engine restart.
+const WATCHDOG_PING_REFUSAL_TTL: Duration = Duration::from_secs(10 * 60);
 /// Rows one retention transaction may delete, keeping each one short.
 const RETENTION_BATCH_MESSAGES: u32 = 2_000;
 /// Breathing room between retention batches so receives and host requests get
@@ -185,6 +209,12 @@ struct DeliveryReceiptJob {
 enum RestartSource {
     Stderr,
     Ping,
+    /// The child process exited on its own (SIGKILL, crash, pipe failure).
+    /// The pre-pool watchdog only reacted to stderr/ping evidence and left a
+    /// silently dead engine parked until the next runtime.start; per-account
+    /// slots need the F3/§6.3 semantics (restart radius = one account), so an
+    /// observed terminal engine arms the same bounded restart lane.
+    Crash,
 }
 
 impl std::fmt::Display for RestartSource {
@@ -192,6 +222,7 @@ impl std::fmt::Display for RestartSource {
         match self {
             RestartSource::Stderr => write!(f, "stderr"),
             RestartSource::Ping => write!(f, "ping"),
+            RestartSource::Crash => write!(f, "crash"),
         }
     }
 }
@@ -200,15 +231,231 @@ impl std::fmt::Display for RestartSource {
 struct PendingRestart {
     source: RestartSource,
     reason: &'static str,
+    /// Earliest instant the deferred restart may execute. Armed once and
+    /// never pushed later by fresh triggers: a fault that keeps reporting
+    /// gets its restart at the first eligible tick instead of "one window
+    /// from now" forever.
+    due_at: Instant,
+    /// Receive-evidence counter value at the moment this pending was armed.
+    /// A delivered envelope afterwards proves the receive path itself is
+    /// alive and cancels the restart; a successful REST ping cannot, because
+    /// `getUserStatus` does not touch the receive WebSocket.
+    evidence: u64,
 }
 
 /// One failure episode: restarts performed since the first trigger, and the
-/// last trigger time. A trigger-free gap longer than one throttle window
-/// resets the budget.
+/// last trigger time. A trigger-free gap longer than the anti-storm window
+/// (watchdog_min_restart_interval) resets the schedule, so only one fresh
+/// "immediate" restart can begin per window — a fault that keeps reporting
+/// inside the window stays on the bounded liveness backoff instead.
 #[derive(Default)]
 struct WatchdogEpisode {
     restarts: u32,
     last_trigger: Option<Instant>,
+}
+
+/// One liveness-ping candidate: the opaque store row id — the only account
+/// identity the watchdog ever logs — beside the signal number, which rides
+/// into engine call params and nowhere else.
+#[derive(Clone, Debug)]
+struct WatchdogPingTarget {
+    account_id: String,
+    number: String,
+}
+
+/// Per-engine-instance liveness-probe verdicts. Neither set is ever written
+/// back to the store: deleting or reconciling a stale row is a separate
+/// concern, the watchdog only stops using it as proof of liveness.
+#[derive(Default)]
+struct WatchdogProbeVerdicts {
+    /// Store rows a successful `listAccounts` answer did not include: the
+    /// engine does not serve them, so a ping would only earn its plain
+    /// -32603 in milliseconds.
+    engine_absent: HashSet<String>,
+    /// Store rows `getUserStatus` refused with a plain upstream error while
+    /// another candidate answered right after: attributed to the account,
+    /// never to the engine (an engine-wide fault refuses every candidate).
+    /// Each entry carries the instant the exclusion expires
+    /// (`WATCHDOG_PING_REFUSAL_TTL`), so a transient refusal heals on its own.
+    ping_refused: HashMap<String, Instant>,
+    /// Engine instance these verdicts belong to. A new pid clears both sets:
+    /// the restarted engine may serve the account again.
+    pid: Option<u32>,
+}
+
+impl WatchdogProbeVerdicts {
+    /// Scope the verdicts to the current engine instance and drop expired
+    /// refusals. Called once per tick, before the candidate set is built.
+    fn for_engine(&mut self, pid: Option<u32>) {
+        if self.pid != pid {
+            self.engine_absent.clear();
+            self.ping_refused.clear();
+            self.pid = pid;
+        }
+        let now = Instant::now();
+        self.ping_refused.retain(|_, until| now < *until);
+    }
+
+    /// Whether this account is currently excluded after a refused probe.
+    fn refuses(&self, account_id: &str) -> bool {
+        self.ping_refused.contains_key(account_id)
+    }
+
+    /// Exclude an account after a refused probe. Answers true when this is a
+    /// fresh exclusion (the caller logs and counts it once).
+    fn refuse(&mut self, account_id: &str) -> bool {
+        let fresh = !self.ping_refused.contains_key(account_id);
+        self.ping_refused.insert(
+            account_id.to_string(),
+            Instant::now() + WATCHDOG_PING_REFUSAL_TTL,
+        );
+        fresh
+    }
+}
+
+/// What one tick's probe series proved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchdogPingOutcome {
+    /// A verified candidate answered: the engine serves at least one account,
+    /// so any plain upstream refusal before it was that account's face.
+    Answered,
+    /// The engine answered `Unauthorized`: the credential is dead but the
+    /// engine itself is alive (contract 1.21), never a restart cause.
+    Unauthorized,
+    /// No candidate answered. An engine-level error ended the series, or the
+    /// caller's evidence rule still decides between an account-scoped skip
+    /// and the pre-existing failure accounting.
+    Failed,
+}
+
+/// The liveness plan of one watchdog tick.
+enum WatchdogPingPlan {
+    /// A link flow is in flight: pinging or restarting is unsafe (existing
+    /// gate, unchanged, not an account-availability skip).
+    LinkFlow,
+    /// No engine-confirmed account to probe this tick. Skipped, never
+    /// counted as a liveness failure.
+    NoTarget(WatchdogPingSkip),
+    /// Ordered, engine-confirmed candidates (bounded by
+    /// `WATCHDOG_PING_ATTEMPT_LIMIT`).
+    Probe(Vec<WatchdogPingTarget>),
+}
+
+/// Why a tick had no probe target, for the structured skip line.
+struct WatchdogPingSkip {
+    reason: &'static str,
+    known_accounts: usize,
+    excluded_accounts: usize,
+    engine_verified: bool,
+}
+
+/// Backoff before the next restart of one failure episode. `restarts` counts
+/// the restarts already executed in the episode: the first is immediate, then
+/// `base`, `2 * base`, `4 * base`, … capped at `cap`. A zero base
+/// (integration-test launchers) keeps every restart immediate; a capped
+/// schedule still retries forever while triggers keep arriving.
+fn watchdog_restart_backoff(base: Duration, restarts: u32, cap: Duration) -> Duration {
+    if restarts == 0 || base.is_zero() {
+        return Duration::ZERO;
+    }
+    let shift = restarts.saturating_sub(1).min(16);
+    base.saturating_mul(1u32 << shift).min(cap)
+}
+
+/// Record a deferred restart without ever loosening the one already armed:
+/// stderr outranks ping (a receive-fatal stderr trigger is the stronger
+/// signal), and among equal sources the earlier deadline wins, so a stream of
+/// triggers cannot postpone a live fault. A replacement keeps the earliest
+/// receive-evidence snapshot: an envelope delivered between two triggers must
+/// still cancel the pending on the next tick.
+/// Returns true when this trigger actually armed or tightened the entry.
+fn arm_pending_restart(pending: &mut Option<PendingRestart>, candidate: PendingRestart) -> bool {
+    let replace = match *pending {
+        None => true,
+        Some(existing) => match (existing.source, candidate.source) {
+            (RestartSource::Stderr, RestartSource::Ping) => false,
+            (RestartSource::Ping, RestartSource::Stderr) => true,
+            _ => candidate.due_at < existing.due_at,
+        },
+    };
+    if !replace {
+        return false;
+    }
+    let evidence = (*pending).map_or(candidate.evidence, |existing| {
+        existing.evidence.min(candidate.evidence)
+    });
+    *pending = Some(PendingRestart {
+        evidence,
+        ..candidate
+    });
+    true
+}
+
+/// The engine's own account list as a number set, or `None` when the engine
+/// could not answer (or answered a shape that is not an array). Unverified
+/// is deliberately NOT the same as "no accounts": the caller must never
+/// skip liveness on a failed cross-check.
+async fn engine_account_numbers(engine: &EngineHandle) -> Option<HashSet<String>> {
+    let result = engine
+        .call_with_timeout(
+            "listAccounts",
+            json!({}),
+            CallClass::ReadOnly,
+            WATCHDOG_ACCOUNT_VERIFY_TIMEOUT,
+        )
+        .await
+        .ok()?;
+    result.as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(|item| {
+                item.get("number")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    })
+}
+
+/// Whether a `getUserStatus` failure can be the *account's* face rather than
+/// the engine's: an account the engine does not serve earns its plain JSON-RPC
+/// internal error (-32603). The numeric code is the only stable discriminator
+/// — the message text of that face is not part of the pinned contract — and it
+/// is honoured only for `-32603`; every other upstream code, and every other
+/// variant (timeout, backpressure, protocol, exit, not-running, the §4.80
+/// transport families), is engine-scoped and keeps the pre-existing failure
+/// accounting. Even a `-32603` is attributed to the account only under the
+/// caller's evidence rule (another candidate answers, or every candidate is
+/// refused and the engine never fails at the transport level).
+fn account_scoped_engine_error(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::Upstream {
+            code: Some(-32603),
+            ..
+        }
+    )
+}
+
+/// Exclude accounts whose `getUserStatus` the engine refused, counting and
+/// logging each fresh exclusion exactly once. The rows stay in the store:
+/// the watchdog only stops treating them as proof of liveness.
+fn exclude_refused_ping_targets(
+    verdicts: &mut WatchdogProbeVerdicts,
+    refused: &[(String, &'static str)],
+    candidates: usize,
+) {
+    for (account_id, error_class) in refused {
+        if verdicts.refuse(account_id) {
+            crate::metrics::record_watchdog_ping_target_skipped();
+            tracing::info!(
+                account_id = %account_id,
+                error_class = *error_class,
+                candidates,
+                "watchdog ping target excluded: the engine refused the account"
+            );
+        }
+    }
 }
 
 /// The §4.119 receipt-failure debounce key: one account, one conversation,
@@ -252,8 +499,20 @@ struct ActiveLinkFinish {
 pub struct RuntimeSupervisor {
     config: EngineConfig,
     /// Opaque group id (launcher-defined, ADR 0001 R1). Appears on the wire
-    /// and in logs; the group's proxy endpoint never does.
+    /// and in logs; the group's proxy endpoint never does. For a per-account
+    /// engine slot this stays the account's *proxy group* (the immutable store
+    /// binding); the slot identity is `preferred_account_id` beside it.
     pub(crate) group_id: String,
+    /// The pre-provisioned opaque account id of a per-account engine slot
+    /// (engine-pool design §5.3). `None` for every legacy group supervisor —
+    /// the pre-pool behavior is retained byte for byte. When present, the
+    /// first account commit (finishLink or the listAccounts sync) inserts the
+    /// row under this id, and log lines carry it so a pool's per-account
+    /// lines are attributable without naming a number.
+    preferred_account_id: Option<String>,
+    /// Successful engine restarts since process start (watchdog recoveries).
+    /// Exposed through the pool's per-account status face; never persisted.
+    restart_count: Arc<AtomicU64>,
     engine: Mutex<Option<EngineHandle>>,
     service: Arc<Mutex<ConnectorService>>,
     /// Shared store handle for the store-only paths (retention, reads) that
@@ -269,6 +528,12 @@ pub struct RuntimeSupervisor {
     host_events: broadcast::Sender<HostSideEvent>,
     receive_ingress: ReceiveIngress,
     receive_worker: JoinHandle<()>,
+    /// Receive-evidence counter (one bump per envelope the engine delivered to
+    /// this group's receive lane). The receive-liveness watchdog uses it as
+    /// the only positive proof the receive WebSocket is alive: the REST ping
+    /// cannot see that channel, so a delivered envelope — not a successful
+    /// `getUserStatus` — is what cancels a pending restart.
+    receive_evidence: Arc<AtomicU64>,
     /// Receive-liveness watchdog; never held across an await.
     watchdog: StdMutex<Option<JoinHandle<()>>>,
     /// Engine-event watcher: device-unlinked accounts (contract 1.21) plus
@@ -361,6 +626,34 @@ pub struct RuntimeSupervisor {
     /// immediately. Bounded like the receipt debounce; never held across an
     /// await.
     group_resync_stamps: StdMutex<HashMap<(String, String), u64>>,
+    /// P0 engine-orphan sweep state: whose slots this supervisor watches and
+    /// the repeat-detection memory for them (see
+    /// `parent::plan_engine_sweep`). Set only by the pool owner — a legacy
+    /// group supervisor never runs the sweep, and a supervisor without a
+    /// setting is byte-for-byte its pre-sweep self.
+    orphan_sweep: StdMutex<Option<OrphanSweepScope>>,
+    /// The slot table the sweep classifies against (set by the pool owner on
+    /// the one supervisor that was armed). Kept as a weak-free `Arc` because
+    /// the pool owns its supervisors: ownership here would be a cycle, so the
+    /// pool clears it when it stops.
+    sweep_owner: StdMutex<Option<Arc<crate::registry::SweepOwner>>>,
+}
+
+/// What the watchdog's orphan-engine pass watches: one scope per process (the
+/// engine pool), because every slot engine is discovered by the same data
+/// directory and must not be swept twice by two watchdog clocks.
+pub(crate) struct OrphanSweepScope {
+    pub(crate) signal_data_dir: PathBuf,
+    pub(crate) memory: crate::parent::SweepMemory,
+}
+
+impl OrphanSweepScope {
+    pub(crate) fn new(signal_data_dir: PathBuf) -> Self {
+        Self {
+            signal_data_dir,
+            memory: crate::parent::SweepMemory::default(),
+        }
+    }
 }
 
 impl RuntimeSupervisor {
@@ -384,13 +677,44 @@ impl RuntimeSupervisor {
         media_handles: Option<Arc<MediaHandleTable>>,
         backup_handles: Option<Arc<crate::backup_export::BackupFileHandleTable>>,
     ) -> Self {
+        Self::with_media_root(
+            config,
+            store,
+            group_id,
+            media_handles,
+            backup_handles,
+            None,
+            None,
+        )
+    }
+
+    /// Launcher entry for a per-account engine slot (engine-pool design
+    /// §3.3/§8): the media namespace stays connector-owned at
+    /// `<signal-data>/media/<accountId>/attachments` even though the engine
+    /// data directory is now the account slot's own
+    /// `<signal-data>/engines/<accountId>`. Passing `None` keeps the legacy
+    /// root (the group's data directory) byte for byte. The engine log file
+    /// is the engine's own concern and follows the data directory
+    /// (`<data-dir>/logs/engine-stderr.log`), which is exactly what makes the
+    /// per-account logs disjoint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_media_root(
+        config: EngineConfig,
+        store: Arc<Store>,
+        group_id: String,
+        media_handles: Option<Arc<MediaHandleTable>>,
+        backup_handles: Option<Arc<crate::backup_export::BackupFileHandleTable>>,
+        media_root: Option<PathBuf>,
+        preferred_account_id: Option<String>,
+    ) -> Self {
         let (events, _) = event_channel();
         let (host_events, _) = broadcast::channel(1024);
         // Media ingest is armed only when the launcher passed both the
         // `--media-ingest` flag and the shared handle table; anything else
         // keeps the service on the pre-PoC capability-unavailable shape.
         let media = if config.media_ingest {
-            media_handles.map(|handles| MediaIngest::new(config.data_dir.clone(), handles))
+            let root = media_root.unwrap_or_else(|| config.data_dir.clone());
+            media_handles.map(|handles| MediaIngest::new(root, handles))
         } else {
             None
         };
@@ -399,9 +723,10 @@ impl RuntimeSupervisor {
                 "media ingest flag is set without a handle table; media methods stay unavailable"
             );
         }
-        let service = Arc::new(Mutex::new(ConnectorService::with_media(
+        let service = Arc::new(Mutex::new(ConnectorService::with_media_and_account(
             Arc::clone(&store),
             media.clone(),
+            preferred_account_id.clone(),
         )));
         let (receive_ingress, receive_rx) = receive_channel();
         // Auto delivery receipts (contract revision 1.34): the persistence
@@ -414,6 +739,10 @@ impl RuntimeSupervisor {
         // hooks send on; the worker (spawned later by the registry) owns the
         // receiver and otherwise paces itself on the due schedules + tick.
         let (outbox_drain_tx, outbox_drain_rx) = mpsc::channel(1);
+        // Receive-path survival evidence for the watchdog: bumped by the
+        // persistence loop for every envelope the engine actually delivers to
+        // this group's receive lane (see the field doc).
+        let receive_evidence = Arc::new(AtomicU64::new(0));
         let receive_worker = tokio::spawn(receive_persistence_loop(
             receive_rx,
             service.clone(),
@@ -421,6 +750,7 @@ impl RuntimeSupervisor {
             group_id.clone(),
             media.as_ref().map(|media| media.governor().clone()),
             delivery_receipt_tx,
+            Arc::clone(&receive_evidence),
         ));
         // Contract 1.21: authorization failures observed on this group's
         // engine mark the dead account in the shared store and surface it on
@@ -436,6 +766,8 @@ impl RuntimeSupervisor {
         Self {
             config,
             group_id,
+            preferred_account_id,
+            restart_count: Arc::new(AtomicU64::new(0)),
             engine: Mutex::new(None),
             service,
             store,
@@ -445,6 +777,7 @@ impl RuntimeSupervisor {
             host_events,
             receive_ingress,
             receive_worker,
+            receive_evidence,
             account_unlink_worker,
             watchdog: StdMutex::new(None),
             retention: StdMutex::new(None),
@@ -467,11 +800,53 @@ impl RuntimeSupervisor {
             plaintext_tasks: Arc::new(crate::backup_export::PlaintextTaskRegistry::new()),
             receipt_failures: StdMutex::new(HashMap::new()),
             group_resync_stamps: StdMutex::new(HashMap::new()),
+            orphan_sweep: StdMutex::new(None),
+            sweep_owner: StdMutex::new(None),
+        }
+    }
+
+    /// Arm the P0 orphan-engine sweep on this supervisor (called once by the
+    /// engine pool, right after the slot exists). Before this call the
+    /// watchdog runs its pre-sweep loop byte for byte.
+    pub(crate) fn arm_orphan_sweep(
+        &self,
+        signal_data_dir: PathBuf,
+        owner: Arc<crate::registry::SweepOwner>,
+    ) {
+        if let Ok(mut scope) = self.orphan_sweep.lock() {
+            *scope = Some(OrphanSweepScope::new(signal_data_dir));
+        }
+        if let Ok(mut slot) = self.sweep_owner.lock() {
+            *slot = Some(owner);
         }
     }
 
     pub fn group_id(&self) -> &str {
         &self.group_id
+    }
+
+    /// The pre-provisioned opaque account id of a per-account slot, or `None`
+    /// for a legacy group supervisor.
+    pub fn account_id(&self) -> Option<&str> {
+        self.preferred_account_id.as_deref()
+    }
+
+    /// Successful watchdog restarts of this slot's engine since process
+    /// start. The per-account status face exposes it as `restarts`.
+    pub fn restart_count(&self) -> u64 {
+        self.restart_count.load(Ordering::Relaxed)
+    }
+
+    /// The media namespace root this supervisor writes under, when the media
+    /// path is armed. Per-account slots point at the connector root
+    /// (`<signal-data>`) so media stays outside the engine data directory;
+    /// legacy groups keep their data-dir root. Test-only visibility: the pool
+    /// tests pin the two shapes.
+    #[cfg(test)]
+    pub(crate) fn media_root(&self) -> Option<&Path> {
+        self.media
+            .as_ref()
+            .map(|media| media.governor().data_dir().as_path())
     }
 
     /// Shared service handle. The registry uses it for cross-group routing
@@ -494,6 +869,35 @@ impl RuntimeSupervisor {
     /// Spawn the receive-liveness watchdog (idempotent). Detects a silently dead
     /// receive path — signal-cli stays alive but its server WebSocket is gone —
     /// via stderr error lines and periodic read-only pings, then restarts the engine.
+    /// Abort the long-lived background tasks that a process-lifetime
+    /// supervisor would otherwise keep forever. Only a dynamic account slot
+    /// being discarded (link rollback / account delete) calls this; legacy
+    /// supervisors live for the process, and their tasks must keep running
+    /// across `runtime.stop`/start.
+    pub fn stop_background_tasks(&self) {
+        if let Ok(mut slot) = self.watchdog.lock()
+            && let Some(handle) = slot.take()
+        {
+            handle.abort();
+        }
+        for task in [
+            &self.retention,
+            &self.media_governor_pass,
+            &self.contacts_resync,
+            &self.expire_sweeper,
+            &self.delivery_receipt_worker,
+            &self.outbox_worker,
+        ] {
+            if let Ok(mut slot) = task.lock()
+                && let Some(handle) = slot.take()
+            {
+                handle.abort();
+            }
+        }
+        self.receive_worker.abort();
+        self.account_unlink_worker.abort();
+    }
+
     pub fn spawn_watchdog(self: &Arc<Self>) {
         let Ok(mut slot) = self.watchdog.lock() else {
             return;
@@ -1820,13 +2224,43 @@ impl RuntimeSupervisor {
     }
 
     pub async fn shutdown(&self) -> Result<(), EngineError> {
+        self.shutdown_within(None).await
+    }
+
+    /// Bounded graceful stop (engine-pool F7): the caller's remaining global
+    /// budget replaces the engine's own grace when it is smaller. On expiry
+    /// the child is **force-killed** while this function still owns the
+    /// handle — dropping the outer future instead would leave the child alive
+    /// behind the actor's own handle clone.
+    pub async fn shutdown_within(&self, budget: Option<Duration>) -> Result<(), EngineError> {
         let engine = self.engine.lock().await.take();
         self.service.lock().await.clear_link();
         *self.active_link_finish.lock().await = None;
-        if let Some(engine) = engine {
-            engine.shutdown().await?;
+        let Some(engine) = engine else {
+            return Ok(());
+        };
+        let Some(budget) = budget else {
+            return engine.shutdown().await;
+        };
+        match tokio::time::timeout(budget, engine.shutdown()).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                    group_id = %self.group_id,
+                    budget_ms = budget.as_millis().min(u64::MAX as u128) as u64,
+                    "engine shutdown exceeded the pool budget; killing the engine process"
+                );
+                if let Err(error) = engine.force_kill().await {
+                    tracing::warn!(
+                        account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                        error_class = ?error.kind(),
+                        "engine force kill failed"
+                    );
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     async fn running_engine(&self) -> Result<EngineHandle, EngineError> {
@@ -1847,11 +2281,12 @@ impl RuntimeSupervisor {
         let engine = match self.running_engine().await {
             Ok(engine) => engine,
             Err(_) => {
-                return self
+                let rows = self
                     .service
                     .lock()
                     .await
-                    .list_accounts_in_group(&self.group_id);
+                    .list_accounts_in_group(&self.group_id)?;
+                return Ok(self.slot_accounts(rows));
             }
         };
         // Contract 1.142 (§4.138): each entry may carry the engine's own-ACI
@@ -1890,11 +2325,12 @@ impl RuntimeSupervisor {
                 })
                 .unwrap_or_default(),
             Err(_) => {
-                return self
+                let rows = self
                     .service
                     .lock()
                     .await
-                    .list_accounts_in_group(&self.group_id);
+                    .list_accounts_in_group(&self.group_id)?;
+                return Ok(self.slot_accounts(rows));
             }
         };
         if numbers.is_empty() {
@@ -1907,13 +2343,53 @@ impl RuntimeSupervisor {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers_with_capabilities(&numbers, &self.group_id)?;
+            .sync_accounts_from_numbers_with_capabilities_and_id(
+                &numbers,
+                &self.group_id,
+                self.preferred_account_id.as_deref(),
+            )?;
+        let accounts = self.slot_accounts(accounts);
         // Contract 1.170 (§4.170): the ACI was just (re)written for these
         // accounts — fold each number-keyed memo shell into the canonical
         // ACI-keyed row and announce it.
         self.backfill_memo_identities(&accounts).await;
         let _ = engine;
         Ok(accounts)
+    }
+
+    /// Whether this slot currently owns a non-expired link session. The
+    /// pool's abandoned-link reaper uses it to tell a merely idle slot from a
+    /// half-finished link that will never be committed.
+    pub async fn has_pending_link(&self) -> bool {
+        self.service.lock().await.has_pending_link()
+    }
+
+    /// Store-only account rows for this slot (the registry's degraded answer
+    /// when the engine misses the global listing deadline). Scoped exactly
+    /// like [`Self::list_accounts`]: a per-account slot answers its own row
+    /// only.
+    pub async fn list_local_accounts(&self) -> Result<Vec<AccountSummary>, ServiceError> {
+        let rows = self
+            .service
+            .lock()
+            .await
+            .list_accounts_in_group(&self.group_id)?;
+        Ok(self.slot_accounts(rows))
+    }
+
+    /// A legacy group supervisor returns every row of its group (the pre-pool
+    /// behavior). A per-account slot answers only its own pre-provisioned
+    /// account: the shared store holds both legacy and dynamic accounts, and a
+    /// dynamic engine's listAccounts must never surface another engine's
+    /// account as if this engine served it.
+    fn slot_accounts(&self, accounts: Vec<AccountSummary>) -> Vec<AccountSummary> {
+        match self.preferred_account_id.as_deref() {
+            Some(preferred) => accounts
+                .into_iter()
+                .filter(|account| account.id == preferred)
+                .collect(),
+            None => accounts,
+        }
     }
 
     /// Contract 1.170 (§4.170): fold each freshly-ACI'd account's number-keyed
@@ -2020,7 +2496,11 @@ impl RuntimeSupervisor {
         // The wire result echoes the selected group (implementation-plan §4.4);
         // this supervisor IS the selected group.
         result["proxyGroup"] = json!(self.group_id);
-        tracing::info!("link session started");
+        tracing::info!(
+            account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+            group_id = %self.group_id,
+            "link session started"
+        );
         Ok(result)
     }
 
@@ -2130,7 +2610,13 @@ impl RuntimeSupervisor {
         let aci = result.get("aci").and_then(Value::as_str);
         let mut account = {
             let mut service = self.service.lock().await;
-            service.complete_link_session(&link_session_id, number, &self.group_id, aci)?
+            service.complete_link_session_with_id(
+                &link_session_id,
+                number,
+                &self.group_id,
+                aci,
+                self.preferred_account_id.as_deref(),
+            )?
         };
         // Contract 1.170 (§4.170): the finish answer may have just written the
         // account's first ACI — fold the number-keyed memo shell and announce
@@ -2234,6 +2720,14 @@ impl RuntimeSupervisor {
         )
         .await?;
         let status = engine.status();
+        self.restart_count.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+            group_id = %self.group_id,
+            pid = status.pid.unwrap_or(0),
+            restarts = self.restart_count(),
+            "engine restarted"
+        );
         let fresh = engine.clone();
         *slot = Some(engine);
         drop(slot);
@@ -2257,6 +2751,149 @@ impl RuntimeSupervisor {
         Ok(())
     }
 
+    /// The pid this supervisor currently believes its engine owns (never a
+    /// terminal handle's stale pid) — the owner-exclusion face the orphan
+    /// sweep consumes.
+    pub(crate) async fn owned_engine_pid(&self) -> Option<u32> {
+        self.engine
+            .lock()
+            .await
+            .as_ref()
+            .filter(|engine| !engine.is_terminal())
+            .and_then(|engine| engine.status().pid)
+    }
+
+    async fn sweep_owner_facts(
+        self: &Arc<Self>,
+    ) -> Option<Vec<(String, crate::parent::SlotFacts)>> {
+        let owner = self
+            .sweep_owner
+            .lock()
+            .ok()
+            .and_then(|owner| owner.as_ref().map(Arc::clone))?;
+        Some(owner.facts().await)
+    }
+
+    /// P0 orphan-engine sweep (watchdog cadence). On Unix only: it reads the
+    /// host process table, classifies the engines that name this data
+    /// directory, and terminates only the ones that are unambiguously orphaned
+    /// (see `parent::plan_engine_sweep` for the full decision table). Every
+    /// signal is preceded by a log line with the pid and the fixed reason
+    /// literal, and no number, path, or account material ever enters it.
+    ///
+    /// The pass is a no-op unless a scope was armed (the pool owner), so a
+    /// legacy group supervisor keeps its pre-sweep behavior exactly.
+    async fn orphan_engine_sweep(&self, facts: &[(String, crate::parent::SlotFacts)]) {
+        #[cfg(not(unix))]
+        {
+            let _ = facts;
+        }
+        #[cfg(unix)]
+        {
+            let Some(data_dir) = self
+                .orphan_sweep
+                .lock()
+                .ok()
+                .and_then(|scope| scope.as_ref().map(|scope| scope.signal_data_dir.clone()))
+            else {
+                return;
+            };
+            let rows = match tokio::task::spawn_blocking(crate::parent::scan_processes).await {
+                Ok(rows) => rows,
+                Err(_) => return,
+            };
+            let self_pid = std::process::id();
+            let plan = match self.orphan_sweep.lock() {
+                Ok(mut scope) => {
+                    let Some(scope) = scope.as_mut() else {
+                        return;
+                    };
+                    crate::parent::plan_engine_sweep(
+                        &rows,
+                        &data_dir,
+                        facts,
+                        self_pid,
+                        &mut scope.memory,
+                        true,
+                    )
+                }
+                Err(_) => return,
+            };
+            for (pid, ppid) in &plan.foreign {
+                tracing::warn!(
+                    pid,
+                    ppid,
+                    "engine names this data directory but is not an orphan; recording only"
+                );
+            }
+            for (pid, slot) in &plan.pending {
+                tracing::info!(
+                    pid,
+                    slot,
+                    "engine orphan candidate recorded; re-checking on the next sweep"
+                );
+            }
+            if plan.kill.is_empty() {
+                return;
+            }
+            let owned: Vec<u32> = facts
+                .iter()
+                .filter_map(|(_, facts)| facts.owned_pid)
+                .collect();
+            for kill in plan.kill {
+                let reason = match kill.reason {
+                    crate::parent::SlotVerdict::OrphanUnprovisioned => "orphan_unprovisioned",
+                    _ => "orphan_engine",
+                };
+                // Last gate, right before the signal: re-read the pid's argv
+                // and ask the kernel who its parent is now. A pid that no
+                // longer names this slot, or whose parent is this process, is
+                // never signalled.
+                let data_dir = data_dir.clone();
+                let pid = kill.pid;
+                let slot = kill.slot.clone();
+                let gate = tokio::task::spawn_blocking(move || {
+                    let still_targets = crate::parent::still_targets(pid, &data_dir, Some(&slot));
+                    let child_of_self = crate::parent::parent_of(pid) == Some(std::process::id());
+                    (still_targets, child_of_self)
+                })
+                .await
+                .unwrap_or((false, false));
+                let (still_targets, child_of_self) = gate;
+                if !still_targets
+                    || !crate::parent::may_kill_orphan(pid, self_pid, &owned, Some(child_of_self))
+                {
+                    tracing::warn!(
+                        pid,
+                        slot = %kill.slot,
+                        reason,
+                        "orphan engine re-check refused the kill; recording only"
+                    );
+                    continue;
+                }
+                tracing::warn!(
+                    pid,
+                    slot = %kill.slot,
+                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                    reason,
+                    "terminating an orphaned engine that holds this data directory"
+                );
+                let outcome = tokio::task::spawn_blocking(move || {
+                    crate::parent::terminate_pid(pid, Duration::from_secs(3))
+                })
+                .await
+                .unwrap_or(crate::parent::TerminatedPid::Refused);
+                tracing::warn!(
+                    pid,
+                    slot = %kill.slot,
+                    reason,
+                    outcome = ?outcome,
+                    "orphan engine termination finished"
+                );
+            }
+        }
+    }
+
     async fn watchdog_loop(self: Arc<Self>) {
         let mut ticker = interval(self.config.watchdog_interval.max(Duration::from_millis(1)));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -2265,19 +2902,27 @@ impl RuntimeSupervisor {
         let mut stderr_pid: Option<u32> = None;
         let mut ping_failures = 0u32;
         let mut last_restart: Option<Instant> = None;
-        // A restart request that arrived inside the throttle window. It must
+        // A restart request that arrived inside the backoff window. It must
         // not be dropped: a dead receive WebSocket produces no further stderr
         // lines, and the REST ping (getUserStatus) does not cover the receive
         // channel at all — a known structural blind spot. The pending retry is
-        // the only backstop for "can send but cannot receive".
+        // the only backstop for "can send but cannot receive", so it carries
+        // its own deadline and is never discarded by an episode budget.
         let mut pending: Option<PendingRestart> = None;
-        // Bounded retry budget per failure episode: the first ("initial")
-        // restart plus at most WATCHDOG_MAX_PENDING_RETRIES further restarts.
-        // Once the budget is spent the watchdog gives up until the engine
-        // stays trigger-free for longer than one throttle window, which
-        // resets the episode. This caps restart churn when the network is
-        // genuinely dead and triggers keep arriving.
+        // Failure episode: restarts executed so far and the last trigger
+        // time. Each executed restart doubles the next backoff (capped), which
+        // bounds restart churn while keeping a persistently dead receive path
+        // retried instead of silently abandoned.
         let mut episode = WatchdogEpisode::default();
+        // Liveness-probe verdicts for the current engine instance: store
+        // rows the engine does not serve. Per instance, cleared on restart.
+        let mut verdicts = WatchdogProbeVerdicts::default();
+        // P0 orphan-engine sweep clock: its own cadence (independent of the
+        // watchdog's, so a tightened test watchdog cannot turn the sweep into
+        // a hot loop) and only while a scope is armed.
+        let mut sweep_clock = interval(crate::parent::ENGINE_SWEEP_INTERVAL);
+        sweep_clock.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        sweep_clock.tick().await;
         loop {
             let engine = self.engine.lock().await.clone();
             let current_pid = engine.as_ref().and_then(|e| e.status().pid);
@@ -2310,12 +2955,17 @@ impl RuntimeSupervisor {
                             }
                             EngineStderrClass::NetworkPath => {
                                 tracing::info!(
+                                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
                                     line = %line,
                                     "engine stderr: network egress declared"
                                 );
                             }
                             EngineStderrClass::Diagnostic => {
-                                tracing::debug!(line = %line, "engine stderr");
+                                tracing::debug!(
+                                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                                    line = %line,
+                                    "engine stderr"
+                                );
                             }
                         },
                         None => {
@@ -2324,77 +2974,223 @@ impl RuntimeSupervisor {
                         }
                     }
                 }
+                _ = sweep_clock.tick() => {
+                    // The pool owner arms exactly one scope on one supervisor;
+                    // without it this supervisor has no slots to attribute and
+                    // the pass is a no-op rather than a scan.
+                    let armed = self
+                        .orphan_sweep
+                        .lock()
+                        .map(|scope| scope.is_some())
+                        .unwrap_or(false);
+                    if armed
+                        && let Some(facts) = self.sweep_owner_facts().await
+                    {
+                        self.orphan_engine_sweep(&facts).await;
+                    }
+                }
                 _ = ticker.tick() => {
-                    // Episode reset: no trigger for longer than one throttle
-                    // window means the engine is considered healthy again.
+                    // Receive-path survival evidence cancels a pending
+                    // restart: an envelope actually delivered over the
+                    // engine's receive lane proves the WebSocket is alive,
+                    // which no REST ping can. This is the only positive
+                    // signal allowed to clear a liveness pending besides an
+                    // executed restart itself.
+                    if let Some(armed) = pending
+                        && self.receive_evidence.load(Ordering::Relaxed) > armed.evidence
+                    {
+                        tracing::info!(
+                            reason = armed.reason,
+                            source = %armed.source,
+                            account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                            group_id = %self.group_id,
+                            episode_restarts = episode.restarts,
+                            "watchdog pending restart cleared: receive path delivered an envelope"
+                        );
+                        pending = None;
+                        ping_failures = 0;
+                    }
+                    // Episode reset (anti-storm window): only a trigger-free
+                    // gap longer than watchdog_min_restart_interval restores
+                    // the immediate restart. Retries inside an episode are
+                    // paced by the seconds-scale liveness backoff instead.
                     if pending.is_none()
                         && let Some(last_trigger) = episode.last_trigger
                         && last_trigger.elapsed() > self.config.watchdog_min_restart_interval
                     {
                         episode = WatchdogEpisode::default();
                     }
-                    // A deferred restart fires as soon as the throttle window
-                    // has passed. While a link flow is active it stays pending:
-                    // restarting would invalidate an in-flight deviceLinkUri.
+                    // Process exit (engine-pool F3/§6.3): a terminal child
+                    // is a restart trigger of its own. Arming through the
+                    // same lane keeps the anti-storm backoff and link-flow
+                    // suppression; the deferred block below executes it.
+                    if self.preferred_account_id.is_some()
+                        && engine.as_ref().is_some_and(EngineHandle::is_terminal)
+                        && pending.is_none()
+                    {
+                        let _ = self
+                            .watchdog_request_restart(
+                                &mut last_restart,
+                                &mut pending,
+                                &mut episode,
+                                RestartSource::Crash,
+                                "engine process exited",
+                            )
+                            .await;
+                    }
+                    // A deferred restart fires when its own deadline passes.
+                    // It is never dropped by an episode budget: a dead
+                    // receive path must not stay dead because earlier
+                    // restarts happened to miss. While a link flow is active
+                    // it stays pending (restarting would invalidate an
+                    // in-flight deviceLinkUri) and fires once the flow ends.
                     if let Some(deferred) = pending
-                        && !self.restart_throttled(&last_restart)
+                        && Instant::now() >= deferred.due_at
                         && !self.link_flow_active().await
                     {
-                        if episode.restarts > WATCHDOG_MAX_PENDING_RETRIES {
-                            tracing::warn!(
-                                reason = deferred.reason,
-                                "watchdog giving up on pending restart: episode retry budget exhausted"
-                            );
-                            pending = None;
-                        } else {
-                            tracing::warn!(
-                                attempt = episode.restarts,
-                                reason = deferred.reason,
-                                "watchdog restarting the engine (pending retry)"
-                            );
-                            if self.restart_engine().await.is_ok() {
+                        tracing::warn!(
+                            reason = deferred.reason,
+                            source = %deferred.source,
+                            account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                            group_id = %self.group_id,
+                            episode_restarts = episode.restarts,
+                            "watchdog restarting the engine (backoff elapsed)"
+                        );
+                        match self.restart_engine().await {
+                            Ok(()) => {
                                 crate::metrics::record_watchdog_restart();
                                 last_restart = Some(Instant::now());
-                                episode.restarts += 1;
+                                episode.restarts = episode.restarts.saturating_add(1);
                                 pending = None;
                                 ping_failures = 0;
                                 stderr_rx = None;
                                 stderr_pid = None;
                             }
+                            Err(error) => {
+                                // Keep the backstop armed: dropping it here
+                                // would recreate the "fault hangs forever"
+                                // shape this deadline exists to prevent.
+                                let retry_in = self
+                                    .config
+                                    .watchdog_interval
+                                    .max(Duration::from_millis(1));
+                                pending = Some(PendingRestart {
+                                    due_at: Instant::now() + retry_in,
+                                    ..deferred
+                                });
+                                crate::metrics::record_watchdog_restart_failed();
+                                tracing::warn!(
+                                    reason = deferred.reason,
+                                    source = %deferred.source,
+                                    account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+                                    group_id = %self.group_id,
+                                    error = %error,
+                                    retry_in_ms =
+                                        retry_in.as_millis().min(u64::MAX as u128) as u64,
+                                    "watchdog deferred restart failed; retrying"
+                                );
+                            }
                         }
+                        // The cloned handle belongs to the engine that was
+                        // just replaced (or whose restart failed): never ping
+                        // it, start a fresh loop iteration on the new slot.
+                        continue;
                     }
                     let Some(engine) = engine.filter(|e| !e.is_terminal()) else {
                         continue;
                     };
-                    let Some(number) = self.watchdog_ping_target().await else {
-                        continue;
-                    };
-                    let ping = engine
-                        .call_with_timeout(
-                            "getUserStatus",
-                            json!({
-                                "account": number,
-                                "recipient": [number],
-                            }),
-                            CallClass::ReadOnly,
-                            WATCHDOG_PING_TIMEOUT,
-                        )
-                        .await;
-                    match ping {
-                        Ok(_) => {
+                    // Probe verdicts are facts about one engine instance.
+                    verdicts.for_engine(current_pid);
+                    let targets = match self.watchdog_ping_plan(&engine, &mut verdicts).await {
+                        WatchdogPingPlan::LinkFlow => continue,
+                        WatchdogPingPlan::NoTarget(skip) => {
+                            // No engine-confirmed account means liveness is
+                            // unobservable this tick, not that it failed.
+                            // Pinging an account the engine does not serve
+                            // would only earn its -32603 and restart a
+                            // healthy engine (the stale-row incident).
+                            crate::metrics::record_watchdog_liveness_tick_skipped();
+                            tracing::info!(
+                                reason = skip.reason,
+                                known_accounts = skip.known_accounts,
+                                excluded_accounts = skip.excluded_accounts,
+                                engine_verified = skip.engine_verified,
+                                "watchdog liveness skipped: no engine-confirmed ping target"
+                            );
+                            // A skipped tick judged nothing, so it must not
+                            // add failure evidence: the threshold stays
+                            // "two consecutive failed pings".
                             ping_failures = 0;
-                            // Ping recovery clears only a ping-sourced pending
-                            // restart. A stderr-sourced one survives: REST
-                            // liveness does not prove the receive WebSocket is
-                            // alive (the blind spot above).
-                            if pending.is_some_and(|p| p.source == RestartSource::Ping) {
-                                tracing::info!(
-                                    "watchdog pending restart cleared: receive liveness ping recovered"
-                                );
-                                pending = None;
+                            continue;
+                        }
+                        WatchdogPingPlan::Probe(targets) => targets,
+                    };
+                    // Probe the verified candidates in order. The engine's
+                    // plain -32603 is its unknown-account face; a refusal is
+                    // attributed to the account only under evidence — another
+                    // candidate answers, or every attempted candidate is
+                    // refused and the engine never fails at the transport
+                    // level. Anything else (timeout, backpressure, protocol,
+                    // exit, another upstream code) is engine-scoped and keeps
+                    // the pre-existing failure accounting.
+                    let mut refused: Vec<(String, &'static str)> = Vec::new();
+                    let mut failed_class: Option<&'static str> = None;
+                    let mut outcome = WatchdogPingOutcome::Failed;
+                    for target in &targets {
+                        let number = &target.number;
+                        let ping = engine
+                            .call_with_timeout(
+                                "getUserStatus",
+                                json!({
+                                    "account": number,
+                                    "recipient": [number],
+                                }),
+                                CallClass::ReadOnly,
+                                WATCHDOG_PING_TIMEOUT,
+                            )
+                            .await;
+                        match ping {
+                            Ok(_) => {
+                                outcome = WatchdogPingOutcome::Answered;
+                                break;
+                            }
+                            Err(EngineError::Unauthorized) => {
+                                outcome = WatchdogPingOutcome::Unauthorized;
+                                break;
+                            }
+                            Err(error) if account_scoped_engine_error(&error) => {
+                                failed_class = Some(error.class());
+                                refused.push((target.account_id.clone(), error.class()));
+                            }
+                            Err(error) => {
+                                failed_class = Some(error.class());
+                                break;
                             }
                         }
-                        Err(EngineError::Unauthorized) => {
+                    }
+                    match outcome {
+                        WatchdogPingOutcome::Answered => {
+                            // A later candidate answered, so every plain
+                            // upstream refusal before it was that account's
+                            // face, not the engine's: exclude those
+                            // accounts from liveness for this engine
+                            // instance.
+                            exclude_refused_ping_targets(
+                                &mut verdicts,
+                                &refused,
+                                targets.len(),
+                            );
+                            // A successful REST ping decays the failure
+                            // counter only. It must NOT clear a pending
+                            // restart: getUserStatus does not touch the
+                            // receive WebSocket, and clearing on a single
+                            // success was exactly the "REST looks fine while
+                            // receive is dead" loop that kept engines down.
+                            // Only delivered envelope evidence (above) or an
+                            // executed restart can clear a pending.
+                            ping_failures = 0;
+                        }
+                        WatchdogPingOutcome::Unauthorized => {
                             // Contract 1.21: the ping target's device was
                             // unlinked by the account holder. The credential
                             // is dead and no restart can resurrect it; the
@@ -2403,8 +3199,41 @@ impl RuntimeSupervisor {
                             // would only churn bounded restarts forever.
                             ping_failures = 0;
                         }
-                        Err(_) => {
+                        WatchdogPingOutcome::Failed
+                            if !refused.is_empty() && refused.len() == targets.len() =>
+                        {
+                            // Every attempted candidate answered with the
+                            // engine's account-scoped face: the engine is
+                            // answering, it just does not serve these
+                            // accounts (the stale-row incident). Exclude
+                            // them and skip the tick instead of counting a
+                            // liveness failure; the next tick walks on to
+                            // whatever the attempt cap left unprobed.
+                            exclude_refused_ping_targets(
+                                &mut verdicts,
+                                &refused,
+                                targets.len(),
+                            );
+                            crate::metrics::record_watchdog_liveness_tick_skipped();
+                            tracing::info!(
+                                reason = "allCandidatesRefused",
+                                candidates = targets.len(),
+                                "watchdog liveness skipped: the engine refused every candidate"
+                            );
+                            ping_failures = 0;
+                        }
+                        WatchdogPingOutcome::Failed => {
+                            // An engine-level error ended the series: keep
+                            // the pre-existing failure accounting (and its
+                            // restart boundary) intact.
                             ping_failures += 1;
+                            tracing::debug!(
+                                error_class = failed_class.unwrap_or("unknown"),
+                                ping_failures,
+                                candidates = targets.len(),
+                                refused_accounts = refused.len(),
+                                "watchdog liveness ping failed"
+                            );
                             if ping_failures >= WATCHDOG_MAX_PING_FAILURES
                                 && self
                                     .watchdog_request_restart(
@@ -2427,41 +3256,150 @@ impl RuntimeSupervisor {
         }
     }
 
-    fn restart_throttled(&self, last_restart: &Option<Instant>) -> bool {
-        last_restart.is_some_and(|last| last.elapsed() < self.config.watchdog_min_restart_interval)
-    }
-
     async fn link_flow_active(&self) -> bool {
         self.active_link_finish.lock().await.is_some()
             || self.service.lock().await.has_pending_link()
     }
 
-    /// Ping target account, or None when pinging/restarting is unsafe: engine not
-    /// usable, a finishLink is in flight, a link session is pending (restarting
-    /// would invalidate its deviceLinkUri), or no account exists yet.
-    async fn watchdog_ping_target(&self) -> Option<String> {
+    /// Resolve this tick's liveness-ping plan.
+    ///
+    /// A ping only proves something about the receive path when the engine
+    /// actually serves the account: an unknown account earns the engine's
+    /// plain -32603 in milliseconds, and counting that as a liveness failure
+    /// restarted healthy engines once per anti-storm window (the stale-row
+    /// incident). So the candidate set is the connector's group rows
+    /// intersected with the engine's own `listAccounts` answer; rows the
+    /// engine does not list are excluded (and counted) instead of pinged.
+    ///
+    /// When the cross-check cannot run, the connector-known candidates are
+    /// used — except the rows the last successful cross-check already proved
+    /// absent, which stay excluded for this engine instance. An engine that
+    /// cannot answer `listAccounts` is exactly what the ping threshold exists
+    /// for, and silently skipping liveness would weaken that boundary rather
+    /// than tighten it.
+    async fn watchdog_ping_plan(
+        &self,
+        engine: &EngineHandle,
+        verdicts: &mut WatchdogProbeVerdicts,
+    ) -> WatchdogPingPlan {
         if self.active_link_finish.lock().await.is_some() {
-            return None;
+            return WatchdogPingPlan::LinkFlow;
         }
-        let service = self.service.lock().await;
-        if service.has_pending_link() {
-            return None;
+        let rows = {
+            let service = self.service.lock().await;
+            if service.has_pending_link() {
+                return WatchdogPingPlan::LinkFlow;
+            }
+            // Never hold the service lock across an engine call: the store
+            // read is the only thing this lock is for.
+            match service.signal_account_candidates_in_group(&self.group_id) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(
+                        error_class = error.class(),
+                        "watchdog ping candidate listing failed"
+                    );
+                    return WatchdogPingPlan::NoTarget(WatchdogPingSkip {
+                        reason: "candidateListingFailed",
+                        known_accounts: 0,
+                        excluded_accounts: 0,
+                        engine_verified: false,
+                    });
+                }
+            }
+        };
+        if rows.is_empty() {
+            return WatchdogPingPlan::NoTarget(WatchdogPingSkip {
+                reason: "noAccounts",
+                known_accounts: 0,
+                excluded_accounts: 0,
+                engine_verified: false,
+            });
         }
-        // Only an account of this group's own engine is a valid probe target.
-        service
-            .any_signal_account_number_in_group(&self.group_id)
-            .ok()
-            .flatten()
+        // The engine's own account list is the only authority on which
+        // accounts this engine serves.
+        let verified = engine_account_numbers(engine).await;
+        let mut targets = Vec::new();
+        let mut excluded_accounts = 0usize;
+        let mut confirmed_accounts = 0usize;
+        for row in &rows {
+            if let Some(numbers) = &verified {
+                if !numbers.contains(&row.signal_account) {
+                    // Record once per engine instance; the exclusion itself
+                    // applies on every later tick.
+                    if verdicts.engine_absent.insert(row.id.clone()) {
+                        crate::metrics::record_watchdog_ping_target_skipped();
+                        tracing::info!(
+                            account_id = %row.id,
+                            reason = "engineAbsent",
+                            "watchdog ping target excluded: the engine does not list the account"
+                        );
+                    }
+                    excluded_accounts += 1;
+                    continue;
+                }
+                // The engine lists it now (re-link, or an earlier refusal
+                // that did not reproduce): it is not absent any more.
+                confirmed_accounts += 1;
+                verdicts.engine_absent.remove(&row.id);
+            } else if verdicts.engine_absent.contains(&row.id) {
+                // A failed cross-check does not erase what the last
+                // successful one proved: the row stays out of the fallback
+                // candidate set for this engine instance.
+                excluded_accounts += 1;
+                continue;
+            }
+            if verdicts.refuses(&row.id) {
+                excluded_accounts += 1;
+                continue;
+            }
+            targets.push(WatchdogPingTarget {
+                account_id: row.id.clone(),
+                number: row.signal_account.clone(),
+            });
+        }
+        if verified.is_none() {
+            tracing::debug!(
+                known_accounts = rows.len(),
+                excluded_accounts,
+                "watchdog account verification unavailable; probing connector-known candidates"
+            );
+        }
+        if targets.is_empty() {
+            let reason = if verified.is_none() {
+                "allCandidatesExcluded"
+            } else if confirmed_accounts == 0 {
+                "noEngineConfirmedAccount"
+            } else {
+                "allConfirmedCandidatesExcluded"
+            };
+            return WatchdogPingPlan::NoTarget(WatchdogPingSkip {
+                reason,
+                known_accounts: rows.len(),
+                excluded_accounts,
+                engine_verified: verified.is_some(),
+            });
+        }
+        if targets.len() > WATCHDOG_PING_ATTEMPT_LIMIT {
+            tracing::debug!(
+                candidates = targets.len(),
+                attempt_limit = WATCHDOG_PING_ATTEMPT_LIMIT,
+                "watchdog ping candidate series capped"
+            );
+            targets.truncate(WATCHDOG_PING_ATTEMPT_LIMIT);
+        }
+        WatchdogPingPlan::Probe(targets)
     }
 
     /// Handle a watchdog restart trigger. Executes immediately unless a link
-    /// flow is active (suppressed) or the throttle window is still open — in
-    /// which case the request is recorded as pending instead of being dropped.
-    /// Restarts within one failure episode are bounded: the initial restart
-    /// plus at most WATCHDOG_MAX_PENDING_RETRIES retries; beyond that the
-    /// trigger is logged as give-up. Any executed restart also satisfies an
-    /// outstanding pending request. Returns true only when a restart happened
-    /// now. Logs carry no phone numbers.
+    /// flow is active (suppressed: restarting would invalidate an in-flight
+    /// deviceLinkUri) or the backoff window is still open — in which case the
+    /// request is armed as pending with a fixed deadline instead of being
+    /// dropped. The window doubles per executed restart inside one episode
+    /// (capped), so churn stays bounded while a persistent fault keeps getting
+    /// retried. Any executed restart also satisfies an outstanding pending
+    /// request. Returns true only when a restart happened now. Logs carry no
+    /// phone numbers.
     async fn watchdog_request_restart(
         &self,
         last_restart: &mut Option<Instant>,
@@ -2470,8 +3408,8 @@ impl RuntimeSupervisor {
         source: RestartSource,
         reason: &'static str,
     ) -> bool {
-        // A quiet gap longer than one throttle window starts a fresh episode
-        // with a full retry budget.
+        // A trigger-free gap longer than the anti-storm window starts a fresh
+        // episode with the fast (immediate) path restored.
         if let Some(last_trigger) = episode.last_trigger
             && last_trigger.elapsed() > self.config.watchdog_min_restart_interval
         {
@@ -2480,43 +3418,97 @@ impl RuntimeSupervisor {
         episode.last_trigger = Some(Instant::now());
 
         if self.link_flow_active().await {
-            tracing::warn!(reason, "watchdog restart suppressed: link in progress");
-            return false;
-        }
-        if episode.restarts > WATCHDOG_MAX_PENDING_RETRIES {
-            tracing::warn!(reason, "watchdog giving up: episode retry budget exhausted");
-            return false;
-        }
-        if self.restart_throttled(last_restart) {
-            // stderr outranks ping: only an executed restart clears a
-            // stderr-sourced pending, while a ping-sourced one may also be
-            // cleared by ping recovery.
-            match pending {
-                Some(p) if p.source == RestartSource::Stderr => {}
-                _ => *pending = Some(PendingRestart { source, reason }),
-            }
+            crate::metrics::record_watchdog_restart_suppressed();
             tracing::warn!(
                 reason,
                 source = %source,
-                "watchdog restart throttled; recorded as pending"
+                "watchdog restart suppressed: link in progress"
             );
             return false;
         }
+        // Receive-liveness retries use their own seconds-scale base. The
+        // five-minute watchdog_min_restart_interval is the anti-storm window
+        // (episode reset), never the retry pace: using it here left users
+        // "connected once every five minutes" during a dead receive path.
+        let backoff = watchdog_restart_backoff(
+            self.config.watchdog_liveness_backoff_base,
+            episode.restarts,
+            WATCHDOG_LIVENESS_BACKOFF_CAP,
+        );
+        let now = Instant::now();
+        if let Some(last) = *last_restart {
+            let due_at = last + backoff;
+            if now < due_at {
+                let armed = arm_pending_restart(
+                    pending,
+                    PendingRestart {
+                        source,
+                        reason,
+                        due_at,
+                        evidence: self.receive_evidence.load(Ordering::Relaxed),
+                    },
+                );
+                let retry_in_ms = (due_at - now).as_millis().min(u64::MAX as u128) as u64;
+                if armed {
+                    crate::metrics::record_watchdog_restart_deferred();
+                    tracing::warn!(
+                        reason,
+                        source = %source,
+                        episode_restarts = episode.restarts,
+                        backoff_ms = backoff.as_millis().min(u64::MAX as u128) as u64,
+                        retry_in_ms,
+                        "watchdog restart throttled; recorded as pending"
+                    );
+                } else {
+                    // The same fault is already armed with an earlier (or
+                    // higher-priority) deadline; do not spam the log every
+                    // tick while the window is open.
+                    tracing::debug!(
+                        reason,
+                        source = %source,
+                        episode_restarts = episode.restarts,
+                        retry_in_ms,
+                        "watchdog restart already pending; deadline unchanged"
+                    );
+                }
+                return false;
+            }
+        }
         let label = if episode.restarts == 0 {
-            "initial".to_string()
+            "initial"
         } else {
-            format!("pending-retry {}", episode.restarts)
+            "backoff-elapsed"
         };
-        tracing::warn!(%label, reason, "watchdog restarting the engine");
+        tracing::warn!(
+            %label,
+            reason,
+            source = %source,
+            account_id = self.preferred_account_id.as_deref().unwrap_or("-"),
+            group_id = %self.group_id,
+            episode_restarts = episode.restarts,
+            "watchdog restarting the engine"
+        );
         match self.restart_engine().await {
             Ok(()) => {
                 crate::metrics::record_watchdog_restart();
                 *last_restart = Some(Instant::now());
-                episode.restarts += 1;
+                episode.restarts = episode.restarts.saturating_add(1);
                 *pending = None;
                 true
             }
-            Err(_) => false,
+            Err(error) => {
+                // Not a restart: keep the previous last_restart so the next
+                // trigger retries, and surface the failure instead of
+                // returning silently.
+                crate::metrics::record_watchdog_restart_failed();
+                tracing::warn!(
+                    reason,
+                    source = %source,
+                    error = %error,
+                    "watchdog restart failed; the next trigger retries"
+                );
+                false
+            }
         }
     }
 
@@ -6138,14 +7130,27 @@ impl RuntimeSupervisor {
     /// failure never fails the request: any failure (including an unknown
     /// outcome) only degrades the answer to `{"status":"unknown"}`, and
     /// nothing is ever retried automatically.
+    ///
+    /// Contract revision 1.216 (§4.216): `read_message_id` is the optional
+    /// message-granular read target — the service advances the conversation
+    /// watermark to that row's `sent_at` (validated: a foreign or unknown
+    /// target fails the request with INVALID_REQUEST before any fan-out).
+    /// Absent keeps the whole-conversation advance byte-identically.
     pub async fn send_read_receipt(
         &self,
         account_id: String,
         conversation_id: String,
         message_ids: Option<Vec<String>>,
+        read_message_id: Option<String>,
     ) -> Result<&'static str, ServiceError> {
-        self.send_receipt(account_id, conversation_id, message_ids, "sendReadReceipt")
-            .await
+        self.send_receipt(
+            account_id,
+            conversation_id,
+            message_ids,
+            read_message_id,
+            "sendReadReceipt",
+        )
+        .await
     }
 
     /// Outbound viewed receipt (contract revision 1.34): identical fan-out,
@@ -6160,6 +7165,9 @@ impl RuntimeSupervisor {
             account_id,
             conversation_id,
             message_ids,
+            // The viewed face has no read-position target: §4.216 is the
+            // read legs' contract only.
+            None,
             "sendViewedReceipt",
         )
         .await
@@ -6193,6 +7201,7 @@ impl RuntimeSupervisor {
         account_id: String,
         conversation_id: String,
         message_ids: Option<Vec<String>>,
+        read_message_id: Option<String>,
         method: &'static str,
     ) -> Result<&'static str, ServiceError> {
         let failure_key = receipt_failure_key(&account_id, &conversation_id, method);
@@ -6203,9 +7212,12 @@ impl RuntimeSupervisor {
         let prepared = {
             let service = self.service.lock().await;
             let prepared = match method {
-                "sendReadReceipt" => {
-                    service.prepare_mark_read(&account_id, &conversation_id, message_ids)?
-                }
+                "sendReadReceipt" => service.prepare_mark_read(
+                    &account_id,
+                    &conversation_id,
+                    message_ids,
+                    read_message_id.as_deref(),
+                )?,
                 _ => service.prepare_mark_viewed(&account_id, &conversation_id, message_ids)?,
             };
             if method == "sendViewedReceipt" {
@@ -6309,9 +7321,16 @@ impl RuntimeSupervisor {
         account_id: String,
         conversation_id: String,
         message_ids: Option<Vec<String>>,
+        read_message_id: Option<String>,
     ) -> Result<&'static str, ServiceError> {
-        self.send_sync_receipt(account_id, conversation_id, message_ids, "markRead")
-            .await
+        self.send_sync_receipt(
+            account_id,
+            conversation_id,
+            message_ids,
+            read_message_id,
+            "markRead",
+        )
+        .await
     }
 
     /// Outbound viewed SELF-SYNC (contract revision 1.108, §4.89): identical
@@ -6324,8 +7343,15 @@ impl RuntimeSupervisor {
         conversation_id: String,
         message_ids: Option<Vec<String>>,
     ) -> Result<&'static str, ServiceError> {
-        self.send_sync_receipt(account_id, conversation_id, message_ids, "markViewed")
-            .await
+        self.send_sync_receipt(
+            account_id,
+            conversation_id,
+            message_ids,
+            // The viewed self-sync has no read-position target.
+            None,
+            "markViewed",
+        )
+        .await
     }
 
     /// messages.deleteForMe (contract revision 1.118, §4.99, capability
@@ -6404,15 +7430,19 @@ impl RuntimeSupervisor {
         account_id: String,
         conversation_id: String,
         message_ids: Option<Vec<String>>,
+        read_message_id: Option<String>,
         method: &'static str,
     ) -> Result<&'static str, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
             let service = self.service.lock().await;
             let prepared = match method {
-                "markRead" => {
-                    service.prepare_sync_read(&account_id, &conversation_id, message_ids)?
-                }
+                "markRead" => service.prepare_sync_read(
+                    &account_id,
+                    &conversation_id,
+                    message_ids,
+                    read_message_id.as_deref(),
+                )?,
                 _ => service.prepare_sync_viewed(&account_id, &conversation_id, message_ids)?,
             };
             if method == "markViewed" {
@@ -9497,6 +10527,7 @@ async fn receive_persistence_loop(
     owner_group: String,
     media_governor: Option<MediaGovernor>,
     delivery_receipts: mpsc::Sender<DeliveryReceiptJob>,
+    receive_evidence: Arc<AtomicU64>,
 ) {
     let mut storage_unavailable = false;
     // ADR 0004 trigger discipline: after every GOVERNOR_INBOUND_MESSAGE_INTERVAL
@@ -9504,6 +10535,11 @@ async fn receive_persistence_loop(
     // single task — no shared state, no resident timer thread.
     let mut inbound_since_governor_pass = 0_u64;
     while let Some(queued) = receives.recv().await {
+        // The engine delivered an envelope over its receive channel: this is
+        // the watchdog's only positive proof that the receive WebSocket is
+        // alive (the REST ping cannot see it). Bumped before the store
+        // attempt — delivery, not persistence success, is the liveness signal.
+        receive_evidence.fetch_add(1, Ordering::Relaxed);
         crate::metrics::receive_queue_drained();
         let mut retry_delay = RECEIVE_STORE_RETRY_MIN;
         loop {
@@ -10010,7 +11046,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    use tokio::time::{sleep, timeout};
+    use tokio::time::{Instant, sleep, timeout};
 
     /// §4.173: the send reply's `results` array counts into success/failure
     /// totals; direct sends (no array), empty arrays, and shape-hostile
@@ -10104,19 +11140,223 @@ mod tests {
 
     use super::{
         EngineStderrClass, HistoryImportProbe, IMPORT_FAILURE_NO_ARCHIVE,
-        MAX_IMPORT_FAILURE_CODE_CHARS, RECEIPT_FAILURE_MAP_CAP, RuntimeSupervisor,
-        attachment_download_client, cdn_root_certificate, classify_engine_stderr,
-        cloud_archive_face, cloud_status_from_engine, compose_contact_display_name,
-        compose_import_progress, engine_import_failure_code, group_extra_json,
-        history_import_status_projection, import_progress_from_engine_snapshot,
+        MAX_IMPORT_FAILURE_CODE_CHARS, PendingRestart, RECEIPT_FAILURE_MAP_CAP, RestartSource,
+        RuntimeSupervisor, arm_pending_restart, attachment_download_client, cdn_root_certificate,
+        classify_engine_stderr, cloud_archive_face, cloud_status_from_engine,
+        compose_contact_display_name, compose_import_progress, engine_import_failure_code,
+        group_extra_json, history_import_status_projection, import_progress_from_engine_snapshot,
         is_receive_fatal_stderr, probe_history_import, receipt_failure_key,
-        upload_status_from_engine,
+        upload_status_from_engine, watchdog_restart_backoff,
     };
+    use super::{WatchdogProbeVerdicts, account_scoped_engine_error};
     use crate::DEFAULT_PROXY_GROUP_ID;
-    use crate::engine::{EngineConfig, NormalizedReceive};
+    use crate::engine::{
+        EngineConfig, NormalizedReceive, WATCHDOG_LIVENESS_BACKOFF_BASE,
+        WATCHDOG_LIVENESS_BACKOFF_CAP,
+    };
     use crate::service::HostSideEvent;
     use crate::store::{MessageRecord, Store, StoreKey};
     use crate::supervisor::EngineError;
+
+    /// The liveness retry schedule is seconds-scale and independent of the
+    /// five-minute anti-storm window: the first restart of an episode is
+    /// immediate, then 10 s, 20 s, 40 s, ... capped at three minutes. A zero
+    /// base (integration-test launchers) stays immediate.
+    #[test]
+    fn liveness_backoff_is_seconds_scale_and_caps() {
+        let base = WATCHDOG_LIVENESS_BACKOFF_BASE;
+        let cap = WATCHDOG_LIVENESS_BACKOFF_CAP;
+        assert_eq!(watchdog_restart_backoff(base, 0, cap), Duration::ZERO);
+        assert_eq!(
+            watchdog_restart_backoff(base, 1, cap),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            watchdog_restart_backoff(base, 2, cap),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            watchdog_restart_backoff(base, 3, cap),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            watchdog_restart_backoff(base, 5, cap),
+            Duration::from_secs(160)
+        );
+        // 10 s * 2^5 = 320 s folds to the cap, and stays there.
+        assert_eq!(watchdog_restart_backoff(base, 6, cap), cap);
+        assert_eq!(watchdog_restart_backoff(base, 1_000, cap), cap);
+        assert_eq!(
+            watchdog_restart_backoff(Duration::ZERO, 9, cap),
+            Duration::ZERO
+        );
+    }
+
+    /// The liveness probe's attribution rule: only the engine's plain -32603
+    /// internal error — the shape an unknown account earns, whose message text
+    /// is not part of the pinned contract — can ever be account-scoped. Any
+    /// other upstream code, any structured engine code, and every engine-level
+    /// variant keep the pre-existing failure accounting, so the restart
+    /// boundary is never weakened by an engine-wide fault.
+    #[test]
+    fn liveness_probe_attributes_only_the_plain_upstream_face_to_the_account() {
+        // The unknown-account face: -32603, with or without a log-only cause.
+        assert!(account_scoped_engine_error(&EngineError::Upstream {
+            cause: None,
+            code: Some(-32603)
+        }));
+        assert!(account_scoped_engine_error(&EngineError::Upstream {
+            cause: Some("UnknownAccount".to_string()),
+            code: Some(-32603)
+        }));
+        // Any other upstream code is engine-scoped: the generic -1 face is the
+        // shape the existing liveness-failure tests pin, and a causeless error
+        // without a code is unattributable.
+        assert!(!account_scoped_engine_error(&EngineError::Upstream {
+            cause: None,
+            code: Some(-1)
+        }));
+        assert!(!account_scoped_engine_error(&EngineError::Upstream {
+            cause: None,
+            code: None
+        }));
+        // A structured engine code is never the unknown-account face.
+        assert!(!account_scoped_engine_error(&EngineError::UpstreamCode {
+            code: "ACCOUNT_NOT_FOUND",
+            data: None
+        }));
+        for error in [
+            EngineError::StartFailed,
+            EngineError::NotRunning,
+            EngineError::Backpressure,
+            EngineError::Timeout,
+            EngineError::UnknownOutcome,
+            EngineError::Exited,
+            EngineError::Protocol,
+            EngineError::Unauthorized,
+            EngineError::RateLimited,
+            EngineError::ProofRequired,
+            EngineError::ServerUnavailable,
+            EngineError::IdentityUnverified,
+        ] {
+            assert!(
+                !account_scoped_engine_error(&error),
+                "{error:?} is engine-scoped, never account-scoped"
+            );
+        }
+    }
+
+    /// Probe verdicts are per engine instance: a restart clears both the
+    /// listAccounts verdict and the ping refusal, because the fresh engine may
+    /// serve the account again.
+    #[test]
+    fn probe_verdicts_are_scoped_to_one_engine_instance() {
+        let mut verdicts = WatchdogProbeVerdicts::default();
+        verdicts.for_engine(Some(7));
+        assert!(verdicts.engine_absent.insert("account-a".to_string()));
+        assert!(verdicts.refuse("account-b"));
+        // A repeated refusal is not a fresh exclusion (no extra count/log).
+        assert!(!verdicts.refuse("account-b"));
+
+        // Same instance: the verdicts persist across ticks.
+        verdicts.for_engine(Some(7));
+        assert!(verdicts.engine_absent.contains("account-a"));
+        assert!(verdicts.refuses("account-b"));
+
+        // A restarted engine re-earns its verdicts from scratch.
+        verdicts.for_engine(Some(8));
+        assert!(verdicts.engine_absent.is_empty());
+        assert!(!verdicts.refuses("account-b"));
+    }
+
+    /// The production defaults are the review's acceptance bounds, and the
+    /// retry base is decoupled from the 300 s anti-storm window: a dead
+    /// receive path is retried in seconds, never once every five minutes.
+    #[test]
+    fn liveness_defaults_are_seconds_scale_and_decoupled_from_the_storm_window() {
+        let config =
+            EngineConfig::new(PathBuf::from("/nonexistent"), PathBuf::from("/nonexistent"));
+        assert_eq!(
+            config.watchdog_liveness_backoff_base,
+            WATCHDOG_LIVENESS_BACKOFF_BASE
+        );
+        assert_eq!(
+            config.watchdog_liveness_backoff_base,
+            Duration::from_secs(10)
+        );
+        assert!(config.watchdog_liveness_backoff_base >= Duration::from_secs(5));
+        assert!(config.watchdog_liveness_backoff_base <= Duration::from_secs(15));
+        assert!(config.watchdog_min_restart_interval >= Duration::from_secs(5 * 60));
+        assert!(
+            config.watchdog_liveness_backoff_base < config.watchdog_min_restart_interval,
+            "the retry base must not borrow the anti-storm window"
+        );
+        assert!(WATCHDOG_LIVENESS_BACKOFF_CAP >= Duration::from_secs(2 * 60));
+        assert!(WATCHDOG_LIVENESS_BACKOFF_CAP <= Duration::from_secs(5 * 60));
+    }
+
+    /// A deferred restart's deadline is binding: later triggers never push
+    /// it out (the "fault hangs forever" shape), ping may not displace an
+    /// armed stderr trigger, and an earlier deadline wins within a source. A
+    /// replacement also keeps the earliest receive-evidence snapshot, so an
+    /// envelope delivered between two triggers still cancels the pending.
+    #[test]
+    fn pending_restart_keeps_the_earliest_deadline_and_stderr_priority() {
+        let now = Instant::now();
+        let mut pending = None;
+        assert!(arm_pending_restart(
+            &mut pending,
+            PendingRestart {
+                source: RestartSource::Ping,
+                reason: "ping",
+                due_at: now + Duration::from_secs(5),
+                evidence: 7,
+            },
+        ));
+        assert_eq!(pending.unwrap().due_at, now + Duration::from_secs(5));
+        assert_eq!(pending.unwrap().evidence, 7);
+
+        // A later ping trigger is a no-op: the fault already has a deadline.
+        assert!(!arm_pending_restart(
+            &mut pending,
+            PendingRestart {
+                source: RestartSource::Ping,
+                reason: "ping",
+                due_at: now + Duration::from_secs(9),
+                evidence: 9,
+            },
+        ));
+        assert_eq!(pending.unwrap().due_at, now + Duration::from_secs(5));
+
+        // A receive-fatal stderr trigger replaces a ping-sourced pending even
+        // with a later deadline: its source outranks a REST-only probe, and
+        // the earlier evidence snapshot survives the replacement.
+        assert!(arm_pending_restart(
+            &mut pending,
+            PendingRestart {
+                source: RestartSource::Stderr,
+                reason: "stderr",
+                due_at: now + Duration::from_secs(9),
+                evidence: 12,
+            },
+        ));
+        assert_eq!(pending.unwrap().source, RestartSource::Stderr);
+        assert_eq!(pending.unwrap().evidence, 7);
+
+        // ...and a ping trigger cannot displace it afterwards.
+        assert!(!arm_pending_restart(
+            &mut pending,
+            PendingRestart {
+                source: RestartSource::Ping,
+                reason: "ping",
+                due_at: now + Duration::from_secs(1),
+                evidence: 15,
+            },
+        ));
+        assert_eq!(pending.unwrap().source, RestartSource::Stderr);
+        assert_eq!(pending.unwrap().due_at, now + Duration::from_secs(9));
+        assert_eq!(pending.unwrap().evidence, 7);
+    }
 
     /// Contract 1.53: the running-state progress composition — download
     /// wins, else THIS account's active import pass renders stage
@@ -10850,6 +12090,7 @@ mod tests {
             .unwrap();
         let expired_at = crate::link::now_ms() - 400 * 24 * 60 * 60 * 1_000;
         let mut expired = MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: "expired".into(),
             account_id: account.id.clone(),
@@ -10969,6 +12210,7 @@ mod tests {
         supervisor
             .receive_ingress
             .enqueue(NormalizedReceive {
+                required_protocol_version: None,
                 timestamp: Some(42),
                 content_kind: "dataMessage",
                 direction: "incoming",
@@ -11057,6 +12299,7 @@ mod tests {
         store
             .insert_message(
                 &MessageRecord {
+                    required_protocol_version: None,
                     author_aci: None,
                     id: "m-shell-1".into(),
                     account_id: account.id.clone(),
@@ -12372,6 +13615,7 @@ mod tests {
         deadline_ms: u64,
     ) -> MessageRecord {
         MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.into(),
             account_id: account_id.into(),
@@ -13880,6 +15124,7 @@ mod tests {
             .unwrap();
         let seed = |id: &str, sent_at: u64, conversation_id: &str| {
             let record = crate::store::MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -13943,6 +15188,7 @@ mod tests {
                 account.id.clone(),
                 conversation.id.clone(),
                 Some(vec!["m1".into()]),
+                None,
             )
             .await
             .unwrap();
@@ -14031,6 +15277,7 @@ mod tests {
             .unwrap();
         let seed = |id: &str, sent_at: u64, conversation_id: &str| {
             let record = MessageRecord {
+                required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
                 account_id: account.id.clone(),
@@ -14102,7 +15349,7 @@ mod tests {
         // the failure records the conversation+face debounce.
         std::fs::write(&fail_marker, b"").unwrap();
         let status = supervisor
-            .send_read_receipt(account.id.clone(), conversation.id.clone(), None)
+            .send_read_receipt(account.id.clone(), conversation.id.clone(), None, None)
             .await
             .unwrap();
         assert_eq!(status, "unknown");
@@ -14110,7 +15357,7 @@ mod tests {
 
         // The immediate same-face replay never reaches the engine.
         let status = supervisor
-            .send_read_receipt(account.id.clone(), conversation.id.clone(), None)
+            .send_read_receipt(account.id.clone(), conversation.id.clone(), None, None)
             .await
             .unwrap();
         assert_eq!(status, "unknown");
@@ -14133,7 +15380,7 @@ mod tests {
         // read face reaches the engine and confirms.
         std::fs::remove_file(&fail_marker).unwrap();
         let status = supervisor
-            .send_read_receipt(account.id.clone(), second.id.clone(), None)
+            .send_read_receipt(account.id.clone(), second.id.clone(), None, None)
             .await
             .unwrap();
         assert_eq!(status, "sent");

@@ -3,8 +3,21 @@
 ## 1. Status
 
 - Decision date: 2026-08-04
+- Launcher liveness and orphan-process reclamation (2026-10-21, no wire change —
+  operational behavior only): §4.218 gives the connector its own parent watch
+  (every platform, 5 s), the orphan-engine sweep, and the data-directory
+  ownership marker; §4.219 records the desktop-side runtime reconciliation that
+  backs both up.
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.216 (2026-10-21; §4.216 the message-granular read
+  watermark: `messages.markRead` / `messages.syncRead` gain the optional
+  `messageId` read-position target. Present = the conversation's
+  `read_watermark_ms` advances to that row's `sent_at`, validated against
+  the addressed account+conversation; a foreign/unknown/clock-less target
+  answers INVALID_REQUEST without moving the watermark. Absent = the
+  pre-1.216 newest-incoming advance, byte-identical. Monotonic MAX fold,
+  additive on the wire (no existing field changes).)
 - Contract revision: 1.198 (2026-10-20; §4.198 the message-level
   delete-for-me uplink `messages.deleteForMeMessages`: the official
   `getDeleteForMeSyncMessage` messageDeletes sender
@@ -386,7 +399,6 @@
   no-local-effect posture (the row converges on the echo), the
   View-poll button/unread/notify faces are the 1.181 desktop pill-chrome
   ledger, and the §4.38 archive chain has no terminate events to mint.)
-
 
 - Contract revision: 1.188 (2026-10-19; §4.188 the two arms extracted from
   the stale pre-merge branches, everything those branches carried that a
@@ -17606,6 +17618,193 @@ adminDelete routes; the history import integration asserts the summary's
 `pinnedAt`/`expiresAt` equal the backup's `pinnedAtTimestamp` /
 `pinExpiresAtTimestamp`.
 
+### 4.216 The message-granular read watermark: `messages.markRead` / `messages.syncRead` take an optional `messageId` target (contract revision 1.216, 2026-10-21)
+
+The official `markConversationRead` marks read up to the message the user
+actually saw, not up to the newest message in the conversation. Until this
+revision the connector's durable read position could only advance to the
+conversation's newest incoming row, so a desktop marking one older message
+read had no way to record that position.
+
+`messages.markRead` and `messages.syncRead` gain one additive optional
+param, `messageId` (opaqueId, 1..=128 bytes). It is independent of the
+existing `messageIds` receipt selection, which still governs which rows
+ride the receipt fan-out:
+
+- **present** — the conversation's `read_watermark_ms` advances to THAT
+  row's `sent_at`. The target is validated against the addressed account
+  AND conversation; a row of another conversation/account, an unknown id,
+  a zero `sent_at`, and a shape-invalid id all answer INVALID_REQUEST
+  (`StoreError::ReadWatermarkTargetInvalid` → the wire error) and leave
+  the watermark untouched. This arm is fallible on purpose: a caller that
+  named a precise target must not be told `sent` while the read position
+  silently stayed put.
+- **absent** — the pre-1.216 behavior byte-identically: best-effort
+  advance to the newest incoming row (a store hiccup is logged and costs
+  the durable divider re-derivation once, never the receipt legs).
+
+Both seams fold with `MAX(COALESCE(read_watermark_ms, 0), sent_at)`:
+naming an older message never rewinds the position.
+`Store::advance_read_watermark_to_message(account_id, conversation_id,
+message_id)` owns the lookup, the validation, and the fold; the service's
+single `advance_read_watermark` helper selects the arm, and the
+supervisor only threads the optional id from params to prepare.
+`messages.markViewed` / `messages.syncViewed` are unchanged — the read
+position has no viewed counterpart.
+
+**Observability.** The `metrics` snapshot gains
+`read_watermark_by_message_total`, `read_watermark_by_latest_total`,
+`read_watermark_targets_rejected_total`, and
+`read_watermark_store_failures_total`; the warn line carries
+`source = byMessage|byLatest` and the error class only — never the
+message id, the conversation id, or any row content.
+
+**Compatibility.** Additive on the wire: pre-1.216 callers send no
+`messageId` and read byte-identical request/response shapes; the
+error-code set is unchanged (INVALID_REQUEST already existed). The
+receipt-class preflights still precede target validation — a debounced
+face answers `unknown` and a stopped engine answers RUNTIME_NOT_RUNNING
+before the local lookup (pre-existing precedence, unchanged). The desktop
+opts in by sending the field; this repository ships the connector half
+only.
+
+Tests: `read_watermark_to_message_validates_the_target_and_never_rewinds`
+(store: lands on the named row, MAX no-rewind, foreign/unknown/wrong-
+account/clock-less refusals leave the position alone),
+`read_legs_advance_the_watermark_to_an_explicit_message` (both prepare
+faces: an older target, the absent-form regression, no rewind,
+INVALID_REQUEST for foreign/unknown/shape-invalid ids with the watermark
+intact, plus the byMessage/byLatest/rejected counters), and the
+`server_integration` watermark walk (markRead with `messageId` lands
+`readWatermarkMs` on the named row, an absent syncRead then advances it
+to the newest row, an older target never rewinds it, and a
+foreign/nonexistent id answers INVALID_REQUEST with the position
+untouched).
+
+### 4.217 全量引擎池：每账号一引擎 + 旧数据迁移 + 池化前置修复（contract revision 1.217, 2026-10-21）
+
+引擎池设计 S1（`kt-signal-engine/docs/plan/engine-pool-per-account-design.md`
+§3/§5.3/§6.2/§9/§10）在连接器侧落地。**没有混合模式**：开关只有
+「全池化」与「全 legacy」两态。
+
+**开关。** `serve --per-account-engines`（env `KT_SIGNAL_PER_ACCOUNT_ENGINES`），
+默认关。启动参数，永不接受 IPC 输入。关：今天的单引擎/组引擎运行时逐字节
+不变（回滚路径）；开：任何账号都不再由组引擎承载。
+
+**全池化运行态。** 每个账号一个监督栈、一个引擎进程、一个数据目录
+`<signal-data>/engines/<accountId>/`（`engine-state.json` 恰好一条
+`{number, dir: accounts/lk-<hex>}`、`accounts/lk-<hex>/store.db`、引擎自己的
+`logs/engine-stderr.log`）。`proxyGroups[]` 保留为代理策略面：仍然按
+launcher 计划列出、`accountCount` 仍是共享 store 的真实计数，但 `state`
+恒为 `stopped`、无 `pid`（全池化没有组引擎）。健康面改为
+`runtime.status.engines[]`（additive）：
+
+~~~text
+engines: [{ accountId, proxyGroup, state, pid?, rssBytes?,
+            resourcePressure, resident, restarts }]
+~~~
+
+`engines` 在空列表时省略，故 legacy 形状不变。聚合状态仍按
+running/faulted/exited/stopped 的既有规则计算，但在池化模式下
+**部分引擎非 Running 时置 `degraded: true`**（9 正常 1 崩溃不再只显示
+Running）；该字段为 false 时省略，legacy 路径逐字节不变。
+
+**路由。** `slot_for_account` 在池化模式下**只查**动态表：命中则（必要时）
+唤醒冷槽后返回该账号的 supervisor；账号行存在但没有槽
+→ `ENGINE_NOT_PROVISIONED`（不可重试，绝不回落到组引擎）；未知 id
+→ `ACCOUNT_NOT_FOUND`。`link.finish`/`link.cancel` 的归属查询同样先查
+动态表；动态会话的 `resolveLinkSession` 返回其 proxy group，保持 host 的
+每组 link lane 语义。
+
+**链接（§5.3）。** `link.start` 预生成 accountId、创建
+`engines/<accountId>`、取每目录 flock、写 crash-window sidecar
+（`<state-dir>/engines/<accountId>.json`，仅 proxy group，无号码/ACI）、
+起该槽引擎后调 `startLink`；失败即回滚（停进程 → 删目录）。
+`link.finish` 以预分配 id 落 store 行；若该号码已属于别的本地账号
+（重链/复制目录），新槽整体回滚并答 `ACCOUNT_ALREADY_LINKED`，保证
+「一个账号永不出现两个引擎」。数量达到硬上限时 `link.start` 在 mint QR
+之前答 `ENGINE_POOL_FULL`。
+
+**容量。** 硬上限 8 个账号引擎（与 `MAX_ACCOUNTS_PER_ENGINE` 对齐）；
+启动时若迁移后的账号数超过该上限，连接器 fail closed（`EnginePoolInvalid`），
+不会悄悄只跑前 8 个。**驻留窗口默认 = 硬上限 8**：常驻接收是设计 §3 的
+不变量，且打包二进制 live 实测约 33 MB/账号（8 个全驻留 ≈ 264 MB +
+connector），足以覆盖 6–8 个账号；`runtime.start` 启动全部已链接账号引擎，
+**默认不做空闲降级**（`enforce_window` 在窗口=上限时永不触发）。
+低内存机器可用 `KT_SIGNAL_POOL_MAX_RESIDENT=5` 显式收窄窗口：此时只启动
+窗口内的槽，其余注册为冷槽、首个账号请求时唤醒（按槽串行），窗口超限时
+后台降级最久未用且空闲超过 60 s 的槽；全部在用时允许临时超驻留至硬上限，
+永不因驱逐让用户等待。`engines[].resident` 的语义是「该槽引擎已启动」
+（默认全部为 true；收窄窗口后冷槽为 false）。
+
+**旧数据迁移（S2）。** 池化启动、任何引擎启动之前，自动执行一次可重入
+迁移：逐账号把 legacy 组数据目录里的 `accounts/lk-*` **rename**（绝不 copy）
+到 `engines/<accountId>/`；顺序固定为「先写目标 `engine-state.json`（恰好
+一条）→ rename store → 从源 registry 删除该条 → 校验」。每一步写
+`<signal-data>/migration/<runId>.jsonl`（只有 opaque id / proxy group /
+步骤，无号码、ACI、密钥路径）。dry-run 只读校验并输出同一份报告：
+`migrate-pool --signal-data-dir <dir> --state-dir <dir> --dry-run
+[--bootstrap-secret-file <payload>]`（`KT_SIGNAL_STORE_KEY` 优先；payload 只
+读取第 2 行，不删除文件）；该
+子命令先取数据目录占用锁，绝不会在连接器运行时搬库。任何无法证明安全的
+状态（两份 store、坏/未知版本 registry、registry 有而 store 无、无账号行的
+凭证目录）都以 `StoreError::EnginePoolInvalid` **fail closed**，连接器
+拒绝启动；空壳 `engines/<id>`（回滚链接的残留、无凭证）被清除。迁移后
+legacy 目录只剩空 registry 空壳。
+
+**池化前置修复。**
+1. 关停宽限：`EngineConfig.shutdown_grace` 3 s → 10 s，连接器总等待
+   12 s（`shutdown_grace + SHUTDOWN_TIMEOUT_MARGIN`），覆盖引擎侧 10 s
+   管线收口，不再把优雅关停截断成 SIGKILL（F6）。
+2. 全池关停：legacy 组与动态槽 **并行**关停，共用 8 s 全局预算
+   （`POOL_SHUTDOWN_BUDGET`）；每个槽拿到「剩余预算」，超时由 supervisor
+   在仍持有引擎句柄时显式 `force_kill`（SIGKILL，Unix 用 pid 直杀，不等
+   actor 的子进程锁）——只丢弃 future 不行：actor 自己的句柄克隆会让子进程
+   存活。进程退出有界（F7）。
+3. `accounts.list`：全部槽并行、3 s 全局预算（`LIST_ACCOUNTS_BUDGET`）；
+   某槽超时降级为**本地 store 行**（`RuntimeSupervisor::list_local_accounts`），
+   单个卡死引擎不再把 host 列表拖成 O(N × 引擎超时)（F9）。
+4. 聚合事件热路径：状态事件只读内存中的 supervisor 状态，不再每槽查一次
+   store 计数（F10）；`accountCount` 只在 `runtime.status` 的
+   `proxyGroups[]` 上计算。
+5. 日志隔离：动态槽引擎日志跟自己的 data-dir 走
+   （`engines/<accountId>/logs/engine-stderr.log`），legacy 组保持原路径；
+   connector 侧的 watchdog/restart/provision 日志带 `account_id`（opaque），
+   不打印号码/ACI。每槽新增 `restarts` 计数（`engines[].restarts`）。
+6. 媒体不随引擎目录迁移：动态槽仍以 `<signal-data>` 为根写
+   `media/<accountId>/attachments/`，与引擎 data-dir 无关；删除某账号的
+   engine slot 不触碰任何账号的媒体桶。
+
+**兼容与回滚。** 新错误码（`ACCOUNT_ALREADY_LINKED`、
+`ENGINE_POOL_FULL`、`ENGINE_NOT_PROVISIONED`）只在新路径出现；
+`engines[]`/`degraded` 只在池化模式出现/为真；开关关即回到 1.216 的
+单引擎形态，现有集成套件全绿。
+
+数据层面的回滚边界必须说清：迁移是 **rename**（不 copy），一旦账号的
+store 搬进 `engines/<accountId>/`，legacy 组引擎看不到它们。因此开关关
+在一个已迁移的数据目录上 **fail closed**（`EnginePoolInvalid`，报槽数），
+绝不静默返回空账号列表；要真正退回 legacy 数据布局，需要反迁移或恢复
+迁移前的副本（本批不提供自动反迁移——迁移前请保留备份）。全新安装/未
+迁移目录关开关即为 1.216 行为。删除某账号时其 `engines/<accountId>`
+随引擎停止后删除（新链接账号没有可丢的存量）。
+
+**已知边界。** 共享匿名槽（账号无关方法，设计 §3.5）本批未做：池化模式下
+sticker 浏览等账号无关引擎调用路由到首个运行中的账号引擎；无运行时
+答 `RUNTIME_NOT_RUNNING`。doctor 仍只探测组引擎，池化模式下为空（S3）。
+
+Tests: `migrate::tests`（dry-run 与 apply 一致、rename 不 copy、崩溃窗口续跑、
+双副本/坏 registry fail closed、空壳清理与凭证目录拒绝、journal 不含号码）；
+`pool::tests`（账号 id 形状、第 9 槽拒绝与回收、discovery 绑定/store 优先、
+外名目录忽略、媒体根不在引擎目录、媒体桶互不干扰、会话归属回收、默认驻留
+窗口=上限）；
+`registry::tests`（degraded 聚合与 legacy 省略、空 engines 省略、启动上限、
+legacy 拒绝已迁移目录）；
+`per_account_pool` 集成（link 产生独立 data-dir/pid、accounts.list、send/
+typing/receipt 各归其引擎、双引擎日志互不穿插、kill -9 只重启该账号、
+8 个卡死引擎下 list/关停预算、CLI 迁移 dry-run 与实跑一致且池化后可服务、
+8 账号全部链接后 8 引擎全驻留且都在收、静置超过旧降级阈值不降级、
+`KT_SIGNAL_POOL_MAX_RESIDENT=5` 恢复窗口并触发空闲降级）。
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
@@ -18042,7 +18241,6 @@ written for rollback, the data is exported online into a fresh encrypted file vi
 backup. The backup is pruned after 7 days through the same once-per-start retention pass as
 history (7.1.1). A keyed open that the store rejects fails closed as well.
 
-
 ### 7.2 Memory budget before measurement
 
 | Component | Idle RSS | Active text RSS | Media transient RSS |
@@ -18243,6 +18441,99 @@ This phase requires evidence of independent release, third-party extension, or f
 It reuses the connector and signal-cli processes and adds a bounded Feature Host pool; it never starts
 one worker per conversation or one JVM per account.
 
+
+### 4.218 孤儿进程治理：父进程看门狗 + 孤儿引擎清扫 + 数据目录归属标记（2026-10-21，纯运维面，零 wire 变更）
+
+**问题。** 引擎在 stdin EOF 时自杀（engine `main.rs`），但这条 EOF 只在连接器
+自己的 stdin 关闭时才出现——Electron 主进程被 SIGKILL 时，连接器收不到任何
+信号，连接器也就永远不会关闭引擎的 stdin。桌面既有的
+`killOrphanConnectors()` 只在启动时跑一次，于是硬杀之后可能留下
+连接器 + 引擎一起占着 data-dir（实测残留 4 个进程），下次启动 flock 失败即
+表现为「通道起不来」。
+
+**P0 父进程看门狗（`src/parent.rs`）。** `serve` 启动即解析 launcher pid：
+`--parent-pid`（所有平台都接受；Windows 必传）优先，其次 Unix 的
+`getppid()`，再次是上一代留在 data-dir 的归属标记（见下）。每
+`PARENT_POLL_INTERVAL`（5 s）判定一次，两个条件**只有这两个**：
+
+- `getppid() == 1` 且记录值确实是本进程的内核父进程 → `parent_reparented`
+  （Linux/macOS 亲进程一死立即 reparent 到 pid 1，旧 pid 可能已被复用，所以
+  这一条不看探针结果）；
+- `kill(ppid, 0)` 失败（ESRCH）→ `parent_vanished`；`EPERM` 不算死亡（进程还
+  在，只是不归本用户发信号）——绝不因「不可探测」自杀。
+
+「reparent」判定的前提是*记录值就是内核父进程*（`RecordedParent::is_actual_parent`）。
+`--parent-pid` 由 launcher 指名时，该 pid 可能是 supervisor / 转发层、从来不是
+本进程的 `getppid()`；此时只由 `kill(ppid, 0)` 定案。两条都**不**采用「ppid
+变了就算死」：wrapper `exec`、subreaper 或父进程迁移都会让 ppid 变化，误杀健康
+连接器比晚退出代价更高。
+
+命中即在 `PARENT_EXIT_BUDGET`（10 s）内 `runtime.shutdown()`（连带停掉全部
+引擎子进程），随后 `reap_children` 在半个预算内确认子进程已退出（已退出的直接
+跳过、仍在跑的补一次 SIGKILL），最后 `exit(0)`——子进程不留 `Z`。日志带固定
+reason 词、`data_dir`（仅目录，不含号码/ACI/密钥路径）、引擎数量与预算毫秒数。
+
+排障开关：`KT_SIGNAL_DISABLE_PARENT_WATCH=1`（也接受 true/yes/on）整进程关闭该
+看门狗；未设、空值、`0` 或拼错一律保持看门狗开启（fail safe，不因含糊取值自废
+自保）。关闭时启动日志落一条 warn。
+
+**P0 孤儿引擎清扫（supervisor watchdog 的独立时钟，`ENGINE_SWEEP_INTERVAL`
+15 s）。** 每个 slot 的引擎在 data-dir 下的 argv 形态是
+`--data-dir <signal-data>/engines/<accountId>`。清扫把**指向本 data-dir** 的
+进程表行按 slot 分组分类：
+
+| 观测 | 判定 | 动作 |
+| --- | --- | --- |
+| 无引擎指向该 slot | `Owned` | — |
+| 命中的 pid 就是 supervisor 记录的 pid | `SelfOwned` | 永不杀 |
+| 已开通 slot + 全部祖先为 1 + supervisor 无记录 | `Orphan` | 连续两轮同一 pid → SIGTERM→SIGKILL |
+| 未开通 slot + 祖先为 1 + 运行时在运行 | `OrphanUnprovisioned` | 同上（冷 slot 唯一可杀面） |
+| 其它（活父进程 / supervisor 仍有旧 pid） | `Foreign` / `Spawning` | 只 warn |
+
+杀之前再做两道复核：重扫确认该 pid 仍指向同一 slot、问内核它是谁的亲进程
+（是本进程的子进程则不杀）。日志只落 pid、slot、固定 reason 词。
+遗留 group 引擎（data-dir 根）不在清扫面内。
+
+**P1 数据目录归属标记。** `serve` 拿到 data-dir 锁后，**只有确实持有根
+data-dir 锁的那个连接器**才写 `.kt-signal-connector.owner`（pid + 毫秒时间
+戳，0600）；代理组连接器不写（根目录归属别人，写进去会指错 launcher）。标记
+只在 120 s 新鲜窗口内被采用：上一次 launcher 硬杀后立刻重启时，新连接器的
+`getppid()` 可能已是 1，标记是唯一可用的 launcher 证据。标记只是簿记，
+占用真相仍是 `datalock` 的内核锁。
+
+**平台面。** macOS 的 `ps -Ao args` 在 MAXCOMLEN 处截断、看不到 `--data-dir`，
+所以 argv 证据取 `KERN_PROCARGS2`（pid 只用于匹配，绝不入日志）。Windows 的
+父进程监视沿用进程句柄等待（`OpenProcess(SYNCHRONIZE)` + 无限等待，父进程一
+结束立即返回，不需要轮询），引擎清扫不启用（未接入）。**Windows 的取舍**：本批
+不做 Job Object——它要求 launcher（Electron 侧）在 spawn 时创建作业并传入句柄，
+属于桌面仓库的改动面，且桌面本来就在每次启动必传 `--parent-pid`、并对
+connector/engine 做运行中对账（§4.219），句柄等待已覆盖「父进程死亡」这一个
+目标；Job Object 的额外收益（`KILL_ON_JOB_CLOSE` 连带杀引擎）在引擎已有 stdin
+EOF 自杀的前提下是冗余的。以后若要在 Windows 上做「连接器被外部硬杀也不留
+引擎」，作业对象应加在桌面 spawn 侧，而不是连接器自己。
+
+**测试。** `tests/orphan_lifecycle.rs`（13 例，真实子进程 + 真实 connector 二进制）：
+判定表（reparent 到 init 才算、ppid 变了不算、`--parent-pid` 指名的 supervisor
+只按探针判）、reparent 到 init 的内核事实、活子进程永不判孤儿、连续两轮才清、
+杀自己的子进程后不留 Z、残留面只统计本 data-dir；端到端四例跑真二进制：
+launcher 存活 → 两轮探测后仍不退出；launcher 被杀 → 在 `PARENT_POLL_INTERVAL +
+`PARENT_EXIT_BUDGET` 内 `exit(0)`；`KT_SIGNAL_DISABLE_PARENT_WATCH=1` → 即使
+孤儿也不退；父死退出后该 connector 名下不留任一子进程（含 Z）。`src/parent.rs`
+内嵌 24 例单测覆盖 argv 证据、目录边界、标记新鲜度、清扫决策表、杀闸、开关
+取值解析与 `reap_children` 的预算内收口。
+
+### 4.219 桌面侧运行中对账（第二道，kt-desktop `processReconciler.ts`）
+
+连接器 P0 之外的第二道防线：桌面每 30 s 扫一遍指向本 data-dir 的
+connector/engine，**默认只记录 warn**；只有 `ppid == 1` 且同一 pid 连续两轮
+观测一致才清理。永远排除自己、supervisor 在管的 connector 子进程与已上报的
+引擎 pid。`KT_SIGNAL_RECONCILE_DISABLED=1` 整体关闭，
+`KT_SIGNAL_RECONCILE_ONLY_LOG=1` 强制只记录。设置页「运行时管理」的
+「检查残留进程」是只读预检（不结束任何进程、不推进确认记忆），
+「清理残留进程」才走完整对账并回数量与类型。
+
+
+
 ## 11. Review Gates
 
 Every phase follows:
@@ -18267,3 +18558,42 @@ Review priority:
 
 No push, remote repository creation, release, deployment, or external message is part of these phases
 without separate authorization.
+
+## §4.220 消息协议安全面透传（requiredProtocolVersion / isErased）
+
+**背景**：engine 已产出这两个事实（kt-signal-engine/src/service/mod.rs:9594
+requiredProtocolVersion、src/history.rs:1147 isErased），但 connector 的
+MessageRecord（src/store.rs:1708）未接收，字段在 connector → 桌面段消失。
+桌面因此无法区分「对端协议过高收不到」与「没有新消息」，也无法表达
+「消息已被擦除」。属**透传断裂**，非能力缺失。
+
+**契约（camelCase 由 serde rename_all = camelCase 自动生成）**：
+
+| wire 键 | Rust 字段 | 类型 | 语义 | 缺席语义 |
+|---|---|---|---|---|
+| requiredProtocolVersion | required_protocol_version | Option<u32> | 发送方要求的最低协议版本；高于本端支持版本时可能无法完整解析 | 键缺席 = 未声明（兼容旧实现） |
+| isErased | is_erased | bool | 该消息在发送端已被擦除（官方 isErased），内容不可恢复 | false |
+
+**写入纪律**：
+
+1. **只由实时接收路径写真实值**（engine envelope value 在手的位置）；
+2. 其余构造路径（历史导入、备份导出、迁移、测试桩）一律写缺席值
+   （None / false），**不得伪造**；
+3. 序列化：Option 用 skip_serializing_if = Option::is_none，bool 用
+   skip_serializing_if = std::ops::Not::not（与既有 mentions_self 同纪律），
+   保证旧行为逐字节不变。
+
+**为什么不做 derive(Default) + ..Default::default()**：
+MessageRecord 有 113 处完整字面量构造点。加 Default 再让各处补 .. 同样要改
+113 处，且会让**将来新增字段静默漏填**——与本次要修的「同一语义多处实现」
+同类缺陷，故不采用。
+
+**测试要求**：
+
+1. 序列化：有值时两键按 camelCase 出现；缺席时键不出现；
+2. 接收路径：engine value 含该键 → 落库后原样透出；缺失 → None / false；
+3. 边界：requiredProtocolVersion 非数字/负数/超 u32 一律降级为缺席，不 panic；
+4. 回归：cargo test --lib 既有 819 例全绿。
+
+**门禁**：cargo fmt --check、cargo clippy --all-targets -- -D warnings、
+cargo test --lib、cargo build --release。

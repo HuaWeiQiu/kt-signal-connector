@@ -2181,6 +2181,7 @@ mod tests {
         status: &'static str,
     ) -> crate::store::MessageRecord {
         crate::store::MessageRecord {
+            required_protocol_version: None,
             author_aci: None,
             id: id.to_string(),
             account_id: account_id.to_string(),
