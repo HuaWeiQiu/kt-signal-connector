@@ -25,25 +25,29 @@
 //! - Per-group engine transitions fan out as `proxyGroup.stateChanged` while
 //!   `runtime.stateChanged` keeps carrying the aggregate shape unchanged.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use futures_util::future::join_all;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout_at};
 
 use crate::DEFAULT_PROXY_GROUP_ID;
 use crate::engine::{EngineConfig, EngineError, EngineEvent, EngineState, EngineStatus};
 use crate::groups::{MAX_PROXY_GROUPS, ProxyGroupPlan};
 use crate::protocol::ApiError;
 use crate::service::{
-    ContactsSyncOutcome, HostSideEvent, MessageText, SendTarget, SendTextMentionParams,
-    SendTextPreviewParams, SendTextStyleParams, ServiceError,
+    ConnectorService, ContactsSyncOutcome, HostSideEvent, MessageText, SendTarget,
+    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
 };
 use crate::store::{
-    AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page, Store, StoreError,
-    StoreKey,
+    AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
+    Store, StoreError, StoreKey,
 };
 use crate::supervisor::RuntimeSupervisor;
 use std::time::Duration;
@@ -55,10 +59,10 @@ pub struct ProxyGroupSlot {
 }
 
 impl ProxyGroupSlot {
-    /// Assemble one slot from an already-built supervision stack. Production
-    /// plans come exclusively from [`open_group_runtime`]; this constructor
-    /// exists for unit tests that build single-group runtimes by hand.
-    #[cfg(test)]
+    /// Assemble one slot from an already-built supervision stack. Legacy
+    /// plans come from [`open_group_runtime`]; the engine pool builds one
+    /// routing handle per dynamic account slot from the same constructor, and
+    /// unit tests build single-group runtimes by hand.
     pub(crate) fn new(id: String, supervisor: Arc<RuntimeSupervisor>) -> Self {
         Self { id, supervisor }
     }
@@ -100,6 +104,18 @@ pub struct AggregateEngineStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rss_bytes: Option<u64>,
     pub resource_pressure: bool,
+    /// Engine-pool design §7.2 (F10's sibling): true when the aggregate is
+    /// `running` but at least one slot is not — the pre-pool rule alone
+    /// reported `running` for nine healthy engines and one crash. Only the
+    /// per-account pool computes it; on the pre-pool path the field is false
+    /// and omitted from the wire, so the flag-off shape stays byte-identical.
+    #[serde(skip_serializing_if = "is_false")]
+    pub degraded: bool,
+}
+
+/// Serde helper: omit `degraded` unless it is true.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl From<EngineStatus> for AggregateEngineStatus {
@@ -109,6 +125,7 @@ impl From<EngineStatus> for AggregateEngineStatus {
             pid: status.pid,
             rss_bytes: status.rss_bytes,
             resource_pressure: status.resource_pressure,
+            degraded: false,
         }
     }
 }
@@ -136,6 +153,51 @@ pub struct RuntimeStatusResult {
     #[serde(flatten)]
     pub aggregate: AggregateEngineStatus,
     pub proxy_groups: Vec<ProxyGroupStatus>,
+    /// Engine-pool design §7.3 (additive): one entry per dynamically
+    /// provisioned account engine. Empty on the pre-pool path and therefore
+    /// omitted, keeping that wire shape byte-identical.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub engines: Vec<crate::pool::AccountEngineStatus>,
+}
+
+/// Which supervisor owns a link session: a launcher-planned proxy group or a
+/// dynamically provisioned per-account engine slot.
+enum LinkOwner {
+    Group(Arc<ProxyGroupSlot>),
+    Account(Arc<crate::pool::AccountSlot>),
+}
+
+/// `ENGINE_NOT_PROVISIONED`: full pooling found an account row with no
+/// engine slot. The binding is intact but its engine data is missing, so the
+/// request cannot be served by any other engine (never a silent fallback to a
+/// legacy group engine — there is none in pool mode).
+fn engine_not_provisioned_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "ENGINE_NOT_PROVISIONED",
+        "this account has no engine slot in the pool; its local engine data is missing",
+        false,
+    ))
+}
+
+/// The v1-shaped delete answer (a recorded receipt under `deleted`, or an
+/// empty object).
+fn account_delete_result(receipt: Option<crate::store::AccountDeleteReceipt>) -> Value {
+    match receipt {
+        Some(receipt) => json!({ "deleted": receipt }),
+        None => json!({}),
+    }
+}
+
+/// `ACCOUNT_ALREADY_LINKED`: a per-account link finish resolved to a number
+/// that already has a local account row, so keeping the fresh slot would run
+/// two engines for one account (design F2/I1). The freshly linked device is
+/// rolled back; the caller must delete the old local data before relinking.
+fn account_already_linked_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "ACCOUNT_ALREADY_LINKED",
+        "this number already has a local account; delete its local data before linking again",
+        false,
+    ))
 }
 
 /// Why `runtime.start` failed when no group engine started.
@@ -153,52 +215,223 @@ pub enum StopFailure {
 }
 
 pub struct ProxyGroupRuntime {
-    groups: Vec<ProxyGroupSlot>,
+    /// Legacy group supervisors. **Empty** when the engine pool is enabled:
+    /// full pooling runs one engine per account and no group engine.
+    groups: Vec<Arc<ProxyGroupSlot>>,
+    /// Launcher-planned group ids in plan order. They stay the proxy-policy
+    /// vocabulary (`proxyGroups[]`/binding) even when no group engine exists.
+    group_ids: Vec<String>,
+    /// Shared routing service over the one per-instance store (legacy mode
+    /// reuses the first group's; pool mode builds a standalone one).
+    router: Arc<Mutex<ConnectorService>>,
+    /// The launcher's effective media-ingest decision (handshake gate).
+    media_ingest_armed: bool,
+    /// Dynamic per-account engine registry. `None` on the pre-pool path: no
+    /// account routing, no `engines[]`, no `degraded`, and every legacy path
+    /// runs exactly as before. `Some` is **full pooling**: no group engine is
+    /// ever started; every account owns an engine slot.
+    pool: Option<Arc<crate::pool::AccountPool>>,
+    /// True between `runtime.start` and `runtime.stop`/`shutdown`. Cold
+    /// dynamic slots wake only while the runtime is running; a stopped
+    /// runtime keeps failing account calls with RUNTIME_NOT_RUNNING exactly
+    /// like a legacy group engine parked by `runtime.stop`.
+    running: AtomicBool,
+    /// One process-wide history-retention pass (spawned on the first available
+    /// supervisor, legacy or pooled).
+    retention_spawned: AtomicBool,
     events: broadcast::Sender<RegistryEvent>,
     host_events: broadcast::Sender<HostSideEvent>,
-    /// Forwarder tasks merging every group's streams into this runtime;
+    /// Forwarder tasks merging every slot's streams into this runtime;
     /// aborted on drop. Never held across an await.
     forwarders: StdMutex<Vec<JoinHandle<()>>>,
+    /// Dynamic account ids whose forwarders were already spawned (one pair of
+    /// tasks per slot; a re-spawn would double every state event).
+    forwarded_accounts: StdMutex<HashSet<String>>,
+    /// The orphan sweep's copy of `running` (full pooling only). Every
+    /// transition writes it; `None` on the legacy path, where no sweep reads
+    /// it.
+    shared_running: StdMutex<Option<Arc<AtomicBool>>>,
 }
 
 impl ProxyGroupRuntime {
-    /// Assemble the runtime from launcher-planned groups and start the event
-    /// forwarders. Callers must have spawned watchdogs/retention already.
+    /// Assemble the legacy runtime from launcher-planned groups and start the
+    /// event forwarders. Callers must have spawned watchdogs/retention
+    /// already.
     pub(crate) fn new(groups: Vec<ProxyGroupSlot>) -> Arc<Self> {
         assert!(
             !groups.is_empty(),
             "the launch plan always contains at least the default group"
         );
+        let group_ids = groups.iter().map(|slot| slot.id.clone()).collect();
+        let router = Arc::clone(groups[0].supervisor.service());
+        let media_ingest_armed = groups[0].supervisor.media_ingest_armed();
+        Self::assemble(
+            groups.into_iter().map(Arc::new).collect(),
+            group_ids,
+            router,
+            media_ingest_armed,
+            None,
+        )
+    }
+
+    /// The full-pool assembly (engine-pool S1, switch on): one engine per
+    /// account, no legacy group engine. `group_ids` keeps the launcher plan
+    /// visible as proxy policy, and a standalone routing service serves the
+    /// shared store. `running` is the flag shared with the orphan sweep, so a
+    /// sweep can tell a running runtime from a stopped one.
+    /// The full-pool assembly whose `running` flag is shared with the orphan
+    /// sweep owner (a sweep must know whether this runtime is between start
+    /// and stop before it classifies a cold slot's engine).
+    pub(crate) fn full_pool_with_running(
+        group_ids: Vec<String>,
+        store: Arc<Store>,
+        media_ingest: bool,
+        pool: Arc<crate::pool::AccountPool>,
+        running: Arc<AtomicBool>,
+    ) -> Arc<Self> {
         assert!(
-            groups.len() <= MAX_PROXY_GROUPS,
+            !group_ids.is_empty(),
+            "the launch plan always contains at least the default group"
+        );
+        assert!(
+            group_ids.len() <= MAX_PROXY_GROUPS,
             "the launch plan enforces the group ceiling"
+        );
+        let router = Arc::new(Mutex::new(ConnectorService::with_media(store, None)));
+        let runtime = Self::assemble(Vec::new(), group_ids, router, media_ingest, Some(pool));
+        // The shared flag starts where the freshly assembled runtime stands
+        // (stopped), then every start/stop writes it as well as its own.
+        running.store(runtime.running.load(Ordering::Acquire), Ordering::Release);
+        if let Ok(mut slot) = runtime.shared_running.lock() {
+            *slot = Some(running);
+        }
+        runtime
+    }
+
+    /// Publish the current running state to the sweep's copy. Called on every
+    /// transition (start/stop/restart), so the sweep reads one writer's fact
+    /// without a polling thread or a second source of truth.
+    fn publish_running(&self) {
+        if let Ok(shared) = self.shared_running.lock()
+            && let Some(shared) = shared.as_ref()
+        {
+            shared.store(self.running.load(Ordering::Acquire), Ordering::Release);
+        }
+    }
+
+    fn assemble(
+        groups: Vec<Arc<ProxyGroupSlot>>,
+        group_ids: Vec<String>,
+        router: Arc<Mutex<ConnectorService>>,
+        media_ingest_armed: bool,
+        pool: Option<Arc<crate::pool::AccountPool>>,
+    ) -> Arc<Self> {
+        assert!(
+            groups.len() <= MAX_PROXY_GROUPS && group_ids.len() <= MAX_PROXY_GROUPS,
+            "the launch plan enforces the group ceiling"
+        );
+        assert!(
+            (pool.is_some() && groups.is_empty())
+                || (pool.is_none() && groups.len() == group_ids.len()),
+            "full pooling has no group engines; legacy mode has one per planned group"
         );
         let (events, _) = broadcast::channel(1024);
         let (host_events, _) = broadcast::channel(1024);
         let runtime = Arc::new(Self {
             groups,
+            group_ids,
+            router,
+            media_ingest_armed,
+            pool,
+            running: AtomicBool::new(false),
+            retention_spawned: AtomicBool::new(false),
             events,
             host_events,
             forwarders: StdMutex::new(Vec::new()),
+            forwarded_accounts: StdMutex::new(HashSet::new()),
+            shared_running: StdMutex::new(None),
         });
         runtime.spawn_forwarders();
+        if let Some(pool) = &runtime.pool {
+            for slot in pool.slots() {
+                runtime.spawn_account_forwarders(&slot);
+            }
+            if let Some(first) = pool.slots().first() {
+                runtime.ensure_history_retention(first.supervisor());
+            }
+            runtime.spawn_link_reaper();
+        }
         runtime
     }
 
+    /// Reclaim half-finished link slots (engine running, no committed store
+    /// row, no live link session, idle past the link-session TTL). Without
+    /// this an abandoned link would pin a data directory and one of the eight
+    /// engine slots until the next process restart.
+    fn spawn_link_reaper(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let Some(runtime) = weak.upgrade() else {
+                    break;
+                };
+                runtime.reap_uncommitted_links().await;
+            }
+        });
+        self.forwarders
+            .lock()
+            .expect("forwarder list mutex")
+            .push(handle);
+    }
+
+    async fn reap_uncommitted_links(&self) {
+        let Some(pool) = &self.pool else {
+            return;
+        };
+        for slot in pool.slots() {
+            if slot.is_provisioned() || slot.idle_for() < crate::pool::ABANDONED_LINK_TTL {
+                continue;
+            }
+            if slot.supervisor().has_pending_link().await {
+                continue;
+            }
+            tracing::warn!(
+                account_id = %slot.account_id(),
+                group_id = %slot.proxy_group(),
+                "abandoned per-account link slot is being reclaimed"
+            );
+            pool.discard(slot.account_id(), true).await;
+            self.forget_account_forwarders(slot.account_id());
+        }
+    }
+
+    /// The dynamic registry, when the per-account pool is enabled.
+    pub(crate) fn account_pool(&self) -> Option<&Arc<crate::pool::AccountPool>> {
+        self.pool.as_ref()
+    }
+
+    /// Exactly one process-wide history-retention pass, whichever supervisor
+    /// happens to land first (a pool can legitimately have no slots at
+    /// startup; the first linked account then owns the pass).
+    fn ensure_history_retention(&self, supervisor: &Arc<RuntimeSupervisor>) {
+        if !self.retention_spawned.swap(true, Ordering::AcqRel) {
+            supervisor.spawn_history_retention();
+        }
+    }
+
     pub fn group_ids(&self) -> Vec<&str> {
-        self.groups.iter().map(|slot| slot.id.as_str()).collect()
+        self.group_ids.iter().map(String::as_str).collect()
     }
 
     /// Whether the media-download capability is genuinely armed process-wide.
-    /// Every group receives the registry's single effective media-ingest
-    /// decision (the launcher's, passed through verbatim since 1.121 —
-    /// §4.102) and the same handle table, so the first group's media table
-    /// answers for the whole runtime — the handshake `attachment-download`
-    /// advertisement gate (contract revision 1.98) and the exact gate the
-    /// media methods themselves answer: a runtime without the table omits the
-    /// tag instead of advertising a face that fails for every call.
+    /// The launcher decision (contract revision 1.98/§4.102) is the exact gate
+    /// every media method answers; the field is the effective decision, so a
+    /// full-pool runtime with no group supervisor still answers it honestly.
     pub fn media_ingest_armed(&self) -> bool {
-        self.groups[0].supervisor.media_ingest_armed()
+        self.media_ingest_armed
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<RegistryEvent> {
@@ -256,6 +489,70 @@ impl ProxyGroupRuntime {
         *self.forwarders.lock().expect("forwarder list mutex") = handles;
     }
 
+    /// Spawn one dynamic slot's event forwarders (idempotent per account).
+    /// Unlike the static groups these tasks never emit
+    /// `proxyGroup.stateChanged`: an account is not a proxy group, and the
+    /// pool's per-account detail rides `runtime.status` `engines[]`. Each
+    /// task owns only its subscription receiver, so removing the slot closes
+    /// the channels and ends the tasks.
+    fn spawn_account_forwarders(self: &Arc<Self>, slot: &Arc<crate::pool::AccountSlot>) {
+        let account_id = slot.account_id().to_string();
+        {
+            let mut forwarded = self
+                .forwarded_accounts
+                .lock()
+                .expect("forwarded account list mutex");
+            if !forwarded.insert(account_id.clone()) {
+                return;
+            }
+        }
+        let mut engine_rx = slot.supervisor().subscribe_engine();
+        let mut host_rx = slot.supervisor().subscribe_host();
+        let mut handles = Vec::new();
+        let weak = Arc::downgrade(self);
+        handles.push(tokio::spawn({
+            let account_id = account_id.clone();
+            async move {
+                loop {
+                    match engine_rx.recv().await {
+                        Ok(event) => {
+                            let Some(runtime) = weak.upgrade() else {
+                                break;
+                            };
+                            runtime.on_account_engine_event(&account_id, event).await;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }));
+        handles.push(tokio::spawn({
+            let host_tx = self.host_events.clone();
+            async move {
+                loop {
+                    match host_rx.recv().await {
+                        Ok(event) => {
+                            let _ = host_tx.send(event);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }));
+        self.forwarders
+            .lock()
+            .expect("forwarder list mutex")
+            .extend(handles);
+    }
+
+    fn forget_account_forwarders(&self, account_id: &str) {
+        if let Ok(mut forwarded) = self.forwarded_accounts.lock() {
+            forwarded.remove(account_id);
+        }
+    }
+
     async fn on_group_engine_event(&self, group_id: &str, event: EngineEvent) {
         match event {
             EngineEvent::StateChanged(status) => {
@@ -303,14 +600,71 @@ impl ProxyGroupRuntime {
         }
     }
 
+    /// A dynamic slot's engine event. Per-account state detail is polled
+    /// through `runtime.status` `engines[]`; the aggregate event keeps the
+    /// desktop's existing subscription working and now carries `degraded`
+    /// when the pool is partial. Account-less lanes (protocol warning,
+    /// storage) keep their pre-pool forwarding; resource pressure is reported
+    /// per slot in `engines[]` instead of inventing a group id for an account.
+    async fn on_account_engine_event(&self, _account_id: &str, event: EngineEvent) {
+        match event {
+            EngineEvent::StateChanged(_) => {
+                let aggregate = self.aggregate_status().await;
+                let _ = self
+                    .events
+                    .send(RegistryEvent::AggregateStateChanged(aggregate));
+            }
+            EngineEvent::ProtocolWarning { kind } => {
+                let _ = self.events.send(RegistryEvent::ProtocolWarning { kind });
+            }
+            EngineEvent::StorageChanged { state } => {
+                let _ = self.events.send(RegistryEvent::StorageChanged { state });
+            }
+            EngineEvent::ResourcePressure { .. }
+            | EngineEvent::AccountUnauthorized { .. }
+            | EngineEvent::ReceiveEmptied { .. }
+            | EngineEvent::ReceiveClockSkew { .. }
+            | EngineEvent::ConversationState { .. }
+            | EngineEvent::StoragePull { .. }
+            | EngineEvent::ReceiveDecryptionError { .. } => {
+                // The dynamic supervisor's own watchers own the account-level
+                // notifications (contract 1.134); the registry forwards the
+                // global lanes only.
+            }
+        }
+    }
+
     /// Current per-group statuses in launcher order, with store-backed
-    /// account counts.
+    /// account counts. Full pooling has no group engine: the plan groups
+    /// still ride `proxyGroups[]` (with the same account counts) but report
+    /// `stopped` and no pid — the live engine health lives in `engines[]`.
     async fn group_statuses(&self) -> Vec<ProxyGroupStatus> {
-        let router = self.groups[0].supervisor.service();
-        let mut statuses = Vec::with_capacity(self.groups.len());
+        let mut statuses = Vec::with_capacity(self.group_ids.len());
+        if self.pool.is_some() {
+            for group_id in &self.group_ids {
+                let account_count = self
+                    .router
+                    .lock()
+                    .await
+                    .count_accounts_in_group_lossy(group_id);
+                statuses.push(ProxyGroupStatus {
+                    group_id: group_id.clone(),
+                    state: EngineState::Stopped,
+                    pid: None,
+                    rss_bytes: None,
+                    resource_pressure: false,
+                    account_count,
+                });
+            }
+            return statuses;
+        }
         for slot in &self.groups {
             let status = slot.supervisor.status().await;
-            let account_count = router.lock().await.count_accounts_in_group_lossy(&slot.id);
+            let account_count = self
+                .router
+                .lock()
+                .await
+                .count_accounts_in_group_lossy(&slot.id);
             statuses.push(ProxyGroupStatus {
                 group_id: slot.id.clone(),
                 state: status.state,
@@ -323,8 +677,17 @@ impl ProxyGroupRuntime {
         statuses
     }
 
-    /// The pinned aggregation rule (implementation-plan §4.4).
-    fn aggregate_from(parts: &[ProxyGroupStatus]) -> AggregateEngineStatus {
+    /// The pinned aggregation rule (implementation-plan §4.4), extended by the
+    /// engine pool: dynamic slots join the same running/faulted/exited ladder,
+    /// and `degraded` reports a partial pool. The extra field is computed only
+    /// when the pool is enabled (flag-off output stays byte-identical), and
+    /// `pid` keeps the pre-pool "exactly one group" rule so a single-group
+    /// deployment is field-for-field unchanged.
+    fn aggregate_from(
+        parts: &[EngineStatus],
+        pid: Option<u32>,
+        pool_enabled: bool,
+    ) -> AggregateEngineStatus {
         let running = parts.iter().any(|part| part.state == EngineState::Running);
         let faulted = parts.iter().any(|part| part.state == EngineState::Faulted);
         let exited = parts.iter().any(|part| part.state == EngineState::Exited);
@@ -340,24 +703,99 @@ impl ProxyGroupRuntime {
         AggregateEngineStatus {
             state,
             // Present only when exactly one group exists, regardless of state.
-            pid: if parts.len() == 1 { parts[0].pid } else { None },
+            pid,
             rss_bytes: parts
                 .iter()
                 .filter_map(|part| part.rss_bytes)
                 .reduce(u64::saturating_add),
             resource_pressure: parts.iter().any(|part| part.resource_pressure),
+            degraded: pool_enabled
+                && running
+                && parts.iter().any(|part| part.state != EngineState::Running),
+        }
+    }
+
+    /// Engine statuses across the whole pool (legacy groups first, then
+    /// dynamic slots in account-id order). Memory-only reads: no store query,
+    /// which is what keeps the state-change hot path free of per-slot SQL
+    /// (design F10).
+    async fn slot_statuses(&self) -> Vec<EngineStatus> {
+        let mut statuses = Vec::with_capacity(self.groups.len());
+        for slot in &self.groups {
+            statuses.push(slot.supervisor.status().await);
+        }
+        if let Some(pool) = &self.pool {
+            for slot in pool.slots() {
+                statuses.push(slot.supervisor().status().await);
+            }
+        }
+        statuses
+    }
+
+    /// The live engine child pids this runtime owns (legacy group engines and
+    /// pool account engines), for the parent-loss exit path's bounded reap.
+    /// Memory-only reads, same face as `slot_statuses`.
+    pub async fn engine_pids(&self) -> Vec<u32> {
+        self.slot_statuses()
+            .await
+            .into_iter()
+            .filter_map(|status| status.pid)
+            .collect()
+    }
+
+    /// The `pid` field keeps its pre-pool rule: only a deployment with exactly
+    /// one proxy group (the flag-off shape) reports it at the top level.
+    fn single_group_pid(&self, statuses: &[EngineStatus]) -> Option<u32> {
+        if self.groups.len() == 1 {
+            statuses.first().and_then(|status| status.pid)
+        } else {
+            None
         }
     }
 
     async fn aggregate_status(&self) -> AggregateEngineStatus {
-        Self::aggregate_from(&self.group_statuses().await)
+        let statuses = self.slot_statuses().await;
+        let pid = self.single_group_pid(&statuses);
+        Self::aggregate_from(&statuses, pid, self.pool.is_some())
     }
 
     pub async fn status(&self) -> RuntimeStatusResult {
         let proxy_groups = self.group_statuses().await;
+        let engines = match &self.pool {
+            Some(pool) => pool.statuses().await,
+            None => Vec::new(),
+        };
+        // Full pooling has no group engine: only the account engines join the
+        // aggregate (a stopped proxyGroups[] entry is proxy policy, not a
+        // fault). Legacy mode aggregates the group engines exactly as before.
+        let mut statuses: Vec<EngineStatus> = if self.pool.is_some() {
+            Vec::new()
+        } else {
+            proxy_groups
+                .iter()
+                .map(|group| EngineStatus {
+                    state: group.state,
+                    pid: group.pid,
+                    rss_bytes: group.rss_bytes,
+                    resource_pressure: group.resource_pressure,
+                })
+                .collect()
+        };
+        statuses.extend(engines.iter().map(|engine| EngineStatus {
+            state: engine.state,
+            pid: engine.pid,
+            rss_bytes: engine.rss_bytes,
+            resource_pressure: engine.resource_pressure,
+        }));
+        let pid = if self.groups.len() == 1 {
+            proxy_groups.first().and_then(|group| group.pid)
+        } else {
+            None
+        };
         RuntimeStatusResult {
-            aggregate: Self::aggregate_from(&proxy_groups),
+            aggregate: Self::aggregate_from(&statuses, pid, self.pool.is_some()),
             proxy_groups,
+            engines,
         }
     }
 
@@ -373,8 +811,30 @@ impl ProxyGroupRuntime {
     }
 
     /// Start every group's engine (R7). Success reports the per-group states;
-    /// RUNTIME_START_FAILED only when no group engine started.
+    /// RUNTIME_START_FAILED only when no group engine started. With the
+    /// per-account pool enabled, the resident window (top-K most recently
+    /// used dynamic slots) starts here too.
     pub async fn start(&self) -> Result<RuntimeStatusResult, StartFailure> {
+        self.running.store(true, Ordering::Release);
+        self.publish_running();
+        if let Some(pool) = &self.pool {
+            // Full pooling: no group engine exists. The resident window (top-K
+            // most recently used account slots) starts here.
+            pool.start_resident().await;
+            let mut any_running = false;
+            for slot in pool.slots() {
+                if slot.supervisor().status().await.state == EngineState::Running {
+                    any_running = true;
+                }
+            }
+            // A pool with no accounts legitimately has nothing to start (the
+            // desktop still gets an honest stopped aggregate); only a pool
+            // whose slots all failed answers RUNTIME_START_FAILED.
+            if !any_running && !pool.is_empty() {
+                return Err(StartFailure::StartFailed);
+            }
+            return Ok(self.status().await);
+        }
         let mut any_running = false;
         let mut already_running = false;
         for slot in &self.groups {
@@ -394,8 +854,11 @@ impl ProxyGroupRuntime {
         Ok(self.status().await)
     }
 
-    /// Stop every group's engine (R7).
+    /// Stop every group's engine (R7). Dynamic engines park too; their slots
+    /// stay registered and cold so a later start rebuilds the resident window.
     pub async fn stop(&self) -> Result<RuntimeStatusResult, StopFailure> {
+        self.running.store(false, Ordering::Release);
+        self.publish_running();
         let mut any_stopped = false;
         let mut any_failed = false;
         for slot in &self.groups {
@@ -403,6 +866,15 @@ impl ProxyGroupRuntime {
                 Ok(_) => any_stopped = true,
                 Err(EngineError::NotRunning) => {}
                 Err(_) => any_failed = true,
+            }
+        }
+        if let Some(pool) = &self.pool {
+            for slot in pool.slots() {
+                match slot.supervisor().stop().await {
+                    Ok(_) => any_stopped = true,
+                    Err(EngineError::NotRunning) => {}
+                    Err(_) => any_failed = true,
+                }
             }
         }
         if any_failed {
@@ -414,12 +886,51 @@ impl ProxyGroupRuntime {
         Ok(self.status().await)
     }
 
-    /// Bounded teardown of every group; used by host session end and signals.
+    /// Bounded teardown of the whole pool; used by host session end and
+    /// signals. Legacy groups and dynamic slots stop **in parallel** under one
+    /// global deadline (design §6.4/F7): the pre-pool loop was sequential, so
+    /// ten engines at the old 5 s wait could hold process exit for 50 s. A
+    /// slot that misses the deadline has its shutdown future dropped, which
+    /// drops the engine handle and kills the child (`kill_on_drop`).
     pub async fn shutdown(&self) -> Result<(), EngineError> {
-        let mut first_error = None;
+        self.running.store(false, Ordering::Release);
+        self.publish_running();
+        let budget = self
+            .pool
+            .as_ref()
+            .map(|pool| pool.policy().shutdown_budget)
+            .unwrap_or(crate::pool::POOL_SHUTDOWN_BUDGET);
+        let deadline = Instant::now() + budget;
+        let mut identities: Vec<(Option<String>, String, Arc<RuntimeSupervisor>)> =
+            Vec::with_capacity(self.groups.len());
         for slot in &self.groups {
-            // Shut every remaining group down even when one fails.
-            if let Err(error) = slot.supervisor.shutdown().await
+            identities.push((None, slot.id.clone(), Arc::clone(&slot.supervisor)));
+        }
+        if let Some(pool) = &self.pool {
+            for slot in pool.slots() {
+                identities.push((
+                    Some(slot.account_id().to_string()),
+                    slot.proxy_group().to_string(),
+                    Arc::clone(slot.supervisor()),
+                ));
+            }
+        }
+        let futures = identities
+            .into_iter()
+            .map(|(_account_id, _group_id, supervisor)| {
+                async move {
+                    // Shut every remaining slot down even when one fails. The
+                    // remaining global budget is passed into the supervisor so
+                    // expiry force-kills the child while the handle is still
+                    // owned (a dropped future would leave the actor's handle
+                    // clone keeping the process alive).
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    supervisor.shutdown_within(Some(remaining)).await
+                }
+            });
+        let mut first_error = None;
+        for result in join_all(futures).await {
+            if let Err(error) = result
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -431,39 +942,125 @@ impl ProxyGroupRuntime {
         }
     }
 
-    /// Union of every group's live accounts (implementation-plan §4.4:
-    /// `accounts.list` items gain an always-present `proxyGroup`).
+    /// Union of every slot's live accounts (implementation-plan §4.4:
+    /// `accounts.list` items gain an always-present `proxyGroup`). All slots
+    /// are asked **in parallel** under one budget (design F9); a slot that
+    /// misses it degrades to its local store rows, so a single wedged engine
+    /// cannot stretch the host's list latency to O(N × engine timeout).
     pub async fn list_accounts(&self) -> Result<Vec<AccountSummary>, ServiceError> {
-        let mut accounts = Vec::new();
+        let budget = self
+            .pool
+            .as_ref()
+            .map(|pool| pool.policy().list_accounts_budget)
+            .unwrap_or(crate::pool::LIST_ACCOUNTS_BUDGET);
+        let deadline = Instant::now() + budget;
+        let mut slots: Vec<(Option<String>, String, Arc<RuntimeSupervisor>)> =
+            Vec::with_capacity(self.groups.len());
         for slot in &self.groups {
-            accounts.extend(slot.supervisor.list_accounts().await?);
+            slots.push((None, slot.id.clone(), Arc::clone(&slot.supervisor)));
         }
-        Ok(accounts)
+        if let Some(pool) = &self.pool {
+            for slot in pool.slots() {
+                slots.push((
+                    Some(slot.account_id().to_string()),
+                    slot.proxy_group().to_string(),
+                    Arc::clone(slot.supervisor()),
+                ));
+            }
+        }
+        let futures = slots.iter().map(|(_, _, supervisor)| {
+            let supervisor = Arc::clone(supervisor);
+            async move { timeout_at(deadline, supervisor.list_accounts()).await }
+        });
+        let results = join_all(futures).await;
+        let mut accounts = Vec::new();
+        let mut first_error: Option<ServiceError> = None;
+        for ((account_id, group_id, supervisor), result) in slots.into_iter().zip(results) {
+            match result {
+                Ok(Ok(rows)) => accounts.extend(rows),
+                Ok(Err(error)) => {
+                    // An engine/store failure already degraded inside the
+                    // supervisor where it could; try the local rows once
+                    // more, then keep the error for the final answer.
+                    match supervisor.list_local_accounts().await {
+                        Ok(rows) => {
+                            tracing::warn!(
+                                account_id = account_id.as_deref().unwrap_or("-"),
+                                group_id = %group_id,
+                                error_class = error.class(),
+                                "account listing degraded to local rows"
+                            );
+                            accounts.extend(rows);
+                        }
+                        Err(_) => {
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Deadline missed: answer from this slot's local rows.
+                    match supervisor.list_local_accounts().await {
+                        Ok(rows) => {
+                            tracing::warn!(
+                                account_id = account_id.as_deref().unwrap_or("-"),
+                                group_id = %group_id,
+                                budget_ms = budget.as_millis().min(u64::MAX as u128) as u64,
+                                "account listing deadline missed; degraded to local rows"
+                            );
+                            accounts.extend(rows);
+                        }
+                        Err(error) => {
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(accounts),
+        }
     }
 
-    /// Resolve the optional `link.start` proxyGroup to its slot. Absent means
-    /// `default`; anything outside the launch plan fails closed (R1/R9).
-    fn slot_for_link(&self, proxy_group: Option<&str>) -> Result<&ProxyGroupSlot, ApiError> {
+    /// Resolve the optional `link.start` proxyGroup to its plan id. Absent
+    /// means `default`; anything outside the launch plan fails closed (R1/R9).
+    /// The returned id is the account's immutable binding whichever runtime
+    /// mode is active; full pooling never touches a group engine.
+    fn link_group_id(&self, proxy_group: Option<&str>) -> Result<String, ApiError> {
         let requested = proxy_group.unwrap_or(DEFAULT_PROXY_GROUP_ID);
-        self.groups
-            .iter()
-            .find(|slot| slot.id == requested)
-            .ok_or_else(|| {
-                ApiError::new(
-                    "PROXY_GROUP_NOT_FOUND",
-                    format!("proxy group '{requested}' is not configured in this connector"),
-                    false,
-                )
-            })
+        if self.group_ids.iter().any(|id| id == requested) {
+            Ok(requested.to_string())
+        } else {
+            Err(ApiError::new(
+                "PROXY_GROUP_NOT_FOUND",
+                format!("proxy group '{requested}' is not configured in this connector"),
+                false,
+            ))
+        }
     }
 
-    /// The reserved `default` group's slot, for account-less engine calls
-    /// (sticker pack browsing, §4.32): the launch plan always contains the
-    /// default group, so this cannot fail in practice.
-    fn default_slot(&self) -> Result<&ProxyGroupSlot, ServiceError> {
+    /// An account-less engine target for the sticker-pack faces (§4.32).
+    /// Legacy mode uses the reserved `default` group. Full pooling has no
+    /// group engine, so the first running account engine answers — a known
+    /// S1 limitation (the design's shared anonymous slot is deferred); with
+    /// nothing running the call honestly answers RUNTIME_NOT_RUNNING.
+    async fn default_slot(&self) -> Result<Arc<ProxyGroupSlot>, ServiceError> {
+        if let Some(pool) = &self.pool {
+            for slot in pool.slots() {
+                if slot.supervisor().status().await.state == EngineState::Running {
+                    return Ok(slot.routing());
+                }
+            }
+            return Err(ServiceError::Engine(EngineError::NotRunning));
+        }
         self.groups
             .iter()
             .find(|slot| slot.id == DEFAULT_PROXY_GROUP_ID)
+            .cloned()
             .ok_or_else(|| {
                 ServiceError::Api(ApiError::new(
                     "RUNTIME_NOT_RUNNING",
@@ -473,31 +1070,92 @@ impl ProxyGroupRuntime {
             })
     }
 
+    /// `link.start`. With the per-account pool enabled the new link gets a
+    /// pre-allocated account id, its own `<signal-data>/engines/<accountId>`
+    /// data directory, its own supervisor/engine, and a proxy group binding
+    /// taken from the launcher plan (design §5.3). Budget accounting:
+    /// the admission lock is held only for the QR mint, never across
+    /// `link.finish`'s phone-approval wait.
     pub async fn start_link(
-        &self,
+        self: &Arc<Self>,
         device_name: String,
         proxy_group: Option<String>,
     ) -> Result<Value, ServiceError> {
-        let slot = self
-            .slot_for_link(proxy_group.as_deref())
+        let group_id = self
+            .link_group_id(proxy_group.as_deref())
             .map_err(ServiceError::Api)?;
-        slot.supervisor.start_link(device_name).await
+        let Some(pool) = &self.pool else {
+            let slot = self
+                .groups
+                .iter()
+                .find(|slot| slot.id == group_id)
+                .cloned()
+                .expect("the legacy plan always contains the selected group slot");
+            return slot.supervisor.start_link(device_name).await;
+        };
+        if !self.running.load(Ordering::Acquire) {
+            // The pre-pool path answers RUNTIME_NOT_RUNNING from the engine
+            // slot; keep that exact error class without provisioning a
+            // directory that can never mint a QR.
+            return Err(ServiceError::Engine(EngineError::NotRunning));
+        }
+        let _admission = pool.lock_admission().await;
+        let account = pool.provision_slot(&group_id)?;
+        self.spawn_account_forwarders(&account);
+        self.ensure_history_retention(account.supervisor());
+        // Start the account's engine before the QR mint (a fresh slot has no
+        // process yet; the supervisor's engine lock keeps this single).
+        if let Err(error) = account.supervisor().start().await
+            && !matches!(error, EngineError::Backpressure)
+        {
+            self.rollback_account_slot(&account).await;
+            return Err(ServiceError::Engine(error));
+        }
+        match account.supervisor().start_link(device_name).await {
+            Ok(value) => {
+                if let Some(session) = value.get("linkSessionId").and_then(Value::as_str) {
+                    pool.remember_session(session, account.account_id());
+                }
+                pool.note_activity(&account);
+                tracing::info!(
+                    account_id = %account.account_id(),
+                    group_id = %account.proxy_group(),
+                    "per-account link slot opened"
+                );
+                Ok(value)
+            }
+            Err(error) => {
+                self.rollback_account_slot(&account).await;
+                Err(error)
+            }
+        }
     }
 
-    /// Which group owns a link session (expired sessions included, so the
-    /// dispatched finish still answers the distinct LINK_EXPIRED). None means
-    /// no live session anywhere.
+    /// Tear a just-provisioned slot back down (link.start failed before any
+    /// account was committed). The directory holds no credentials yet, so the
+    /// delete is always safe (design §5.3 step ⑧).
+    async fn rollback_account_slot(&self, account: &Arc<crate::pool::AccountSlot>) {
+        if let Some(pool) = &self.pool {
+            pool.discard(account.account_id(), true).await;
+        }
+        self.forget_account_forwarders(account.account_id());
+    }
+
+    /// Which proxy group owns a link session (expired sessions included, so
+    /// the dispatched finish still answers the distinct LINK_EXPIRED). None
+    /// means no live session anywhere. A dynamic session reports its proxy
+    /// group: the host's per-group finish lane keeps its pre-pool shape, and
+    /// two accounts in one group serialize their finishes exactly like two
+    /// legacy links in one group always did.
     pub async fn resolve_link_session(&self, link_session_id: &str) -> Option<String> {
-        self.slot_for_session(link_session_id)
-            .await
-            .ok()
-            .map(|slot| slot.id.clone())
+        match self.link_owner(link_session_id).await {
+            Ok(LinkOwner::Group(slot)) => Some(slot.id.clone()),
+            Ok(LinkOwner::Account(slot)) => Some(slot.proxy_group().to_string()),
+            Err(_) => None,
+        }
     }
 
-    async fn slot_for_session(
-        &self,
-        link_session_id: &str,
-    ) -> Result<&ProxyGroupSlot, ServiceError> {
+    async fn link_owner(&self, link_session_id: &str) -> Result<LinkOwner, ServiceError> {
         for slot in &self.groups {
             if slot
                 .supervisor
@@ -506,8 +1164,14 @@ impl ProxyGroupRuntime {
                 .await
                 .has_link_session(link_session_id)
             {
-                return Ok(slot);
+                return Ok(LinkOwner::Group(Arc::clone(slot)));
             }
+        }
+        if let Some(pool) = &self.pool
+            && let Some(account_id) = pool.session_owner(link_session_id)
+            && let Some(slot) = pool.get(&account_id)
+        {
+            return Ok(LinkOwner::Account(slot));
         }
         Err(ServiceError::Api(ApiError::new(
             "LINK_NOT_FOUND",
@@ -520,20 +1184,100 @@ impl ProxyGroupRuntime {
         &self,
         link_session_id: String,
     ) -> Result<AccountSummary, ServiceError> {
-        let slot = self.slot_for_session(&link_session_id).await?;
-        slot.supervisor.finish_link(link_session_id).await
+        match self.link_owner(&link_session_id).await? {
+            LinkOwner::Group(slot) => slot.supervisor.finish_link(link_session_id).await,
+            LinkOwner::Account(slot) => {
+                let summary = slot.supervisor().finish_link(link_session_id.clone()).await;
+                match summary {
+                    Ok(summary) if summary.id == slot.account_id() => {
+                        if let Some(pool) = &self.pool {
+                            pool.mark_provisioned(&slot);
+                            pool.forget_session(&link_session_id);
+                            pool.note_activity(&slot);
+                        }
+                        tracing::info!(
+                            account_id = %slot.account_id(),
+                            group_id = %slot.proxy_group(),
+                            "per-account link committed"
+                        );
+                        Ok(summary)
+                    }
+                    Ok(summary) => {
+                        // The number already belongs to another local account:
+                        // committing it here would produce two engines for one
+                        // account (I1). The freshly linked device/data-dir is
+                        // rolled back and the caller is told to delete the old
+                        // local data before linking again.
+                        if let Some(pool) = &self.pool {
+                            pool.forget_session(&link_session_id);
+                        }
+                        self.rollback_account_slot(&slot).await;
+                        tracing::warn!(
+                            account_id = %slot.account_id(),
+                            existing_account_id = %summary.id,
+                            "link landed on an already-linked number; the per-account slot was rolled back"
+                        );
+                        Err(account_already_linked_error())
+                    }
+                    Err(error) => {
+                        // A timed-out/cancelled finish keeps the slot and its
+                        // session for the retry the contract allows.
+                        Err(error)
+                    }
+                }
+            }
+        }
     }
 
     pub async fn cancel_link(&self, link_session_id: String) -> Result<Value, ServiceError> {
-        let slot = self.slot_for_session(&link_session_id).await?;
-        slot.supervisor.cancel_link(link_session_id).await
+        match self.link_owner(&link_session_id).await? {
+            LinkOwner::Group(slot) => slot.supervisor.cancel_link(link_session_id).await,
+            LinkOwner::Account(slot) => {
+                let result = slot.supervisor().cancel_link(link_session_id.clone()).await;
+                if let Some(pool) = &self.pool {
+                    pool.forget_session(&link_session_id);
+                }
+                // An uncommitted link's directory holds no credentials: drop
+                // the slot and delete it. A committed slot stays (cancelling
+                // an already-committed session has nothing to roll back).
+                if !slot.is_provisioned() {
+                    self.rollback_account_slot(&slot).await;
+                }
+                result
+            }
+        }
     }
 
-    /// Route by the account's immutable binding. A binding whose group is not
-    /// in this launch plan means the connector was started without that
-    /// group's configuration: the account stays intact but unreachable
-    /// (dormant), reported without retry advice.
-    async fn slot_for_account(&self, account_id: &str) -> Result<&ProxyGroupSlot, ServiceError> {
+    /// Route by account. Full pooling consults **only** the per-account slot
+    /// table (the binding column degenerates to accountId → engine); a cold
+    /// slot wakes first, so the first request after a restart is served
+    /// instead of answered RUNTIME_NOT_RUNNING. Legacy mode keeps the
+    /// immutable group binding and the exact pre-pool error ladder, including
+    /// the dormant answer for a group the launch plan does not contain.
+    async fn slot_for_account(
+        &self,
+        account_id: &str,
+    ) -> Result<Arc<ProxyGroupSlot>, ServiceError> {
+        if let Some(pool) = &self.pool {
+            let Some(slot) = pool.get(account_id) else {
+                // Full pooling has no legacy fallback: an account row without
+                // a slot is a broken pool (a migration/consistency bug), and
+                // an unknown id keeps ACCOUNT_NOT_FOUND.
+                return match self
+                    .router_service()
+                    .lock()
+                    .await
+                    .account_proxy_group(account_id)
+                {
+                    Ok(_) => Err(engine_not_provisioned_error()),
+                    Err(error) => Err(error),
+                };
+            };
+            if self.running.load(Ordering::Acquire) {
+                pool.ensure_resident(&slot).await?;
+            }
+            return Ok(slot.routing());
+        }
         let group = self
             .router_service()
             .lock()
@@ -542,6 +1286,7 @@ impl ProxyGroupRuntime {
         self.groups
             .iter()
             .find(|slot| slot.id == group)
+            .cloned()
             .ok_or_else(|| {
                 ServiceError::Api(ApiError::new(
                     "CAPABILITY_UNAVAILABLE",
@@ -551,9 +1296,54 @@ impl ProxyGroupRuntime {
             })
     }
 
-    /// Any supervisor's service works for routing lookups: all share one store.
-    fn router_service(&self) -> &Arc<Mutex<crate::service::ConnectorService>> {
-        self.groups[0].supervisor.service()
+    /// The v1-compatible delete of an account that has no local row (or an
+    /// idempotent replay of an already-completed delete) in full-pool mode.
+    /// There is no group supervisor to borrow, so the store-only plan runs
+    /// through the shared routing service. A row that exists without a slot
+    /// is a broken pool and fails closed.
+    async fn delete_absent_account(
+        &self,
+        account_id: &str,
+        operation_id: Option<String>,
+    ) -> Result<Value, ServiceError> {
+        if let Some(operation_id) = operation_id.as_deref() {
+            crate::service::validate_account_delete_operation_id(operation_id)?;
+        }
+        let mut service = self.router_service().lock().await;
+        if let Some(operation_id) = operation_id.as_deref() {
+            match service.prepare_account_delete(account_id, operation_id)? {
+                AccountDeletePlan::Completed => {
+                    return Ok(account_delete_result(
+                        service
+                            .store_ref()
+                            .account_delete_receipt(account_id)
+                            .ok()
+                            .flatten(),
+                    ));
+                }
+                AccountDeletePlan::Dispatch { .. } => {
+                    return Err(engine_not_provisioned_error());
+                }
+            }
+        }
+        if service
+            .account_signal_number_optional(account_id)?
+            .is_some()
+        {
+            return Err(engine_not_provisioned_error());
+        }
+        Ok(account_delete_result(
+            service
+                .store_ref()
+                .account_delete_receipt(account_id)
+                .ok()
+                .flatten(),
+        ))
+    }
+
+    /// The shared routing service over the one per-instance store.
+    fn router_service(&self) -> &Arc<Mutex<ConnectorService>> {
+        &self.router
     }
 
     pub async fn delete_local_account(
@@ -568,16 +1358,38 @@ impl ProxyGroupRuntime {
         // ACCOUNT_NOT_FOUND from the failed route lookup. Absent-account plans
         // complete inside the store and never touch an engine, so serving them
         // through any supervisor — all share one store — is group-agnostic.
+        if let Some(pool) = &self.pool {
+            let Some(slot) = pool.get(&account_id) else {
+                return self.delete_absent_account(&account_id, operation_id).await;
+            };
+            if self.running.load(Ordering::Acquire) {
+                pool.ensure_resident(&slot).await?;
+            }
+            let result = slot
+                .supervisor()
+                .delete_local_account(account_id.clone(), operation_id)
+                .await;
+            // A committed per-account slot owns a whole data directory: stop
+            // its engine and delete the credentials (I5: after the process is
+            // gone). Media is connector-owned (media/<accountId>) and is not
+            // part of the engine directory, so this never touches another
+            // account's media.
+            if result.is_ok() {
+                pool.discard(slot.account_id(), true).await;
+                self.forget_account_forwarders(slot.account_id());
+            }
+            return result;
+        }
         match self.slot_for_account(&account_id).await {
             Ok(slot) => {
                 slot.supervisor
-                    .delete_local_account(account_id, operation_id)
+                    .delete_local_account(account_id.clone(), operation_id)
                     .await
             }
             Err(ServiceError::Store(StoreError::AccountNotFound)) => {
                 self.groups[0]
                     .supervisor
-                    .delete_local_account(account_id, operation_id)
+                    .delete_local_account(account_id.clone(), operation_id)
                     .await
             }
             Err(error) => Err(error),
@@ -907,7 +1719,7 @@ impl ProxyGroupRuntime {
         &self,
         params: crate::service::StickerPackManifestParams,
     ) -> Result<crate::service::StickerPackManifest, ServiceError> {
-        let slot = self.default_slot()?;
+        let slot = self.default_slot().await?;
         slot.supervisor.get_sticker_pack_manifest(params).await
     }
 
@@ -915,7 +1727,7 @@ impl ProxyGroupRuntime {
         &self,
         params: crate::service::StickerPackImageParams,
     ) -> Result<crate::service::StickerPackImage, ServiceError> {
-        let slot = self.default_slot()?;
+        let slot = self.default_slot().await?;
         slot.supervisor.get_sticker_image(params).await
     }
 
@@ -1397,7 +2209,7 @@ impl ProxyGroupRuntime {
     /// but identical everywhere, so the default group's engine serves (the
     /// getStickerPackManifest anonymous-face posture).
     pub async fn calls_endorsements_public_key(&self) -> Result<serde_json::Value, ServiceError> {
-        let slot = self.default_slot()?;
+        let slot = self.default_slot().await?;
         slot.supervisor.calls_endorsements_public_key().await
     }
 
@@ -1496,6 +2308,7 @@ impl ProxyGroupRuntime {
                 params.account_id,
                 params.conversation_id,
                 params.message_ids,
+                params.message_id,
             )
             .await
     }
@@ -1529,6 +2342,7 @@ impl ProxyGroupRuntime {
                 params.account_id,
                 params.conversation_id,
                 params.message_ids,
+                params.message_id,
             )
             .await
     }
@@ -1894,7 +2708,7 @@ impl ProxyGroupRuntime {
         &self,
         params: crate::service::GroupsInviteLinkPasswordParams,
     ) -> Result<crate::service::GroupInviteLinkPassword, ServiceError> {
-        let slot = self.default_slot()?;
+        let slot = self.default_slot().await?;
         slot.supervisor
             .generate_group_invite_link_password(params)
             .await
@@ -1904,7 +2718,7 @@ impl ProxyGroupRuntime {
         &self,
         params: crate::service::GroupsParseInviteLinkParams,
     ) -> Result<crate::service::GroupInviteLinkParse, ServiceError> {
-        let slot = self.default_slot()?;
+        let slot = self.default_slot().await?;
         slot.supervisor.parse_group_invite_link(params).await
     }
 
@@ -2079,14 +2893,59 @@ fn effective_media_ingest(media_ingest: bool) -> bool {
     media_ingest
 }
 
-/// Open the shared per-profile store once and assemble one supervised engine
-/// stack per planned group (ADR 0001 R4/R5). History retention is process-wide
-/// and therefore spawned once; watchdogs are per group. With `media_ingest`
-/// (ADR 0004) every group's service is armed with the engine's data directory
-/// and one process-wide handle table — process-wide because a
-/// `readChunk`/`closeHandle` carries no accountId, so handle resolution must
-/// not depend on which supervisor the registry routed a request through —
-/// and each group gets its own start-up retention pass.
+/// Whether the signal-data root carries a per-account pool layout (any
+/// `engines/<accountId>/` directory with a registry or a store). The legacy
+/// mode refuses to start in that state instead of hiding the accounts.
+fn pool_layout_accounts(signal_data_dir: &Path) -> Option<usize> {
+    let engines_root = signal_data_dir.join(crate::pool::ENGINE_SLOT_SUBDIR);
+    let entries = std::fs::read_dir(engines_root).ok()?;
+    let mut found = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !crate::pool::is_account_id(name) {
+            continue;
+        }
+        let path = entry.path();
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let has_registry = path.join("engine-state.json").is_file();
+        let has_store = path
+            .join("accounts")
+            .read_dir()
+            .ok()
+            .is_some_and(|mut accounts| {
+                accounts.any(|account| {
+                    account
+                        .ok()
+                        .is_some_and(|account| account.path().join("store.db").is_file())
+                })
+            });
+        if has_registry || has_store {
+            found += 1;
+        }
+    }
+    (found > 0).then_some(found)
+}
+
+/// Launcher options for the per-account engine pool (design S1). The default
+/// is the pre-pool runtime, byte for byte.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeOptions {
+    /// The master switch. Two states only — **full pooling** (every account
+    /// owns an engine; no group engine runs) or **full legacy** (today's
+    /// single multi-account engine per proxy group). There is deliberately no
+    /// mixed mode: the legacy path exists only as the rollback shape.
+    pub per_account_engines: bool,
+    pub pool_policy: crate::pool::EnginePoolPolicy,
+    /// Watchdog cadence override (tests / operational diagnostics). Defaults
+    /// to the production 30 s when absent. Applies to both runtime modes.
+    pub watchdog_interval: Option<Duration>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn open_group_runtime(
     plan: ProxyGroupPlan,
@@ -2096,6 +2955,29 @@ pub fn open_group_runtime(
     store_key: Option<StoreKey>,
     media_ingest: bool,
     expire_sweep_interval: Duration,
+) -> Result<Arc<ProxyGroupRuntime>, crate::store::StoreError> {
+    open_group_runtime_with_options(
+        plan,
+        engine_bin,
+        state_dir,
+        java_home,
+        store_key,
+        media_ingest,
+        expire_sweep_interval,
+        RuntimeOptions::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn open_group_runtime_with_options(
+    plan: ProxyGroupPlan,
+    engine_bin: PathBuf,
+    state_dir: &Path,
+    java_home: Option<PathBuf>,
+    store_key: Option<StoreKey>,
+    media_ingest: bool,
+    expire_sweep_interval: Duration,
+    options: RuntimeOptions,
 ) -> Result<Arc<ProxyGroupRuntime>, crate::store::StoreError> {
     // Transitional launcher compatibility: the desktop launcher still passes
     // `--java-home` on every start (ADR 0003 defers the desktop-side cleanup);
@@ -2110,11 +2992,94 @@ pub fn open_group_runtime(
     // `readChunk`/`closeHandle` carry no accountId, so handle resolution must
     // not depend on which supervisor the registry routed a request through.
     let backup_handles = Arc::new(crate::backup_export::BackupFileHandleTable::new());
+    let group_ids: Vec<String> = plan.groups.iter().map(|group| group.id.clone()).collect();
+    let signal_data_dir = plan
+        .groups
+        .iter()
+        .find(|group| group.id == DEFAULT_PROXY_GROUP_ID)
+        .map(|group| group.data_dir.clone())
+        .unwrap_or_else(|| plan.groups[0].data_dir.clone());
+
+    if options.per_account_engines {
+        // Full pooling (S1 switch on). Migration and consistency run BEFORE
+        // any engine exists: a state that cannot be proven complete aborts
+        // startup, never a half-migrated serve (requirement 3).
+        let report = crate::migrate::run(&store, &signal_data_dir, state_dir, false)?;
+        tracing::info!(
+            migrated = report.migrated,
+            already_migrated = report.already_migrated,
+            orphans_removed = report.orphans_removed,
+            "engine pool migration pass complete"
+        );
+        let rows = store.list_all_account_rows()?;
+        let max_engines = options
+            .pool_policy
+            .max_engines
+            .clamp(1, crate::pool::MAX_PER_ACCOUNT_ENGINES);
+        if rows.len() > max_engines {
+            return Err(StoreError::EnginePoolInvalid(format!(
+                "{} accounts exceed the per-account engine ceiling ({max_engines}); full pooling cannot start this data directory",
+                rows.len()
+            )));
+        }
+        let pool = crate::pool::AccountPool::discover(crate::pool::EnginePoolConfig {
+            engine_bin: engine_bin.clone(),
+            signal_data_dir,
+            state_dir: state_dir.to_path_buf(),
+            media_ingest,
+            expire_sweep_interval,
+            store: Arc::clone(&store),
+            media_handles: media_ingest.then(|| media_handles.clone()),
+            backup_handles: Some(backup_handles.clone()),
+            policy: options.pool_policy.clone(),
+            watchdog_interval: options.watchdog_interval,
+        });
+        if pool.len() != rows.len() {
+            return Err(StoreError::EnginePoolInvalid(format!(
+                "{} account rows but {} engine slots after migration",
+                rows.len(),
+                pool.len()
+            )));
+        }
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = ProxyGroupRuntime::full_pool_with_running(
+            group_ids,
+            Arc::clone(&store),
+            media_ingest,
+            Arc::clone(&pool),
+            Arc::clone(&running),
+        );
+        pool.install_orphan_sweep(running);
+        tracing::info!(
+            groups = json!(runtime.group_ids()).to_string(),
+            pool_enabled = true,
+            pool_accounts = runtime
+                .account_pool()
+                .map(|pool| pool.len())
+                .unwrap_or_default(),
+            "connector runtime assembled (full pooling)"
+        );
+        return Ok(runtime);
+    }
+
+    // Full legacy (rollback shape): exactly the pre-pool runtime — but never
+    // silently ignore a migrated pool layout. The legacy group engines cannot
+    // see accounts whose stores moved to `engines/<accountId>/`; serving an
+    // empty account list would look like data loss. Fail closed with the
+    // remedy instead (the pool switch, or a restored pre-migration copy).
+    if let Some(count) = pool_layout_accounts(&signal_data_dir) {
+        return Err(StoreError::EnginePoolInvalid(format!(
+            "this data directory holds {count} per-account engine slot(s); start with --per-account-engines (the legacy group engines cannot serve the pool layout)"
+        )));
+    }
     let mut slots = Vec::with_capacity(plan.groups.len());
     for entry in &plan.groups {
         let mut config = EngineConfig::new(engine_bin.clone(), entry.data_dir.clone());
         config.media_ingest = media_ingest;
         config.expire_sweep_interval = expire_sweep_interval;
+        if let Some(interval) = options.watchdog_interval {
+            config.watchdog_interval = interval;
+        }
         let supervisor = Arc::new(RuntimeSupervisor::with_backup_handles(
             config,
             store.clone(),
@@ -2136,9 +3101,48 @@ pub fn open_group_runtime(
     let runtime = ProxyGroupRuntime::new(slots);
     tracing::info!(
         groups = json!(runtime.group_ids()).to_string(),
-        "connector runtime assembled"
+        pool_enabled = false,
+        "connector runtime assembled (legacy)"
     );
     Ok(runtime)
+}
+
+/// The slot table the P0 orphan sweep classifies against: every account slot
+/// of one per-account engine pool, plus the runtime's running flag. Held by
+/// the one supervisor the pool armed for sweeping, never owned by it (the
+/// pool owns its supervisors; this struct holds them weakly by identity, and
+/// `shutdown` drops it).
+pub struct SweepOwner {
+    pool: Arc<crate::pool::AccountPool>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SweepOwner {
+    pub(crate) fn new(
+        pool: Arc<crate::pool::AccountPool>,
+        running: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self { pool, running }
+    }
+
+    /// One entry per slot, keyed by the slot id the engine argv names
+    /// (`<signal-data>/engines/<accountId>`).
+    pub(crate) async fn facts(&self) -> Vec<(String, crate::parent::SlotFacts)> {
+        let running = self.running.load(std::sync::atomic::Ordering::Acquire);
+        let mut facts = Vec::new();
+        for slot in self.pool.slots() {
+            let owned_pid = slot.supervisor().owned_engine_pid().await;
+            facts.push((
+                slot.account_id().to_string(),
+                crate::parent::SlotFacts {
+                    provisioned: slot.is_provisioned(),
+                    owned_pid,
+                    running,
+                },
+            ));
+        }
+        facts
+    }
 }
 
 #[cfg(test)]
@@ -2220,5 +3224,151 @@ mod tests {
     fn media_ingest_passes_through() {
         assert!(effective_media_ingest(true));
         assert!(!effective_media_ingest(false));
+    }
+
+    fn running() -> EngineStatus {
+        EngineStatus {
+            state: EngineState::Running,
+            pid: Some(1),
+            rss_bytes: Some(1),
+            resource_pressure: false,
+        }
+    }
+
+    fn faulted() -> EngineStatus {
+        EngineStatus {
+            state: EngineState::Faulted,
+            pid: None,
+            rss_bytes: None,
+            resource_pressure: false,
+        }
+    }
+
+    /// Engine-pool §7.2: nine healthy engines and one crash must not read as
+    /// a plain `running` aggregate. Full pooling reports `degraded`; the
+    /// legacy path keeps the pre-pool bytes (no `degraded` key at all).
+    #[test]
+    fn pooled_aggregate_is_degraded_while_the_legacy_shape_is_unchanged() {
+        let mut statuses = vec![running(); 9];
+        statuses.push(faulted());
+        let pooled = ProxyGroupRuntime::aggregate_from(&statuses, None, true);
+        assert_eq!(pooled.state, EngineState::Running);
+        assert!(pooled.degraded);
+        let wire = serde_json::to_value(&pooled).unwrap();
+        assert_eq!(wire["degraded"], true);
+
+        let legacy = ProxyGroupRuntime::aggregate_from(&statuses, None, false);
+        assert_eq!(legacy.state, EngineState::Running);
+        assert!(!legacy.degraded);
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(
+            wire.get("degraded").is_none(),
+            "the flag-off shape must not gain a field"
+        );
+    }
+
+    /// The pool ceiling is enforced at startup too: a migrated directory
+    /// with more accounts than the per-account engine ceiling must fail closed
+    /// rather than silently start only the first eight.
+    #[test]
+    fn pool_runtime_refuses_more_accounts_than_the_engine_ceiling() {
+        let temp = TempDir::new().unwrap();
+        let signal_data = temp.path().join("signal-data");
+        let state_dir = temp.path().join("state");
+        let store = Store::open(&state_dir, Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
+        for index in 1..=9u8 {
+            let id = format!("{index:032x}");
+            let number = format!("+1555555{index:08}");
+            store
+                .upsert_account_from_signal_with_id(
+                    &number,
+                    Some(1),
+                    DEFAULT_PROXY_GROUP_ID,
+                    Some(&id),
+                )
+                .unwrap();
+            let slot = signal_data.join("engines").join(&id);
+            std::fs::create_dir_all(slot.join("accounts/lk-one")).unwrap();
+            std::fs::write(slot.join("accounts/lk-one/store.db"), b"store").unwrap();
+            std::fs::write(
+                slot.join("engine-state.json"),
+                serde_json::to_vec(&json!({
+                    "version": 2,
+                    "accounts": [{"number": number, "dir": "accounts/lk-one"}],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        drop(store);
+        let plan = crate::groups::build_group_plan(&[], None, None, &signal_data).unwrap();
+        let error = open_group_runtime_with_options(
+            plan,
+            PathBuf::from("unused-engine"),
+            &state_dir,
+            None,
+            Some(StoreKey::from_bytes([0x5A; 32])),
+            false,
+            Duration::from_secs(30),
+            RuntimeOptions {
+                per_account_engines: true,
+                ..RuntimeOptions::default()
+            },
+        )
+        .err()
+        .expect("nine accounts exceed the eight-engine ceiling");
+        assert!(
+            matches!(error, StoreError::EnginePoolInvalid(_)),
+            "{error:?}"
+        );
+    }
+
+    /// Rollback data boundary: legacy mode must refuse a migrated pool
+    /// layout instead of silently serving an empty account list.
+    #[test]
+    fn legacy_runtime_refuses_a_migrated_pool_layout() {
+        let temp = TempDir::new().unwrap();
+        let signal_data = temp.path().join("signal-data");
+        let slot = signal_data
+            .join("engines")
+            .join("0123456789abcdef0123456789abcdef");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(
+            slot.join("engine-state.json"),
+            b"{\"version\":2,\"accounts\":[{\"number\":\"+15555550100\",\"dir\":\"accounts/lk-x\"}]}",
+        )
+        .unwrap();
+        let plan = crate::groups::build_group_plan(&[], None, None, &signal_data).unwrap();
+        let error = open_group_runtime(
+            plan,
+            PathBuf::from("unused-engine"),
+            &temp.path().join("state"),
+            None,
+            Some(StoreKey::from_bytes([0x5A; 32])),
+            false,
+            Duration::from_secs(30),
+        )
+        .err()
+        .expect("legacy mode must fail closed on the pool layout");
+        assert!(
+            matches!(error, StoreError::EnginePoolInvalid(_)),
+            "{error:?}"
+        );
+        assert_eq!(pool_layout_accounts(&signal_data), Some(1));
+        assert_eq!(pool_layout_accounts(&temp.path().join("elsewhere")), None);
+    }
+
+    /// The empty `engines[]` array is omitted, so a legacy `runtime.status`
+    /// answer is byte-identical to the pre-pool build.
+    #[test]
+    fn empty_pool_engine_list_is_omitted_from_the_status_shape() {
+        let result = RuntimeStatusResult {
+            aggregate: ProxyGroupRuntime::aggregate_from(&[running()], Some(1), false),
+            proxy_groups: Vec::new(),
+            engines: Vec::new(),
+        };
+        let wire = serde_json::to_value(result).unwrap();
+        assert!(wire.get("engines").is_none());
+        assert!(wire.get("degraded").is_none());
     }
 }

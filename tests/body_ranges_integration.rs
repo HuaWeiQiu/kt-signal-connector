@@ -22,7 +22,6 @@ use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use tempfile::TempDir;
-use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
@@ -71,22 +70,6 @@ fn spawn_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
         .env("JDK_JAVA_OPTIONS", "poison");
     command.spawn().unwrap()
 }
-
-async fn assert_clean_exit(connector: &mut Child) {
-    let status = timeout(Duration::from_secs(2), connector.wait())
-        .await
-        .expect("connector should exit after the host disconnects")
-        .unwrap();
-    if status.success() {
-        return;
-    }
-    let mut stderr = String::new();
-    if let Some(mut pipe) = connector.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr).await;
-    }
-    panic!("connector exited with {status:?}; stderr: {stderr}");
-}
-
 async fn wait_for_path(path: &Path) {
     timeout(Duration::from_secs(3), async {
         while !path.exists() {
@@ -432,5 +415,9 @@ async fn body_ranges_receive_round_trips_to_every_wire_face() {
     // process to end cleanly (the harness pattern across the integration
     // family): no panic, no watchdog exit code.
     sleep(Duration::from_millis(200)).await;
-    assert_clean_exit(&mut connector).await;
+    // 台账 §23.11：S5（ea11a7a）把 host::serve 改成常驻（select 活动会话 +
+    // accept，晚到连接回 runtime.busy）。全仓只有 main.rs:343/583 两处 process::exit，
+    // 没有任何路径在会话结束后退出进程，因此这条断言已失去前提。busy 行为由
+    // a_second_host_connection_is_answered_busy_without_queueing 覆盖。
+    let _ = &mut connector;
 }

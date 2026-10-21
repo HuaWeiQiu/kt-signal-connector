@@ -1711,6 +1711,11 @@ pub struct MessageRecord {
     /// 只由实时接收路径写真实值；其余构造路径一律 None，不得伪造。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required_protocol_version: Option<u32>,
+    /// 契约 §4.221：该消息内容已被擦除（官方 model-types.d.ts:207 isErased）。
+    /// engine 只在「阅后即焚已查看」时产出（history.rs:1139），connector 忠实透传；
+    /// 其余路径一律 false，不伪造（官方另一来源是 cleanup 的主动擦除，本端无该机制）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_erased: bool,
     pub account_id: String,
     pub conversation_id: String,
     pub direction: &'static str,
@@ -12884,6 +12889,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
     let attachments_json: Option<String> = row.get(14)?;
     let rich_json: Option<String> = row.get(15)?;
     Ok(MessageRecord {
+        is_erased: false,
         required_protocol_version: None,
         id: row.get(0)?,
         account_id: row.get(1)?,
@@ -12973,6 +12979,7 @@ mod tests {
         next_attempt_at: Option<u64>,
     ) {
         let record = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -14501,6 +14508,7 @@ mod tests {
         sent_at: u64,
     ) {
         let record = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -15553,6 +15561,7 @@ mod tests {
         sent_at: u64,
     ) -> MessageRecord {
         MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -15621,6 +15630,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m1".into(),
@@ -15697,6 +15707,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -15882,6 +15893,7 @@ mod tests {
                    rich: Option<NormalizedRich>|
          -> MessageRecord {
             MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -16094,6 +16106,7 @@ mod tests {
             duration: None,
         };
         let row = |id: &str, sent_at: u64, media: bool| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -16216,6 +16229,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -16356,6 +16370,7 @@ mod tests {
         let now = now_ms();
         let seed = |store: &Store, id: &str, sent_at: u64| {
             let record = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -16827,6 +16842,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -16951,6 +16967,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -17154,6 +17171,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -17659,6 +17677,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
             .unwrap();
         let base = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -17767,6 +17786,7 @@ mod tests {
              attachments: Vec<crate::engine::NormalizedAttachment>| {
                 clock += 1;
                 let message = MessageRecord {
+                    is_erased: false,
                     required_protocol_version: None,
                     author_aci: None,
                     id: format!("m{clock}"),
@@ -17909,6 +17929,7 @@ mod tests {
                     sent_at: u64,
                     text: Option<&str>| {
             let message = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -18112,6 +18133,7 @@ mod tests {
             .unwrap();
         let push = |id: &str, status: &'static str, sent_at: u64| {
             let message = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -18221,6 +18243,7 @@ mod tests {
             .unwrap();
         let push = |id: &str, authors: &[&str], increment_unread: bool| {
             let message = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -18351,6 +18374,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
         let plain = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m1".into(),
@@ -18458,6 +18482,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "pending".into(),
@@ -18569,6 +18594,7 @@ mod tests {
             )
             .unwrap();
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "atomic-message".into(),
@@ -18648,6 +18674,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "unread-message".into(),
@@ -18732,6 +18759,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "system-message".into(),
@@ -18801,6 +18829,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "contended".into(),
@@ -18885,6 +18914,7 @@ mod tests {
             .unwrap();
         let row = |store: &Store, id: &str, sender: &str| {
             let message = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -18986,6 +19016,7 @@ mod tests {
             .unwrap();
         let row = |store: &Store, id: &str, status: &'static str| {
             let message = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -19093,6 +19124,7 @@ mod tests {
                    sent_at: u64,
                    status: &'static str| {
             let message = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -19206,6 +19238,7 @@ mod tests {
             (&same_time, "same-time-message", 20),
         ] {
             let message = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -19293,6 +19326,7 @@ mod tests {
         ));
 
         let changed = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "newer-message-2".into(),
@@ -19355,6 +19389,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "other-peer", "Other peer")
             .unwrap();
         let other_message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "other-message".into(),
@@ -19459,6 +19494,7 @@ mod tests {
             .unwrap();
         let hit = |id: &str, conversation_id: &str, sent_at: u64, text: &str| {
             let mut message = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -19565,6 +19601,7 @@ mod tests {
         .enumerate()
         {
             let message = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: format!("row-{index}"),
@@ -19676,6 +19713,7 @@ mod tests {
             .unwrap();
         let hit = |id: &str, conversation_id: &str, sent_at: u64, text: &str| {
             let message = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -19779,6 +19817,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "delete-message".into(),
@@ -19929,6 +19968,7 @@ mod tests {
             .upsert_contact(&survivor.id, "contact", "+15555550103", "Bob", None, 10)
             .unwrap();
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "receipt-message".into(),
@@ -21046,6 +21086,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "kept".into(),
@@ -21128,6 +21169,7 @@ mod tests {
         let now = 40 * 365 * 24 * 60 * 60 * 1_000;
         let day = 24 * 60 * 60 * 1_000;
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "before-upgrade".into(),
@@ -21233,6 +21275,7 @@ mod tests {
             .map(|(index, age)| {
                 let id = format!("message-{index}");
                 let message = MessageRecord {
+                    is_erased: false,
                     required_protocol_version: None,
                     author_aci: None,
                     id: id.clone(),
@@ -21392,6 +21435,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "in-flight".into(),
@@ -21497,6 +21541,7 @@ mod tests {
                     direction: &'static str,
                     sent_at: u64| {
             let record = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -21646,6 +21691,7 @@ mod tests {
             .unwrap();
         let sent_at = now_ms() - 60_000;
         let record = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "reconcile-row".into(),
@@ -21759,6 +21805,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550102", "contact")
             .unwrap();
         let recent = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "recent".into(),
@@ -21838,6 +21885,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "kept".into(),
@@ -21920,6 +21968,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let mut message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "unread-incoming".into(),
@@ -22562,6 +22611,7 @@ mod tests {
         sent_at: u64,
     ) {
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: message_id.into(),
@@ -22619,6 +22669,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-edited".into(),
@@ -22881,6 +22932,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550199", "peer")
             .unwrap();
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-own".into(),
@@ -23154,6 +23206,7 @@ mod tests {
             .unwrap();
         let base =
             |id: &str, conversation_id: &str, direction: &'static str, rich: bool| MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -23270,6 +23323,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-view".into(),
@@ -23367,6 +23421,7 @@ mod tests {
 
     fn expire_record(id: &str, account_id: &str, conversation_id: &str) -> MessageRecord {
         MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -24433,6 +24488,7 @@ mod tests {
         sent_at: u64,
     ) -> MessageRecord {
         MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -24790,6 +24846,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, status: &'static str| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -24941,6 +24998,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550201", "contact")
             .unwrap();
         let record = |id: &str, conversation_id: &str, sent_at: u64| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -25108,6 +25166,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550303", "contact")
             .unwrap();
         let record = |id: &str, conversation_id: &str| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -25223,6 +25282,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAta2V5", "Group")
             .unwrap();
         let record = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-cascade-600".into(),
@@ -25327,6 +25387,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAta2V5", "Group")
             .unwrap();
         let record = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-seed-700".into(),
@@ -25560,6 +25621,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -25670,6 +25732,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -25785,6 +25848,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -26548,6 +26612,7 @@ mod tests {
         let insert_poll =
             |store: &Store, id: &str, sender: &str, sent_at: u64, status: &'static str| {
                 let message = MessageRecord {
+                    is_erased: false,
                     required_protocol_version: None,
                     author_aci: None,
                     id: id.into(),
@@ -26751,6 +26816,7 @@ mod tests {
                       status: &'static str,
                       rich: Option<NormalizedRich>| {
             let message = MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -26939,6 +27005,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAtcG9sbA==", "Polls")
             .unwrap();
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: "poll-capped".into(),
@@ -27188,6 +27255,7 @@ mod tests {
 
         let row =
             |id: &str, direction: &'static str, sender_id: &str, sent_at: u64| MessageRecord {
+                is_erased: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -27404,6 +27472,7 @@ mod tests {
         assert_eq!(summary_watermark(), None);
 
         let row = |id: &str, direction: &'static str, sent_at: u64| MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),

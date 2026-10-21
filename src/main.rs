@@ -20,9 +20,11 @@ use kt_signal_connector::manifest::{
     LicenseRef, RuntimeManifest, artifact_for_file, build_local_unsigned_manifest,
     load_signing_key, load_verifying_key,
 };
-#[cfg(windows)]
-use kt_signal_connector::parent::wait_for_parent_exit;
-use kt_signal_connector::registry::open_group_runtime;
+use kt_signal_connector::parent::{
+    PARENT_EXIT_BUDGET, ParentDown, record_owner_marker_if_root, resolve_parent_pid, watch_parent,
+};
+use kt_signal_connector::pool::EnginePoolPolicy;
+use kt_signal_connector::registry::{RuntimeOptions, open_group_runtime_with_options};
 use kt_signal_connector::resource::{measure_child_idle, write_report};
 use kt_signal_connector::store::store_key_from_env;
 
@@ -104,6 +106,13 @@ enum CliCommand {
             default_value_t = 30_000
         )]
         expire_sweep_interval_ms: u64,
+        /// Per-account engine pool (engine-pool design S1, launcher input, env:
+        /// KT_SIGNAL_PER_ACCOUNT_ENGINES). Default off: the pre-pool runtime is
+        /// byte-identical. When on, every NEW link provisions its own engine
+        /// under `<signal-data>/engines/<accountId>`; existing accounts stay
+        /// on their legacy proxy-group engine (mixed mode).
+        #[arg(long, env = "KT_SIGNAL_PER_ACCOUNT_ENGINES", default_value_t = false)]
+        per_account_engines: bool,
         #[arg(long)]
         signal_data_dir: PathBuf,
         #[arg(long)]
@@ -113,6 +122,23 @@ enum CliCommand {
     Package {
         #[command(subcommand)]
         command: PackageCommand,
+    },
+    /// Migrate legacy per-group engine data directories to the per-account
+    /// pool layout (`<signal-data>/engines/<accountId>/`). Idempotent and
+    /// journaled under `<signal-data>/migration/`; `--dry-run` validates and
+    /// prints the plan without touching the filesystem. Requires exclusive
+    /// occupancy of the data directory (no connector may be running).
+    MigratePool {
+        #[arg(long)]
+        signal_data_dir: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// The launcher's bootstrap payload (line 2 carries the store key).
+        /// KT_SIGNAL_STORE_KEY, when set, wins exactly like serve mode.
+        #[arg(long)]
+        bootstrap_secret_file: Option<PathBuf>,
     },
 }
 
@@ -239,6 +265,7 @@ struct ServeOptions {
     proxy_group: Vec<String>,
     media_ingest: bool,
     expire_sweep_interval_ms: u64,
+    per_account_engines: bool,
     signal_data_dir: PathBuf,
     state_dir: PathBuf,
 }
@@ -275,6 +302,7 @@ async fn main() {
             proxy_group,
             media_ingest,
             expire_sweep_interval_ms,
+            per_account_engines,
             signal_data_dir,
             state_dir,
         } => serve_command(ServeOptions {
@@ -289,12 +317,24 @@ async fn main() {
             proxy_group,
             media_ingest,
             expire_sweep_interval_ms,
+            per_account_engines,
             signal_data_dir,
             state_dir,
         })
         .await
         .map_err(|error| error.to_string()),
         CliCommand::Package { command } => package_command(command),
+        CliCommand::MigratePool {
+            signal_data_dir,
+            state_dir,
+            dry_run,
+            bootstrap_secret_file,
+        } => migrate_pool_command(
+            &signal_data_dir,
+            &state_dir,
+            dry_run,
+            bootstrap_secret_file.as_deref(),
+        ),
     };
     if let Err(error) = result {
         // The final exit diagnostic: `error` is the classified message of the
@@ -339,6 +379,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         proxy_group,
         media_ingest,
         expire_sweep_interval_ms,
+        per_account_engines,
         signal_data_dir,
         state_dir,
     } = options;
@@ -370,6 +411,11 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
     // endpoint; a crashed holder's locks die with the process (kernel
     // release), so this can never brick the next start.
     let _data_dir_locks = datalock::lock_plan_data_dirs(&plan)?;
+    // P1 ownership marker: the root data directory records this generation's
+    // pid so an immediate restart whose launcher did not pass --parent-pid
+    // can still bridge to it (see parent.rs). Best effort, after the lock is
+    // held and before any engine can be started.
+    record_owner_marker_if_root(&signal_data_dir, std::time::SystemTime::now());
     let payload = if bootstrap_secret_stdin {
         load_bootstrap_payload_from_reader(std::io::stdin().lock())?
     } else {
@@ -427,7 +473,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
             LocalListener::bind(&endpoint)?
         }
     };
-    let runtime = open_group_runtime(
+    let runtime = open_group_runtime_with_options(
         plan,
         engine_bin,
         &state_dir,
@@ -435,19 +481,154 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         store_key,
         media_ingest,
         Duration::from_millis(expire_sweep_interval_ms),
+        RuntimeOptions {
+            per_account_engines,
+            // Full pooling keeps every linked account resident by default;
+            // KT_SIGNAL_POOL_MAX_RESIDENT is the low-memory opt-out.
+            pool_policy: if per_account_engines {
+                EnginePoolPolicy::from_env()
+            } else {
+                EnginePoolPolicy::default()
+            },
+            ..RuntimeOptions::default()
+        },
     )?;
-    #[cfg(windows)]
-    {
-        let parent_pid = parent_pid.expect("validated Windows parent PID");
-        let parent_runtime = runtime.clone();
-        tokio::spawn(async move {
-            let _ = wait_for_parent_exit(parent_pid).await;
-            let _ = parent_runtime.shutdown().await;
-            std::process::exit(0);
-        });
+    // P0 parent watch (every platform). The engine self-exits on stdin EOF,
+    // but a connector whose launcher was SIGKILLed never sees that EOF and
+    // never closes its own end — so the launcher pid is watched directly and
+    // the runtime teardown (which carries the engine children) runs once it
+    // is gone. Windows passes --parent-pid on every start; Unix uses the flag
+    // when the launcher sends it, otherwise the parent-of-record and the
+    // ownership marker bridged in above.
+    // The operator opt-out is evaluated first and covers both the armed and
+    // the unarmed case identically: with it set the connector never watches a
+    // launcher for this process lifetime (task requirement: one env key, no
+    // restart-side effects).
+    let watch_disabled = kt_signal_connector::parent::parent_watch_disabled();
+    let recorded_parent = if watch_disabled {
+        tracing::warn!(
+            env = kt_signal_connector::parent::PARENT_WATCH_DISABLE_ENV,
+            "connector parent watch disabled by operator; this process may outlive its launcher"
+        );
+        None
+    } else {
+        resolve_parent_pid(parent_pid, &signal_data_dir, std::time::SystemTime::now())
+    };
+    match recorded_parent {
+        Some(recorded) => {
+            tracing::info!(
+                parent_via = recorded.via,
+                interval_ms = kt_signal_connector::parent::PARENT_POLL_INTERVAL.as_millis() as u64,
+                "connector parent watch armed"
+            );
+            spawn_parent_watch(recorded, runtime.clone(), signal_data_dir.clone());
+        }
+        None => {
+            if !watch_disabled {
+                tracing::info!("connector parent watch not armed (no launcher pid evidence)");
+            }
+        }
     }
     serve(listener, payload.secret, runtime).await?;
     Ok(())
+}
+
+/// The P0 exit path: the launcher is gone, so the connector must not outlive
+/// it. The runtime teardown runs under a bounded budget (every engine child
+/// is stopped, or killed directly when the budget expires), the engine
+/// children are then reaped so no zombie survives this process, and only
+/// then does the process exit without serving anything else.
+///
+/// The `data_dir` field is the only path this line carries: it names the
+/// directory that was about to be stranded, which is what an operator needs
+/// to correlate the exit with the failed next start. Nothing account-shaped
+/// (numbers, ACIs, key paths) ever rides along.
+fn spawn_parent_watch(
+    recorded: kt_signal_connector::parent::RecordedParent,
+    runtime: std::sync::Arc<kt_signal_connector::registry::ProxyGroupRuntime>,
+    data_dir: std::path::PathBuf,
+) {
+    tokio::spawn(async move {
+        let down = watch_parent(recorded).await;
+        let reason = match down {
+            ParentDown::Reparented => kt_signal_connector::parent::REASON_REPARENTED,
+            ParentDown::Vanished => kt_signal_connector::parent::REASON_VANISHED,
+        };
+        // The engine pids are read before the teardown clears the runtime: a
+        // child the supervisor already dropped is not ours to reap, but one
+        // it is about to drop is, and the wait below must not race it.
+        let child_pids = runtime.engine_pids().await;
+        tracing::warn!(
+            reason,
+            data_dir = %data_dir.display(),
+            engines = child_pids.len(),
+            budget_ms = PARENT_EXIT_BUDGET.as_millis() as u64,
+            "launcher is gone; stopping the runtime and exiting"
+        );
+        match tokio::time::timeout(PARENT_EXIT_BUDGET, runtime.shutdown()).await {
+            Ok(Ok(())) => tracing::info!(reason, "runtime stopped after launcher loss"),
+            Ok(Err(error)) => {
+                tracing::warn!(reason, error_class = ?error, "runtime teardown after launcher loss failed")
+            }
+            Err(_) => tracing::warn!(
+                reason,
+                "runtime teardown after launcher loss exceeded its budget; exiting anyway"
+            ),
+        }
+        // P1 zombie discipline: the runtime normally reaps its children, but a
+        // teardown that hit the budget leaves them unreaped (Z) until this
+        // process is gone — and this process exits by definition right here.
+        // Bounded, and a no-op for pids the tokio child handle already reaped.
+        kt_signal_connector::parent::reap_children(&child_pids, PARENT_EXIT_BUDGET / 2).await;
+        std::process::exit(0);
+    });
+}
+
+/// `migrate-pool`: the explicit operator face of the automatic startup
+/// migration. It takes the same data-directory occupancy lock the connector
+/// takes, so it can never move stores under a live engine. `--dry-run` runs
+/// every validation and prints the same report shape as the applied pass.
+fn migrate_pool_command(
+    signal_data_dir: &std::path::Path,
+    state_dir: &std::path::Path,
+    dry_run: bool,
+    bootstrap_secret_file: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let _lock = datalock::DataDirLock::acquire("default", signal_data_dir)
+        .map_err(|error| error.to_string())?;
+    let key = match store_key_from_env().map_err(|error| error.to_string())? {
+        Some(key) => Some(key),
+        // Read line 2 without the launcher's read-and-destroy loader: the
+        // desktop may still need that bootstrap file for its next launch.
+        None => match bootstrap_secret_file {
+            Some(path) => Some(read_store_key_line(path)?),
+            None => None,
+        },
+    };
+    let store = kt_signal_connector::store::Store::open(state_dir, key)
+        .map_err(|error| error.to_string())?;
+    let report = kt_signal_connector::migrate::run(&store, signal_data_dir, state_dir, dry_run)
+        .map_err(|error| error.to_string())?;
+    let rendered = serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?;
+    println!("{rendered}");
+    Ok(())
+}
+
+/// Read the store key (payload line 2) without consuming the launcher's
+/// bootstrap file. `KT_SIGNAL_STORE_KEY` remains the preferred override.
+fn read_store_key_line(
+    path: &std::path::Path,
+) -> Result<kt_signal_connector::store::StoreKey, String> {
+    let payload = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let line = payload
+        .lines()
+        .nth(1)
+        .ok_or("bootstrap payload line 2 (store key) is missing")?;
+    let bytes = hex::decode(line.trim()).map_err(|_| "store key is not hexadecimal")?;
+    let key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "store key must be exactly 32 bytes")?;
+    Ok(kt_signal_connector::store::StoreKey::from_bytes(key))
 }
 
 fn package_command(command: PackageCommand) -> Result<(), String> {

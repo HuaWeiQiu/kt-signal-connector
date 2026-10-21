@@ -573,6 +573,29 @@ pub enum HostError {
     RuntimeShutdown,
 }
 
+/// Unix：父进程消失（被 reparent）时完成，让 `serve` 退出。
+///
+/// 判据是「父 PID 变化」而不是「父 PID == 1」：reparent 的目标不一定是 init。
+/// 之所以不用「stdin EOF」：`--bootstrap-secret-stdin` 模式下密钥读完本来就是
+/// EOF，把 EOF 当宿主死亡会让 connector 启动即退（台账 §23.7）。
+#[cfg(unix)]
+async fn parent_gone() {
+    let parent = std::os::unix::process::parent_id();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    loop {
+        tick.tick().await;
+        if std::os::unix::process::parent_id() != parent {
+            return;
+        }
+    }
+}
+
+/// 非 Unix：Windows 侧已有 parent_pid 监控（main.rs 强制要求），此臂永不完成。
+#[cfg(not(unix))]
+async fn parent_gone() {
+    std::future::pending::<()>().await;
+}
+
 pub async fn serve(
     listener: LocalListener,
     secret: BootstrapSecret,
@@ -582,12 +605,17 @@ pub async fn serve(
     spawn_metrics_log(Arc::downgrade(&runtime));
     let busy_answers = Arc::new(Semaphore::new(HOST_BUSY_ANSWER_CONCURRENCY));
     loop {
+        // P0（台账 §23）：Unix 下补「宿主进程消失即退」，与 Windows 的 parent_pid
+        // 监控语义对齐。不加这条时 serve() 只有 ctrl_c / 连接 shutdown 两个出口，
+        // 宿主崩溃后 connector 变孤儿进程，占着 endpoint 与数据目录不放。
+        let parent_watch = parent_gone();
         let stream = tokio::select! {
             accepted = listener.accept() => accepted?,
             signal = tokio::signal::ctrl_c() => {
                 signal?;
                 return Ok(());
             }
+            _ = parent_watch => return Ok(()),
         };
         let authenticated = Arc::new(AtomicBool::new(false));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1493,7 +1521,7 @@ async fn dispatch_within_stall_budget(
     }
 }
 
-async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResponse {
+async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> HostResponse {
     let request_id = request.request_id;
     match request.method.as_str() {
         "runtime.status" if empty_params(&request.params) => HostResponse::success(

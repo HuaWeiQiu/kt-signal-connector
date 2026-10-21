@@ -736,7 +736,14 @@ impl<'a> Importer<'a> {
             .get("expireStartDate")
             .and_then(Value::as_u64)
             .filter(|value| *value > 0);
+        // 契约 §4.221：历史导入是 isErased 的唯一来源（engine history.rs:1139 只在
+        // 「阅后即焚已查看」置 true）；只认布尔，缺席/非布尔一律 false，绝不把
+        // 「没写」当成「已擦除」。
         let record = MessageRecord {
+            is_erased: value
+                .get("isErased")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             required_protocol_version: None,
             author_aci: None,
             id: message_id,
@@ -924,6 +931,7 @@ impl<'a> Importer<'a> {
             "已更新消息定时消失：已关闭".to_string()
         };
         let record = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: message_id,
@@ -1031,6 +1039,7 @@ impl<'a> Importer<'a> {
         ]);
         let text = "群聊信息已更新".to_string();
         let record = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: message_id,
@@ -2945,6 +2954,7 @@ mod tests {
         // sender hash before the import ran.
         let live_sender = stable_hash_id(&[&account.id, "direct", ALICE_ACI]);
         let live = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: stable_hash_id(&[
@@ -3040,6 +3050,7 @@ mod tests {
         // The restore copy: same identity, body present, no descriptors.
         let live_sender = stable_hash_id(&[&account.id, "direct", ALICE_E164]);
         let restored = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: stable_hash_id(&[

@@ -100,6 +100,7 @@ fn seed_direct_history(store: &Store, account_id: &str) -> String {
         .ensure_conversation(account_id, "direct", ALICE_E164, "Alice Contact")
         .unwrap();
     let incoming = MessageRecord {
+        is_erased: false,
         required_protocol_version: None,
         author_aci: None,
         id: "m-in".into(),
@@ -140,6 +141,7 @@ fn seed_direct_history(store: &Store, account_id: &str) -> String {
     };
     store.insert_message(&incoming, None, None, true).unwrap();
     let outgoing = MessageRecord {
+        is_erased: false,
         required_protocol_version: None,
         author_aci: None,
         id: "m-out".into(),
@@ -521,6 +523,7 @@ async fn export_projects_groups_and_note_to_self() {
     // One group message authored by Alice's UUID spelling.
     let sender_uuid_hash = stable_hash_id(&[account_id.as_str(), "group", ALICE_UUID]);
     let group_message = MessageRecord {
+        is_erased: false,
         required_protocol_version: None,
         author_aci: None,
         id: "m-group".into(),
@@ -564,6 +567,7 @@ async fn export_projects_groups_and_note_to_self() {
         .unwrap();
     // One Note to Self outgoing message.
     let self_message = MessageRecord {
+        is_erased: false,
         required_protocol_version: None,
         author_aci: None,
         id: "m-self".into(),
@@ -770,6 +774,7 @@ async fn export_counts_skips_per_cause() {
             admin_deleted,
         } = row;
         let message = MessageRecord {
+            is_erased: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
