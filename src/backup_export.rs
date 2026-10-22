@@ -2182,6 +2182,7 @@ mod tests {
     ) -> crate::store::MessageRecord {
         crate::store::MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.to_string(),
