@@ -1716,6 +1716,12 @@ pub struct MessageRecord {
     /// 其余路径一律 false，不伪造（官方另一来源是 cleanup 的主动擦除，本端无该机制）。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_erased: bool,
+    /// 契约 §4.224：本机「为所有人删除」的发送失败态（官方
+    /// model-types.d.ts:330 deletedForEveryoneFailed 对位）。真值 =
+    /// 墓碑已落但删除请求未确认成功，桌面渲染删除失败可重试行。
+    /// 内存失败旗标跨重启丢失的持久化半面（台账 §26.17）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub delete_failed: bool,
     pub account_id: String,
     pub conversation_id: String,
     pub direction: &'static str,
@@ -12890,6 +12896,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
     let rich_json: Option<String> = row.get(15)?;
     Ok(MessageRecord {
         is_erased: false,
+        delete_failed: false,
         required_protocol_version: None,
         id: row.get(0)?,
         account_id: row.get(1)?,
@@ -12980,6 +12987,7 @@ mod tests {
     ) {
         let record = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -14509,6 +14517,7 @@ mod tests {
     ) {
         let record = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -15562,6 +15571,7 @@ mod tests {
     ) -> MessageRecord {
         MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -15631,6 +15641,7 @@ mod tests {
             .unwrap();
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m1".into(),
@@ -15708,6 +15719,7 @@ mod tests {
             .unwrap();
         let base = |id: &str| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -15894,6 +15906,7 @@ mod tests {
          -> MessageRecord {
             MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -16107,6 +16120,7 @@ mod tests {
         };
         let row = |id: &str, sent_at: u64, media: bool| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -16230,6 +16244,7 @@ mod tests {
             .unwrap();
         let base = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -16371,6 +16386,7 @@ mod tests {
         let seed = |store: &Store, id: &str, sent_at: u64| {
             let record = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -16843,6 +16859,7 @@ mod tests {
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -16968,6 +16985,7 @@ mod tests {
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -17172,6 +17190,7 @@ mod tests {
             .unwrap();
         let base = |id: &str, sent_at: u64| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -17678,6 +17697,7 @@ mod tests {
             .unwrap();
         let base = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -17787,6 +17807,7 @@ mod tests {
                 clock += 1;
                 let message = MessageRecord {
                     is_erased: false,
+                    delete_failed: false,
                     required_protocol_version: None,
                     author_aci: None,
                     id: format!("m{clock}"),
@@ -17930,6 +17951,7 @@ mod tests {
                     text: Option<&str>| {
             let message = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -18134,6 +18156,7 @@ mod tests {
         let push = |id: &str, status: &'static str, sent_at: u64| {
             let message = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -18244,6 +18267,7 @@ mod tests {
         let push = |id: &str, authors: &[&str], increment_unread: bool| {
             let message = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -18375,6 +18399,7 @@ mod tests {
             .unwrap();
         let plain = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m1".into(),
@@ -18483,6 +18508,7 @@ mod tests {
             .unwrap();
         let mut message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "pending".into(),
@@ -18595,6 +18621,7 @@ mod tests {
             .unwrap();
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "atomic-message".into(),
@@ -18675,6 +18702,7 @@ mod tests {
             .unwrap();
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "unread-message".into(),
@@ -18760,6 +18788,7 @@ mod tests {
             .unwrap();
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "system-message".into(),
@@ -18830,6 +18859,7 @@ mod tests {
             .unwrap();
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "contended".into(),
@@ -18915,6 +18945,7 @@ mod tests {
         let row = |store: &Store, id: &str, sender: &str| {
             let message = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -19017,6 +19048,7 @@ mod tests {
         let row = |store: &Store, id: &str, status: &'static str| {
             let message = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -19125,6 +19157,7 @@ mod tests {
                    status: &'static str| {
             let message = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -19239,6 +19272,7 @@ mod tests {
         ] {
             let message = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -19327,6 +19361,7 @@ mod tests {
 
         let changed = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "newer-message-2".into(),
@@ -19390,6 +19425,7 @@ mod tests {
             .unwrap();
         let other_message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "other-message".into(),
@@ -19495,6 +19531,7 @@ mod tests {
         let hit = |id: &str, conversation_id: &str, sent_at: u64, text: &str| {
             let mut message = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -19602,6 +19639,7 @@ mod tests {
         {
             let message = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: format!("row-{index}"),
@@ -19714,6 +19752,7 @@ mod tests {
         let hit = |id: &str, conversation_id: &str, sent_at: u64, text: &str| {
             let message = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -19818,6 +19857,7 @@ mod tests {
             .unwrap();
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "delete-message".into(),
@@ -19969,6 +20009,7 @@ mod tests {
             .unwrap();
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "receipt-message".into(),
@@ -21087,6 +21128,7 @@ mod tests {
             .unwrap();
         let mut message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "kept".into(),
@@ -21170,6 +21212,7 @@ mod tests {
         let day = 24 * 60 * 60 * 1_000;
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "before-upgrade".into(),
@@ -21276,6 +21319,7 @@ mod tests {
                 let id = format!("message-{index}");
                 let message = MessageRecord {
                     is_erased: false,
+                    delete_failed: false,
                     required_protocol_version: None,
                     author_aci: None,
                     id: id.clone(),
@@ -21436,6 +21480,7 @@ mod tests {
             .unwrap();
         let mut message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "in-flight".into(),
@@ -21542,6 +21587,7 @@ mod tests {
                     sent_at: u64| {
             let record = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -21692,6 +21738,7 @@ mod tests {
         let sent_at = now_ms() - 60_000;
         let record = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "reconcile-row".into(),
@@ -21806,6 +21853,7 @@ mod tests {
             .unwrap();
         let recent = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "recent".into(),
@@ -21886,6 +21934,7 @@ mod tests {
             .unwrap();
         let mut message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "kept".into(),
@@ -21969,6 +22018,7 @@ mod tests {
             .unwrap();
         let mut message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "unread-incoming".into(),
@@ -22612,6 +22662,7 @@ mod tests {
     ) {
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: message_id.into(),
@@ -22670,6 +22721,7 @@ mod tests {
             .unwrap();
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-edited".into(),
@@ -22933,6 +22985,7 @@ mod tests {
             .unwrap();
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-own".into(),
@@ -23207,6 +23260,7 @@ mod tests {
         let base =
             |id: &str, conversation_id: &str, direction: &'static str, rich: bool| MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -23324,6 +23378,7 @@ mod tests {
             .unwrap();
         let record = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-view".into(),
@@ -23422,6 +23477,7 @@ mod tests {
     fn expire_record(id: &str, account_id: &str, conversation_id: &str) -> MessageRecord {
         MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -24489,6 +24545,7 @@ mod tests {
     ) -> MessageRecord {
         MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -24847,6 +24904,7 @@ mod tests {
             .unwrap();
         let record = |id: &str, sent_at: u64, status: &'static str| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -24999,6 +25057,7 @@ mod tests {
             .unwrap();
         let record = |id: &str, conversation_id: &str, sent_at: u64| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -25167,6 +25226,7 @@ mod tests {
             .unwrap();
         let record = |id: &str, conversation_id: &str| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -25283,6 +25343,7 @@ mod tests {
             .unwrap();
         let record = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-cascade-600".into(),
@@ -25388,6 +25449,7 @@ mod tests {
             .unwrap();
         let record = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-seed-700".into(),
@@ -25622,6 +25684,7 @@ mod tests {
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -25733,6 +25796,7 @@ mod tests {
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -25849,6 +25913,7 @@ mod tests {
             .unwrap();
         let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -26613,6 +26678,7 @@ mod tests {
             |store: &Store, id: &str, sender: &str, sent_at: u64, status: &'static str| {
                 let message = MessageRecord {
                     is_erased: false,
+                    delete_failed: false,
                     required_protocol_version: None,
                     author_aci: None,
                     id: id.into(),
@@ -26817,6 +26883,7 @@ mod tests {
                       rich: Option<NormalizedRich>| {
             let message = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -27006,6 +27073,7 @@ mod tests {
             .unwrap();
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "poll-capped".into(),
@@ -27256,6 +27324,7 @@ mod tests {
         let row =
             |id: &str, direction: &'static str, sender_id: &str, sent_at: u64| MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -27473,6 +27542,7 @@ mod tests {
 
         let row = |id: &str, direction: &'static str, sent_at: u64| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),

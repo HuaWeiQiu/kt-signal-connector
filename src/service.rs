@@ -3550,6 +3550,7 @@ impl ConnectorService {
         ]);
         let pending = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: pending_id.clone(),
@@ -3667,6 +3668,7 @@ impl ConnectorService {
             stable_hash_id(&[account_id, conversation_id, "outgoing", client_request_id]);
         let pending = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: pending_id.clone(),
@@ -9934,6 +9936,7 @@ impl ConnectorService {
         }
         let mut message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: receive.required_protocol_version,
             // Contract 1.191 (§4.191): the incoming author's protocol identity
             // — the envelope's `sourceUuid` member ACI, verbatim. Outgoing
@@ -10681,6 +10684,7 @@ impl ConnectorService {
         };
         let message = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: message_id,
@@ -10974,6 +10978,7 @@ impl ConnectorService {
             let sent_at = receive.timestamp.unwrap_or(0);
             let record = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: receive.required_protocol_version,
                 author_aci: None,
                 id: stable_hash_id(&["signal-story-sync", &account.id, &sent_at.to_string()]),
@@ -11795,6 +11800,7 @@ impl ConnectorService {
                     .map(|text| text.len().min(u32::MAX as usize) as u32);
                 let message = MessageRecord {
                     is_erased: false,
+                    delete_failed: false,
                     required_protocol_version: None,
                     author_aci: None,
                     id: message_id,
@@ -18822,6 +18828,7 @@ mod tests {
     fn expire_record_fixture(account_id: &str, conversation_id: &str, id: &str) -> MessageRecord {
         MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -26783,6 +26790,7 @@ mod tests {
             .unwrap();
         let base = |id: &str, conversation_id: &str, direction: &'static str| MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: id.into(),
@@ -33871,6 +33879,7 @@ mod tests {
         let seed = |id: &str, sent_at: u64| {
             let record = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -34449,6 +34458,7 @@ mod tests {
         let seed = |conversation_id: &str, id: &str, sent_at: u64, direction: &'static str| {
             let record = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -34688,6 +34698,7 @@ mod tests {
     ) {
         let record = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: author_aci.map(str::to_string),
             id: id.into(),
@@ -35043,6 +35054,7 @@ mod tests {
         let seed = |conversation_id: &str, id: &str, sent_at: u64| {
             let record = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -35956,6 +35968,7 @@ mod tests {
         let seed = |id: &str, sent_at: u64, direction: &'static str, conv: &str| {
             let record = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -36085,6 +36098,7 @@ mod tests {
         let seed = |service: &ConnectorService, id: &str, sent_at: u64, conv: &str| {
             let record = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -36206,6 +36220,7 @@ mod tests {
         let seed = |service: &ConnectorService, conv: &str, id: &str, sent_at: u64| {
             let record = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -36348,6 +36363,7 @@ mod tests {
         let seed = |service: &ConnectorService, id: &str, sent_at: u64| {
             let record = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -36455,6 +36471,7 @@ mod tests {
             .unwrap();
         let record = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "sg1".into(),
@@ -36528,6 +36545,7 @@ mod tests {
         let seed = |service: &ConnectorService, id: &str, sent_at: u64| {
             let record = MessageRecord {
                 is_erased: false,
+                delete_failed: false,
                 required_protocol_version: None,
                 author_aci: None,
                 id: id.into(),
@@ -36640,6 +36658,7 @@ mod tests {
         // clientRequestId makes it a one-shot per conversation).
         let second = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-401".into(),
@@ -38911,6 +38930,7 @@ mod tests {
             .unwrap();
         let row = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-group-400".into(),
@@ -39074,6 +39094,7 @@ mod tests {
             .unwrap();
         let second = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: "m-gate-401".into(),

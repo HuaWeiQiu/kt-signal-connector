@@ -740,6 +740,7 @@ impl<'a> Importer<'a> {
         // 「阅后即焚已查看」置 true）；只认布尔，缺席/非布尔一律 false，绝不把
         // 「没写」当成「已擦除」。
         let record = MessageRecord {
+            delete_failed: false,
             is_erased: value
                 .get("isErased")
                 .and_then(Value::as_bool)
@@ -932,6 +933,7 @@ impl<'a> Importer<'a> {
         };
         let record = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: message_id,
@@ -1040,6 +1042,7 @@ impl<'a> Importer<'a> {
         let text = "群聊信息已更新".to_string();
         let record = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: message_id,
@@ -2955,6 +2958,7 @@ mod tests {
         let live_sender = stable_hash_id(&[&account.id, "direct", ALICE_ACI]);
         let live = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: stable_hash_id(&[
@@ -3051,6 +3055,7 @@ mod tests {
         let live_sender = stable_hash_id(&[&account.id, "direct", ALICE_E164]);
         let restored = MessageRecord {
             is_erased: false,
+            delete_failed: false,
             required_protocol_version: None,
             author_aci: None,
             id: stable_hash_id(&[
