@@ -976,7 +976,16 @@ impl ServiceError {
             // a mutating send is never auto-retried, the flag is display-side
             // only); the server-unavailable family may succeed on a later
             // attempt and reads retryable=true.
-            ServiceError::Engine(EngineError::RateLimited) => ApiError::new(
+            ServiceError::Engine(EngineError::RateLimited {
+                retry_after_secs: Some(secs),
+            }) => ApiError::with_data(
+                "SEND_RATE_LIMITED",
+                "the upstream rate-limited the send",
+                serde_json::json!({ "retryAfterSecs": secs }),
+            ),
+            ServiceError::Engine(EngineError::RateLimited {
+                retry_after_secs: None,
+            }) => ApiError::new(
                 "SEND_RATE_LIMITED",
                 "the upstream rate-limited the send",
                 false,
@@ -9610,7 +9619,7 @@ impl ConnectorService {
     /// engine ANSWERED a definitive JSON-RPC error, so the send provably did
     /// not land and a resend carries no unknown-outcome risk —
     /// [`EngineError::ServerUnavailable`] / [`EngineError::Upstream`] on the
-    /// backoff arm, and (contract 1.143, §4.139) [`EngineError::RateLimited`]
+    /// backoff arm, and (contract 1.143, §4.139) [`EngineError::RateLimited { retry_after_secs: None }`]
     /// on the Retry-After arm: a 429/413 is the server answering "wait", not
     /// "lost", so the row enrolls on the official Retry-After beat instead
     /// of the curve (the wire carries no value, so the official one-minute
@@ -9697,7 +9706,7 @@ impl ConnectorService {
     /// failed with no automatic follow-up.
     pub(crate) fn auto_retry_schedule(error: &EngineError) -> crate::store::SendRetrySchedule {
         match error {
-            EngineError::RateLimited => crate::store::SendRetrySchedule::RateLimit,
+            EngineError::RateLimited { .. } => crate::store::SendRetrySchedule::RateLimit,
             EngineError::ServerUnavailable | EngineError::Upstream { .. } => {
                 crate::store::SendRetrySchedule::Backoff
             }
@@ -20139,7 +20148,13 @@ mod tests {
     #[test]
     fn send_chain_transport_errors_map_to_send_error_codes() {
         for (error, code, retryable) in [
-            (EngineError::RateLimited, "SEND_RATE_LIMITED", false),
+            (
+                EngineError::RateLimited {
+                    retry_after_secs: None,
+                },
+                "SEND_RATE_LIMITED",
+                false,
+            ),
             (EngineError::ProofRequired, "SEND_PROOF_REQUIRED", false),
             (
                 EngineError::ServerUnavailable,
@@ -21787,7 +21802,12 @@ mod tests {
             };
             let settled_at = now_ms();
             let events = service
-                .complete_send_failed_for_engine(&pending_id, &EngineError::RateLimited)
+                .complete_send_failed_for_engine(
+                    &pending_id,
+                    &EngineError::RateLimited {
+                        retry_after_secs: None,
+                    },
+                )
                 .unwrap();
             assert_eq!(events.len(), 1, "the failed transition emits");
             let (status, first, count, next) = face(&service, &pending_id);
@@ -21856,7 +21876,9 @@ mod tests {
     fn auto_retry_schedule_classifies_the_three_arms() {
         use crate::store::SendRetrySchedule;
         assert_eq!(
-            ConnectorService::auto_retry_schedule(&EngineError::RateLimited),
+            ConnectorService::auto_retry_schedule(&EngineError::RateLimited {
+                retry_after_secs: None
+            }),
             SendRetrySchedule::RateLimit
         );
         assert_eq!(

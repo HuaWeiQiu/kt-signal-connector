@@ -329,7 +329,11 @@ pub enum EngineError {
     /// user data — and the classification carries no event: a transport
     /// failure never touches account state.
     #[error("engine send was rate-limited upstream")]
-    RateLimited,
+    RateLimited {
+        /// 契约 §4.222：服务端 429/413 给出的等待秒数（engine data 投影）。
+        /// 缺席 = 引擎未带（旧版本），宿主回落固定 60 秒（官方 DEFAULT_RETRY_AFTER）。
+        retry_after_secs: Option<u64>,
+    },
     #[error("engine send requires an upstream proof challenge")]
     ProofRequired,
     #[error("engine server is unavailable")]
@@ -379,7 +383,7 @@ impl EngineError {
             EngineError::Protocol => "protocol",
             EngineError::Upstream { .. } => "upstream",
             EngineError::Unauthorized => "unauthorized",
-            EngineError::RateLimited => "rate_limited",
+            EngineError::RateLimited { .. } => "rate_limited",
             EngineError::ProofRequired => "proof_required",
             EngineError::ServerUnavailable => "server_unavailable",
             EngineError::IdentityUnverified => "identity_unverified",
@@ -3804,9 +3808,16 @@ const ENGINE_SEND_IDENTITY_UNVERIFIED_ANCHOR: &str = "(UntrustedIdentityExceptio
 /// `AccountUnauthorized` → `ACCOUNT_UNLINKED` chain keeps head-of-line
 /// precedence at the call site.
 fn upstream_error_send_class(error: Option<&Value>) -> Option<EngineError> {
-    let message = error?.get("message").and_then(Value::as_str)?;
+    let error = error?;
+    let message = error.get("message").and_then(Value::as_str)?;
     if message.contains(ENGINE_SEND_RATE_LIMITED_ANCHOR) {
-        Some(EngineError::RateLimited)
+        // 契约 §4.222：data.retryAfterSecs 随分类一并带回（服务端 429/413
+        // 的等待秒数），宿主据此按服务端窗口等待，而非固定 60 秒撞限流。
+        let retry_after_secs = error
+            .get("data")
+            .and_then(|data| data.get("retryAfterSecs"))
+            .and_then(Value::as_u64);
+        Some(EngineError::RateLimited { retry_after_secs })
     } else if message.contains(ENGINE_SEND_PROOF_REQUIRED_ANCHOR) {
         Some(EngineError::ProofRequired)
     } else if message.contains(ENGINE_SEND_SERVER_UNAVAILABLE_ANCHOR) {
@@ -9243,7 +9254,9 @@ mod tests {
                 "code": -32603,
                 "message": "Failed to send message: Timed out waiting for a response (RateLimitExceeded)"
             })),
-            Some(EngineError::RateLimited)
+            Some(EngineError::RateLimited {
+                retry_after_secs: None
+            })
         );
         assert_eq!(
             classify(json!({
@@ -9264,7 +9277,9 @@ mod tests {
         // trailing suffix.
         assert_eq!(
             classify(json!({ "code": -32603, "message": "(RateLimitExceeded)" })),
-            Some(EngineError::RateLimited)
+            Some(EngineError::RateLimited {
+                retry_after_secs: None
+            })
         );
     }
 
@@ -9488,7 +9503,9 @@ mod tests {
         for (message, expected) in [
             (
                 "Failed to send message: Timed out waiting for a response (RateLimitExceeded)",
-                EngineError::RateLimited,
+                EngineError::RateLimited {
+                    retry_after_secs: None,
+                },
             ),
             (
                 "Failed to send message: Proof required (ProofRequiredException)",

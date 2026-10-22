@@ -11249,7 +11249,9 @@ mod tests {
             EngineError::Exited,
             EngineError::Protocol,
             EngineError::Unauthorized,
-            EngineError::RateLimited,
+            EngineError::RateLimited {
+                retry_after_secs: None,
+            },
             EngineError::ProofRequired,
             EngineError::ServerUnavailable,
             EngineError::IdentityUnverified,
