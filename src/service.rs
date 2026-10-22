@@ -6872,24 +6872,36 @@ impl ConnectorService {
         &self,
         account_id: &str,
         conversation_id: &str,
-        safety_number: &str,
+        intent: &IdentitiesVerifyIntent,
     ) -> Result<Value, ServiceError> {
-        if safety_number.is_empty()
-            || safety_number.chars().count() > IDENTITY_SAFETY_NUMBER_MAX_CHARS
-        {
-            return Err(ServiceError::Api(ApiError::new(
-                "INVALID_REQUEST",
-                "safetyNumber must contain between 1 and 256 characters",
-                false,
-            )));
-        }
         let (mut upstream, peer_key) = self.prepare_identities_face(account_id, conversation_id)?;
-        if let Some(map) = upstream.as_object_mut() {
-            map.insert("recipient".to_string(), Value::String(peer_key));
-            map.insert(
-                "verifiedSafetyNumber".to_string(),
-                Value::String(safety_number.to_string()),
-            );
+        match intent {
+            IdentitiesVerifyIntent::Verified { safety_number } => {
+                if safety_number.is_empty()
+                    || safety_number.chars().count() > IDENTITY_SAFETY_NUMBER_MAX_CHARS
+                {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "safetyNumber must contain between 1 and 256 characters",
+                        false,
+                    )));
+                }
+                if let Some(map) = upstream.as_object_mut() {
+                    map.insert("recipient".to_string(), Value::String(peer_key));
+                    map.insert(
+                        "verifiedSafetyNumber".to_string(),
+                        Value::String(safety_number.to_string()),
+                    );
+                }
+            }
+            // 契约 §4.223：sendAnyway 半面——state=default 重置信任，无数字
+            // 比对闸。engine trust 的 (None, Some("default")) 臂。
+            IdentitiesVerifyIntent::TrustDefault => {
+                if let Some(map) = upstream.as_object_mut() {
+                    map.insert("recipient".to_string(), Value::String(peer_key));
+                    map.insert("state".to_string(), Value::String("default".to_string()));
+                }
+            }
         }
         Ok(upstream)
     }
@@ -16242,12 +16254,25 @@ pub struct IdentitiesGetParams {
 /// travel back as the verification confirmation, the official
 /// "Mark as verified" semantics. The wire bound mirrors
 /// `IDENTITY_SAFETY_NUMBER_MAX_CHARS`; the grammar is the upstream's.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// 契约 §4.223：verify 的两条出口——全验证（比对安全码）或信任重置
+/// （sendAnyway，无比对）。与官方 SafetyNumberChangeDialog 的
+/// [标记为已验证] / [仍然发送] 两钮一一对应。内部路由类型，不上 wire。
+#[derive(Debug)]
+pub enum IdentitiesVerifyIntent {
+    Verified { safety_number: String },
+    TrustDefault,
+}
+
+#[derive(serde::Deserialize)]
 pub struct IdentitiesVerifyParams {
     pub account_id: String,
     pub conversation_id: String,
-    pub safety_number: String,
+    /// 契约 §4.223：safety_number 与 state 两臂恰一。
+    /// safety_number = 官方「标记为已验证」（verifiedSafetyNumber 形，比对闸）；
+    /// state = 官方 sendAnyway 的信任重置（"default"，无数字比对）。
+    /// 双臂同置或双缺 = INVALID_REQUEST（fail-closed，同 engine trust 语义）。
+    pub safety_number: Option<String>,
+    pub state: Option<String>,
 }
 
 /// One projected identity row (contract revision 1.68, §4.61; contract
@@ -28955,7 +28980,13 @@ mod tests {
         // Verify: the same reference as `recipient` plus the echoed digits;
         // trustAllKnownKeys is never part of the payload.
         let upstream = service
-            .prepare_identities_verify(&account.id, &conversation.id, "12345 67890")
+            .prepare_identities_verify(
+                &account.id,
+                &conversation.id,
+                &IdentitiesVerifyIntent::Verified {
+                    safety_number: "12345 67890".to_string(),
+                },
+            )
             .unwrap();
         assert_eq!(upstream["recipient"], conversation.peer_key);
         assert_eq!(upstream["verifiedSafetyNumber"], "12345 67890");
@@ -28968,7 +28999,13 @@ mod tests {
             ("over-bound-digits", &"1".repeat(257)[..]),
         ] {
             let error = service
-                .prepare_identities_verify(&account.id, &conversation.id, safety_number)
+                .prepare_identities_verify(
+                    &account.id,
+                    &conversation.id,
+                    &IdentitiesVerifyIntent::Verified {
+                        safety_number: safety_number.to_string(),
+                    },
+                )
                 .unwrap_err();
             assert_eq!(error.into_api().code, "INVALID_REQUEST", "{request_id}");
         }
@@ -28989,7 +29026,13 @@ mod tests {
             .ensure_conversation(&account.id, "legacyGroup", "abc123LEGACY", "Legacy")
             .unwrap();
         let error = service
-            .prepare_identities_verify(&account.id, &legacy.id, "12345 67890")
+            .prepare_identities_verify(
+                &account.id,
+                &legacy.id,
+                &IdentitiesVerifyIntent::Verified {
+                    safety_number: "12345 67890".to_string(),
+                },
+            )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
         let self_row = service

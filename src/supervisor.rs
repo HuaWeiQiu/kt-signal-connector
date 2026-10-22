@@ -37,34 +37,35 @@ use crate::service::{
     GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
     GroupsMigrateResult, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
     GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
-    IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary, MAX_AVATAR_DATA_URI_CHARS,
-    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView,
-    MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary, MessageRequestOutcome,
-    MessageRequestParams, MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams,
-    MessagesReportSpamParams, MessagesSendContactParams, MessagesSendPollCreateParams,
-    MessagesSendPollTerminateParams, MessagesSendPollVoteParams, MessagesSendStickerParams,
-    MessagesSendStoryParams, NotificationProfileSyncs, NotificationProfilesListParams,
-    NotificationProfilesSetRecordsParams, PeerTarget, PhoneLookupEntry, PhoneLookupParams,
-    PhoneLookupResult, PinnedConversations, PreparedHistoryDownload, PreparedSend,
-    ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams,
-    SendTextStyleParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
-    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
-    StickerPackSetSyncParams, StickerPackSyncs, StorageGetCallLinksParams, StorageIngestParams,
-    StorageSetCallLinkParams, StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams,
-    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListSyncs,
-    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, StorySendGroupFace,
-    StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
-    UsernameLookupParams, UsernameLookupResult, account_device_capabilities_from_engine,
-    account_limit_error, blocked_conversations_result, call_link_syncs_result,
-    chat_folder_syncs_result, conversation_state_from_engine, device_list_from_engine,
-    group_create_result_from_engine, group_invite_join_status_from_engine,
-    group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
-    group_invite_link_preview_from_engine, group_migrate_result_from_engine, identity_from_engine,
-    import_groups_summary_from_engine, merge_contacts_summary_from_engine,
-    notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
-    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
-    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
+    HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyIntent,
+    IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary,
+    MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS,
+    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary,
+    MessageRequestOutcome, MessageRequestParams, MessagesDeleteForMeMessagesParams,
+    MessagesDeleteForMeParams, MessagesReportSpamParams, MessagesSendContactParams,
+    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
+    MessagesSendStickerParams, MessagesSendStoryParams, NotificationProfileSyncs,
+    NotificationProfilesListParams, NotificationProfilesSetRecordsParams, PeerTarget,
+    PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
+    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
+    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
+    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
+    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
+    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams, StoriesDisabled,
+    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
+    StoriesSetDisabledParams, StoryDistributionListSyncs, StoryDistributionListsListParams,
+    StoryDistributionListsSetRecordsParams, StorySendGroupFace, StorySendRecipientResult,
+    StorySendResult, StorySendSuccess, UsernameLookupEntry, UsernameLookupParams,
+    UsernameLookupResult, account_device_capabilities_from_engine, account_limit_error,
+    blocked_conversations_result, call_link_syncs_result, chat_folder_syncs_result,
+    conversation_state_from_engine, device_list_from_engine, group_create_result_from_engine,
+    group_invite_join_status_from_engine, group_invite_link_parse_from_engine,
+    group_invite_link_password_from_engine, group_invite_link_preview_from_engine,
+    group_migrate_result_from_engine, identity_from_engine, import_groups_summary_from_engine,
+    merge_contacts_summary_from_engine, notification_profile_syncs_result,
+    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
+    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
+    store_list_conversations, store_list_messages, store_search_messages,
     story_distribution_lists_result, validate_account_delete_operation_id,
 };
 use crate::store::{
@@ -6180,10 +6181,24 @@ impl RuntimeSupervisor {
         let engine = self.running_engine().await?;
         let upstream = {
             let service = self.service.lock().await;
+            // 契约 §4.223：两臂恰一路由（双臂/双缺 fail-closed 同 engine）。
+            let intent = match (params.safety_number.as_deref(), params.state.as_deref()) {
+                (Some(code), None) => IdentitiesVerifyIntent::Verified {
+                    safety_number: code.to_string(),
+                },
+                (None, Some("default")) => IdentitiesVerifyIntent::TrustDefault,
+                _ => {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "exactly one of safetyNumber or state=\"default\" is required",
+                        false,
+                    )));
+                }
+            };
             service.prepare_identities_verify(
                 &params.account_id,
                 &params.conversation_id,
-                &params.safety_number,
+                &intent,
             )?
         };
         match engine.call("trust", upstream, CallClass::Mutating).await {
