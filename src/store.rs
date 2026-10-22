@@ -6569,12 +6569,7 @@ impl Store {
         conn.execute(
             "UPDATE messages SET delete_failed=?2, delete_failed_at=?3
              WHERE account_id=?1 AND id=?4",
-            params![
-                account_id,
-                failed as i64,
-                failed_at.map(|value| value as i64),
-                message_id
-            ],
+            params![account_id, failed as i64, failed_at, message_id],
         )
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(())
