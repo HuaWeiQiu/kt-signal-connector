@@ -94,6 +94,7 @@ fn seed_outgoing_row(
 ) -> String {
     let id = stable_hash_id(&[account_id, conversation_id, "outgoing", request]);
     let record = MessageRecord {
+        delete_failed: false,
         is_erased: false,
         required_protocol_version: None,
         author_aci: None,
