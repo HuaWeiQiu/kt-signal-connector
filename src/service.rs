@@ -1694,6 +1694,15 @@ pub enum HostSideEvent {
     ReceiveDecryptionError {
         account_id: String,
     },
+    /// 契约 §4.226：对端安全码（身份钥）变更。观测事件——不自动重置会话，
+    /// 信任决定权在用户（sendAnyway / 会话信息确认，同 §4.223 语义）。
+    /// 桌面据此渲染时间线系统行（官方 SystemMessage 家族
+    /// safetyNumberChanged 形态）。
+    IdentityChanged {
+        account_id: String,
+        source_uuid: String,
+        timestamp: Option<u64>,
+    },
 }
 
 /// One conversation-scoped delete group on the `message.deleteForMe` event
@@ -9577,6 +9586,25 @@ impl ConnectorService {
         };
         Ok(vec![HostSideEvent::ReceiveDecryptionError {
             account_id: account.id.clone(),
+        }])
+    }
+
+    /// 契约 §4.226：对端安全码（身份钥）变更通知的转发（归因同
+    /// forward_decryption_error：账号解析失败 warn-only 丢弃）。
+    pub fn forward_identity_changed(
+        &self,
+        signal_account: &str,
+        source_uuid: &str,
+        timestamp: Option<u64>,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some(account) = self.resolve_account_transient(signal_account, "identity.changed")?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![HostSideEvent::IdentityChanged {
+            account_id: account.id.clone(),
+            source_uuid: source_uuid.to_string(),
+            timestamp,
         }])
     }
 

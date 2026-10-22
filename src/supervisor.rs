@@ -10514,6 +10514,19 @@ async fn engine_event_watch_loop(
                 };
                 emit_forwarded(&host_events, forwarded);
             }
+            Ok(EngineEvent::ReceiveIdentityChanged {
+                account,
+                source_uuid,
+                timestamp,
+            }) => {
+                // 契约 §4.226：对端安全码（身份钥）变更通知的消费臂——
+                // 转发宿主渲染时间线系统行。观测事件：不自动重置会话。
+                let forwarded = {
+                    let guard = service.lock().await;
+                    guard.forward_identity_changed(&account, &source_uuid, timestamp)
+                };
+                emit_forwarded(&host_events, forwarded);
+            }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,

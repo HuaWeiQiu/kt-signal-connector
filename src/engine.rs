@@ -494,6 +494,14 @@ pub enum EngineEvent {
     ReceiveDecryptionError {
         account: String,
     },
+    /// 契约 §4.226：对端安全码（身份钥）变更信封。转发宿主用于时间线
+    /// 系统行渲染；不自动重置会话——信任决定权在用户（sendAnyway /
+    /// 会话信息确认，同 §4.223 语义）。
+    ReceiveIdentityChanged {
+        account: String,
+        source_uuid: String,
+        timestamp: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -3411,6 +3419,42 @@ async fn handle_upstream_line(
             // than inventing one. No automatic reset action ever rides the
             // event — decryption failures self-heal through the engine's
             // DERM retry protocol.
+            if params
+                .get("envelope")
+                .and_then(|envelope| envelope.get("identityChanged"))
+                .is_some()
+            {
+                // 契约 §4.226：对端身份钥变更信封（engine
+                // identity_changed_notification 投影，service/mod.rs:6539）。
+                // 账号归因纪律同 decryptionError 臂：可归因才发事件，
+                // 否则落 unknownNotification 警告。
+                let attributed = params
+                    .get("account")
+                    .and_then(Value::as_str)
+                    .filter(|account| !account.is_empty());
+                if let Some(account) = attributed {
+                    let source_uuid = params
+                        .get("envelope")
+                        .and_then(|envelope| envelope.get("sourceUuid"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let timestamp = params
+                        .get("envelope")
+                        .and_then(|envelope| envelope.get("timestamp"))
+                        .and_then(Value::as_u64);
+                    let _ = events.send(EngineEvent::ReceiveIdentityChanged {
+                        account: account.to_string(),
+                        source_uuid,
+                        timestamp,
+                    });
+                } else {
+                    let _ = events.send(EngineEvent::ProtocolWarning {
+                        kind: "unknownNotification",
+                    });
+                }
+                return Ok(());
+            }
             if params
                 .get("envelope")
                 .and_then(|envelope| envelope.get("decryptionError"))
