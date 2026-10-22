@@ -6556,6 +6556,30 @@ impl Store {
     /// retention prunes the row like any other. Idempotent; returns the
     /// updated row when the flag actually flipped so a replayed adminDelete
     /// does not re-emit events.
+    /// 契约 §4.224：删除（为所有人）发送失败态落库/清除。
+    /// 按 message_id 定位（删除请求以消息 id 为靶）。
+    pub fn set_delete_failed(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        failed: bool,
+        failed_at: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE messages SET delete_failed=?2, delete_failed_at=?3
+             WHERE account_id=?1 AND id=?4",
+            params![
+                account_id,
+                failed as i64,
+                failed_at.map(|value| value as i64),
+                message_id
+            ],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
     pub fn mark_admin_deleted(
         &self,
         account_id: &str,

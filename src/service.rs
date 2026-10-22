@@ -6879,6 +6879,19 @@ impl ConnectorService {
     /// the wire bound and never invents a second grammar — a malformed
     /// string is the upstream's definite UserError, not a local guess.
     /// The testing-only `trustAllKnownKeys` mode is never sent.
+    /// 契约 §4.224：删除失败态落库/清除（supervisor 结算臂调用）。
+    pub fn set_message_delete_failed(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        failed: bool,
+    ) -> Result<(), ServiceError> {
+        let failed_at = if failed { Some(now_ms() as i64) } else { None };
+        self.store
+            .set_delete_failed(account_id, message_id, failed, failed_at)
+            .map_err(ServiceError::from)
+    }
+
     pub fn prepare_identities_verify(
         &self,
         account_id: &str,

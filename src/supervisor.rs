@@ -6953,10 +6953,18 @@ impl RuntimeSupervisor {
             let service = self.service.lock().await;
             service.prepare_remote_delete(&account_id, &conversation_id, &message_id)?
         };
-        match engine
+        let outcome = engine
             .call("remoteDelete", prepared.params, CallClass::Mutating)
-            .await
+            .await;
+        // 契约 §4.224：结算删除失败态——成功清旗标；未知/失败落旗标+时刻
+        // （持久化，重启后桌面仍可见「删除失败可重试」）。结果本身不自动重试
+        // （unknown_outcome 纪律）。
         {
+            let service = self.service.lock().await;
+            let failed = outcome.is_err();
+            let _ = service.set_message_delete_failed(&account_id, &message_id, failed);
+        }
+        match outcome {
             Ok(_) => Ok("deleted"),
             Err(EngineError::UnknownOutcome) => Ok("unknown"),
             Err(error) => Err(error.into()),
