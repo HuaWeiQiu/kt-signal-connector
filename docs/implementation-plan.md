@@ -18597,3 +18597,41 @@ MessageRecord 有 113 处完整字面量构造点。加 Default 再让各处补 
 
 **门禁**：cargo fmt --check、cargo clippy --all-targets -- -D warnings、
 cargo test --lib、cargo build --release。
+
+## §4.228 保留期到期主动擦除（eraseMessageContents 到期半面）
+
+**背景**：官方 isErased 有两个来源——「阅后即焚已查看」（§4.221 已接）
+与「保留期到期主动擦除」（`cleanup.preload.ts:63-105
+eraseMessageContents`，由 `tapToViewMessagesDeletionService` 以
+`view-once-expired` 置位）。本端此前到期 sweep 一刀切删行
+（`removeMessagesById` 对位），view-once 行到期后被整行删掉——桌面既
+没有擦除占位态，行也丢时间线位置。
+
+**官方语义**（`Message.std.ts:30-80` erase 行为表）：
+
+| 面 | 官方 | 本端对位 |
+|---|---|---|
+| 保留 | id/timestamps/conversationId/type/sent_at/received_at(+ms)/serverGuid/serverTimestamp/source 族/readAt/readStatus/seenStatus/expireTimer/expirationStartTimestamp/sendState/synced/errors/isViewOnce | 行不删，上述列/富键原样 |
+| 擦除 | body/attachments/quote/preview/contact/sticker/payment/poll/editHistory/group_update/groupV2Change/bodyRanges/reactions(非 view-once reason) | body/body_bytes/body_truncated/quote_snapshot/attachments_json/attachment_locators/live_attachment_locators/sticker_json 清空；rich 清 previews/mentions/textStyles/群与身份标记/story/poll/payment/contact/giftBadge 面 |
+| 旗标 | isErased=true | messages.is_erased=1（新列） |
+
+**到期分路**（sweep_expired_messages 双路）：带 view-once 标记
+（rich.viewOnce/viewOnceInvalid）的到期行走擦除路（保行清内容）；其余到
+期行维持删行（官方 expiringMessagesDeletion 的 removeMessagesById）。已擦
+行 is_erased=1 后被两路候选共同排除（官方允许 re-erase；sweep 单向一次
+擦净，不重复计数）。擦除行不进 `message.expired` 分组——行还占着时间
+线位置，桌面按行上 isErased 词形在下次列表拉取时渲染擦除占位；擦除积压
+由后续 sweep tick 续扫。触及会话的 summary 修复（last_message/preview/
+unread clamp）对删除行与擦除行同跑——最新行被擦时 preview 随 body 落地，
+已擦正文不泄露到会话摘要。
+
+**迁移**：SCHEMA_VERSION 39，messages ADD COLUMN is_erased INTEGER NOT
+NULL DEFAULT 0（照 admin_deleted/delete_failed 先例，附加列不回填历史
+行——历史行的擦除态只来自导入记录本身，§4.221 纪律）。
+
+**测试**：到期 view-once 行内容清空 + 行保留 + is_erased 置位 + 元数据
+（sent_at/received_at/timer 族）原样；普通到期行仍删行；message.expired
+分组只含删除行；已擦行二次 sweep 不重选；最新行被擦后 summary preview
+落地；未到期 view-once 行原样。
+
+---

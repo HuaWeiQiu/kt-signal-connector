@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 37;
+const SCHEMA_VERSION: i64 = 39;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -4266,7 +4266,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -4342,7 +4342,7 @@ impl Store {
         let mut older: Vec<MessageRecord> = {
             let conn = self.read_conn()?;
             let mut stmt = conn
-                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -4377,7 +4377,7 @@ impl Store {
         let mut newer: Vec<MessageRecord> = {
             let conn = self.read_conn()?;
             let mut stmt = conn
-                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
@@ -4517,7 +4517,7 @@ impl Store {
                     AdjacentMediaDirection::Older => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -4527,7 +4527,7 @@ impl Store {
                     AdjacentMediaDirection::Newer => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
@@ -4621,7 +4621,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                      FROM messages
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
@@ -4671,7 +4671,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -4691,7 +4691,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -4721,7 +4721,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -5221,7 +5221,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -5269,7 +5269,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -5396,7 +5396,7 @@ impl Store {
                 .query_row(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                      FROM messages WHERE id=?1",
                     params![message_id],
                     message_record_from_row,
@@ -5741,7 +5741,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -5817,7 +5817,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -5890,7 +5890,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -6074,7 +6074,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages
                  WHERE id=?1",
                 params![message_id],
@@ -6131,7 +6131,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3 AND sender_id=?4
                  ORDER BY id ASC LIMIT 1",
@@ -6632,7 +6632,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -7570,7 +7570,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY received_at DESC",
@@ -7936,7 +7936,7 @@ impl Store {
                     m.body, m.body_bytes, m.body_truncated, m.status, m.quote_message_id, m.client_request_id,
                     m.quote_snapshot, m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
                     m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
-                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci
+                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,m.is_erased
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id AND c.account_id = m.account_id
              WHERE m.account_id = ?1 AND m.sent_at = ?2 AND m.rich_json IS NOT NULL
@@ -8018,7 +8018,7 @@ impl Store {
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
                         quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self,
-                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
@@ -8093,7 +8093,7 @@ impl Store {
                             m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
                             m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
                             m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid,
-                            m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,
+                            m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,m.is_erased,
                             c.kind, c.peer_key
                      FROM messages m
                      JOIN conversations c ON c.id = m.conversation_id
@@ -8110,7 +8110,7 @@ impl Store {
                 let rows: Vec<(MessageRecord, String, String)> = stmt
                     .query_map(params![account_id, timestamp as i64], |row| {
                         let record = message_record_from_row(row)?;
-                        Ok((record, row.get::<_, String>(31)?, row.get::<_, String>(32)?))
+                        Ok((record, row.get::<_, String>(32)?, row.get::<_, String>(33)?))
                     })
                     .map_err(|error| StoreError::Unavailable(Some(error)))?
                     .collect::<Result<_, _>>()
@@ -8568,7 +8568,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming' AND sent_at=?3",
             )
@@ -8957,7 +8957,7 @@ impl Store {
         let sql = format!(
             "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
                    AND sent_at > ?3
@@ -8996,7 +8996,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3 AND direction='incoming'",
             )
@@ -9420,7 +9420,7 @@ impl Store {
                 let sql = format!(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND id IN ({placeholders})"
                 );
@@ -9800,7 +9800,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -10909,65 +10909,158 @@ impl Store {
         Ok(changed > 0)
     }
 
-    /// One bounded expire-sweep pass (contract 1.42, §4.41): delete at most
-    /// [`EXPIRE_SWEEP_BATCH`] rows whose deadline has passed, oldest deadline
-    /// first, then repair exactly the touched conversations' summaries — the
-    /// same last-message/unread clamp [`Self::prune_history`] applies — and
-    /// recompute the account aggregates in the same transaction, so a sweep
-    /// never leaves a summary promising a row the timer ate. Returns the
-    /// deletions grouped per conversation (empty = nothing was due; a full
-    /// batch means the caller should run another pass). Attachments stay
-    /// where retention leaves them: byte cleanup is the media governor's
-    /// existing discipline, identical to a retention prune.
+    /// One bounded expire-sweep pass (contract 1.42, §4.41; erased half =
+    /// contract 1.218, §29.3): the official dual-path expiry — upstream
+    /// `expiringMessagesDeletion.preload.ts` deletes plain due rows
+    /// (`removeMessagesById`), while `tapToViewMessagesDeletionService` +
+    /// `cleanup.preload.ts:63-105 eraseMessageContents` erase a view-once
+    /// row's contents **in place** (row kept, `isErased=true`). Per pass at
+    /// most `cap` due rows are processed, oldest deadline first:
+    ///
+    /// - **Erase path** (rows carrying a view-once marker): content fields
+    ///   clear — body, quote snapshot, attachments and both locator faces,
+    ///   sticker, and the rich content keys — `is_erased` sets, and the row
+    ///   stays with its identity/timestamp/receipt/timer metadata (the
+    ///   official preserved-attribute list, `Message.std.ts:30-80`). The rich
+    ///   record keeps the view-once markers, the protocol timer-version stamp
+    ///   and the send-transcript facts (the official `isViewOnce`/
+    ///   `sendState`/`unidentifiedDeliveries` preserve arms);
+    ///   previews/mentions/styles and the group/identity/story/poll/payment/
+    ///   contact faces go (the official `erase` arms).
+    /// - **Delete path** (every other due row): the existing bounded delete.
+    ///
+    /// Then exactly the touched conversations' summaries are repaired — the
+    /// same last-message/unread clamp [`Self::prune_history`] applies, and
+    /// now also re-runs over erased rows so a newest-row preview can never
+    /// outlive the body it quoted — and the account aggregates recompute in
+    /// the same transaction. Returns the **deleted** rows grouped per
+    /// conversation (empty = nothing was deleted; a full batch means the
+    /// caller should run another pass). Erased rows stay put and never enter
+    /// the groups: no `message.expired` fires for them (the row still holds
+    /// its timeline place; the desktop renders the erased placeholder off the
+    /// row's `isErased` face on its next list pull). A pass that spends the
+    /// whole budget erasing returns no groups, so the drain pauses until the
+    /// next tick and the erase backlog drains over following intervals.
+    /// Attachments stay where retention leaves them: byte cleanup is the
+    /// media governor's existing discipline, identical to a retention prune —
+    /// clearing the row's locator faces just drops the last row-side
+    /// reference, the official `cleanupFilesAndReferencesToMessage` posture
+    /// minus the connector's disk ownership.
     pub fn sweep_expired_messages(
         &self,
         now_ms: u64,
         cap: u32,
     ) -> Result<Vec<ExpiredMessageGroup>, StoreError> {
+        const VIEW_ONCE_MARKER_LIKE: &str = "%\"viewOnce\":true%";
+        const VIEW_ONCE_INVALID_MARKER_LIKE: &str = "%\"viewOnceInvalid\":true%";
         let conn = self.lock_conn()?;
         let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let mut deleted = transaction
+        // --- Erase path: view-once rows burn their contents in place. ---
+        let mut candidates = transaction
             .prepare(
-                "DELETE FROM messages WHERE id IN (
-                   SELECT id FROM messages
-                   WHERE expire_at IS NOT NULL AND expire_at <= ?1
-                   ORDER BY expire_at, id
-                   LIMIT ?2
-                 )
-                 RETURNING account_id, conversation_id, id",
+                "SELECT id, account_id, conversation_id, rich_json FROM messages
+                  WHERE expire_at IS NOT NULL AND expire_at <= ?1
+                    AND is_erased = 0
+                    AND (rich_json LIKE ?2 OR rich_json LIKE ?3)
+                  ORDER BY expire_at, id
+                  LIMIT ?4",
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let rows = deleted
-            .query_map(params![now_ms as i64, cap], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
+        let due_view_once: Vec<(String, String, String, Option<String>)> = candidates
+            .query_map(
+                params![
+                    now_ms as i64,
+                    VIEW_ONCE_MARKER_LIKE,
+                    VIEW_ONCE_INVALID_MARKER_LIKE,
+                    cap
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        drop(candidates);
+        let mut touched: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        if !due_view_once.is_empty() {
+            let mut erase = transaction
+                .prepare(
+                    "UPDATE messages
+                        SET body=NULL, body_bytes=NULL, body_truncated=0,
+                            quote_snapshot=NULL, attachments_json=NULL,
+                            attachment_locators=NULL, live_attachment_locators=NULL,
+                            sticker_json=NULL, rich_json=?2, is_erased=1
+                      WHERE id=?1",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for (id, account_id, conversation_id, rich_json) in &due_view_once {
+                erase
+                    .execute(params![id, erased_rich_json(rich_json.as_deref())])
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                touched.insert((account_id.clone(), conversation_id.clone()));
+            }
+            drop(erase);
+        }
+        let erased = due_view_once.len();
+        drop(due_view_once);
+        // --- Delete path: plain rows leave, the upstream removeMessagesById
+        // face. The marker filters keep a not-yet-erased view-once row from
+        // being deleted by the same pass that ran out of erase budget. ---
+        let delete_cap = cap.saturating_sub(erased as u32);
         let mut groups: std::collections::BTreeMap<(String, String), Vec<String>> =
             std::collections::BTreeMap::new();
-        for row in rows {
-            let (account_id, conversation_id, id) =
-                row.map_err(|error| StoreError::Unavailable(Some(error)))?;
-            groups
-                .entry((account_id, conversation_id))
-                .or_default()
-                .push(id);
-        }
-        drop(deleted);
-        if groups.is_empty() {
-            transaction
-                .commit()
+        if delete_cap > 0 {
+            let mut deleted = transaction
+                .prepare(
+                    "DELETE FROM messages WHERE id IN (
+                       SELECT id FROM messages
+                       WHERE expire_at IS NOT NULL AND expire_at <= ?1
+                         AND is_erased = 0
+                         AND (rich_json IS NULL
+                              OR (rich_json NOT LIKE ?2 AND rich_json NOT LIKE ?3))
+                       ORDER BY expire_at, id
+                       LIMIT ?4
+                     )
+                     RETURNING account_id, conversation_id, id",
+                )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
-            return Ok(Vec::new());
+            let rows = deleted
+                .query_map(
+                    params![
+                        now_ms as i64,
+                        VIEW_ONCE_MARKER_LIKE,
+                        VIEW_ONCE_INVALID_MARKER_LIKE,
+                        delete_cap
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for row in rows {
+                let (account_id, conversation_id, id) =
+                    row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+                groups
+                    .entry((account_id, conversation_id))
+                    .or_default()
+                    .push(id);
+            }
+            drop(deleted);
         }
-        // The newest row may be the one that expired: recompute each touched
-        // conversation's summary from what it still holds, then the account
-        // aggregates from the conversation maxima (prune_history's repair).
+        // The newest row may be the one that expired *or* the one that was
+        // just erased: recompute each touched conversation's summary from
+        // what it still holds (an erased newest row loses its preview with
+        // its body), then the account aggregates from the conversation maxima
+        // (prune_history's repair).
+        for key in groups.keys() {
+            touched.insert(key.clone());
+        }
         let mut repair = transaction
             .prepare(
                 "UPDATE conversations
@@ -10987,14 +11080,13 @@ impl Store {
                   WHERE id=?1",
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        for (account_id, conversation_id) in groups.keys() {
-            let touched = repair
+        for (account_id, conversation_id) in touched.iter() {
+            let touched_rows = repair
                 .execute(params![conversation_id, PREVIEW_CHARS])
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
-            if touched == 0 {
+            if touched_rows == 0 {
                 // The conversation row itself is gone (concurrent account
-                // delete): its group simply carries no event target anymore,
-                // but the ids were deleted, so the group stays for symmetry.
+                // delete): its deletions still stand, the erase still stands.
                 tracing::debug!(account = %account_id, "expire sweep outlived conversation");
             }
         }
@@ -11027,6 +11119,31 @@ impl Store {
             )
             .collect())
     }
+}
+
+/// The erased row's rich record (§29.3): the official
+/// `getMessageAttrsToPreserveAfterErase("view-once-expired")` preserve arms
+/// keep the view-once markers (`isViewOnce`), the protocol timer-version
+/// stamp and the send-transcript facts (`sendState`/`unidentifiedDeliveries`);
+/// every content face — previews, mentions, styles, the group/identity
+/// markers and the story/poll/payment/contact/gift-badge material — goes the
+/// way of the official `erase` arms. The burn stamp stays: an already-viewed
+/// row that later expires keeps its opened-at fact (the official allows
+/// re-erase; the stamp is metadata, not content). A row without rich content
+/// erases nothing here (`None` in, `None` out).
+fn erased_rich_json(rich_json: Option<&str>) -> Option<String> {
+    let rich: crate::engine::NormalizedRich = serde_json::from_str(rich_json?).unwrap_or_default();
+    let erased = crate::engine::NormalizedRich {
+        view_once: rich.view_once,
+        view_once_invalid: rich.view_once_invalid,
+        view_once_opened_at: rich.view_once_opened_at,
+        expire_timer_version: rich.expire_timer_version,
+        is_recipient_update: rich.is_recipient_update,
+        unidentified_status: rich.unidentified_status,
+        story_message_recipients: rich.story_message_recipients,
+        ..Default::default()
+    };
+    serde_json::to_string(&erased).ok()
 }
 
 /// The connector-computed sweep deadline for one row (contract 1.42, §4.41):
@@ -12380,6 +12497,21 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         conn.execute(&sql, [])
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
+    if current < 39 {
+        // 契约 1.218（§29.3，到期主动擦除）：messages.is_erased 列——官方
+        // eraseMessageContents（cleanup.preload.ts:63-105）的行内旗标对位
+        // （model-types.d.ts:207 isErased）：保留期到期的阅后即焚行不再
+        // 删行，而是清内容字段、保行保时间戳、置 is_erased=true。照
+        // admin_deleted/delete_failed 先例，附加列 DEFAULT 0 不回填历史行
+        // （历史行的擦除态只来自导入记录本身，§4.221 纪律）。
+        if !table_has_column(conn, "messages", "is_erased")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN is_erased INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     if current < 37 {
         // 契约 1.207（M5）：conversations 补会话外观八列——官方 color /
         // colorFromPrimary / conversationColor / customColor / customColorId /
@@ -12948,7 +13080,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
     let attachments_json: Option<String> = row.get(14)?;
     let rich_json: Option<String> = row.get(15)?;
     Ok(MessageRecord {
-        is_erased: false,
+        is_erased: row.get::<_, i64>(31)? != 0,
         delete_failed: false,
         required_protocol_version: None,
         id: row.get(0)?,
@@ -24537,6 +24669,179 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// 到期主动擦除（contract 1.218, §29.3）：到期 view-once 行走官方
+    /// eraseMessageContents 语义 —— 内容字段清空（body/quote/attachments/
+    /// sticker/rich 内容键）、行保留、is_erased=true、身份/时间戳/收据/
+    /// timer 元数据保留；普通到期行仍删行（upstream removeMessagesById）；
+    /// `message.expired` 分组只含删除行；已擦行不再被任何一路重选；最新行
+    /// 被擦后会话 preview 跟着落地（已擦正文不泄露到摘要）。
+    #[test]
+    fn sweep_erases_due_view_once_rows_and_deletes_the_rest() {
+        use crate::engine::{
+            NormalizedAttachment, NormalizedPreview, NormalizedQuote, NormalizedRich,
+            NormalizedSticker, NormalizedTextStyle,
+        };
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+
+        // Due view-once row with every content face loaded — also the
+        // conversation's newest row, so the erase must pull the preview.
+        let mut view_once = expire_record("m-vo-due", &account.id, &conversation.id);
+        view_once.sent_at = 300;
+        view_once.received_at = Some(150);
+        view_once.expire_seconds = Some(60);
+        view_once.expire_start_at = Some(1_000);
+        view_once.text = Some("erase me secret".into());
+        view_once.quote_snapshot = Some(NormalizedQuote {
+            id: 42,
+            author: "+15555550199".into(),
+            text: "quoted secret".into(),
+            attachments: Vec::new(),
+        });
+        view_once.attachments = vec![NormalizedAttachment {
+            id: "att-vo-1".into(),
+            content_type: Some("image/jpeg".into()),
+            filename: Some("snap.jpg".into()),
+            size: Some(2048),
+            width: Some(64),
+            height: Some(32),
+            is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
+            locator: None,
+            waveform: None,
+            duration: None,
+        }];
+        view_once.sticker = Some(NormalizedSticker {
+            pack_id: "abcd".into(),
+            pack_key: "a2V5".into(),
+            sticker_id: 7,
+            emoji: Some("\u{1f389}".into()),
+        });
+        view_once.rich = Some(NormalizedRich {
+            view_once: true,
+            previews: vec![NormalizedPreview {
+                url: "https://example.net/secret".into(),
+                title: Some("secret title".into()),
+                description: None,
+                date: None,
+                image: None,
+            }],
+            text_styles: vec![NormalizedTextStyle {
+                style: "bold".into(),
+                start: 0,
+                length: 5,
+            }],
+            ..Default::default()
+        });
+        // Due plain row: the delete path keeps its upstream face.
+        let mut plain = expire_record("m-plain-due", &account.id, &conversation.id);
+        plain.sent_at = 200;
+        plain.expire_seconds = Some(60);
+        plain.expire_start_at = Some(1_000);
+        // Not-due view-once row: untouched on both faces.
+        let mut waiting = expire_record("m-vo-waiting", &account.id, &conversation.id);
+        waiting.sent_at = 100;
+        waiting.expire_seconds = Some(3_600);
+        waiting.expire_start_at = Some(1_000_000_000_000);
+        waiting.rich = Some(NormalizedRich {
+            view_once: true,
+            ..Default::default()
+        });
+
+        for record in [&view_once, &plain, &waiting] {
+            assert!(
+                store
+                    .insert_message(
+                        record,
+                        None,
+                        Some(record.text.as_deref().unwrap_or("")),
+                        true
+                    )
+                    .unwrap()
+            );
+        }
+
+        let groups = store
+            .sweep_expired_messages(1_000_000, EXPIRE_SWEEP_BATCH)
+            .unwrap();
+        assert_eq!(groups.len(), 1, "only the delete path feeds the groups");
+        assert_eq!(groups[0].conversation_id, conversation.id);
+        assert_eq!(groups[0].message_ids, vec!["m-plain-due"]);
+
+        let rows = store
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap();
+        let by_id: std::collections::HashMap<&str, &_> = rows
+            .items
+            .iter()
+            .map(|row| (row.id.as_str(), row))
+            .collect();
+        // 行保留（普通行删除）；HashMap 无序，排序后比较。
+        let mut surviving: Vec<&str> = by_id.keys().copied().collect();
+        surviving.sort_unstable();
+        assert_eq!(surviving, vec!["m-vo-due", "m-vo-waiting"]);
+
+        // 官方 eraseMessageContents 语义：内容清空。
+        let erased = by_id["m-vo-due"];
+        assert!(erased.is_erased, "is_erased sets");
+        assert_eq!(erased.text, None);
+        assert_eq!(erased.text_bytes, None);
+        assert!(erased.quote_snapshot.is_none(), "quote erases");
+        assert!(erased.attachments.is_empty(), "attachments erase");
+        assert!(erased.sticker.is_none(), "sticker erases");
+        let rich = erased.rich.as_ref().expect("rich keeps the view-once face");
+        assert!(rich.view_once, "isViewOnce preserves");
+        assert!(rich.previews.is_empty(), "preview erases");
+        assert!(rich.text_styles.is_empty(), "bodyRanges erase");
+        // 官方 preserve 面：时间戳/收据/timer 元数据原样。
+        assert_eq!(erased.sent_at, 300);
+        assert_eq!(erased.received_at, Some(150));
+        assert_eq!(erased.expire_seconds, Some(60));
+        assert_eq!(erased.expire_start_at, Some(1_000));
+
+        // 摘要不泄露已擦正文（最新行被擦 → preview 落地）。
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .expect("summary");
+        assert_eq!(
+            summary.last_message_preview, None,
+            "an erased newest row leaves no preview behind"
+        );
+        assert_eq!(summary.last_message_at, Some(300));
+
+        // 未到期 view-once 行原样。
+        let waiting_row = by_id["m-vo-waiting"];
+        assert!(!waiting_row.is_erased);
+        assert!(waiting_row.text.is_some());
+        assert!(waiting_row.rich.as_ref().unwrap().view_once);
+
+        // 第二遍：已擦行不再被任何一路选中，quiet sweep。
+        assert!(
+            store
+                .sweep_expired_messages(1_000_000, EXPIRE_SWEEP_BATCH)
+                .unwrap()
+                .is_empty()
+        );
+        let rows = store
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap();
+        let still = rows.items.iter().find(|row| row.id == "m-vo-due").unwrap();
+        assert!(still.is_erased);
+        assert_eq!(still.text, None);
     }
 
     /// The conversation timer mirror writes only on real transitions: the
