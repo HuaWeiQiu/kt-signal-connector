@@ -123,6 +123,18 @@ const DELIVERY_RECEIPT_QUEUE_CAP: usize = 512;
 /// short-circuit above it stays budget-free (local store only).
 const CONTACTS_SYNC_BUDGET: Duration = Duration::from_secs(120);
 
+/// Batch I background sync: capacity of the engine-completion kick queue.
+/// Bounded and lossy by design (AGENTS.md bounded-queue rule) — a full queue
+/// drops the kick, never blocks the engine-event watcher. The 60 s marker
+/// inside the sync folds duplicate kicks, and the desktop gate remains the
+/// fallback when a kick is dropped.
+const BACKGROUND_SYNC_QUEUE_CAP: usize = 8;
+
+/// Batch I background sync: one silent retry after a failed pass. A short
+/// settle keeps a wedged engine from being hammered; after the retry the next
+/// completion event (or the desktop gate) converges.
+const BACKGROUND_SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 /// §4.123 outbox drain cadence: the periodic sweep runs at most this often
 /// per group. The cadence is deliberately slow — the queue's own schedule
 /// (190 ms exponential → 15-minute cap) is what paces retries; the tick only
@@ -546,9 +558,22 @@ pub struct RuntimeSupervisor {
     /// One-shot media governor pass (ADR 0004: once per process start);
     /// never held across an await.
     media_governor_pass: StdMutex<Option<JoinHandle<()>>>,
-    /// One-shot contacts/groups re-sync pass (once per process start);
-    /// never held across an await.
+    /// The contacts/groups re-sync pass armed by every engine landing (boot
+    /// start or watchdog recovery); never held across an await. The running
+    /// flag, not the handle slot, is what keeps one pass at a time — each
+    /// landing may arm a fresh pass, and the 60 s cache folds a restart storm
+    /// into read-only no-ops (the official afterAuthSocketConnect posture:
+    /// run the sync chain on every authenticated connection).
     contacts_resync: StdMutex<Option<JoinHandle<()>>>,
+    contacts_resync_running: Arc<AtomicBool>,
+    /// Receiver of the bounded background-sync kicks (engine completion
+    /// events); `Some` until `spawn_background_sync_worker` takes it. The
+    /// queue exists in `new` because the engine-event watcher holds the
+    /// sender, but the worker is spawned by the registry once the supervisor
+    /// sits behind its `Arc`.
+    background_sync_rx: StdMutex<Option<mpsc::Receiver<String>>>,
+    /// The background-sync worker; never held across an await.
+    background_sync_worker: StdMutex<Option<JoinHandle<()>>>,
     /// Link-time history import single flight (contract revision 1.39,
     /// §4.38): at most one import per group at a time — claimed by the
     /// `link.finish` watcher or the startup sweep, released when the import
@@ -740,6 +765,12 @@ impl RuntimeSupervisor {
         // hooks send on; the worker (spawned later by the registry) owns the
         // receiver and otherwise paces itself on the due schedules + tick.
         let (outbox_drain_tx, outbox_drain_rx) = mpsc::channel(1);
+        // Batch I: the engine's completion notifications (storagePull /
+        // initialSyncComplete) kick the ordinary contacts/groups sync from the
+        // background. Bounded and lossy; the worker is spawned by the registry
+        // (a supervisor is not behind its `Arc` yet inside `new`).
+        let (background_sync_tx, background_sync_rx) =
+            mpsc::channel::<String>(BACKGROUND_SYNC_QUEUE_CAP);
         // Receive-path survival evidence for the watchdog: bumped by the
         // persistence loop for every envelope the engine actually delivers to
         // this group's receive lane (see the field doc).
@@ -763,6 +794,7 @@ impl RuntimeSupervisor {
             events.subscribe(),
             service.clone(),
             host_events.clone(),
+            background_sync_tx,
         ));
         Self {
             config,
@@ -784,6 +816,9 @@ impl RuntimeSupervisor {
             retention: StdMutex::new(None),
             media_governor_pass: StdMutex::new(None),
             contacts_resync: StdMutex::new(None),
+            contacts_resync_running: Arc::new(AtomicBool::new(false)),
+            background_sync_rx: StdMutex::new(Some(background_sync_rx)),
+            background_sync_worker: StdMutex::new(None),
             history_import_running: Arc::new(AtomicBool::new(false)),
             history_import_holder: Arc::new(StdMutex::new(None)),
             history_import_abort: Arc::new(AtomicBool::new(false)),
@@ -1218,15 +1253,21 @@ impl RuntimeSupervisor {
     }
 
     /// One best-effort contacts/groups re-sync per linked account of this
-    /// group once an engine has landed (boot start or watchdog recovery).
+    /// group on every engine landing (boot start or watchdog recovery).
     ///
-    /// The sync is what materializes the contract-1.14 conversation
-    /// skeletons, so an account linked before that revision — or whose
-    /// inline link-time sync failed — would otherwise surface conversations
-    /// only message by message. It runs in the background (the host
-    /// handshake path never waits on the engine) and the 60-second cache inside
-    /// the sync folds repeat starts into read-only no-ops. One pass per
-    /// process start, same discipline as history retention.
+    /// Batch I aligns this with the official `afterAuthSocketConnect` posture
+    /// (`upstream/Signal-Desktop/ts/background.preload.ts:1829-1948`): the
+    /// sync chain runs from the background service on every authenticated
+    /// connection, not from a UI/RPC trigger. The sync is what materializes
+    /// the contract-1.14 conversation skeletons, so an account linked before
+    /// that revision — or whose inline link-time sync failed — would
+    /// otherwise surface conversations only message by message. It runs in
+    /// the background (the host handshake path never waits on the engine) and
+    /// the 60-second cache inside the sync folds repeat starts into read-only
+    /// no-ops. The running flag keeps one pass at a time; a landing that
+    /// arrives while a pass is still running is not double-armed — the
+    /// engine's own completion events (and, failing those, the desktop gate)
+    /// are the convergence path for that window.
     fn spawn_contacts_resync(&self) {
         let Ok(engine_slot) = self.engine.try_lock() else {
             return;
@@ -1243,16 +1284,27 @@ impl RuntimeSupervisor {
     }
 
     fn spawn_contacts_resync_with(&self, engine: EngineHandle) {
-        let Ok(mut slot) = self.contacts_resync.lock() else {
-            return;
-        };
-        if slot.is_some() {
+        if self.contacts_resync_running.swap(true, Ordering::AcqRel) {
             return;
         }
+        let Ok(mut slot) = self.contacts_resync.lock() else {
+            self.contacts_resync_running.store(false, Ordering::Release);
+            return;
+        };
         let service = Arc::clone(&self.service);
         let group_id = self.group_id.clone();
         let host_events = self.host_events.clone();
+        let running = Arc::clone(&self.contacts_resync_running);
         *slot = Some(tokio::spawn(async move {
+            // Every early return and panic unwinds through this guard, so one
+            // failed landing can never wedge the lane for later ones.
+            struct RunningGuard(Arc<AtomicBool>);
+            impl Drop for RunningGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _guard = RunningGuard(running);
             // Let the fresh engine settle and any link-time inline sync land
             // first; the 60-second cache then folds the overlap into a no-op.
             sleep(Duration::from_secs(2)).await;
@@ -1275,6 +1327,68 @@ impl RuntimeSupervisor {
                         account_id = %account.id,
                         "startup contacts resync failed"
                     );
+                }
+            }
+        }));
+    }
+
+    /// Take the bounded background-sync receiver and spawn its single worker
+    /// (idempotent, the delivery-receipt worker's discipline).
+    ///
+    /// Batch I: the engine's own completion notifications (`storagePull`
+    /// both-ok, `initialSyncComplete` manifest-ok) are consumed from the same
+    /// broadcast stream whose host frames ride to the desktop, and each kick
+    /// runs the ordinary [`RuntimeSupervisor::sync_contacts`] face. The
+    /// desktop's manual `contacts.sync` and this worker therefore share one
+    /// implementation — the 60 s marker, the 120 s budget, and the one
+    /// all-or-nothing upsert transaction — so the two paths cannot drift.
+    ///
+    /// Failures are host-silent: one retry after
+    /// [`BACKGROUND_SYNC_RETRY_DELAY`], then the next completion event or the
+    /// desktop gate converges. The worker re-resolves `running_engine()` per
+    /// kick, so a watchdog restart never leaves it on a stale handle.
+    pub fn spawn_background_sync_worker(self: &Arc<Self>) {
+        let Some(receiver) = self
+            .background_sync_rx
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        else {
+            return;
+        };
+        let Ok(mut slot) = self.background_sync_worker.lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let supervisor = Arc::clone(self);
+        *slot = Some(tokio::spawn(async move {
+            let mut receiver = receiver;
+            while let Some(account_id) = receiver.recv().await {
+                match supervisor.sync_contacts(&account_id).await {
+                    Ok(outcome) => tracing::info!(
+                        account_id = %account_id,
+                        contact_count = outcome.contact_count,
+                        group_count = outcome.group_count,
+                        synced_at = outcome.synced_at,
+                        "background contacts sync completed"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            error_class = error.class(),
+                            account_id = %account_id,
+                            "background contacts sync failed; retrying once"
+                        );
+                        sleep(BACKGROUND_SYNC_RETRY_DELAY).await;
+                        if let Err(error) = supervisor.sync_contacts(&account_id).await {
+                            tracing::warn!(
+                                error_class = error.class(),
+                                account_id = %account_id,
+                                "background contacts sync retry failed; the next completion event or the desktop gate converges"
+                            );
+                        }
+                    }
                 }
             }
         }));
@@ -9536,6 +9650,11 @@ impl Drop for RuntimeSupervisor {
         {
             handle.abort();
         }
+        if let Ok(mut slot) = self.background_sync_worker.lock()
+            && let Some(handle) = slot.take()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -10502,6 +10621,7 @@ async fn engine_event_watch_loop(
     mut engine_events: broadcast::Receiver<EngineEvent>,
     service: Arc<Mutex<ConnectorService>>,
     host_events: broadcast::Sender<HostSideEvent>,
+    background_sync: mpsc::Sender<String>,
 ) {
     loop {
         match engine_events.recv().await {
@@ -10562,6 +10682,14 @@ async fn engine_event_watch_loop(
                     let guard = service.lock().await;
                     guard.forward_storage_pull(&account, &trigger, contacts_ok, groups_ok)
                 };
+                // Batch I: consume the same completion frame the desktop
+                // receives and kick the background store merge. The forward
+                // arm already resolved the account (an unknown one queues
+                // nothing), so the queue carries exactly the attribution the
+                // host frame proves.
+                if let Some(account_id) = background_sync_account(&forwarded) {
+                    queue_background_sync(&background_sync, account_id);
+                }
                 emit_forwarded(&host_events, forwarded);
             }
             Ok(EngineEvent::InitialSyncComplete {
@@ -10577,6 +10705,9 @@ async fn engine_event_watch_loop(
                     let guard = service.lock().await;
                     guard.forward_initial_sync_complete(&account, manifest_ok, profiles_ok)
                 };
+                if let Some(account_id) = background_sync_account(&forwarded) {
+                    queue_background_sync(&background_sync, account_id);
+                }
                 emit_forwarded(&host_events, forwarded);
             }
             Ok(EngineEvent::ReceiveDecryptionError { account }) => {
@@ -10611,6 +10742,48 @@ async fn engine_event_watch_loop(
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
         }
+    }
+}
+
+/// Batch I: the account id of one forwarded completion frame whose
+/// successful face the official background waits for. `engine.initialSyncComplete`
+/// maps to the official link-window `contactSync:complete` +
+/// `storageService:syncComplete` pair (the storage-manifest leg is the one
+/// that imports contacts/groups; the profile-refresh leg does not gate the
+/// merge), and `engine.storagePull` with both family legs ok maps to the
+/// per-pull `storageService:syncComplete` signal. A false leg is not a
+/// successful completion (the official events only fire on success); the
+/// desktop gate keeps its own wait semantics and the next authenticated
+/// connection retries.
+fn background_sync_account(forwarded: &Result<Vec<HostSideEvent>, ServiceError>) -> Option<String> {
+    forwarded
+        .as_ref()
+        .ok()?
+        .iter()
+        .find_map(|event| match event {
+            HostSideEvent::StoragePull {
+                account_id,
+                contacts_ok: true,
+                groups_ok: true,
+                ..
+            } => Some(account_id.clone()),
+            HostSideEvent::InitialSyncComplete {
+                account_id,
+                manifest_ok: true,
+                ..
+            } => Some(account_id.clone()),
+            _ => None,
+        })
+}
+
+/// Batch I: hand one completion kick to the bounded worker queue. A full or
+/// closed queue drops the kick (never blocks the engine-event watcher); the
+/// 60 s marker and the desktop gate keep that lossy choice safe.
+fn queue_background_sync(sender: &mpsc::Sender<String>, account_id: String) {
+    if sender.try_send(account_id).is_err() {
+        tracing::debug!(
+            "background contacts sync queue full or closed; dropping this kick (the next completion event or the desktop gate converges)"
+        );
     }
 }
 

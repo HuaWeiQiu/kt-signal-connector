@@ -798,6 +798,20 @@ for line in sys.stdin:
         else:
             result = [account_entry(LINKED_ACCOUNT)] if ACCOUNT_LINKED else []
     elif method == "listContacts":
+        # Batch I retry hook: one-shot -32603, consumed by the first call.
+        # The background-sync worker's single silent retry is exercisable
+        # without wedging the engine or touching the read shape.
+        fail_once = SIGNAL_DATA_DIR / ".fixture-list-contacts-fail-once"
+        if fail_once.exists():
+            fail_once.unlink(missing_ok=True)
+            emit_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32603, "message": "Internal error"},
+                }
+            )
+            continue
         # Contract 1.27 hook: deliver extra receives appended to the marker
         # after link time before answering. Only reached outside the
         # contacts-sync debounce window.

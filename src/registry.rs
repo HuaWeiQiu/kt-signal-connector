@@ -3095,6 +3095,7 @@ pub fn open_group_runtime_with_options(
         supervisor.spawn_media_governor();
         supervisor.spawn_delivery_receipt_worker();
         supervisor.spawn_outbox_worker();
+        supervisor.spawn_background_sync_worker();
         supervisor.spawn_expire_sweeper();
         slots.push(ProxyGroupSlot {
             id: entry.id.clone(),

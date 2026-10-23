@@ -8,6 +8,13 @@
   (every platform, 5 s), the orphan-engine sweep, and the data-directory
   ownership marker; §4.219 records the desktop-side runtime reconciliation that
   backs both up.
+- Background sync (2026-10-24, no wire change — internal behavior only): the
+  connector consumes the engine's own completion notifications
+  (`engine.storagePull` both-ok / `engine.initialSyncComplete` manifest-ok)
+  and runs the ordinary contacts/groups store merge, from the background
+  service, with no UI/RPC trigger. The desktop's `contacts.sync` remains a
+  manual refresh face. See "后台同步事件消费（批 I）" at the end of this
+  document for the official anchor and the event mapping.
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
 - Contract revision: 1.216 (2026-10-21; §4.216 the message-granular read
@@ -18864,3 +18871,57 @@ obsoleteConversationNumber?}`；`{conversationTitle}` 由桌面读会话行
 群行缺席；`message_request_accepted_derives_official_factor_weights`
 扩展）；引擎 `project_contact_entry_shapes` 新签名/两键形状；桌面纯模块
 与 source-lock（signalMessageRequestState/Wiring spec）。
+
+---
+
+## 后台同步事件消费（批 I · 2026-10-24 · 无 wire 变更）
+
+**官方锚点（只读取语义，零抄码）**：`upstream/Signal-Desktop/ts/background.preload.ts:1829-1948`
+`afterAuthSocketConnect`——同步链由**后台服务**在每次授权 socket 连接后自行启动：
+
+1. 注册后同步未完成（新链接）→ `sendSyncRequests`（contacts/configuration/block）+
+   `waitForEvent('contactSync:complete')`；
+2. `maybeDownloadAndImportBackup`（链接备份导入）；
+3. `messageReceiver.startProcessingQueue()`；
+4. 首连接或注册后未完成 → `enableStorageService({andSync:'afterFirstAuthSocketConnect'})` +
+   `waitForEvent('storageService:syncComplete')`；
+5. `Promise.all` 等 contactSync + storageService 完成 → 持久化，
+   `postRegistrationSyncsStatus='complete'`。
+
+要点：同步链在后台服务内跑，**零 UI/RPC 触发**；每次认证连接都跑（后续连接以
+watch 模式启用 storage，不阻塞）；完成后事件驱动，**store 落库是完成事件的消费者**。
+
+**事件映射（engine 已发，connector 只消费；不改 wire）**：
+
+| engine 事件 | 官方等价信号 | 本批消费口径 |
+|---|---|---|
+| `engine.initialSyncComplete {account, manifestOk, profilesOk}` | 链接窗 `contactSync:complete` + `storageService:syncComplete` | `manifestOk=true` 视为 contacts/groups 数据面完成（storage-manifest 腿才导入联系人/群；`profilesOk` 是名字刷新腿，不 gate 合并）；`manifestOk=false` 不是成功完成，不触发，下一条认证连接重补 |
+| `engine.storagePull {account, trigger, contactsOk, groupsOk}` | 每次拉取后的 `storageService:syncComplete` | `contactsOk && groupsOk` 双 ok 时触发；单腿 false 保留桌面闸的逐腿等待语义 |
+
+**实现（connector 后台服务角色）**：
+
+- `RuntimeSupervisor::spawn_background_sync_worker`（registry / pool 在 supervisor
+  进入 `Arc` 之后调用，delivery-receipt worker 同款幂等）消费有界队列
+  （cap 8，满则丢，**不阻塞** engine-event watcher）。
+- `engine_event_watch_loop` 在 `storagePull` / `initialSyncComplete` 两个完成帧转发桌面的
+  同时，取同一帧已解析的 `accountId` 入队——**同一事件流内部消费一份**；账号未解析
+  （`forward_*` 丢弃）时零入队。
+- worker 调 `RuntimeSupervisor::sync_contacts`——与桌面 `contacts.sync` **完全同一实现**
+  （60 s marker、120 s budget、单事务全量 upsert），两条路径不会漂移。
+- 失败：host 静默（warn-only），2 s 后**静默重试一次**；再失败等下一条完成事件或桌面闸。
+- 每次 engine landing（`start` / `restart_engine`）仍由 `spawn_contacts_resync_with`
+  后台跑一轮；本批把「once per process」改为可重复（running flag 单飞），对齐官方
+  「每次认证连接都跑」，60 s marker 折叠重启风暴。
+- 桌面 `contacts.sync` 保留为手动刷新（**KT 扩展**：官方无此 RPC 面）；桌面 gate 的
+  等待语义不变，它继续消费 connector 转发的完成帧。
+
+**事件源缺口（本批未改 engine）**：engine 没有「每次 auth socket 连接」的独立完成事件；
+`initialSyncComplete` / `storagePull` 受登录窗 60 s 一次性闸与 pull 触发面限制，进程内
+60 s 内的重连不会重发。连接器侧由 engine landing 重同步覆盖进程重启；进程内重连的
+缺口建议 engine additively 增发 `engine.connectionReady {account, epoch, resumed}`
+（或在每次连接成功后以 `trigger:"reconnect"` 发 `storagePull`），connector 侧无需 wire
+改动即可复用本消费臂。
+
+**测试**：`tests/background_contacts_sync.rs`（无桌面调用自动落库、双 ok gate、false 腿
+不触发、60 s 幂等、失败一次静默重试）；`tests/fixtures/fake-engine.py` 增一次性
+`listContacts` 失败钩子（测试专用，正常路径零变化）。
