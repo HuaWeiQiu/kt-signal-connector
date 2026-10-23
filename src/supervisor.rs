@@ -9535,7 +9535,29 @@ fn group_extra_json(members: &[Value], group: &Value) -> String {
     // link-join state and UNKNOWN is the engine's unparsed fallback —
     // neither is a display state the official client knows, so both (and
     // every malformed value) collapse to absent: unknown, never a lie.
-    if let Some(word) = group.get("addFromInviteLink").and_then(Value::as_str)
+    // Contract 1.252 (§4.237): the engine's listGroups face — the only
+    // runtime — never carries the top-level key; it projects the word
+    // inside its accessControl object (P5 b991076), which is also the
+    // official client's own read position (GroupLinkManagement.dom.tsx:
+    // 46-53 reads conversation.accessControl.addFromInviteLink), so the
+    // top-level-only capture stayed absent on every engine-mode sync and
+    // the group-link panel sat on its unsynced placeholder forever. When
+    // the top-level word is absent the capture falls back to the nested
+    // accessControl.addFromInviteLink word under the identical §4.180
+    // vocabulary and collapse rules; the top-level word keeps precedence
+    // when a face carries both (the pinned signal-cli JsonGroup shape) —
+    // a top-level word outside the vocabulary collapses the key and never
+    // blends with the nested face.
+    let link_access_word = group
+        .get("addFromInviteLink")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            group
+                .get("accessControl")
+                .and_then(|access| access.get("addFromInviteLink"))
+                .and_then(Value::as_str)
+        });
+    if let Some(word) = link_access_word
         && matches!(word, "ANY" | "ADMINISTRATOR" | "UNSATISFIABLE")
     {
         extra.insert("linkAccess".to_string(), json!(word));
@@ -12951,6 +12973,90 @@ mod tests {
         .unwrap();
         assert!(no_word.get("linkAccess").is_none());
 
+        // Contract 1.252 (§4.237): the engine face — the only runtime —
+        // never carries the top-level word; it rides inside accessControl
+        // (the official client's own read position). A top-level absence
+        // now falls back to the nested accessControl word under the
+        // identical §4.180 vocabulary; the nested UNKNOWN (the engine's
+        // unparsed fallback), MEMBER, and malformed values collapse to
+        // absent exactly like their top-level twins.
+        for word in ["ANY", "ADMINISTRATOR", "UNSATISFIABLE"] {
+            let extra = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+                members.as_array().unwrap(),
+                &json!({
+                    "id": "aWQ",
+                    "isMember": true,
+                    "accessControl": {"addFromInviteLink": word},
+                }),
+            ))
+            .unwrap();
+            assert_eq!(
+                extra["linkAccess"],
+                serde_json::json!(word),
+                "nested word {word} feeds the fallback"
+            );
+        }
+        for word in ["MEMBER", "UNKNOWN", "not-a-word"] {
+            let extra = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+                members.as_array().unwrap(),
+                &json!({
+                    "id": "aWQ",
+                    "isMember": true,
+                    "accessControl": {"addFromInviteLink": word},
+                }),
+            ))
+            .unwrap();
+            assert!(
+                extra.get("linkAccess").is_none(),
+                "nested word {word} collapses"
+            );
+        }
+        // A malformed nested shape (non-object accessControl, non-string
+        // word) drops silently — the capture never fails the sync.
+        let malformed_nested = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true, "accessControl": 7}),
+        ))
+        .unwrap();
+        assert!(malformed_nested.get("linkAccess").is_none());
+        let malformed_word = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({
+                "id": "aWQ",
+                "isMember": true,
+                "accessControl": {"addFromInviteLink": 7},
+            }),
+        ))
+        .unwrap();
+        assert!(malformed_word.get("linkAccess").is_none());
+        // The top-level word keeps precedence when a face carries both —
+        // the engine shape (nested only) and the pinned signal-cli shape
+        // (top-level only) are the only real faces; a blend never happens.
+        let both = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({
+                "id": "aWQ",
+                "isMember": true,
+                "addFromInviteLink": "ANY",
+                "accessControl": {"addFromInviteLink": "ADMINISTRATOR"},
+            }),
+        ))
+        .unwrap();
+        assert_eq!(both["linkAccess"], serde_json::json!("ANY"));
+        // A top-level word outside the vocabulary collapses the key and
+        // never falls through to the nested face — no cross-face guessing.
+        let top_invalid = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({
+                "id": "aWQ",
+                "isMember": true,
+                "addFromInviteLink": "not-a-word",
+                "accessControl": {"addFromInviteLink": "ANY"},
+            }),
+        ))
+        .unwrap();
+        assert!(top_invalid.get("linkAccess").is_none());
+
         // Contract 1.181 (§4.181): the announcements-only flag is captured
         // verbatim when the upstream JsonGroup carries the key (the engine's
         // listGroups always does — true and false both land); a face without
@@ -13031,8 +13137,12 @@ mod tests {
         // accessControl object projects arm by arm — only the two official
         // gate words (MEMBER / ADMINISTRATOR) ride; UNKNOWN/ANY/
         // UNSATISFIABLE and malformed shapes drop that arm, and the whole
-        // key is absent when none survives. addFromInviteLink stays on its
-        // own top-level linkAccess face (the nested word never leaks).
+        // key is absent when none survives. addFromInviteLink stays off
+        // the three-arm object (the §4.180 boundary is unchanged) — and
+        // since contract 1.252 (§4.237) its nested word feeds the
+        // linkAccess fallback: the batch-H-era "never leaks" pin recorded
+        // exactly the engine-mode linkAccess permanent absence this batch
+        // fixes, so the pin flips with it.
         let triple = serde_json::from_str::<serde_json::Value>(&group_extra_json(
             members.as_array().unwrap(),
             &json!({
@@ -13055,9 +13165,10 @@ mod tests {
                 "memberLabel": "MEMBER",
             })
         );
-        assert!(
-            triple.get("linkAccess").is_none(),
-            "the nested addFromInviteLink word stays out of linkAccess"
+        assert_eq!(
+            triple["linkAccess"],
+            json!("ADMINISTRATOR"),
+            "the nested addFromInviteLink word feeds the §4.237 linkAccess fallback"
         );
 
         // Each arm is independent: a partial object keeps only the valid arm.
