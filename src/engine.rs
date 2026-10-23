@@ -815,6 +815,14 @@ pub struct NormalizedRich {
     /// as mirror material, not as a diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_name: Option<String>,
+    /// Safety-number (identity-key) change marker (contract §4.226): the
+    /// peer's identity key changed and the connector landed the persisted
+    /// timeline system row. Set only by the service layer's
+    /// forward_identity_changed persist face — never by receive parsing
+    /// (the engine's identityChanged notification carries no message row).
+    /// The trust decision stays with the user (the §4.223 posture).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_identity_change: bool,
     /// Story-reply context (contract 1.76, §4.67): the dataMessage's
     /// `storyReply` face — {authorAci, sentTimestamp} verbatim, the story the
     /// reply answers. The reply itself is a normal DM/group row; absent on

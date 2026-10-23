@@ -9591,6 +9591,15 @@ impl ConnectorService {
 
     /// 契约 §4.226：对端安全码（身份钥）变更通知的转发（归因同
     /// forward_decryption_error：账号解析失败 warn-only 丢弃）。
+    ///
+    /// 落库半（台账 §27.11/§27.12）：ACI 能解析到本地直会话时，观测同步
+    /// 落一条持久化时间线系统行（history_import 群通知先例：
+    /// direction=system/status=system，rich 面带 is_identity_change 类型
+    /// 标记）。幂等键折叠
+    /// account+conversation+identityChanged+sourceUuid+timestamp——引擎侧
+    /// 重连重放（同一 client timestamp）经 INSERT OR IGNORE 折叠为同一行。
+    /// 解析或落库失败降级 warn-only：identity.changed 帧照常转发（桌面
+    /// 横幅/信任读面是主面，落行只是持久的时间线回声）。
     pub fn forward_identity_changed(
         &self,
         signal_account: &str,
@@ -9601,11 +9610,123 @@ impl ConnectorService {
         else {
             return Ok(Vec::new());
         };
-        Ok(vec![HostSideEvent::IdentityChanged {
+        // Row events ride first so the desktop renders the timeline row and
+        // the observation frame in one pass; the persist face never blocks
+        // the frame (warn-only on the store hiccup, the lane's discipline).
+        let row_events = self
+            .persist_identity_changed_row(&account.id, source_uuid, timestamp)
+            .unwrap_or_else(|_| {
+                tracing::warn!("identity-changed timeline row skipped; forwarding the frame only");
+                None
+            });
+        let mut events = row_events.unwrap_or_default();
+        events.push(HostSideEvent::IdentityChanged {
             account_id: account.id.clone(),
             source_uuid: source_uuid.to_string(),
             timestamp,
-        }])
+        });
+        Ok(events)
+    }
+
+    /// One identity-changed observation's persisted timeline echo: resolve
+    /// the peer's ACI to a local direct conversation and land the system
+    /// row (the group-notice precedent). `Ok(None)` — an empty ACI or an
+    /// unresolvable one, no local conversation row — lands nothing; the
+    /// observation frame still rides. A replay (the deterministic id already
+    /// present) is a no-op, never a duplicate row.
+    fn persist_identity_changed_row(
+        &self,
+        account_id: &str,
+        source_uuid: &str,
+        timestamp: Option<u64>,
+    ) -> Result<Option<Vec<HostSideEvent>>, ServiceError> {
+        if source_uuid.is_empty() {
+            return Ok(None);
+        }
+        let Some(conversation) = self
+            .store
+            .conversation_by_identity(account_id, source_uuid)?
+        else {
+            return Ok(None);
+        };
+        let sent_at = timestamp.unwrap_or_else(now_ms);
+        // 幂等键（台账 §27.12）；"signal-message-v2" 域前缀同全部消息行。
+        // timestamp 缺席的稀例退化为本机时钟——同刻重放各落一行，观测面
+        // 可容忍（横幅面不受影响）。
+        let id = stable_hash_id(&[
+            "signal-message-v2",
+            account_id,
+            &conversation.id,
+            "identityChanged",
+            source_uuid,
+            &sent_at.to_string(),
+        ]);
+        let sender_id = stable_hash_id(&[account_id, "direct", &conversation.peer_key]);
+        let text = "安全码已改变".to_string();
+        let rich = crate::engine::NormalizedRich {
+            is_identity_change: true,
+            ..Default::default()
+        };
+        let message = MessageRecord {
+            is_erased: false,
+            delete_failed: false,
+            required_protocol_version: None,
+            author_aci: None,
+            id,
+            account_id: account_id.to_string(),
+            conversation_id: conversation.id.clone(),
+            direction: "system",
+            sender_id,
+            // The notice row carries no author-name copy — the desktop
+            // joins its name ladder from the sender face (the system-row
+            // family posture).
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: Some(now_ms()),
+            text: Some(text.clone()),
+            text_bytes: Some(text.len().min(u32::MAX as usize) as u32),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "system",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(rich),
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            admin_deleted: false,
+            sticker: None,
+            // The notice row never sweeps (§4.41 posture): the columns stay
+            // NULL — a safety-number notice carries no deadline of its own.
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        let inserted = self.store.insert_message(&message, None, None, false)?;
+        if !inserted {
+            return Ok(None);
+        }
+        let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
+            message,
+        ))];
+        if let Some(summary) = self
+            .store
+            .conversation_summary(account_id, &conversation.id)?
+        {
+            events.push(HostSideEvent::ConversationChanged(summary));
+        }
+        Ok(Some(events))
     }
 
     /// The lane's single attribution point: the signal account resolves
@@ -33871,6 +33992,94 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
         (account, conversation)
+    }
+
+    /// 契约 §4.226 落库半（台账 §27.11/§27.12）：ACI 解析到本地直会话时，
+    /// 观测同步落持久化时间线系统行——行事件在前（MessageUpserted +
+    /// ConversationChanged）、观测帧在后（IdentityChanged）；行形态照群通知
+    /// 先例 direction=system/status=system，rich 面带 is_identity_change。
+    #[test]
+    fn identity_changed_lands_a_persisted_timeline_system_row() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        const ACI: &str = "11111111-1111-1111-1111-111111111111";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, ACI, &conversation.peer_key)
+            .unwrap();
+
+        const SENT_AT: u64 = 1_729_600_000_000;
+        let events = service
+            .forward_identity_changed("+15555550100", ACI, Some(SENT_AT))
+            .unwrap();
+        let [
+            HostSideEvent::MessageUpserted(row),
+            HostSideEvent::ConversationChanged(_),
+            HostSideEvent::IdentityChanged {
+                account_id,
+                source_uuid,
+                timestamp,
+            },
+        ] = &events[..]
+        else {
+            panic!("expected row events then the observation frame, got {events:?}");
+        };
+        assert_eq!(row.direction, "system");
+        assert_eq!(row.status, "system");
+        assert_eq!(row.text.as_deref(), Some("安全码已改变"));
+        assert_eq!(row.conversation_id, conversation.id);
+        assert_eq!(row.sent_at, SENT_AT);
+        let rich = row.rich.as_ref().unwrap();
+        assert!(rich.is_identity_change);
+        // 幂等键（台账 §27.12）：account+conv+identityChanged+sourceUuid+ts。
+        assert_eq!(
+            row.id,
+            stable_hash_id(&[
+                "signal-message-v2",
+                &account.id,
+                &conversation.id,
+                "identityChanged",
+                ACI,
+                &SENT_AT.to_string(),
+            ])
+        );
+        assert_eq!(account_id, &account.id);
+        assert_eq!(source_uuid, ACI);
+        assert_eq!(*timestamp, Some(SENT_AT));
+
+        // 同一通知的引擎侧重放（同一 timestamp）折叠为同一行：重放只回
+        // 观测帧，不再落行、不再报会话变更。
+        let replay = service
+            .forward_identity_changed("+15555550100", ACI, Some(SENT_AT))
+            .unwrap();
+        assert_eq!(replay.len(), 1);
+        assert!(matches!(&replay[0], HostSideEvent::IdentityChanged { .. }));
+    }
+
+    /// 解析不到本地直会话（未知 ACI / 空 ACI）时只转发观测帧，落零行——
+    /// 观测面（横幅）不受影响，时间线不为未归属的 ACI 造会话。
+    #[test]
+    fn identity_changed_without_a_local_conversation_forwards_frame_only() {
+        let (_temp, mut service) = service();
+        // 只需一个已绑账号：未知 ACI 的观测帧仍转发（账号归因过闸），
+        // 落库面因无直会话而静默缺席。
+        let _ = linked_account_and_conversation(&mut service);
+        const UNKNOWN_ACI: &str = "22222222-2222-2222-2222-222222222222";
+
+        let events = service
+            .forward_identity_changed("+15555550100", UNKNOWN_ACI, Some(7))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            HostSideEvent::IdentityChanged { source_uuid, .. } if source_uuid == UNKNOWN_ACI
+        ));
+
+        let events = service
+            .forward_identity_changed("+15555550100", "", Some(7))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], HostSideEvent::IdentityChanged { .. }));
     }
 
     fn seed_outgoing_sent(

@@ -3944,6 +3944,40 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
+    /// The identity-changed persist face's reverse lookup (contract §4.226,
+    /// ledger §27.12): resolve one direct conversation from the peer's ACI.
+    /// The ladder matches the conversation's stored `peer_key` spelling —
+    /// the ACI itself, or through the `peer_identities` mapping (a
+    /// number-keyed conversation whose ACI the identity capture learned).
+    /// Read-only, creates nothing: an unknown ACI answers None and the
+    /// caller forwards the observation without a timeline row.
+    pub fn conversation_by_identity(
+        &self,
+        account_id: &str,
+        aci: &str,
+    ) -> Result<Option<ConversationRow>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT id, account_id, kind, peer_key FROM conversations
+                 WHERE account_id=?1 AND kind='direct' AND peer_key IN (
+                     SELECT peer_key FROM peer_identities WHERE account_id=?1 AND aci=?2
+                     UNION SELECT ?2
+                 )
+                 ORDER BY peer_key LIMIT 1",
+                params![account_id, aci],
+                |row| {
+                    Ok(ConversationRow {
+                        id: row.get(0)?,
+                        account_id: row.get(1)?,
+                        kind: row.get(2)?,
+                        peer_key: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
     /// Direct chats that may still show a masked peer id as title.
     pub fn list_direct_peers_needing_title(
         &self,
