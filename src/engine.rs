@@ -815,6 +815,19 @@ pub struct NormalizedRich {
     /// as mirror material, not as a diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_name: Option<String>,
+    /// The structured group-state-change material (contract §4.227): the
+    /// official `GroupV2ChangeType` detail vocabulary the desktop's
+    /// GroupV2Change renderer consumes — the bounded verbatim `changes[]`
+    /// (the GroupV2ChangeDetailType word list the engine already projects on
+    /// the transient `groupChanged` event, §4.81), the resulting `revision`
+    /// and the `editor` ACI when the producer named one. The disappearing-
+    /// timer leg stays off this shape (the official keeps no timer detail
+    /// type — that change rides its own §4.41 face). Today's live
+    /// `groupInfo` projection carries none of the keys (`{groupId}` only,
+    /// §4.44 mirror posture) — the face parses when a producer lands them;
+    /// presence without material stays `None`, never an empty shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_change: Option<NormalizedGroupChange>,
     /// Safety-number (identity-key) change marker (contract §4.226): the
     /// peer's identity key changed and the connector landed the persisted
     /// timeline system row. Set only by the service layer's
@@ -901,6 +914,27 @@ pub struct NormalizedStoryReply {
     pub sent_timestamp: u64,
 }
 
+/// One structured group-state change (contract §4.227): the official
+/// `GroupV2ChangeType` material — the bounded verbatim `changes[]` detail
+/// list (the official `GroupV2ChangeDetailType` word list: title, avatar,
+/// description, the access-*/group-link-* privilege family and the
+/// member-*/pending-*/admin-approval-* membership family, exactly what the
+/// engine's transient `groupChanged` event already carries, §4.81), the
+/// resulting `revision` and the `editor` ACI when the producer named them.
+/// The timer leg stays off (official: no timer detail type — §4.41's own
+/// face); `from` rides as `editor`, the §4.81 wire name the connector
+/// pinned for the same vocabulary.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedGroupChange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<serde_json::Value>,
+}
+
 /// One sent-transcript sealed-sender entry (contract 1.107, §4.88): the
 /// engine's `Sent.unidentifiedStatus[]` item forwarded verbatim — the
 /// destination's service-id string (PNI-prefixed for a PNI destination, the
@@ -945,6 +979,7 @@ impl NormalizedRich {
             && !self.is_expiration_update
             && !self.is_group_update
             && self.group_name.is_none()
+            && self.group_change.is_none()
             && self.story_reply.is_none()
             && self.contact.is_none()
             && self.poll.is_none()
@@ -5688,6 +5723,13 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
                     .take(GROUP_UPDATE_TITLE_MIRROR_CHARS)
                     .collect::<String>()
             });
+        // Structured material (§4.227): only an UPDATE row carries the
+        // change vocabulary — a DELIVER face with stray keys is a hostile or
+        // malformed shape and keeps no face (the marker is the gate, the
+        // §4.44 posture).
+        if rich.is_group_update {
+            rich.group_change = normalized_group_change(info);
+        }
     }
     // The engine's P14 dataMessage protocol stamp and Sent-transcript faces
     // (contract 1.107, §4.88): `expireTimerVersion` forwards when positive
@@ -6902,12 +6944,55 @@ fn group_update_text() -> Option<NormalizedText> {
     normalized_text("群聊信息已更新")
 }
 
+/// The structured group-change face off one `groupInfo` object (§4.227):
+/// the bounded verbatim `changes[]` — entries past the
+/// `GROUP_CHANGED_MAX_CHANGES` cap truncate, material over the coarse
+/// `MAX_GROUP_CHANGED_BYTES` guard drops the whole face (宁缺勿错, never a
+/// truncated lie — the §4.81 posture) — the resulting `revision` when it
+/// names a real u32, and the `editor` ACI under the shared bounded form.
+/// Presence without material (`changes` missing/empty) is no face — the
+/// §4.38 import chain's `details` posture; a face without `changes` can
+/// never exist.
+fn normalized_group_change(info: &serde_json::Map<String, Value>) -> Option<NormalizedGroupChange> {
+    let raw_changes = info.get("changes")?.as_array()?;
+    if raw_changes.is_empty() {
+        return None;
+    }
+    let mut bounded = raw_changes.clone();
+    bounded.truncate(crate::service::GROUP_CHANGED_MAX_CHANGES);
+    if serde_json::to_string(&bounded)
+        .is_ok_and(|material| material.len() > MAX_GROUP_CHANGED_BYTES)
+    {
+        return None;
+    }
+    let revision = info
+        .get("revision")
+        .and_then(Value::as_u64)
+        .and_then(|revision| u32::try_from(revision).ok());
+    let editor = info
+        .get("editor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|aci| !aci.is_empty() && aci.len() <= GROUP_UPDATED_EDITOR_MAX_BYTES)
+        .map(str::to_string);
+    Some(NormalizedGroupChange {
+        revision,
+        editor,
+        changes: bounded,
+    })
+}
+
 /// The rich marker a group-update row carries (§4.44): the flag plus the
-/// engine's post-change title when the update supplied one.
-fn group_update_rich(group_name: Option<String>) -> NormalizedRich {
+/// engine's post-change title when the update supplied one, and the
+/// structured §4.227 change vocabulary when the update carried it.
+fn group_update_rich(
+    group_name: Option<String>,
+    group_change: Option<NormalizedGroupChange>,
+) -> NormalizedRich {
     NormalizedRich {
         is_group_update: true,
         group_name,
+        group_change,
         ..Default::default()
     }
 }
@@ -7315,6 +7400,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                     Vec::new(),
                     Some(group_update_rich(
                         rich.as_ref().and_then(|rich| rich.group_name.clone()),
+                        rich.as_ref().and_then(|rich| rich.group_change.clone()),
                     )),
                     None,
                 ));
@@ -7630,6 +7716,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 Vec::new(),
                 Some(group_update_rich(
                     rich.as_ref().and_then(|rich| rich.group_name.clone()),
+                    rich.as_ref().and_then(|rich| rich.group_change.clone()),
                 )),
                 None,
             ));
@@ -15089,6 +15176,186 @@ mod tests {
         let rich = normalize.rich.expect("timer row carries rich");
         assert!(rich.is_expiration_update);
         assert!(!rich.is_group_update);
+    }
+
+    /// Contract §4.227: a structured `groupInfo.changes[]` face rides the
+    /// group-update row verbatim — the official detail vocabulary the
+    /// desktop's GroupV2Change renderer consumes — beside the resulting
+    /// `revision` and the bounded `editor`. The wire key is the camelCase
+    /// `groupChange`; a marker-only rich serializes no such key (the serde
+    /// skip discipline every rich face keeps).
+    #[test]
+    fn group_change_structured_face_rides_the_update_row() {
+        let changes = json!([
+            { "type": "title", "newTitle": "Renamed" },
+            {
+                "type": "member-add",
+                "aci": "22222222-3333-4444-8555-666666666666",
+            },
+        ]);
+        let normalized = normalize_receive_fields(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "ZmFrZS1ncm91cC0x",
+                        "type": "UPDATE",
+                        "revision": 7u64,
+                        "editor": "11111111-2222-4333-8444-555555555555",
+                        "changes": changes,
+                    },
+                },
+            },
+        }))
+        .unwrap();
+        assert_eq!(normalized.direction, "system");
+        assert_eq!(normalized.text.as_deref(), Some("群聊信息已更新"));
+        let rich = normalized.rich.expect("update row carries rich");
+        assert!(rich.is_group_update);
+        let face = rich.group_change.as_ref().expect("structured face parses");
+        assert_eq!(face.revision, Some(7));
+        assert_eq!(
+            face.editor.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(Value::Array(face.changes.clone()), changes);
+
+        // The wire face is the camelCase `groupChange` object, the changes
+        // verbatim; a marker-only rich carries no such key at all.
+        let wire = serde_json::to_value(&rich).unwrap();
+        assert_eq!(wire["groupChange"]["revision"], json!(7));
+        assert_eq!(
+            wire["groupChange"]["editor"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(wire["groupChange"]["changes"], changes);
+        let bare = serde_json::to_value(NormalizedRich {
+            is_group_update: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            bare.get("groupChange").is_none(),
+            "an absent face stays off the wire"
+        );
+
+        // A body-carrying update keeps the face beside the body row.
+        let body = normalize_receive_fields(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "dataMessage": {
+                    "message": "renamed us",
+                    "groupInfo": {
+                        "groupId": "ZmFrZS1ncm91cC0x",
+                        "type": "UPDATE",
+                        "changes": [{ "type": "title", "newTitle": "New Name" }],
+                    },
+                },
+            },
+        }))
+        .unwrap();
+        assert_eq!(body.direction, "incoming");
+        let rich = body.rich.expect("body row carries the marker");
+        assert!(rich.is_group_update);
+        let face = rich.group_change.expect("body row carries the face");
+        assert_eq!(face.revision, None);
+        assert_eq!(face.editor, None);
+        assert_eq!(
+            Value::Array(face.changes.clone()),
+            json!([{ "type": "title", "newTitle": "New Name" }])
+        );
+    }
+
+    /// Contract §4.227 degradation arms: entries past the §4.81 change cap
+    /// truncate, material over the coarse byte guard drops the whole face
+    /// (宁缺勿错), presence without material (`changes` missing/empty) is no
+    /// face, a DELIVER face with stray keys keeps nothing (the marker is the
+    /// gate), and per-key hostile shapes (oversized editor, out-of-range
+    /// revision) drop the key and never the face.
+    #[test]
+    fn group_change_face_degrades_per_guard() {
+        let normalize = |info: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": { "groupInfo": info },
+                },
+            }))
+            .unwrap()
+        };
+        let update = |info: serde_json::Value| {
+            let mut object = info;
+            object["groupId"] = json!("ZmFrZS1ncm91cC0x");
+            object["type"] = json!("UPDATE");
+            object
+        };
+
+        // Entries past the cap truncate to the §4.81 ceiling.
+        let many: Vec<serde_json::Value> = (0..crate::service::GROUP_CHANGED_MAX_CHANGES + 1)
+            .map(|_| json!({ "type": "summary" }))
+            .collect();
+        let rich = normalize(update(json!({ "changes": many })))
+            .rich
+            .expect("truncation keeps the row");
+        let face = rich.group_change.expect("capped face stays a face");
+        assert_eq!(
+            face.changes.len(),
+            crate::service::GROUP_CHANGED_MAX_CHANGES
+        );
+        assert_eq!(face.revision, None);
+        assert_eq!(face.editor, None);
+
+        // Material over the coarse byte guard drops the whole face — the row
+        // and its marker survive.
+        let huge = json!([{ "type": "description", "description": "x".repeat(70_000) }]);
+        let rich = normalize(update(json!({ "changes": huge })))
+            .rich
+            .expect("the byte guard drops the face, never the row");
+        assert!(rich.is_group_update);
+        assert!(rich.group_change.is_none(), "宁缺勿错: no truncated lie");
+
+        // Presence without material: no changes key, or an empty one — no
+        // face, even with revision/editor material beside.
+        for info in [
+            json!({ "revision": 3u64, "editor": "11111111-2222-4333-8444-555555555555" }),
+            json!({ "changes": [], "revision": 3u64 }),
+            json!({ "changes": "not-an-array" }),
+        ] {
+            let rich = normalize(update(info)).rich.expect("marker-only row");
+            assert!(
+                rich.group_change.is_none(),
+                "presence without material is no face"
+            );
+        }
+
+        // A DELIVER face with stray keys keeps nothing — the UPDATE marker is
+        // the face's gate, and a bodyless DELIVER stays a plain skip.
+        let deliver = normalize(json!({
+            "groupId": "ZmFrZS1ncm91cC0x",
+            "type": "DELIVER",
+            "changes": [{ "type": "title", "newTitle": "nope" }],
+        }));
+        assert_eq!(deliver.direction, "skip");
+        assert!(deliver.rich.is_none());
+
+        // Per-key hostile shapes drop the key and never the face.
+        let rich = normalize(update(json!({
+            "changes": [{ "type": "summary" }],
+            "editor": "e".repeat(65),
+            "revision": u64::from(u32::MAX) + 1,
+        })))
+        .rich
+        .expect("hostile keys never sink the face");
+        let face = rich.group_change.expect("the face survives");
+        assert_eq!(face.editor, None, "oversized editor drops");
+        assert_eq!(face.revision, None, "out-of-range revision drops");
+        assert_eq!(
+            Value::Array(face.changes.clone()),
+            json!([{ "type": "summary" }])
+        );
     }
 
     #[test]
