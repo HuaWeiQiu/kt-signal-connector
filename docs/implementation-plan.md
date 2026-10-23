@@ -18676,7 +18676,58 @@ UUID 键直聊行上可能开始出现（材料全部来自本机已持有的桥
 归一 + 桥缺席诚实缺席）；写面 passive/pull 双路（changed 携真实行 id +
 真名不覆盖）。
 
-## §4.231 时间线行族 · A2「联系人加入 Signal」行（批 A，契约 1.250）
+
+---
+
+## §4.231 群访问控制三臂透传（accessControl attributes/members/memberLabel · 契约 1.221）
+
+**背景**：官方三个派生函数带「非管理员臂」——`canEditGroupInfo`
+（canEditGroupInfo.preload.ts:24-31，`accessControl?.attributes === MEMBER`）、
+`canAddNewMembers`（canAddNewMembers.preload.ts:24-28，
+`accessControl?.members === MEMBER`）、`getCanAddLabel`
+（GroupMemberLabels.std.ts:26-38，`accessControlMemberLabel === MEMBER`）。
+桌面三门此前收敛为 `areWeAdmin ∧ capability ∧ !terminated`，全员可编辑/可加人/
+可加标签的群里非管理员成员少四处可见性。引擎 `listGroups` 自 P5 批
+（`b991076`）已投影 `accessControl{attributes,members,addFromInviteLink,
+memberLabel}` 四族词表——本批把其中三臂透传到 `groups.get`，并让
+`groups.update` 接受 member-label 权限写意图（引擎写臂缺席 → 整调
+`CAPABILITY_UNAVAILABLE` 诚实拒绝，与既有 add-member/edit-details 两臂同
+纪律）。
+
+**wire（additive absent-key）**：
+
+| 键 | 形状 | 语义 | 缺席语义 |
+|---|---|---|---|
+| accessControl | `{attributes?, members?, memberLabel?}` | 上次同步捕获的官方访问控制词 | pre-1.221 行 / 引擎无该面 = 键缺席（桌面回落旧 admin-only 门） |
+| accessControl.* | `"MEMBER" \| "ADMINISTRATOR"` | 逐臂独立投影 | `UNKNOWN`/`ANY`/`UNSATISFIABLE`/坏形状 = 该臂缺席（unknown, never a lie） |
+
+- 捕获点在 `group_extra_json`（contacts.sync 群行 extra）：只读引擎
+  `listGroups` 条目的 `accessControl` 对象；`addFromInviteLink` 仍走独立
+  `linkAccess` 面（§4.180），不混入三臂。
+- 读面在 `store_get_group_with_requesting`：逐臂再验词表，坏存值丢该臂、
+  绝不 fail 读（isTerminated/linkAccess 同纪律）。
+- `permissionMemberLabel`（groups.update，every-member | only-admins）上行
+  映射 `setPermissionMemberLabel`；引擎 updateGroup 无 access-control 写臂，
+  因此落入整调拒绝面（§4.44 的 whole-call refusal，error 文案列出
+  `permissionMemberLabel`），绝不部分应用。
+
+**桌面消费**：`SignalGroupDetails.accessControl` 形状闸（hostAdapter：在场
+必须是对象，三臂各自 enum 闸，坏形状 retryable UPSTREAM_ERROR）；信息页三门
+`areWeAdmin || accessControl?.<arm> === 'MEMBER'`，权限区第四行
+（member-label）+ 非管理员有标签时的清除警告（GVP:43-55/130-187 官方
+zh/en 逐字）。
+
+**测试**：捕获臂（三臂齐全 / 部分臂 / 词表外逐臂丢 / 无对象缺席）；读面
+（命中 / 坏存值丢臂 / 旧行缺席）；groups.update 拒绝臂名字面量。
+
+---
+
+> **合流重编（台账 §29.38）**：批 H 的 §4.231（群访问控制三臂）为契约号准，
+> 批 A 的时间线行族四节原为 §4.231-§4.234，与 H 同号，故整体顺延为
+> §4.232-§4.235（保持 A2→A5 原序）；批 B 的消息请求因子节再顺延为 §4.236。
+> 上游 wire 面零变化，仅契约标号归一。
+
+## §4.232 时间线行族 · A2「联系人加入 Signal」行（批 A，契约 1.250）
 
 **官方对位**（upstream Signal-Desktop 只读零抄码，AGPL）：行源 =
 `simpleUpdate.type === JOINED_SIGNAL` → 消息 type
@@ -18698,14 +18749,14 @@ status=system + rich 标记）。词表外词整面不落行并计入 skippedMes
 `joined-signal-notification`）——本行族只有档案面，如实记档（无假 live
 投影）。
 
-## §4.232 时间线行族 · A3「对方更改手机号码」行（批 A，契约 1.250）
+## §4.233 时间线行族 · A3「对方更改手机号码」行（批 A，契约 1.250）
 
 **官方对位**：行源 = `simpleUpdate.type === CHANGE_NUMBER` → 消息 type
 `change-number-notification`（import.preload.ts:3837-3840）；
 ChangeNumberNotification.dom.tsx:25-47 SystemMessage icon="phone" +
 icu:ChangeNumber--notification（{sender} = 行作者显示名）。
 
-**数据面**：同 §4.231 的 `simpleUpdate` 面；本族署名 = 档案行 authorId →
+**数据面**：同 §4.232 的 `simpleUpdate` 面；本族署名 = 档案行 authorId →
 §4.38 作者阶梯（recipient → 可寻址身份 + 档案捕获名），解析不到的档案行
 署名缺席（桌面走官方空名臂，绝不拿会话身份冒充作者）。
 
@@ -18717,7 +18768,7 @@ icu:ChangeNumber--notification（{sender} = 行作者显示名）。
 号码历史），本批不造假 live 行；回访触发 = 联系身份重键批（号码历史列）
 落地时。
 
-## §4.233 时间线行族 · A4「标题过渡」行（批 A，契约 1.250）
+## §4.234 时间线行族 · A4「标题过渡」行（批 A，契约 1.250）
 
 **官方对位**：行源 = `learnedProfileChange.previousName` →
 `title-transition-notification`（import.preload.ts:2957-2981），
@@ -18741,7 +18792,7 @@ isTitleTransitionNotification 同判 `titleTransition != null`）；material
 用户名标题发过消息」）。本批只落档案面；回访触发 = 直聊标题过渡 live
 批（需在 profile 到站写点做旧标题差分 + outgoing 存在性闸）。
 
-## §4.234 时间线行族 · A5「会话合并」提示（批 A，契约 1.251）
+## §4.235 时间线行族 · A5「会话合并」提示（批 A，契约 1.251）
 
 **官方对位**：行源 = `threadMerge.previousE164` → `conversation-merge`
 （import.preload.ts:2983-2997，renderInfo {type:'private', e164}）；呈现 =

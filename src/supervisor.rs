@@ -9341,7 +9341,12 @@ fn fold_invite_candidates(
 /// when it fits whole (the label discipline: an over-budget description
 /// drops rather than truncating into a lie); engines without the face (the
 /// pinned signal-cli JsonGroup) never set the key, and the captured value
-/// is cache material only, never logged.
+/// is cache material only, never logged. `accessControl` (contract 1.221,
+/// §4.231) is the engine listGroups entry's three-arm object, projected arm
+/// by arm: only MEMBER / ADMINISTRATOR ride (the official gate words the
+/// desktop's canEditGroupInfo / canAddNewMembers / getCanAddLabel read);
+/// every other word and every malformed shape drops that arm, and the whole
+/// key is absent when no arm survives — unknown, never a lie.
 fn group_extra_json(members: &[Value], group: &Value) -> String {
     let admin_ids: std::collections::BTreeSet<String> = group
         .get("admins")
@@ -9403,7 +9408,7 @@ fn group_extra_json(members: &[Value], group: &Value) -> String {
             Some(Value::Object(projected))
         })
         .collect();
-    let mut extra = serde_json::Map::with_capacity(3);
+    let mut extra = serde_json::Map::with_capacity(4);
     extra.insert("memberCount".to_string(), json!(members.len()));
     extra.insert("members".to_string(), Value::Array(roster));
     if group.get("isTerminated").and_then(Value::as_bool) == Some(true) {
@@ -9420,6 +9425,32 @@ fn group_extra_json(members: &[Value], group: &Value) -> String {
         && matches!(word, "ANY" | "ADMINISTRATOR" | "UNSATISFIABLE")
     {
         extra.insert("linkAccess".to_string(), json!(word));
+    }
+    // Contract 1.221 (§4.231): the engine listGroups entry's accessControl
+    // object (`{attributes, members, addFromInviteLink, memberLabel}`,
+    // engine P5 b991076 — the official ConversationType arms at
+    // getConversation.preload.ts:226-228). Only the three gate arms ride,
+    // and each only in the official two gate words: MEMBER / ADMINISTRATOR.
+    // UNKNOWN/ANY/UNSATISFIABLE and malformed values collapse that arm to
+    // absence (unknown, never a lie); the whole key is absent when no arm
+    // survives, so pre-1.221 rows stay byte-identical. addFromInviteLink
+    // stays on its own linkAccess face above — different vocabulary.
+    let mut access_control = serde_json::Map::new();
+    if let Some(access) = group.get("accessControl").and_then(Value::as_object) {
+        for (key, host) in [
+            ("attributes", "attributes"),
+            ("members", "members"),
+            ("memberLabel", "memberLabel"),
+        ] {
+            if let Some(word) = access.get(key).and_then(Value::as_str)
+                && matches!(word, "MEMBER" | "ADMINISTRATOR")
+            {
+                access_control.insert(host.to_string(), json!(word));
+            }
+        }
+    }
+    if !access_control.is_empty() {
+        extra.insert("accessControl".to_string(), Value::Object(access_control));
     }
     // Contract 1.181 (§4.181): the announcements-only flag the upstream
     // JsonGroup carries verbatim (the engine's listGroups always does; the
@@ -12822,6 +12853,90 @@ mod tests {
         ))
         .unwrap();
         assert!(malformed_description.get("description").is_none());
+
+        // Contract 1.221 (§4.231): the engine listGroups entry's
+        // accessControl object projects arm by arm — only the two official
+        // gate words (MEMBER / ADMINISTRATOR) ride; UNKNOWN/ANY/
+        // UNSATISFIABLE and malformed shapes drop that arm, and the whole
+        // key is absent when none survives. addFromInviteLink stays on its
+        // own top-level linkAccess face (the nested word never leaks).
+        let triple = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({
+                "id": "aWQ",
+                "isMember": true,
+                "accessControl": {
+                    "attributes": "MEMBER",
+                    "members": "ADMINISTRATOR",
+                    "memberLabel": "MEMBER",
+                    "addFromInviteLink": "ADMINISTRATOR",
+                },
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            triple["accessControl"],
+            json!({
+                "attributes": "MEMBER",
+                "members": "ADMINISTRATOR",
+                "memberLabel": "MEMBER",
+            })
+        );
+        assert!(
+            triple.get("linkAccess").is_none(),
+            "the nested addFromInviteLink word stays out of linkAccess"
+        );
+
+        // Each arm is independent: a partial object keeps only the valid arm.
+        let partial = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({
+                "id": "aWQ",
+                "isMember": true,
+                "accessControl": {"members": "MEMBER"},
+            }),
+        ))
+        .unwrap();
+        assert_eq!(partial["accessControl"], json!({"members": "MEMBER"}));
+
+        // Every other word and shape collapses that arm; an all-invalid
+        // object leaves the whole key absent (unknown, never a lie).
+        let rejected = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({
+                "id": "aWQ",
+                "isMember": true,
+                "accessControl": {
+                    "attributes": "UNKNOWN",
+                    "members": "ANY",
+                    "memberLabel": "UNSATISFIABLE",
+                },
+            }),
+        ))
+        .unwrap();
+        assert!(rejected.get("accessControl").is_none());
+        let malformed = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({
+                "id": "aWQ",
+                "isMember": true,
+                "accessControl": {"attributes": 7, "members": null},
+            }),
+        ))
+        .unwrap();
+        assert!(malformed.get("accessControl").is_none());
+        let not_an_object = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true, "accessControl": "MEMBER"}),
+        ))
+        .unwrap();
+        assert!(not_an_object.get("accessControl").is_none());
+        let absent = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true}),
+        ))
+        .unwrap();
+        assert!(absent.get("accessControl").is_none());
     }
 
     #[test]

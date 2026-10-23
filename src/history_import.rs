@@ -538,7 +538,7 @@ impl<'a> Importer<'a> {
             .get("expirationTimerChange")
             .and_then(Value::as_object);
         let group_update = import_group_update(value.get("groupUpdate"));
-        // 批 A（connector §4.231-§4.234）：非气泡 update 三面（engine §5
+        // 批 A（connector §4.232-§4.235）：非气泡 update 三面（engine §5
         // 快照面 simpleUpdate/learnedProfileChange/threadMerge）——官方 import
         // 把它们落成时间线系统行（import.preload.ts:3837-3854 / :2957-2997），
         // 与 timer/group 两族同款：行源是会话级状态，不受档案行方向影响。
@@ -926,7 +926,7 @@ impl<'a> Importer<'a> {
         Ok(())
     }
 
-    /// 批 A 系统行族公共铸造点（connector §4.231-§4.234；行身份与 live 的
+    /// 批 A 系统行族公共铸造点（connector §4.232-§4.235；行身份与 live 的
     /// timer/group 通知行同构——deterministic id + direction=system +
     /// status=system + rich 标记）。`family` 是行族判别词，进幂等键：同一
     /// 会话同一 `sent_at` 的不同族行不撞 id；同族重放（重跑导入）经
@@ -1025,7 +1025,7 @@ impl<'a> Importer<'a> {
         Some((sender_id, name))
     }
 
-    /// 批 A · A2/A3（connector §4.231/§4.232）：官方 simpleUpdate 词表的
+    /// 批 A · A2/A3（connector §4.232/§4.233）：官方 simpleUpdate 词表的
     /// 两族行（import.preload.ts:3837-3854 逐臂）——JOINED_SIGNAL →
     /// 「联系人加入 Signal」、CHANGE_NUMBER → change-number 行（官方带
     /// sourceServiceId 署名；档案行按 authorId → 可寻址身份解析，解析不到
@@ -1077,7 +1077,7 @@ impl<'a> Importer<'a> {
         }
     }
 
-    /// 批 A · A4（connector §4.233）：标题过渡行——官方
+    /// 批 A · A4（connector §4.234）：标题过渡行——官方
     /// learnedProfileChange.previousName 的 e164/username 二选一解析成
     /// oldTitle（官方 getTitle 输出形：号码场 +E164 逐字、用户名场原值），
     /// 行材料 rich.titleTransition{oldTitle} + 中文原文兜底。缺材料整面不落行
@@ -1120,7 +1120,7 @@ impl<'a> Importer<'a> {
         .map(|()| true)
     }
 
-    /// 批 A · A5（connector §4.234）：会话合并行——官方 threadMerge 的
+    /// 批 A · A5（connector §4.235）：会话合并行——官方 threadMerge 的
     /// previousE164（strictAssert 必在）→ renderInfo{type:'private', e164}；
     /// 官方 selector 对该 renderInfo 的解析产物 = obsoleteConversationTitle
     /// 与 obsoleteConversationNumber 同为该号码（getTitleNoDefault 的号码
@@ -1892,7 +1892,7 @@ fn non_empty(text: &str) -> Option<&str> {
 /// (64 hex) — the caps are generous multiples over the real shapes, tight
 /// enough that a hostile line cannot bloat the column. cdnKey is an opaque
 /// server string (official URLs carry ~40-80 chars).
-/// 批 A（§4.233）：标题过渡行的旧标题材料上限——官方 oldTitle 是号码/用户名
+/// 批 A（§4.234）：标题过渡行的旧标题材料上限——官方 oldTitle 是号码/用户名
 /// 尺度（一个 E.164 ≤ 16 字符、用户名 ≤ 64），128 是宽裕上界；超长截断保留
 /// 可读前缀（与 contact/mention 名的 renderable-prefix 纪律同款）。
 const MAX_NOTICE_TITLE_CHARS: usize = 128;
@@ -3453,7 +3453,7 @@ mod tests {
         assert_eq!(row.attempts, 2);
     }
 
-    /// 批 A（connector §4.231-§4.234）：非气泡 update 三面落行钉形——
+    /// 批 A（connector §4.232-§4.235）：非气泡 update 三面落行钉形——
     /// simpleUpdate 两词（JOINED_SIGNAL/CHANGE_NUMBER）、learnedProfileChange
     /// （e164/username 双臂）、threadMerge（号码面），每族一条系统行 + rich
     /// 标记 + 中文原文兜底；词表外与缺材料整面不落行但 skipped 可见。

@@ -851,21 +851,21 @@ pub struct NormalizedRich {
     /// The trust decision stays with the user (the §4.223 posture).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_identity_change: bool,
-    /// 批 A · A2（connector §4.231；桌面契约 1.250）：「联系人加入 Signal」
+    /// 批 A · A2（connector §4.232；桌面契约 1.250）：「联系人加入 Signal」
     /// 系统行标记——官方 message.type `joined-signal-notification` 的行级
     /// 投影（官方 import 行源 import.preload.ts:3851-3854 的 simpleUpdate
     /// JOINED_SIGNAL 臂；engine §5 快照面 simpleUpdate{type}）。仅真值出现
     /// （serde 跳过假值）；键缺席 = 非该族行。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_joined_signal: bool,
-    /// 批 A · A3（connector §4.232；桌面契约 1.250）：对方更改手机号码系统行
+    /// 批 A · A3（connector §4.233；桌面契约 1.250）：对方更改手机号码系统行
     /// 标记——官方 message.type `change-number-notification`（import 行源
     /// import.preload.ts:3837-3840 CHANGE_NUMBER 臂）。仅有 archive 面——
     /// live 面（官方 updateE164 本地通知链）本连接器无 e164 差分源，记档
     /// 另案。仅真值出现。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_change_number: bool,
-    /// 批 A · A4（connector §4.233；桌面契约 1.250）：标题过渡系统行材料——
+    /// 批 A · A4（connector §4.234；桌面契约 1.250）：标题过渡系统行材料——
     /// 官方 message.type `title-transition-notification` 的
     /// `titleTransition.renderInfo` 经 getTitle 解析后的 oldTitle（官方
     /// import 行源 import.preload.ts:2957-2981 learnedProfileChange.previousName
@@ -873,7 +873,7 @@ pub struct NormalizedRich {
     /// 即官方 getTitle 的输出）；缺材料整面缺席。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_transition: Option<NormalizedTitleTransition>,
-    /// 批 A · A5（connector §4.234；桌面契约 1.251）：会话合并系统行材料——
+    /// 批 A · A5（connector §4.235；桌面契约 1.251）：会话合并系统行材料——
     /// 官方 message.type `conversation-merge`（官方 import 行源
     /// import.preload.ts:2983-2997 threadMerge.previousE164 → renderInfo
     /// {type:'private', e164}）。官方 selector 的 conversationTitle 取自
@@ -947,7 +947,7 @@ pub struct NormalizedRich {
     pub story_message_recipients: Vec<NormalizedStoryRecipient>,
 }
 
-/// 批 A · A4（connector §4.233）：标题过渡材料。官方
+/// 批 A · A4（connector §4.234）：标题过渡材料。官方
 /// `TitleTransitionNotification` 的 PropsData 只有 `oldTitle` 一键
 /// （TitleTransitionNotification.dom.tsx:12-14）——renderInfo 的
 /// type/e164/username 三键是解析输入，解析产物才是行材料，所以这里只携产物。
@@ -958,7 +958,7 @@ pub struct NormalizedTitleTransition {
     pub old_title: String,
 }
 
-/// 批 A · A5（connector §4.234）：会话合并材料——官方 selector
+/// 批 A · A5（connector §4.235）：会话合并材料——官方 selector
 /// getPropsForConversationMerge 三 prop 中由被并壳行决定的两项
 /// （message.preload.ts:2021-2045）。conversationTitle 不在此面（桌面读
 /// 会话行，官方同一来源）。
