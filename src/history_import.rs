@@ -538,10 +538,24 @@ impl<'a> Importer<'a> {
             .get("expirationTimerChange")
             .and_then(Value::as_object);
         let group_update = import_group_update(value.get("groupUpdate"));
+        // 批 A（connector §4.231-§4.234）：非气泡 update 三面（engine §5
+        // 快照面 simpleUpdate/learnedProfileChange/threadMerge）——官方 import
+        // 把它们落成时间线系统行（import.preload.ts:3837-3854 / :2957-2997），
+        // 与 timer/group 两族同款：行源是会话级状态，不受档案行方向影响。
+        let simple_update = value.get("simpleUpdate").and_then(Value::as_object);
+        let learned_profile = value.get("learnedProfileChange").and_then(Value::as_object);
+        let thread_merge = value.get("threadMerge").and_then(Value::as_object);
         let direction = match value.get("direction").and_then(Value::as_str) {
             Some("incoming") => "incoming",
             Some("outgoing") => "outgoing",
-            _ if timer_change.is_some() || group_update.is_some() => "system",
+            _ if timer_change.is_some()
+                || group_update.is_some()
+                || simple_update.is_some()
+                || learned_profile.is_some()
+                || thread_merge.is_some() =>
+            {
+                "system"
+            }
             _ => {
                 self.counters.skipped_messages += 1;
                 return Ok(());
@@ -557,12 +571,34 @@ impl<'a> Importer<'a> {
         // notice row. Both riding one archive row (a batched group change
         // that also moved the timer) is the official
         // `additionalMessages` shape — two system rows.
-        if direction == "system" || group_update.is_some() {
+        if direction == "system"
+            || group_update.is_some()
+            || simple_update.is_some()
+            || learned_profile.is_some()
+            || thread_merge.is_some()
+        {
             if let Some(change) = timer_change {
                 self.handle_timer_change(change, &chat, sent_at)?;
             }
             if let Some(group) = group_update {
                 self.handle_group_update(group, value, &chat, sent_at, direction)?;
+            }
+            // 三面共用 skipped 计数（§4.38 可见性纪律）：词表外/缺材料的档案行
+            // 不落行但必须可见，绝不静默吞。
+            if let Some(face) = simple_update
+                && !self.handle_simple_update(face, value, &chat, sent_at)?
+            {
+                self.counters.skipped_messages += 1;
+            }
+            if let Some(face) = learned_profile
+                && !self.handle_title_transition(face, &chat, sent_at)?
+            {
+                self.counters.skipped_messages += 1;
+            }
+            if let Some(face) = thread_merge
+                && !self.handle_thread_merge(face, &chat, sent_at)?
+            {
+                self.counters.skipped_messages += 1;
             }
             return Ok(());
         }
@@ -888,6 +924,239 @@ impl<'a> Importer<'a> {
             self.flush()?;
         }
         Ok(())
+    }
+
+    /// 批 A 系统行族公共铸造点（connector §4.231-§4.234；行身份与 live 的
+    /// timer/group 通知行同构——deterministic id + direction=system +
+    /// status=system + rich 标记）。`family` 是行族判别词，进幂等键：同一
+    /// 会话同一 `sent_at` 的不同族行不撞 id；同族重放（重跑导入）经
+    /// INSERT OR IGNORE 折叠为一行（§6.4 幂等纪律同款）。
+    #[allow(clippy::too_many_arguments)]
+    fn push_system_family_row(
+        &mut self,
+        chat: &ResolvedChat,
+        sent_at: u64,
+        family: &str,
+        text: String,
+        sender_name: Option<String>,
+        sender_id: Option<String>,
+        rich: crate::engine::NormalizedRich,
+    ) -> Result<(), ImportFailure> {
+        let sender_id = sender_id
+            .unwrap_or_else(|| stable_hash_id(&[self.account_id, chat.kind, &chat.peer_key]));
+        let message_id = stable_hash_id(&[
+            "signal-message-v2",
+            self.account_id,
+            &chat.conversation_id,
+            family,
+            &sent_at.to_string(),
+        ]);
+        let record = MessageRecord {
+            is_erased: false,
+            delete_failed: false,
+            required_protocol_version: None,
+            author_aci: None,
+            id: message_id,
+            account_id: self.account_id.to_string(),
+            conversation_id: chat.conversation_id.clone(),
+            direction: "system",
+            sender_id,
+            sender_name,
+            mentions_self: false,
+            sent_at,
+            received_at: Some(crate::link::now_ms()),
+            text: Some(text.clone()),
+            text_bytes: Some(text.len().min(u32::MAX as usize) as u32),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "system",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(rich),
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            admin_deleted: false,
+            sticker: None,
+            // 提示行不参与清扫（§4.41 同款纪律）：期限列恒 NULL。
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        let preview = Some(text.chars().take(120).collect::<String>());
+        self.batch.push(HistoryImportInsert {
+            record,
+            preview,
+            alt_sender_id: None,
+            locators: Vec::new(),
+        });
+        if self.batch.len() >= BATCH_MESSAGES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// 档案行作者的可寻址身份（§4.38 同款阶梯：authorId → recipient 暂存行 →
+    /// 真名 + 号码优先/ACI 次之的来源形）。缺任一级返回 None——调用方按
+    /// 「无署名材料」处理，绝不拿会话身份冒充作者。
+    fn archive_author(
+        &self,
+        value: &Value,
+        chat: &ResolvedChat,
+    ) -> Option<(String, Option<String>)> {
+        let author_id = value.get("authorId").and_then(Value::as_u64)?;
+        let author = self
+            .store
+            .history_recipient(self.account_id, author_id)
+            .ok()??;
+        let source = recipient_source(&author, self.signal_account)?;
+        let sender_id = stable_hash_id(&[self.account_id, chat.kind, &source]);
+        let name = non_empty(&author.name).map(|name| truncate_utf8_bytes(name, SENDER_NAME_CHARS));
+        Some((sender_id, name))
+    }
+
+    /// 批 A · A2/A3（connector §4.231/§4.232）：官方 simpleUpdate 词表的
+    /// 两族行（import.preload.ts:3837-3854 逐臂）——JOINED_SIGNAL →
+    /// 「联系人加入 Signal」、CHANGE_NUMBER → change-number 行（官方带
+    /// sourceServiceId 署名；档案行按 authorId → 可寻址身份解析，解析不到
+    /// 则署名缺席，桌面走官方空名臂，不冒名）。词表外（IDENTITY_*/BLOCKED/…）
+    /// 整面不落行：它们属于别的行族，本批不投影。
+    fn handle_simple_update(
+        &mut self,
+        face: &serde_json::Map<String, Value>,
+        value: &Value,
+        chat: &ResolvedChat,
+        sent_at: u64,
+    ) -> Result<bool, ImportFailure> {
+        match face.get("type").and_then(Value::as_str) {
+            Some("JOINED_SIGNAL") => self
+                .push_system_family_row(
+                    chat,
+                    sent_at,
+                    "joinedSignal",
+                    "联系人加入 Signal".to_string(),
+                    None,
+                    None,
+                    crate::engine::NormalizedRich {
+                        is_joined_signal: true,
+                        ..Default::default()
+                    },
+                )
+                .map(|()| true),
+            Some("CHANGE_NUMBER") => {
+                let (sender_id, sender_name) = match self.archive_author(value, chat) {
+                    Some((sender_id, name)) => (Some(sender_id), name),
+                    None => (None, None),
+                };
+                self.push_system_family_row(
+                    chat,
+                    sent_at,
+                    "changeNumber",
+                    "已更改手机号码".to_string(),
+                    sender_name,
+                    sender_id,
+                    crate::engine::NormalizedRich {
+                        is_change_number: true,
+                        ..Default::default()
+                    },
+                )
+                .map(|()| true)
+            }
+            // 词表外/坏形状：整面不落行（这是「本批不投影的行族」，不是坏形状）。
+            _ => Ok(false),
+        }
+    }
+
+    /// 批 A · A4（connector §4.233）：标题过渡行——官方
+    /// learnedProfileChange.previousName 的 e164/username 二选一解析成
+    /// oldTitle（官方 getTitle 输出形：号码场 +E164 逐字、用户名场原值），
+    /// 行材料 rich.titleTransition{oldTitle} + 中文原文兜底。缺材料整面不落行
+    /// （官方 import 对两面皆空的档案记 frameError 跳行，同语义）。
+    fn handle_title_transition(
+        &mut self,
+        face: &serde_json::Map<String, Value>,
+        chat: &ResolvedChat,
+        sent_at: u64,
+    ) -> Result<bool, ImportFailure> {
+        let old_title = face
+            .get("previousE164")
+            .and_then(Value::as_u64)
+            .filter(|e164| *e164 > 0)
+            .map(|e164| format!("+{e164}"))
+            .or_else(|| {
+                face.get("previousUsername")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|username| !username.is_empty())
+                    .map(str::to_string)
+            });
+        let Some(old_title) = old_title else {
+            return Ok(false);
+        };
+        let old_title = truncate_utf8_bytes(&old_title, MAX_NOTICE_TITLE_CHARS).to_string();
+        let text = format!("您向 {old_title} 发起了聊天");
+        self.push_system_family_row(
+            chat,
+            sent_at,
+            "titleTransition",
+            text,
+            None,
+            None,
+            crate::engine::NormalizedRich {
+                title_transition: Some(crate::engine::NormalizedTitleTransition { old_title }),
+                ..Default::default()
+            },
+        )
+        .map(|()| true)
+    }
+
+    /// 批 A · A5（connector §4.234）：会话合并行——官方 threadMerge 的
+    /// previousE164（strictAssert 必在）→ renderInfo{type:'private', e164}；
+    /// 官方 selector 对该 renderInfo 的解析产物 = obsoleteConversationTitle
+    /// 与 obsoleteConversationNumber 同为该号码（getTitleNoDefault 的号码
+    /// 梯级即 getNumber），因此两键同值随行。缺号码整面不落行（官方 import
+    /// 对 threadMerge 缺 previousE164 记 frameError 跳行，同语义）。
+    fn handle_thread_merge(
+        &mut self,
+        face: &serde_json::Map<String, Value>,
+        chat: &ResolvedChat,
+        sent_at: u64,
+    ) -> Result<bool, ImportFailure> {
+        let Some(number) = face
+            .get("previousE164")
+            .and_then(Value::as_u64)
+            .filter(|e164| *e164 > 0)
+            .map(|e164| format!("+{e164}"))
+        else {
+            return Ok(false);
+        };
+        let text = format!("已合并与 {number} 的会话记录");
+        self.push_system_family_row(
+            chat,
+            sent_at,
+            "threadMerge",
+            text,
+            None,
+            None,
+            crate::engine::NormalizedRich {
+                conversation_merge: Some(crate::engine::NormalizedConversationMerge {
+                    obsolete_conversation_title: Some(number.clone()),
+                    obsolete_conversation_number: Some(number),
+                }),
+                ..Default::default()
+            },
+        )
+        .map(|()| true)
     }
 
     /// One direction-less timer-change frame (contract 1.42, §4.41): the
@@ -1623,6 +1892,11 @@ fn non_empty(text: &str) -> Option<&str> {
 /// (64 hex) — the caps are generous multiples over the real shapes, tight
 /// enough that a hostile line cannot bloat the column. cdnKey is an opaque
 /// server string (official URLs carry ~40-80 chars).
+/// 批 A（§4.233）：标题过渡行的旧标题材料上限——官方 oldTitle 是号码/用户名
+/// 尺度（一个 E.164 ≤ 16 字符、用户名 ≤ 64），128 是宽裕上界；超长截断保留
+/// 可读前缀（与 contact/mention 名的 renderable-prefix 纪律同款）。
+const MAX_NOTICE_TITLE_CHARS: usize = 128;
+
 const MAX_LOCATOR_BASE64_CHARS: usize = 512;
 const MAX_LOCATOR_HEX_CHARS: usize = 128;
 
@@ -3177,6 +3451,173 @@ mod tests {
             .expect_err("still missing");
         let row = store.history_import_row(&account.id).unwrap().unwrap();
         assert_eq!(row.attempts, 2);
+    }
+
+    /// 批 A（connector §4.231-§4.234）：非气泡 update 三面落行钉形——
+    /// simpleUpdate 两词（JOINED_SIGNAL/CHANGE_NUMBER）、learnedProfileChange
+    /// （e164/username 双臂）、threadMerge（号码面），每族一条系统行 + rich
+    /// 标记 + 中文原文兜底；词表外与缺材料整面不落行但 skipped 可见。
+    #[test]
+    fn non_bubble_update_frames_land_system_rows() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                // A2：官方 import 的 JOINED_SIGNAL 臂（无署名面的行）。
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "dateSent": 2000,
+                    "simpleUpdate": {"type": "JOINED_SIGNAL"}
+                })
+                .to_string(),
+                // A3：CHANGE_NUMBER 臂（官方带 sourceServiceId 署名）。
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 3000,
+                    "simpleUpdate": {"type": "CHANGE_NUMBER"}
+                })
+                .to_string(),
+                // A4：learnedProfileChange 号码臂（旧标题 = +E164）。
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "dateSent": 4000,
+                    "learnedProfileChange": {"previousE164": 15_550_100_u64}
+                })
+                .to_string(),
+                // A5：threadMerge 号码面（官方 strictAssert 必在）。
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "dateSent": 5000,
+                    "threadMerge": {"previousE164": 15_550_122_u64}
+                })
+                .to_string(),
+                // 词表外 simpleUpdate：整面不落行，skipped 可见。
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "dateSent": 6000,
+                    "simpleUpdate": {"type": "BLOCKED"}
+                })
+                .to_string(),
+                // 缺材料的两族：坏档案不落假行。
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "dateSent": 7000,
+                    "learnedProfileChange": {}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "dateSent": 8000,
+                    "threadMerge": {"previousE164": 0}
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        assert_eq!(counters.imported, 4, "四个投影族各一行");
+        assert_eq!(counters.skipped_messages, 3, "词表外 + 两族缺材料");
+
+        let conversation_id = alice_conversation_id(&account.id);
+        let system_sender = stable_hash_id(&[&account.id, "direct", ALICE_E164]);
+        // A2：joinedSignal 行（无署名面，署名走会话系统身份）。
+        let joined = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation_id,
+                "system",
+                2000,
+                &system_sender,
+                &system_sender,
+            )
+            .unwrap()
+            .expect("joined-signal 行");
+        assert_eq!(joined.text.as_deref(), Some("联系人加入 Signal"));
+        let rich = joined.rich.as_ref().expect("rich 面");
+        assert!(rich.is_joined_signal);
+        assert!(!rich.is_change_number);
+
+        // A3：changeNumber 行（作者可寻址 → 同一系统身份 + 档案名署名）。
+        let changed = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation_id,
+                "system",
+                3000,
+                &system_sender,
+                &system_sender,
+            )
+            .unwrap()
+            .expect("change-number 行");
+        assert_eq!(changed.text.as_deref(), Some("已更改手机号码"));
+        assert!(
+            changed
+                .rich
+                .as_ref()
+                .is_some_and(|rich| rich.is_change_number)
+        );
+        assert_eq!(changed.sender_name.as_deref(), Some("Alice"));
+
+        // A4：titleTransition 行（oldTitle = 官方 getTitle 的号码形）。
+        let title = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation_id,
+                "system",
+                4000,
+                &system_sender,
+                &system_sender,
+            )
+            .unwrap()
+            .expect("title-transition 行");
+        let title_face = title
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.title_transition.as_ref())
+            .expect("titleTransition 材料");
+        assert_eq!(title_face.old_title, "+15550100");
+        assert_eq!(title.text.as_deref(), Some("您向 +15550100 发起了聊天"));
+
+        // A5：conversationMerge 行（官方 selector 两 prop 同值 = 号码）。
+        let merge = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation_id,
+                "system",
+                5000,
+                &system_sender,
+                &system_sender,
+            )
+            .unwrap()
+            .expect("conversation-merge 行");
+        let merge_face = merge
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.conversation_merge.as_ref())
+            .expect("conversationMerge 材料");
+        assert_eq!(
+            merge_face.obsolete_conversation_title.as_deref(),
+            Some("+15550122")
+        );
+        assert_eq!(
+            merge_face.obsolete_conversation_number.as_deref(),
+            Some("+15550122")
+        );
+
+        // 重放幂等：同一档案重跑不添行（确定性 id 折叠）。
+        let replay =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        assert_eq!(replay.imported, 0, "重放零新增行");
+        let rows = store
+            .list_messages(&account.id, &conversation_id, 200, None)
+            .unwrap();
+        let system_rows = rows
+            .items
+            .iter()
+            .filter(|row| row.direction == "system")
+            .count();
+        assert_eq!(system_rows, 4, "四族行不重复");
     }
 
     /// Contract 1.42 (§4.41): the archive's disappearing-timer material

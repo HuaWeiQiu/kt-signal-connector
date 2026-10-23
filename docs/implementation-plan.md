@@ -18675,3 +18675,94 @@ UUID 键直聊行上可能开始出现（材料全部来自本机已持有的桥
 **测试**：读面跨桥（systemName/e164 命中 + 列表/单行同梯 + 裸数字桥拼法
 归一 + 桥缺席诚实缺席）；写面 passive/pull 双路（changed 携真实行 id +
 真名不覆盖）。
+
+## §4.231 时间线行族 · A2「联系人加入 Signal」行（批 A，契约 1.250）
+
+**官方对位**（upstream Signal-Desktop 只读零抄码，AGPL）：行源 =
+`simpleUpdate.type === JOINED_SIGNAL` → 消息 type
+`joined-signal-notification`（import.preload.ts:3851-3854）；呈现 =
+JoinedSignalNotification.dom.tsx:22-37 SystemMessage icon="info" +
+icu:JoinedSignal--notification + 行内时间戳。
+
+**数据面**：engine 快照面 §5 新增 `simpleUpdate {type}`（本批只投
+JOINED_SIGNAL / CHANGE_NUMBER 两词）；connector 历史导入侧消费——
+directionless/任意方向的该面一律落系统行（与 §4.41 timer / §4.44 group
+通知行同款：deterministic id 含行族判别词 + direction=system +
+status=system + rich 标记）。词表外词整面不落行并计入 skippedMessages
+（可见，不静默）。
+
+**wire**：行级键 `isJoinedSignal: true`（serde 假值省略）；行文 material
+「联系人加入 Signal」，桌面按官方 icu 文案本地化，不直接展示材料。
+
+**live 面**：官方 live 链不生成本行（barcode 面取证：全仓仅 import 生成
+`joined-signal-notification`）——本行族只有档案面，如实记档（无假 live
+投影）。
+
+## §4.232 时间线行族 · A3「对方更改手机号码」行（批 A，契约 1.250）
+
+**官方对位**：行源 = `simpleUpdate.type === CHANGE_NUMBER` → 消息 type
+`change-number-notification`（import.preload.ts:3837-3840）；
+ChangeNumberNotification.dom.tsx:25-47 SystemMessage icon="phone" +
+icu:ChangeNumber--notification（{sender} = 行作者显示名）。
+
+**数据面**：同 §4.231 的 `simpleUpdate` 面；本族署名 = 档案行 authorId →
+§4.38 作者阶梯（recipient → 可寻址身份 + 档案捕获名），解析不到的档案行
+署名缺席（桌面走官方空名臂，绝不拿会话身份冒充作者）。
+
+**wire**：行级键 `isChangeNumber: true`；material「已更改手机号码」。
+
+**live 面记档**：官方 live 源是 `updateE164` 的本地差分通知
+（conversations.preload.ts:2230-2232 → :3863-3900，向该人所有共享群各落
+一行）。本仓 live 侧无 e164 差分源（contacts 缓存只存 title/extra，不存
+号码历史），本批不造假 live 行；回访触发 = 联系身份重键批（号码历史列）
+落地时。
+
+## §4.233 时间线行族 · A4「标题过渡」行（批 A，契约 1.250）
+
+**官方对位**：行源 = `learnedProfileChange.previousName` →
+`title-transition-notification`（import.preload.ts:2957-2981），
+renderInfo {type:'private', e164?, username?} 经官方 getTitle 解析成
+oldTitle；TitleTransitionNotification.dom.tsx:22-38 SystemMessage
+icon="thread" + icu:TitleTransition--notification。
+
+**数据面**：engine 快照面 §5 新增 `learnedProfileChange
+{previousE164?, previousUsername?}`（oneof 真在场的那一键；空 oneof /
+零号码 / 空用户名整面省略）；connector 解析成 oldTitle（号码场 `+E164`
+逐字 = 官方 getNumber 形；用户名场原值），行材料
+`titleTransition {oldTitle}`（≤128 字符截断保留可读前缀）。缺材料整面
+不落行且 skipped 可见。
+
+**wire**：`titleTransition: {oldTitle}`（对象在场即行族判别，官方
+isTitleTransitionNotification 同判 `titleTransition != null`）；material
+「您向 {oldTitle} 发起了聊天」。
+
+**live 面记档**：官方 live 源是 needsTitleTransition 置位者的 profile 到站
+（conversations.preload.ts:4525-4545 / :5403-5421，且仅当「我们曾用号码/
+用户名标题发过消息」）。本批只落档案面；回访触发 = 直聊标题过渡 live
+批（需在 profile 到站写点做旧标题差分 + outgoing 存在性闸）。
+
+## §4.234 时间线行族 · A5「会话合并」提示（批 A，契约 1.251）
+
+**官方对位**：行源 = `threadMerge.previousE164` → `conversation-merge`
+（import.preload.ts:2983-2997，renderInfo {type:'private', e164}）；呈现 =
+ConversationMergeNotification.dom.tsx:23-93 → SystemMessage icon="merge" +
+getStringForConversationMerge 三分支（no-title / with-e164 / 基础键）+
+Learn More 钮（→ ConversationMergeExplainer 弹窗）。
+
+**数据面**：engine 快照面 §5 新增 `threadMerge {previousE164}`（0 = 无
+号码，整面省略）；connector 按官方 selector 对该 renderInfo 的解析产物落
+两键——`obsoleteConversationTitle` 与 `obsoleteConversationNumber` 同为
+`+E164`（getTitleNoDefault 的号码梯级即 getNumber），行 material
+「已合并与 {号码} 的会话记录」。
+
+**wire**：`conversationMerge {obsoleteConversationTitle?,
+obsoleteConversationNumber?}`；`{conversationTitle}` 由桌面读会话行
+（官方 `conversation.title` 同位，不重复投影）。
+
+**呈现降级**：官方 Learn More 钮 + 解释弹窗属按钮/弹窗 chrome，KT 系统行
+药丸无钮位（§4.181 系统行族同口径），本批只落文案行；钮面另案。
+
+**live 面记档**：官方 live 源是本地两会话被判定同人后的 addConversationMerge
+（conversations.preload.ts:3478-3505）。本仓直聊双行（号码键 × ACI 键）经
+§4.229 身份梯**只做 JOIN 不并行**，没有「合并」这一动作可通知——如实
+记档，不造假行；回访触发 = 直聊行合并批（真并行）落地时。
