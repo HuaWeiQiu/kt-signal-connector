@@ -18675,3 +18675,47 @@ UUID 键直聊行上可能开始出现（材料全部来自本机已持有的桥
 **测试**：读面跨桥（systemName/e164 命中 + 列表/单行同梯 + 裸数字桥拼法
 归一 + 桥缺席诚实缺席）；写面 passive/pull 双路（changed 携真实行 id +
 真名不覆盖）。
+
+
+---
+
+## §4.231 群访问控制三臂透传（accessControl attributes/members/memberLabel · 契约 1.221）
+
+**背景**：官方三个派生函数带「非管理员臂」——`canEditGroupInfo`
+（canEditGroupInfo.preload.ts:24-31，`accessControl?.attributes === MEMBER`）、
+`canAddNewMembers`（canAddNewMembers.preload.ts:24-28，
+`accessControl?.members === MEMBER`）、`getCanAddLabel`
+（GroupMemberLabels.std.ts:26-38，`accessControlMemberLabel === MEMBER`）。
+桌面三门此前收敛为 `areWeAdmin ∧ capability ∧ !terminated`，全员可编辑/可加人/
+可加标签的群里非管理员成员少四处可见性。引擎 `listGroups` 自 P5 批
+（`b991076`）已投影 `accessControl{attributes,members,addFromInviteLink,
+memberLabel}` 四族词表——本批把其中三臂透传到 `groups.get`，并让
+`groups.update` 接受 member-label 权限写意图（引擎写臂缺席 → 整调
+`CAPABILITY_UNAVAILABLE` 诚实拒绝，与既有 add-member/edit-details 两臂同
+纪律）。
+
+**wire（additive absent-key）**：
+
+| 键 | 形状 | 语义 | 缺席语义 |
+|---|---|---|---|
+| accessControl | `{attributes?, members?, memberLabel?}` | 上次同步捕获的官方访问控制词 | pre-1.221 行 / 引擎无该面 = 键缺席（桌面回落旧 admin-only 门） |
+| accessControl.* | `"MEMBER" \| "ADMINISTRATOR"` | 逐臂独立投影 | `UNKNOWN`/`ANY`/`UNSATISFIABLE`/坏形状 = 该臂缺席（unknown, never a lie） |
+
+- 捕获点在 `group_extra_json`（contacts.sync 群行 extra）：只读引擎
+  `listGroups` 条目的 `accessControl` 对象；`addFromInviteLink` 仍走独立
+  `linkAccess` 面（§4.180），不混入三臂。
+- 读面在 `store_get_group_with_requesting`：逐臂再验词表，坏存值丢该臂、
+  绝不 fail 读（isTerminated/linkAccess 同纪律）。
+- `permissionMemberLabel`（groups.update，every-member | only-admins）上行
+  映射 `setPermissionMemberLabel`；引擎 updateGroup 无 access-control 写臂，
+  因此落入整调拒绝面（§4.44 的 whole-call refusal，error 文案列出
+  `permissionMemberLabel`），绝不部分应用。
+
+**桌面消费**：`SignalGroupDetails.accessControl` 形状闸（hostAdapter：在场
+必须是对象，三臂各自 enum 闸，坏形状 retryable UPSTREAM_ERROR）；信息页三门
+`areWeAdmin || accessControl?.<arm> === 'MEMBER'`，权限区第四行
+（member-label）+ 非管理员有标签时的清除警告（GVP:43-55/130-187 官方
+zh/en 逐字）。
+
+**测试**：捕获臂（三臂齐全 / 部分臂 / 词表外逐臂丢 / 无对象缺席）；读面
+（命中 / 坏存值丢臂 / 旧行缺席）；groups.update 拒绝臂名字面量。

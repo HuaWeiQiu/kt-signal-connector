@@ -4128,6 +4128,10 @@ impl ConnectorService {
                 params.permission_send_messages.as_deref(),
                 "setPermissionSendMessages",
             ),
+            (
+                params.permission_member_label.as_deref(),
+                "setPermissionMemberLabel",
+            ),
         ] {
             let Some(value) = value else {
                 continue;
@@ -4206,7 +4210,8 @@ impl ConnectorService {
         // and (contract 1.188, §4.188) setPermissionSendMessages→the
         // engine's `announcementsOnly` bool. A change set carrying any key
         // outside that subset (groupDescription, the admin and ban
-        // families, the remaining permission pair, the member label pair)
+        // families, the remaining permission pair including the contract
+        // 1.221 member-label access arm, the member label pair)
         // answers
         // CAPABILITY_UNAVAILABLE naming the keys — the honest whole-call
         // refusal, never a partial application: the engine commits the set
@@ -4264,6 +4269,7 @@ impl ConnectorService {
                         "unbans" => "unbanMembers",
                         "setPermissionAddMember" => "permissionAddMember",
                         "setPermissionEditDetails" => "permissionEditDetails",
+                        "setPermissionMemberLabel" => "permissionMemberLabel",
                         other => other,
                     };
                     unsupported.push(host);
@@ -13817,6 +13823,19 @@ pub(crate) fn store_get_group_with_requesting(
             "ANY" | "ADMINISTRATOR" | "UNSATISFIABLE" => Some(word.to_string()),
             _ => None,
         });
+    // Contract 1.221 (§4.231): the access-control triple the sync captured.
+    // Per-arm word gate (MEMBER / ADMINISTRATOR only); every other word and
+    // every malformed stored shape drops that arm, never the read (the
+    // linkAccess/isTerminated discipline). The whole key stays absent when
+    // no arm survives — pre-1.221 rows and engines without the face keep
+    // their old byte-identical response.
+    let access_control = extra
+        .as_ref()
+        .and_then(|extra| extra.get("accessControl"))
+        .map(project_group_access_control)
+        .filter(|access| {
+            access.attributes.is_some() || access.members.is_some() || access.member_label.is_some()
+        });
     // Contract 1.181 (§4.181): the announcements-only flag the sync captured
     // — the CompositionArea.dom.tsx:1108 `announcementsOnly && !areWeAdmin`
     // banner gate's first half; the roster's admin/self marks answer the
@@ -13863,6 +13882,7 @@ pub(crate) fn store_get_group_with_requesting(
         members: members?,
         is_terminated,
         link_access,
+        access_control,
         announcements_only,
         description,
         requesting_members,
@@ -14032,6 +14052,29 @@ fn project_pending_members(
             })
         })
         .collect())
+}
+
+/// Contract 1.221 (§4.231): one stored `accessControl` value projected
+/// arm by arm. Only MEMBER / ADMINISTRATOR are gate states the official
+/// derived functions read; everything else (UNKNOWN, ANY, UNSATISFIABLE, a
+/// non-string, a non-object container) leaves that arm absent — unknown,
+/// never a lie. Pure and total: a hostile stored row can never fail the
+/// read.
+fn project_group_access_control(value: &Value) -> GroupAccessControl {
+    let arm = |key: &str| -> Option<String> {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|word| match word {
+                "MEMBER" | "ADMINISTRATOR" => Some(word.to_string()),
+                _ => None,
+            })
+    };
+    GroupAccessControl {
+        attributes: arm("attributes"),
+        members: arm("members"),
+        member_label: arm("memberLabel"),
+    }
 }
 
 /// One projected roster entry (§4.39): the stored identity, the read-time
@@ -14539,6 +14582,15 @@ pub struct MediaCloseView {
 /// (GroupLinkManagement.dom.tsx:46-53). Absent on pre-1.180 rows and every
 /// capture outside the vocabulary — unknown, never a lie; the row converges
 /// through the next sync like every other captured flag.
+/// `access_control` (contract revision 1.221, §4.231) is the three-arm
+/// access-control triple the sync captured from the engine's `listGroups`
+/// entry — the official ConversationType arms (getConversation.preload.ts
+/// :226-228) the desktop's canEditGroupInfo / canAddNewMembers /
+/// getCanAddLabel gates read. Each arm is independently optional and only
+/// the two gate words ride (MEMBER / ADMINISTRATOR); UNKNOWN / ANY /
+/// UNSATISFIABLE and malformed values collapse to that arm's absence —
+/// unknown, never a lie. The whole key is absent on pre-1.221 rows, so the
+/// desktop keeps its pre-batch admin-only gates until the next sync.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupDetails {
@@ -14550,6 +14602,13 @@ pub struct GroupDetails {
     pub is_terminated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_access: Option<String>,
+    /// Contract 1.221 (§4.231): the access-control triple the sync
+    /// captured — each arm optional, official gate words only (MEMBER /
+    /// ADMINISTRATOR); absent = pre-1.221 row / engine without the face /
+    /// an unparsed upstream word. The desktop answers the official
+    /// admin-or-MEMBER gate per arm, never invents a value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_control: Option<GroupAccessControl>,
     /// Contract 1.181 (§4.181): the announcements-only flag the sync
     /// captured from the upstream JsonGroup (the engine's listGroups always
     /// carries it). Absent on pre-1.181 rows and every capture without the
@@ -14569,6 +14628,27 @@ pub struct GroupDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_members: Option<Vec<GroupPendingMemberView>>,
     pub synced_at: u64,
+}
+
+/// The three-arm group access-control triple (contract revision 1.221,
+/// §4.231): the official ConversationType access-control fields
+/// (getConversation.preload.ts:226-228) exactly as the desktop's three
+/// derived gates consume them — `attributes` (canEditGroupInfo),
+/// `members` (canAddNewMembers), `memberLabel` (getCanAddLabel). Each arm
+/// is independently optional: the sync captured no value, the upstream word
+/// was outside the two gate states, or a stored value was malformed — all
+/// three mean "unknown" and the desktop falls back to its admin-only arm.
+/// `addFromInviteLink` deliberately does not ride here; it has its own
+/// `linkAccess` face (§4.180) with a different vocabulary.
+#[derive(Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupAccessControl {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_label: Option<String>,
 }
 
 /// The `groups.common` answer (contract 1.181, §4.181): the direct contact's
@@ -17005,6 +17085,7 @@ pub struct GroupsUpdateParams {
     pub permission_add_member: Option<String>,
     pub permission_edit_details: Option<String>,
     pub permission_send_messages: Option<String>,
+    pub permission_member_label: Option<String>,
     pub member_label: Option<String>,
     pub member_label_emoji: Option<String>,
     #[serde(default)]
@@ -33597,6 +33678,83 @@ mod tests {
             Some(MAX_GROUP_MEMBERS)
         );
 
+        // Contract 1.221 (§4.231): the captured accessControl triple
+        // projects arm by arm — only MEMBER / ADMINISTRATOR survive; a word
+        // outside the two gate states and a malformed arm drop individually,
+        // never failing the read. The whole key stays absent on rows without
+        // the capture (pre-1.221 rows stay byte-identical).
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "YWNjZXNzLWN0cmwtZ3JvdXA",
+                "Access Group",
+                Some(
+                    json!({
+                        "memberCount": 1,
+                        "accessControl": {
+                            "attributes": "MEMBER",
+                            "members": "ADMINISTRATOR",
+                            "memberLabel": "MEMBER",
+                        },
+                    })
+                    .to_string()
+                    .as_str(),
+                ),
+                1725300009,
+            )
+            .unwrap();
+        let access = service
+            .get_group(&account.id, "YWNjZXNzLWN0cmwtZ3JvdXA")
+            .unwrap();
+        let wire = serde_json::to_value(&access).unwrap();
+        assert_eq!(
+            wire["accessControl"],
+            json!({
+                "attributes": "MEMBER",
+                "members": "ADMINISTRATOR",
+                "memberLabel": "MEMBER",
+            })
+        );
+
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "cGFydGlhbC1hY2Nlc3MtZ3JvdXA",
+                "Partial Access Group",
+                Some(
+                    json!({
+                        "memberCount": 1,
+                        "accessControl": {
+                            "attributes": "UNKNOWN",
+                            "members": "MEMBER",
+                            "memberLabel": 7,
+                        },
+                    })
+                    .to_string()
+                    .as_str(),
+                ),
+                1725300010,
+            )
+            .unwrap();
+        let partial = service
+            .get_group(&account.id, "cGFydGlhbC1hY2Nlc3MtZ3JvdXA")
+            .unwrap();
+        let wire = serde_json::to_value(&partial).unwrap();
+        assert_eq!(wire["accessControl"], json!({"members": "MEMBER"}));
+
+        let access_absent = service.get_group(&account.id, "ZmFrZS1ncm91cC0x").unwrap();
+        assert_eq!(access_absent.access_control, None);
+        assert!(
+            serde_json::to_value(&access_absent)
+                .unwrap()
+                .get("accessControl")
+                .is_none()
+        );
+
         // A contact peer key is not a group row: deterministic GROUP_NOT_FOUND.
         let contact = service.get_group(&account.id, "+15555550101").unwrap_err();
         assert_eq!(contact.into_api().code, "GROUP_NOT_FOUND");
@@ -41395,6 +41553,7 @@ mod tests {
             permission_add_member: None,
             permission_edit_details: None,
             permission_send_messages: None,
+            permission_member_label: None,
             member_label: None,
             member_label_emoji: None,
             avatar: AvatarUpdate::Keep,
@@ -41524,6 +41683,7 @@ mod tests {
             permission_add_member: None,
             permission_edit_details: None,
             permission_send_messages: None,
+            permission_member_label: None,
             member_label: None,
             member_label_emoji: None,
             avatar: AvatarUpdate::Keep,
@@ -41623,6 +41783,7 @@ mod tests {
             permission_add_member: None,
             permission_edit_details: None,
             permission_send_messages: None,
+            permission_member_label: None,
             member_label: None,
             member_label_emoji: None,
             avatar: AvatarUpdate::Keep,
@@ -41709,6 +41870,7 @@ mod tests {
             permission_add_member: None,
             permission_edit_details: None,
             permission_send_messages: permission,
+            permission_member_label: None,
             member_label: None,
             member_label_emoji: None,
             avatar: AvatarUpdate::Keep,
@@ -41761,6 +41923,18 @@ mod tests {
                 if api.code == "CAPABILITY_UNAVAILABLE"
                     && !api.retryable
                     && api.message.contains("permissionAddMember")));
+        // The contract 1.221 member-label access arm rides the same
+        // whole-call refusal under its own host vocabulary.
+        let error = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                permission_member_label: Some("only-admins".into()),
+                ..params(None)
+            })
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE"
+                    && !api.retryable
+                    && api.message.contains("permissionMemberLabel")));
         // The description write key keeps its refusal too — the engine's
         // updateGroup carries no description arm (the §4.188 recorded gap;
         // the local validation ladder still runs ahead of the seam).
@@ -41844,6 +42018,7 @@ mod tests {
             permission_add_member: None,
             permission_edit_details: None,
             permission_send_messages: None,
+            permission_member_label: None,
             member_label: None,
             member_label_emoji: None,
             avatar,
