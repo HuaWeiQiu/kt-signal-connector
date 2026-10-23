@@ -18636,38 +18636,42 @@ NULL DEFAULT 0（照 admin_deleted/delete_failed 先例，附加列不回填历�
 
 ---
 
-## §4.230 链接期初始同步完成事件（engine.initialSyncComplete）
+## §4.229 直聊标题 JOIN 键归一（号码键 contacts 行 × ACI 键会话行 · 未知联系人根因批第二腿，契约 1.219）
 
-**背景**：官方 background.preload.ts:1926-1948 步骤 7「Wait for critical
-post-registration syncs before showing inbox」——收件箱在
-contactSyncComplete 与 storageServiceSyncComplete 两信号 Promise.all 落定
-前不显示（postRegistrationSyncsStatus 持久化，重启不重走；backup 导入
-完成砍 storage 半边）。桌面收件箱闸（勘误③）已有 contacts + storage
-两半；本轮补第三半边「首轮 profile 刷新」的引擎侧定局信号——官方对位
-语义里名字/媒体就绪是放行后的观感，桌面对位把它升为放行条件（台账
-§29.9/§29.15 收件箱闸批）。§4.229 编号让位未并分支（直聊 JOIN 键归一
-契约 1.219），本节取 §4.230 / 契约 1.220。
+**症状**：手机通讯录有名字的直聊（contacts 缓存 title=「菲菲 林」），会话
+列表标题落「未知联系人」——桌面 signalConversationTitle 梯：备注 miss →
+systemName 缺席 → title 掩码弃用 → profileName 缺席 → e164 缺席 →
+username 缺席 → icu:unknownContact 占位。
 
-**契约**：引擎登录窗 sync 臂（每链路 60s 一次性）三件套全部落定后恒发
-恰一条 `engine.initialSyncComplete` 通知（引擎侧形状权威）：
+**根因（键空间分裂；§29.2 头像批「direct 两行 id 不同源」发现的写面读面
+孪生）**：同一人双行不同键——contacts 缓存行 peer_key=**号码**（pull §6.5 /
+passive §4.122 同步 number 优先）；在用直聊行 peer_key=**ACI**（sealed-sender
+信封普遍无 legacy source，envelope_peer_source 梯落到 sourceUuid 臂，§4.37
+收路据此建行）。三个 JOIN 面全部按裸 peer_key / 条目拼写派生 id 等值命中：
 
-| wire 键 | 类型 | 语义 | 缺席语义 |
-|---|---|---|---|
-| params.account | string | 通道惯例域（receive.emptied 同款） | 无（缺席/空 = 协议错误，unknownNotification 警告） |
-| params.manifestOk | boolean | 登录 manifest 拉两腿（contacts+groups merge）全 ok；30s 超时 = false | 缺席/非布尔 = 协议错误 |
-| params.profilesOk | boolean | 首轮 profile 刷新批无错误落定 | 缺席/非布尔 = 协议错误 |
+| 面 | 断点 | 后果 |
+|---|---|---|
+| 读面命名材料 `conversation_naming_material` | `contacts.peer_key = 会话.peer_key` 等值 | systemName/username 恒缺席 |
+| 读面标识派生 `conversation_identifiers` | UUID 键行 e164 恒缺席（不反查桥） | 桌面号码梯臂拿不到材料 |
+| 写面标题升级 `upsert_synced_contacts` / `upsert_passive_contacts` | 条目拼写派生 id ≠ 在用行 id | 同步名字永不升级掩码标题，changed 也带不上它 |
 
-**投影链**：engine notification → connector `EngineEvent::InitialSyncComplete`
-→ 账号域瞬态车道（`forward_initial_sync_complete`，store 归因，
-resolve 失败 warn-only 丢弃绝不猜发）→ host 帧 `engine.initialSyncComplete`
-{accountId, manifestOk, profilesOk} → 桌面收件箱闸第三半边（ok face =
-双腿 true 才落定；失败腿只打点不 settle，半边 2min 超时兜底放行——官方
-complete 信号仅成功路径发的语义转译）。瞬态零落库零重试；错过事件由
-桌面半边超时收敛。connector 为管道：两腿布尔 verbatim 转发，绝不把
-false 腿折叠成 done 位。
+**修复（全收在既有 §4.190 身份梯上；桥行由同一收路 §4.37 / 同一同步批
+§4.144 写下——键归一零新存储，因果：修复后 JOIN 两侧键取自同一身份集
+{号码, 交替拼法, ACI}，探针集必含对侧行的实际键）**：
 
-**测试**：engine 侧通知帧 strict-parse 词表钉形（558 套件内）；connector
-侧 parse 归因臂（好帧按账号归因 + 四坏形状整拒）+ host 帧逐键 verbatim
-钉形 + schema 枚举/帧形登记。
+1. 读面命名材料：exact 探针 miss 后按 `peer_identity_set` 逐键再探 contacts；
+   桥读失败降级缺席（lossy，`conversation_identifiers_lossy` 同纪律）。
+2. 读面标识派生：UUID 键行 e164 经 `phone_key_for_aci_on`（§4.144 镜像读）
+   补号码面，两种拼法归一 `+` 前缀 wire 词形；无人观察过保持缺席（诚实
+   缺席，绝不发明）。
+3. 写面标题升级：id 探针 miss 后按同一身份梯按 peer_key 探在用行，
+   `title_should_upgrade` 闸照旧（掩码/占位才升，真名绝不覆盖）；升级行进
+   changed → conversation.changed 事件面照旧（§4.135），桌面免轮询收敛。
 
----
+**wire**：additive absent-key——systemName/username/e164 在此前恒缺席的
+UUID 键直聊行上可能开始出现（材料全部来自本机已持有的桥/缓存行，零新
+数据源）；无人观察过的行缺席语义逐字节不变，pre-1.219 宿主读行零变化。
+
+**测试**：读面跨桥（systemName/e164 命中 + 列表/单行同梯 + 裸数字桥拼法
+归一 + 桥缺席诚实缺席）；写面 passive/pull 双路（changed 携真实行 id +
+真名不覆盖）。
