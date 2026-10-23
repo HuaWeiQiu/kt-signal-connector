@@ -5090,6 +5090,22 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
                 }),
             ))
         }
+        HostSideEvent::IdentityChanged {
+            account_id,
+            source_uuid,
+            timestamp,
+        } => {
+            // 契约 §4.226（台账 §27.10）：对端安全码变更通知——转发宿主渲染
+            // 时间线系统行。观测事件：不自动重置会话，信任决定权在用户。
+            Ok(HostEvent::new(
+                "identity.changed",
+                json!({
+                    "accountId": account_id,
+                    "sourceUuid": source_uuid,
+                    "timestamp": timestamp,
+                }),
+            ))
+        }
         HostSideEvent::ReceiveDecryptionError { account_id } => {
             // Contract 1.165, §4.163: the decryption-error envelope — the
             // fact alone (the receive.emptied posture). Observability only:
