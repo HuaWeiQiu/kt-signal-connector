@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 37;
+const SCHEMA_VERSION: i64 = 38;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -329,6 +329,16 @@ CREATE TABLE IF NOT EXISTS contacts (
 );
 CREATE INDEX IF NOT EXISTS contacts_account_peer
   ON contacts(account_id, kind, peer_key);
+CREATE TABLE IF NOT EXISTS conversation_avatars (
+  conversation_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  data_uri TEXT NOT NULL,
+  byte_size INTEGER NOT NULL,
+  synced_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id)
+);
+CREATE INDEX IF NOT EXISTS conversation_avatars_account
+  ON conversation_avatars(account_id);
 CREATE TABLE IF NOT EXISTS message_edits (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id TEXT NOT NULL,
@@ -930,6 +940,15 @@ pub struct ConversationSummary {
     /// it). Absent when nothing is drafted or after `conversations.clearDraft`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft_timestamp: Option<u64>,
+    /// 契约 1.217（§29.2，头像字节面）：缓存头像 data URI——官方桌面
+    /// Avatar 组件的 `avatarUrl` 消费词形（Avatar.dom.tsx:63，色块占位
+    /// fallback 是 avatarPlaceholderGradient）。值为本地缓存的
+    /// `data:<mime>;base64,<payload>` 整体（getAvatar 下行字节的第一块
+    /// 持久化家），缺席键 = 无缓存字节（桌面回落占位色块或走
+    /// conversations.getAvatar 现拉）——缺席是诚实的「未拉取」，永不发明。
+    #[serde(rename = "avatarUrl")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
 }
 
 /// One conversation's pinned state (contract 1.33): the local row the pin
@@ -1589,6 +1608,25 @@ fn conversation_identifiers_lossy(
 /// over the caller's already-held connection guard — the same held-guard
 /// discipline as the meta lookups next door, answering None when the table
 /// has no row (nothing drafted, or cleared).
+/// 契约 1.217（§29.2，头像字节面）：一行的缓存头像 data URI。缺席 =
+/// 无缓存字节（「未拉取」的诚实面，永不发明）；查询失败同样降级缺席
+/// （§4.42 summary-list 容错读纪律——头像缺席永不失败整页/整行）。
+fn conversation_avatar_cached(
+    conn: &Connection,
+    account_id: &str,
+    conversation_id: &str,
+) -> Option<String> {
+    conn.query_row(
+        "SELECT data_uri FROM conversation_avatars
+          WHERE conversation_id=?1 AND account_id=?2",
+        params![conversation_id, account_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
 fn conversation_draft_timestamp(
     conn: &Connection,
     account_id: &str,
@@ -2134,6 +2172,12 @@ pub struct ContactSummary {
     /// Group rows answer absent (JsonGroup has no username face).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// 契约 1.217（§29.2，头像字节面）：compose/联系人行与摘要行同一
+    /// avatarUrl 词形（行 id 与 conversations 共用同一 stable id，§4.52），
+    /// 缓存命中才携带——缺席键纪律同摘要行。
+    #[serde(rename = "avatarUrl")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
 }
 
 /// One recorded reaction (contract 1.15): the actor's emoji state on a target
@@ -3404,6 +3448,12 @@ impl Store {
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
             transaction
                 .execute(
+                    "DELETE FROM conversation_avatars WHERE account_id=?1",
+                    params![account_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            transaction
+                .execute(
                     "DELETE FROM meta WHERE key=?1",
                     params![format!("contacts_synced_at:{account_id}")],
                 )
@@ -4160,6 +4210,12 @@ impl Store {
                         // Contract 1.138 (§4.130): filled in the post-map
                         // loop (below), the same read-time family.
                         draft_timestamp: None,
+                        // 契约 1.217（§29.2）：缓存头像 data URI（缺席键）。
+                        avatar_url: conversation_avatar_cached(
+                            &conn,
+                            account_id,
+                            &row.get::<_, String>(0)?,
+                        ),
                     })
                 },
             )
@@ -10047,6 +10103,12 @@ impl Store {
                         // Contract 1.138 (§4.130): filled in the post-map
                         // match (below), the same read-time family.
                         draft_timestamp: None,
+                        // 契约 1.217（§29.2）：页读族同一缓存读（缺席键）。
+                        avatar_url: conversation_avatar_cached(
+                            &conn,
+                            account_id,
+                            &row.get::<_, String>(0)?,
+                        ),
                     })
                 },
             )
@@ -10105,6 +10167,9 @@ impl Store {
                 // drafting window and every other window cannot disagree.
                 summary.draft_timestamp =
                     conversation_draft_timestamp(&conn, account_id, conversation_id)?;
+                // 契约 1.217（§29.2）：缓存头像 data URI——随 conversation.changed
+                // 的事件面与整页读共用同一读时家族（事件窗与重载窗不撕裂）。
+                summary.avatar_url = conversation_avatar_cached(&conn, account_id, conversation_id);
                 Ok(Some(summary))
             }
             None => Ok(None),
@@ -10612,6 +10677,21 @@ impl Store {
                         } else {
                             None
                         },
+                        // 契约 1.217（§29.2）：与摘要行同一份缓存，compose/联系人行
+                        // 免二次查找。缓存按会话寻址：contacts 行的 kind 词表（'contact'）
+                        // 与会话行（'direct'）不同词，两行的 stable id 因此不同源
+                        // （group 两边同词同 id）——直聊行投影前把 kind 归回会话词表再派生
+                        // id（与 ensure_conversation 同一派生式）；群行原词即同 id。
+                        // 一个查不到缓存的派生只是诚实缺席（§4.42 容错纪律）。
+                        avatar_url: conversation_avatar_cached(
+                            &conn,
+                            account_id,
+                            &stable_hash_id(&[
+                                account_id,
+                                if kind == "contact" { "direct" } else { kind },
+                                row.get::<_, String>(2)?.as_str(),
+                            ]),
+                        ),
                     })
                 },
             )
@@ -10628,6 +10708,75 @@ impl Store {
             None
         };
         Ok(Page { items, next_cursor })
+    }
+
+    /// 契约 1.217（§29.2，头像字节面）：getAvatar 下行字节的缓存写——
+    /// upsert 覆盖（latest-wins，新头像换旧）。result-face 门禁（上限 +
+    /// base64 解码交叉验证 byteSize）与目标行解析都在 service 提交闸；
+    /// 本层只落库。行 id 与 contacts/conversations 共用同一 stable id，
+    /// 两张读面因此共享一份缓存。字节从不入日志（§4.47 同纪律）。
+    pub fn upsert_conversation_avatar(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        data_uri: &str,
+        byte_size: u64,
+        synced_at_ms: u64,
+    ) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "INSERT INTO conversation_avatars(conversation_id, account_id, data_uri, byte_size, synced_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                   account_id=excluded.account_id,
+                   data_uri=excluded.data_uri,
+                   byte_size=excluded.byte_size,
+                   synced_at=excluded.synced_at",
+                params![
+                    conversation_id,
+                    account_id,
+                    data_uri,
+                    byte_size as i64,
+                    synced_at_ms as i64
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// 契约 1.217（§29.2）：缓存失效面——上游头像被移除（setProfile null
+    /// 臂 / 群头像删除）或重新拉取 404 时清行；缺席即无操作（幂等）。
+    pub fn clear_conversation_avatar(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "DELETE FROM conversation_avatars
+                  WHERE conversation_id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// 契约 1.217（§29.2）：一行的缓存头像严格读（错误传播，与容错的
+    /// 投影 helper 分职——投影缺席纪律归读时家族，本面归直接消费方）。
+    pub fn conversation_avatar(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT data_uri FROM conversation_avatars
+                  WHERE conversation_id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
     /// (contact_count, group_count) currently cached for the account.
@@ -12379,6 +12528,34 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         );
         conn.execute(&sql, [])
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
+    if current < 38 {
+        // 契约 1.217（§29.2，头像字节面）：conversation_avatars 缓存表——
+        // getAvatar 下行字节的第一块持久化家（官方桌面把头像落盘
+        // attachments 目录并在会话行存指针；connector 侧以 data URI 整体
+        // 缓存对位，行 id 与 contacts/conversations 共用同一 stable id）。
+        // FK 只挂 account：contacts 缓存行与 conversations 行的存在性
+        // 各自独立（联系人可先于会话行出现），主键 conversation_id 的
+        // 一致性由写入闸保证；旧库补建语句与 SCHEMA_DDL 同文（CREATE
+        // TABLE IF NOT EXISTS，双保险纪律）。
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS conversation_avatars (
+               conversation_id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               data_uri TEXT NOT NULL,
+               byte_size INTEGER NOT NULL,
+               synced_at INTEGER NOT NULL,
+               FOREIGN KEY(account_id) REFERENCES accounts(id)
+             )",
+            [],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS conversation_avatars_account
+               ON conversation_avatars(account_id)",
+            [],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
     if current < 37 {
         // 契约 1.207（M5）：conversations 补会话外观八列——官方 color /

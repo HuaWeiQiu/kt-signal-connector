@@ -6242,6 +6242,77 @@ impl ConnectorService {
         }))
     }
 
+    /// 契约 1.217（§29.2，头像字节面）：getAvatar 下行结果的缓存提交闸。
+    /// supervisor 桥在 `avatar_from_engine` 投影成功后调用本面：result-face
+    /// 门禁重放（上限 + `;base64,` 形状 + 解码交叉验证 byteSize——解码不符
+    /// 是协议错误，与 supervisor.rs 同一姿态，残缺结果进不了缓存）→ 账号/
+    /// 会话解析（wire 顺序 ladder，未知目标先于任何落库回答 NOT_FOUND）→
+    /// store upsert（latest-wins）。字节不落日志（§4.47 同纪律）。
+    pub fn commit_conversation_avatar(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        data_uri: &str,
+        byte_size: u64,
+    ) -> Result<(), ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        if data_uri.len() > MAX_AVATAR_DATA_URI_CHARS {
+            return Err(ServiceError::Engine(EngineError::Protocol));
+        }
+        let payload = data_uri
+            .split_once(";base64,")
+            .map(|(_, payload)| payload)
+            .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+        let mut decoded = Vec::new();
+        let decodes = base64_decode_to_vec(payload, &mut decoded);
+        if decodes.is_err() || decoded.len() as u64 != byte_size {
+            return Err(ServiceError::Engine(EngineError::Protocol));
+        }
+        self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        self.store.upsert_conversation_avatar(
+            account_id,
+            &conversation.id,
+            data_uri,
+            byte_size,
+            now_ms(),
+        )?;
+        Ok(())
+    }
+
+    /// 契约 1.217（§29.2）：一行的缓存头像读面（缺席 = 无缓存字节）。与
+    /// 摘要行投影共用同一份缓存表；目标 ladder 与提交闸同序。
+    pub fn cached_conversation_avatar(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        Ok(self
+            .store
+            .conversation_avatar(account_id, &conversation.id)?)
+    }
+
     /// conversations.setBlocked (contract revision 1.48, §4.47): bounds,
     /// kind enum, and resolution — the §4.33 pin-write ladder verbatim. No
     /// local row is written: the cloud record is the whole state and the
@@ -29438,6 +29509,143 @@ mod tests {
                 "{broken}"
             );
         }
+    }
+
+    /// 契约 1.217（§29.2，头像字节面）：缓存提交闸与投影面——门禁四态
+    /// （byteSize 失配 / 无 base64 标 / 坏载荷 → 协议错误；未知会话 →
+    /// CONVERSATION_NOT_FOUND 先于任何落库）+ 好路径落库后，摘要行、
+    /// contacts 行、conversations.list、单行读四处投影同一份 avatarUrl；
+    /// 覆盖提交 latest-wins。
+    #[test]
+    fn avatar_commit_gate_feeds_the_summary_projection() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap());
+        let service = ConnectorService::with_media(Arc::clone(&store), None);
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        // Nothing committed yet: the honest absent-cache face.
+        assert!(
+            service
+                .cached_conversation_avatar(&account.id, &conversation.id)
+                .unwrap()
+                .is_none()
+        );
+
+        // Good path: "QUJD" decodes to "ABC" (3 bytes).
+        let uri = "data:image/png;base64,QUJD";
+        service
+            .commit_conversation_avatar(&account.id, &conversation.id, uri, 3)
+            .unwrap();
+
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.avatar_url.as_deref(), Some(uri));
+
+        // The contacts-cache row shares the stable id — same cache answer.
+        store
+            .upsert_contact(&account.id, "contact", "+15555550101", "Peer", None, 10)
+            .unwrap();
+        let contacts = store.list_contacts(&account.id, None, 50, None).unwrap();
+        let row = contacts
+            .items
+            .iter()
+            .find(|row| row.peer_key == "+15555550101")
+            .unwrap();
+        assert_eq!(row.avatar_url.as_deref(), Some(uri));
+
+        // conversations.list carries it too.
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        let listed = page
+            .items
+            .iter()
+            .find(|row| row.id == conversation.id)
+            .unwrap();
+        assert_eq!(listed.avatar_url.as_deref(), Some(uri));
+
+        // Latest-wins overwrite.
+        let next = "data:image/jpeg;base64,REVG"; // "DEF", 3 bytes
+        service
+            .commit_conversation_avatar(&account.id, &conversation.id, next, 3)
+            .unwrap();
+        assert_eq!(
+            service
+                .cached_conversation_avatar(&account.id, &conversation.id)
+                .unwrap()
+                .as_deref(),
+            Some(next)
+        );
+
+        // Gate: byteSize disagreeing with the decoded count is a protocol
+        // error, and the cache keeps the committed value.
+        assert_eq!(
+            service
+                .commit_conversation_avatar(&account.id, &conversation.id, uri, 4)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "UPSTREAM_PROTOCOL_ERROR"
+        );
+        // Gate: no base64 mark / undecodable payload.
+        assert_eq!(
+            service
+                .commit_conversation_avatar(&account.id, &conversation.id, "data:image/png,QUJD", 3)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "UPSTREAM_PROTOCOL_ERROR"
+        );
+        assert_eq!(
+            service
+                .commit_conversation_avatar(
+                    &account.id,
+                    &conversation.id,
+                    "data:image/png;base64,!!!",
+                    3
+                )
+                .unwrap_err()
+                .into_api()
+                .code,
+            "UPSTREAM_PROTOCOL_ERROR"
+        );
+        // Gate: one answer past the coarse result-face bound never lands.
+        let oversize = format!(
+            "data:image/png;base64,{}",
+            "a".repeat(MAX_AVATAR_DATA_URI_CHARS)
+        );
+        assert!(oversize.len() > MAX_AVATAR_DATA_URI_CHARS);
+        assert_eq!(
+            service
+                .commit_conversation_avatar(&account.id, &conversation.id, &oversize, 1)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "UPSTREAM_PROTOCOL_ERROR"
+        );
+        assert_eq!(
+            service
+                .cached_conversation_avatar(&account.id, &conversation.id)
+                .unwrap()
+                .as_deref(),
+            Some(next)
+        );
+
+        // Gate: an unknown conversation answers NOT_FOUND before any write.
+        assert_eq!(
+            service
+                .commit_conversation_avatar(&account.id, "no-such-row", uri, 3)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "CONVERSATION_NOT_FOUND"
+        );
     }
 
     /// Call-link credential material (contract revision 1.88, §4.73): the
