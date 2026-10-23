@@ -13842,15 +13842,36 @@ pub(crate) fn store_get_group_with_requesting(
 /// uuid tail, the same ladder the §4.39 name resolution runs. A cache row
 /// with no captured username contributes no pair member; the projection
 /// answers absent, never invents one.
+///
+/// 未知联系人根因批（2026-10-23，§12.4）：members outside the phone's
+/// contact set never land a contacts-cache row, so the contacts tier alone
+/// answered absent for members the account chats with daily. The captured
+/// message envelope's display name (the `contact_sender_name_map` tier)
+/// now backs the contacts tier: a masked cache row (the sync's
+/// `mask_address` placeholder, the `:***)` judgment shape) never outranks
+/// a real envelope name — the sender tier wins over a masked title only,
+/// while a real contacts title keeps its sync-chain authority.
 fn member_name_username(
     titles: &std::collections::HashMap<String, String>,
     usernames: &std::collections::HashMap<String, String>,
+    sender_names: &std::collections::HashMap<String, String>,
     id: &str,
     uuid: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    let name = titles
-        .get(id)
-        .or_else(|| uuid.and_then(|uuid| titles.get(uuid)))
+    let cached = || {
+        titles
+            .get(id)
+            .or_else(|| uuid.and_then(|uuid| titles.get(uuid)))
+    };
+    let sender = || {
+        sender_names
+            .get(id)
+            .or_else(|| uuid.and_then(|uuid| sender_names.get(uuid)))
+    };
+    let name = cached()
+        .filter(|value| !value.contains("***"))
+        .or_else(sender)
+        .or_else(cached)
         .cloned();
     let username = usernames
         .get(id)
@@ -13874,6 +13895,7 @@ fn project_requesting_members(
 ) -> Result<Vec<GroupRequestingMemberView>, ServiceError> {
     let titles = store.contact_title_map(account_id)?;
     let usernames = store.contact_username_map(account_id)?;
+    let sender_names = store.contact_sender_name_map(account_id)?;
     Ok(entries
         .iter()
         .take(MAX_GROUP_MEMBERS)
@@ -13905,7 +13927,8 @@ fn project_requesting_members(
                         .take(MAX_GROUP_MEMBER_ID_CHARS)
                         .collect::<String>()
                 });
-            let (name, username) = member_name_username(&titles, &usernames, &id, uuid.as_deref());
+            let (name, username) =
+                member_name_username(&titles, &usernames, &sender_names, &id, uuid.as_deref());
             Some(GroupRequestingMemberView {
                 id,
                 uuid,
@@ -13933,6 +13956,7 @@ fn project_pending_members(
 ) -> Result<Vec<GroupPendingMemberView>, ServiceError> {
     let titles = store.contact_title_map(account_id)?;
     let usernames = store.contact_username_map(account_id)?;
+    let sender_names = store.contact_sender_name_map(account_id)?;
     Ok(entries
         .iter()
         .take(MAX_GROUP_MEMBERS)
@@ -13964,7 +13988,8 @@ fn project_pending_members(
                         .take(MAX_GROUP_MEMBER_ID_CHARS)
                         .collect::<String>()
                 });
-            let (name, username) = member_name_username(&titles, &usernames, &id, uuid.as_deref());
+            let (name, username) =
+                member_name_username(&titles, &usernames, &sender_names, &id, uuid.as_deref());
             Some(GroupPendingMemberView {
                 id,
                 uuid,
@@ -13991,6 +14016,7 @@ fn project_group_roster(
 ) -> Result<Vec<GroupMemberView>, ServiceError> {
     let titles = store.contact_title_map(account_id)?;
     let usernames = store.contact_username_map(account_id)?;
+    let sender_names = store.contact_sender_name_map(account_id)?;
     // Contract 1.181 (§4.181): the account's stored ACI for the roster's
     // self mark — one indexed read, absent on accounts the engine has not
     // answered yet (the honest absent face, never minted).
@@ -14022,7 +14048,8 @@ fn project_group_roster(
                         .take(MAX_GROUP_MEMBER_ID_CHARS)
                         .collect::<String>()
                 });
-            let (name, username) = member_name_username(&titles, &usernames, &id, uuid.as_deref());
+            let (name, username) =
+                member_name_username(&titles, &usernames, &sender_names, &id, uuid.as_deref());
             let label_emoji = super_supervisor_label_bound(
                 object.get("labelEmoji").and_then(Value::as_str),
                 GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES,
@@ -33553,6 +33580,125 @@ mod tests {
 
         let malformed = service.get_group(&account.id, "").unwrap_err();
         assert_eq!(malformed.into_api().code, "INVALID_REQUEST");
+    }
+
+    /// 未知联系人根因批（2026-10-23，§12.4）：a member outside the phone's
+    /// contact set (no contacts-cache row at all, or a masked placeholder
+    /// title) presents the display name the message envelopes supplied —
+    /// the newest non-empty incoming `sender_name` backs the contacts tier,
+    /// and a real contacts title keeps its sync-chain authority. A member
+    /// with neither tier stays bare (absent, never invented).
+    #[test]
+    fn get_group_falls_back_to_the_envelope_sender_name() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "c2VuZGVyLW5hbWUtZ3JvdXA",
+                "Sender Name Group",
+                Some(
+                    json!({
+                        "memberCount": 3,
+                        "members": [
+                            {"id": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"},
+                            {"id": "+15555550102"},
+                            {"id": "+15555550103"},
+                        ],
+                    })
+                    .to_string()
+                    .as_str(),
+                ),
+                1725300008,
+            )
+            .unwrap();
+        // The number-keyed member's masked contacts row lands before the
+        // conn guard scope (upsert_contact takes the store lock itself).
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "contact",
+                "+15555550102",
+                "+155***02",
+                None,
+                1725300008,
+            )
+            .unwrap();
+        // A conversation row per member (the messages table's FK target).
+        {
+            let conn = service.store_ref().conn();
+            for (id, peer) in [
+                ("cv1", "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"),
+                ("cv2", "+15555550102"),
+                ("cv3", "+15555550103"),
+            ] {
+                conn.execute(
+                    "INSERT INTO conversations(id, account_id, kind, peer_key, title)
+                     VALUES (?1, ?2, 'direct', ?3, ?3)",
+                    rusqlite::params![id, account.id, peer],
+                )
+                .unwrap();
+            }
+            let insert = |id: &str, conv: &str, sender: &str, name: Option<&str>, received: i64| {
+                conn.execute(
+                    "INSERT INTO messages(id, account_id, conversation_id, direction,
+                                          sender_id, sent_at, received_at, status, sender_name)
+                     VALUES (?1, ?2, ?3, 'incoming', ?4, ?5, ?5, 'read', ?6)",
+                    rusqlite::params![id, account.id, conv, sender, received, name],
+                )
+                .unwrap();
+            };
+            // The ACI-keyed stranger: two named envelopes — the newest wins.
+            insert(
+                "sm1",
+                "cv1",
+                "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1",
+                Some("Old"),
+                1000,
+            );
+            insert(
+                "sm2",
+                "cv1",
+                "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1",
+                Some("林菲菲"),
+                2000,
+            );
+            // The number-keyed member: only a masked contacts row (the sync's
+            // placeholder title) and a real envelope name — the envelope
+            // outranks the mask. The row lands before the conn guard scope:
+            // upsert_contact takes the store lock itself, so nesting it
+            // inside the held guard would self-deadlock.
+            insert("sm3", "cv2", "+15555550102", Some("真名"), 2000);
+            // The third member has no messages at all: stays bare.
+        }
+        let roster = service
+            .get_group(&account.id, "c2VuZGVyLW5hbWUtZ3JvdXA")
+            .unwrap();
+        let wire = serde_json::to_value(roster.members.unwrap()).unwrap();
+        assert_eq!(
+            wire[0],
+            json!({"id": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1", "name": "林菲菲"}),
+            "the newest non-empty envelope name backs the cache-miss tier"
+        );
+        assert_eq!(
+            wire[1],
+            json!({"id": "+15555550102", "name": "真名"}),
+            "an envelope name outranks a masked placeholder title"
+        );
+        assert_eq!(
+            wire[2],
+            json!({"id": "+15555550103"}),
+            "a member with neither tier stays bare — absent, never invented"
+        );
     }
 
     /// The live pending-invite projection (contract revision 1.64, §4.57):

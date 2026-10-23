@@ -4368,7 +4368,7 @@ impl Store {
         let anchor: MessageRecord = {
             let conn = self.read_conn()?;
             conn.query_row(
-                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci FROM messages WHERE id=?1 AND account_id=?2",
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci, is_erased FROM messages WHERE id=?1 AND account_id=?2",
                 params![anchor_id, account_id],
                 message_record_from_row,
             )
@@ -10449,6 +10449,50 @@ impl Store {
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(row)
+    }
+
+    /// The latest non-empty incoming `sender_name` per `sender_id` (§12.4
+    /// roster-name fallback tier, 2026-10-23 未知联系人根因批): group members
+    /// outside the phone's contact set never land a contacts-cache row, but
+    /// every captured message already carries the envelope's display name —
+    /// the roster projection reads this map after the contacts-cache maps so
+    /// a member the account has chatted with presents the name the envelopes
+    /// supplied (sender_id shares the roster entry's address domain: the
+    /// envelope source, E.164 or ACI string). Newest-first bounded scan, the
+    /// first sighting wins (every later row is older); the cap bounds the
+    /// scan, not the result — one row per distinct sender inside the window.
+    pub fn contact_sender_name_map(
+        &self,
+        account_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        const SENDER_NAME_SCAN_CAP: usize = 20_000;
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT sender_id, sender_name
+                 FROM messages
+                 WHERE account_id=?1 AND direction='incoming'
+                   AND sender_name IS NOT NULL AND TRIM(sender_name) != ''
+                 ORDER BY received_at DESC, stored_at DESC, id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id, SENDER_NAME_SCAN_CAP as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (sender_id, sender_name) =
+                row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let trimmed = sender_name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            map.entry(sender_id).or_insert_with(|| trimmed.to_owned());
+        }
+        Ok(map)
     }
 
     /// The cached `kind='contact'` display names of one account, keyed by
@@ -28195,6 +28239,125 @@ mod tests {
             page.items[0].wallpaper_photo_pointer_base64.as_deref(),
             Some("legacy-pointer"),
             "改名后应从旧列回填"
+        );
+    }
+
+    /// §12.4 roster-name fallback tier（2026-10-23 未知联系人根因批）：the
+    /// map carries the latest non-empty incoming `sender_name` per
+    /// `sender_id` — the newest sighting wins, blank names never enter,
+    /// outgoing rows and foreign accounts stay out, and the envelope source
+    /// (the roster entry's own address domain: E.164 or ACI string) keys it.
+    #[test]
+    fn contact_sender_name_map_carries_the_latest_envelope_name() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let foreign = store
+            .upsert_account_from_signal("+15555550199", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        {
+            let conn = store.conn();
+            conn.execute(
+                "INSERT INTO conversations(id, account_id, kind, peer_key, title)
+                 VALUES ('c1', ?1, 'group', 'ZmFrZTE', 'Fixture Group'),
+                        ('c2', ?2, 'group', 'ZmFrZTI', 'Foreign Group')",
+                params![account.id, foreign.id],
+            )
+            .unwrap();
+            let insert = |id: &str,
+                          conv: &str,
+                          acct: &str,
+                          dir: &str,
+                          sender: &str,
+                          name: Option<&str>,
+                          received: i64| {
+                conn.execute(
+                    "INSERT INTO messages(id, account_id, conversation_id, direction,
+                                          sender_id, sent_at, received_at, status, sender_name)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'read', ?8)",
+                    params![id, acct, conv, dir, sender, received, received, name],
+                )
+                .unwrap();
+            };
+            insert(
+                "m1",
+                "c1",
+                &account.id,
+                "incoming",
+                "+15555550101",
+                Some("Old Name"),
+                1000,
+            );
+            insert(
+                "m2",
+                "c1",
+                &account.id,
+                "incoming",
+                "+15555550101",
+                Some("New Name"),
+                2000,
+            );
+            // A later blank (or whitespace-only) name never overwrites —
+            // the map answers the newest non-empty sighting.
+            insert(
+                "m3",
+                "c1",
+                &account.id,
+                "incoming",
+                "+15555550101",
+                Some("   "),
+                3000,
+            );
+            insert(
+                "m4",
+                "c1",
+                &account.id,
+                "outgoing",
+                "+15555550100",
+                Some("Ignored"),
+                4000,
+            );
+            insert(
+                "m5",
+                "c1",
+                &account.id,
+                "incoming",
+                "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1",
+                Some("Aci Peer"),
+                2500,
+            );
+            // A foreign account's row never leaks into this account's map.
+            insert(
+                "m6",
+                "c2",
+                &foreign.id,
+                "incoming",
+                "+15555550102",
+                Some("Foreign Name"),
+                3000,
+            );
+        }
+        let map = store.contact_sender_name_map(&account.id).unwrap();
+        assert_eq!(
+            map.get("+15555550101").map(String::as_str),
+            Some("New Name"),
+            "the newest non-empty envelope name wins"
+        );
+        assert_eq!(
+            map.get("d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1")
+                .map(String::as_str),
+            Some("Aci Peer"),
+            "the ACI-shaped envelope source keys its own entry"
+        );
+        assert!(
+            !map.contains_key("+15555550100"),
+            "outgoing rows never enter the map"
+        );
+        assert!(
+            !map.contains_key("+15555550102"),
+            "a foreign account's rows never leak across accounts"
         );
     }
 }
