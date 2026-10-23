@@ -5090,6 +5090,24 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
                 }),
             ))
         }
+        HostSideEvent::InitialSyncComplete {
+            account_id,
+            manifest_ok,
+            profiles_ok,
+        } => {
+            // Contract 1.220, §4.230: the link-window post-registration sync
+            // completion — the two per-leg result bits ride verbatim (the
+            // connector never folds a false leg into a done bit); the
+            // desktop's inbox gate owns the ok-face settle.
+            Ok(HostEvent::new(
+                "engine.initialSyncComplete",
+                json!({
+                    "accountId": account_id,
+                    "manifestOk": manifest_ok,
+                    "profilesOk": profiles_ok,
+                }),
+            ))
+        }
         HostSideEvent::IdentityChanged {
             account_id,
             source_uuid,
@@ -6859,6 +6877,19 @@ mod tests {
             frame["data"]["trigger"], "someFutureEngineTrigger",
             "an unseen trigger forwards verbatim: {frame}"
         );
+
+        // Contract 1.220 (§4.230): the link-window post-registration sync
+        // completion frame — the two per-leg bits ride verbatim (a false leg
+        // is never folded into a done bit).
+        let frame = read_frame(HostSideEvent::InitialSyncComplete {
+            account_id: "acct-1".into(),
+            manifest_ok: true,
+            profiles_ok: false,
+        });
+        assert_eq!(frame["event"], "engine.initialSyncComplete");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["manifestOk"], true);
+        assert_eq!(frame["data"]["profilesOk"], false);
 
         // Contract 1.165 (§4.163): the decryption-error frame — the fact
         // alone (the receive.emptied posture), observability only.

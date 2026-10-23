@@ -10499,6 +10499,21 @@ async fn engine_event_watch_loop(
                 };
                 emit_forwarded(&host_events, forwarded);
             }
+            Ok(EngineEvent::InitialSyncComplete {
+                account,
+                manifest_ok,
+                profiles_ok,
+            }) => {
+                // Contract 1.220 §4.230: the link-window post-registration
+                // sync completion joins the same account-domain transient
+                // lane with the same attribution discipline (an unmatchable
+                // account drops warn-only inside the service).
+                let forwarded = {
+                    let guard = service.lock().await;
+                    guard.forward_initial_sync_complete(&account, manifest_ok, profiles_ok)
+                };
+                emit_forwarded(&host_events, forwarded);
+            }
             Ok(EngineEvent::ReceiveDecryptionError { account }) => {
                 // Contract 1.165 §4.163: the decryption-error envelope's
                 // consumption arm — the count lands in the metrics snapshot

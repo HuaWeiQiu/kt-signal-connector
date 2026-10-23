@@ -18635,3 +18635,39 @@ NULL DEFAULT 0（照 admin_deleted/delete_failed 先例，附加列不回填历�
 落地；未到期 view-once 行原样。
 
 ---
+
+## §4.230 链接期初始同步完成事件（engine.initialSyncComplete）
+
+**背景**：官方 background.preload.ts:1926-1948 步骤 7「Wait for critical
+post-registration syncs before showing inbox」——收件箱在
+contactSyncComplete 与 storageServiceSyncComplete 两信号 Promise.all 落定
+前不显示（postRegistrationSyncsStatus 持久化，重启不重走；backup 导入
+完成砍 storage 半边）。桌面收件箱闸（勘误③）已有 contacts + storage
+两半；本轮补第三半边「首轮 profile 刷新」的引擎侧定局信号——官方对位
+语义里名字/媒体就绪是放行后的观感，桌面对位把它升为放行条件（台账
+§29.9/§29.15 收件箱闸批）。§4.229 编号让位未并分支（直聊 JOIN 键归一
+契约 1.219），本节取 §4.230 / 契约 1.220。
+
+**契约**：引擎登录窗 sync 臂（每链路 60s 一次性）三件套全部落定后恒发
+恰一条 `engine.initialSyncComplete` 通知（引擎侧形状权威）：
+
+| wire 键 | 类型 | 语义 | 缺席语义 |
+|---|---|---|---|
+| params.account | string | 通道惯例域（receive.emptied 同款） | 无（缺席/空 = 协议错误，unknownNotification 警告） |
+| params.manifestOk | boolean | 登录 manifest 拉两腿（contacts+groups merge）全 ok；30s 超时 = false | 缺席/非布尔 = 协议错误 |
+| params.profilesOk | boolean | 首轮 profile 刷新批无错误落定 | 缺席/非布尔 = 协议错误 |
+
+**投影链**：engine notification → connector `EngineEvent::InitialSyncComplete`
+→ 账号域瞬态车道（`forward_initial_sync_complete`，store 归因，
+resolve 失败 warn-only 丢弃绝不猜发）→ host 帧 `engine.initialSyncComplete`
+{accountId, manifestOk, profilesOk} → 桌面收件箱闸第三半边（ok face =
+双腿 true 才落定；失败腿只打点不 settle，半边 2min 超时兜底放行——官方
+complete 信号仅成功路径发的语义转译）。瞬态零落库零重试；错过事件由
+桌面半边超时收敛。connector 为管道：两腿布尔 verbatim 转发，绝不把
+false 腿折叠成 done 位。
+
+**测试**：engine 侧通知帧 strict-parse 词表钉形（558 套件内）；connector
+侧 parse 归因臂（好帧按账号归因 + 四坏形状整拒）+ host 帧逐键 verbatim
+钉形 + schema 枚举/帧形登记。
+
+---

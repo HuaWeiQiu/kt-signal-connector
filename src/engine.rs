@@ -478,6 +478,21 @@ pub enum EngineEvent {
         contacts_ok: bool,
         groups_ok: bool,
     },
+    /// The engine's `engine.initialSyncComplete` notification (contract
+    /// 1.220, §4.230): the link-window post-registration sync set finished —
+    /// the engine's initial three sync requests went up, and the login
+    /// manifest pull and the first profile-refresh batch both settled (each
+    /// with its own timeout face). The two boolean legs answer truthfully
+    /// rather than a bare done bit (a false leg = that leg errored or timed
+    /// out); the official "complete only fires on success" semantics stay
+    /// the desktop's call (it settles its inbox gate on the ok face). The
+    /// account-domain transient lane (the supervisor's engine-event watcher)
+    /// resolves the account and forwards the host frame.
+    InitialSyncComplete {
+        account: String,
+        manifest_ok: bool,
+        profiles_ok: bool,
+    },
     /// The engine's decryption-error receive envelope (contract 1.165,
     /// §4.163): a `receive` notification whose envelope carries the
     /// `decryptionError` marker (`{account, envelope: {sourceUuid,
@@ -3662,6 +3677,40 @@ async fn handle_upstream_line(
                         account: account.to_string(),
                         conversations,
                         overflow,
+                    });
+                }
+                _ => {
+                    let _ = events.send(EngineEvent::ProtocolWarning {
+                        kind: "unknownNotification",
+                    });
+                }
+            }
+        } else if method == "engine.initialSyncComplete" {
+            // Contract 1.220 §4.230: the engine's link-window
+            // post-registration sync completion, forwarded through the same
+            // account-domain lane. The parse guarantees the faces the engine
+            // contract promises — the attribution account and the two
+            // per-leg result bits — and a missing or wrong-typed face is a
+            // protocol error answered by the unknown-notification warning,
+            // never a guessed forward. The attribution discipline is the
+            // storagePull arm's.
+            let params = object.get("params");
+            let account = params
+                .and_then(|params| params.get("account"))
+                .and_then(Value::as_str)
+                .filter(|account| !account.is_empty());
+            let manifest_ok = params
+                .and_then(|params| params.get("manifestOk"))
+                .and_then(Value::as_bool);
+            let profiles_ok = params
+                .and_then(|params| params.get("profilesOk"))
+                .and_then(Value::as_bool);
+            match (account, manifest_ok, profiles_ok) {
+                (Some(account), Some(manifest_ok), Some(profiles_ok)) => {
+                    let _ = events.send(EngineEvent::InitialSyncComplete {
+                        account: account.to_string(),
+                        manifest_ok,
+                        profiles_ok,
                     });
                 }
                 _ => {
@@ -12950,6 +12999,91 @@ mod tests {
             trigger, "someFutureEngineTrigger",
             "an unseen trigger word forwards verbatim, never guessed"
         );
+    }
+
+    /// Contract 1.220 (§4.230): the engine's link-window
+    /// post-registration sync completion parses into the attributed event
+    /// with both per-leg bits verbatim; a missing, empty, or wrong-typed
+    /// face falls back to the unknown-notification warning (never a guessed
+    /// forward) — the storagePull arm's attribution discipline.
+    #[tokio::test]
+    async fn initial_sync_complete_notification_routes_by_account() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+        let line = |value: serde_json::Value| serde_json::to_string(&value).unwrap();
+
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "engine.initialSyncComplete",
+                "params": {
+                    "account": "+15555550100",
+                    "manifestOk": true,
+                    "profilesOk": false,
+                },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        let EngineEvent::InitialSyncComplete {
+            account,
+            manifest_ok,
+            profiles_ok,
+        } = event_rx.recv().await.unwrap()
+        else {
+            panic!("expected the InitialSyncComplete event");
+        };
+        assert_eq!(account, "+15555550100");
+        assert!(manifest_ok);
+        assert!(!profiles_ok, "a false leg forwards verbatim, never folded");
+
+        for bad in [
+            json!({
+                "jsonrpc": "2.0",
+                "method": "engine.initialSyncComplete",
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "engine.initialSyncComplete",
+                "params": { "account": "" }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "engine.initialSyncComplete",
+                "params": {
+                    "account": "+15555550100",
+                    "manifestOk": "yes",
+                    "profilesOk": true,
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "engine.initialSyncComplete",
+                "params": {
+                    "account": "+15555550100",
+                    "manifestOk": true,
+                }
+            }),
+        ] {
+            handle_upstream_line(&line(bad), &mut pending, &events, &ingress, &mut degraded)
+                .await
+                .unwrap();
+        }
+        for _ in 0..4 {
+            assert!(matches!(
+                event_rx.recv().await.unwrap(),
+                EngineEvent::ProtocolWarning {
+                    kind: "unknownNotification"
+                }
+            ));
+        }
+        assert!(event_rx.try_recv().is_err());
     }
 
     /// Contract 1.134 (§4.117): the account-domain notifications follow the

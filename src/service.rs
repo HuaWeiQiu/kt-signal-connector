@@ -1684,6 +1684,19 @@ pub enum HostSideEvent {
         contacts_ok: bool,
         groups_ok: bool,
     },
+    /// The engine's `engine.initialSyncComplete` notification forwarded
+    /// (contract 1.220, §4.230): the link-window post-registration sync set
+    /// finished (initial sync requests up + login manifest pull + first
+    /// profile-refresh batch settled). The two per-leg result bits ride
+    /// verbatim; the desktop's inbox gate settles its profile-refresh half
+    /// on the ok face and keeps waiting on a false leg (its half timeout is
+    /// the fail-fast release). Transient: nothing persists, and a missed
+    /// event converges through the gate's half-timeout release.
+    InitialSyncComplete {
+        account_id: String,
+        manifest_ok: bool,
+        profiles_ok: bool,
+    },
     /// The engine's decryption-error receive envelope forwarded (contract
     /// 1.165, §4.163): an inbound envelope failed to decrypt — the fact
     /// alone, the receive.emptied posture. Observability only: the consumer
@@ -9566,6 +9579,27 @@ impl ConnectorService {
             trigger: trigger.to_string(),
             contacts_ok,
             groups_ok,
+        }])
+    }
+
+    /// The `engine.initialSyncComplete` arm of the account-domain lane
+    /// (contract 1.220, §4.230): the two per-leg result bits forward
+    /// verbatim — the connector never folds a false leg into a done bit.
+    pub fn forward_initial_sync_complete(
+        &self,
+        signal_account: &str,
+        manifest_ok: bool,
+        profiles_ok: bool,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some(account) =
+            self.resolve_account_transient(signal_account, "engine.initialSyncComplete")?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![HostSideEvent::InitialSyncComplete {
+            account_id: account.id.clone(),
+            manifest_ok,
+            profiles_ok,
         }])
     }
 

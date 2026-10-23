@@ -4737,6 +4737,7 @@
             "receive.clockSkew",
             "conversation.stateChanged",
             "engine.storagePull",
+            "engine.initialSyncComplete",
             "receive.decryptionError"
           ]
         },
@@ -5931,6 +5932,33 @@
                   "groupsOk": {
                     "type": "boolean",
                     "description": "Whether the pull's groups leg landed."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "engine.initialSyncComplete" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "manifestOk", "profilesOk"],
+                "description": "One link-window post-registration sync completion forwarded (contract 1.220, §4.230): the engine's engine.initialSyncComplete standalone notification — fired once per link window after the initial sync requests went up and the login manifest pull and the first profile-refresh batch both settled. The two per-leg bits answer truthfully (a false leg = that leg errored or timed out); the desktop's inbox gate settles its profile-refresh half only on the ok face and keeps waiting otherwise (its half timeout is the fail-fast release). Account-domain transient lane (the receive.emptied attribution discipline); nothing persists connector-side.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "manifestOk": {
+                    "type": "boolean",
+                    "description": "Whether the login manifest pull landed (both merge legs ok; a pull timeout answers false)."
+                  },
+                  "profilesOk": {
+                    "type": "boolean",
+                    "description": "Whether the first profile-refresh batch settled without error."
                   }
                 }
               }

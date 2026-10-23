@@ -588,6 +588,7 @@ impl ProxyGroupRuntime {
             | EngineEvent::ReceiveClockSkew { .. }
             | EngineEvent::ConversationState { .. }
             | EngineEvent::StoragePull { .. }
+            | EngineEvent::InitialSyncComplete { .. }
             | EngineEvent::ReceiveDecryptionError { .. }
             | EngineEvent::ReceiveIdentityChanged { .. } => {
                 // Contract 1.21: handled by the supervisor's engine-event
@@ -627,6 +628,7 @@ impl ProxyGroupRuntime {
             | EngineEvent::ReceiveClockSkew { .. }
             | EngineEvent::ConversationState { .. }
             | EngineEvent::StoragePull { .. }
+            | EngineEvent::InitialSyncComplete { .. }
             | EngineEvent::ReceiveDecryptionError { .. }
             | EngineEvent::ReceiveIdentityChanged { .. } => {
                 // The dynamic supervisor's own watchers own the account-level
