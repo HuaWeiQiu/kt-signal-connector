@@ -8640,6 +8640,25 @@ impl RuntimeSupervisor {
                 !details.is_terminated && details.member_count.is_none_or(|count| count == 0)
             }
         };
+        // 【临时诊断探针 · 名册链路】台账 §29.23：groups.get 读形状 +
+        // 重同步决策，验证「名册缺席」断点（A 没触发 / B 引擎没回 / C 回填丢）。
+        tracing::warn!(
+            target: "kt_signal_connector::groupdiag",
+            stage = "groups_get_read",
+            has_member_count = cached
+                .as_ref()
+                .map(|details| details.member_count.is_some())
+                .unwrap_or(false),
+            members_len = cached
+                .as_ref()
+                .ok()
+                .and_then(|details| details.members.as_ref())
+                .map(|members| members.len())
+                .unwrap_or(0),
+            is_group_not_found = matches!(&cached, Err(ServiceError::Api(api)) if api.code == "GROUP_NOT_FOUND"),
+            needs_resync,
+            "groups.get cached read shape and resync decision"
+        );
         if !needs_resync {
             return cached;
         }
@@ -8667,8 +8686,18 @@ impl RuntimeSupervisor {
     ) -> Result<GroupDetails, ServiceError> {
         let now_ms = crate::link::now_ms();
         if self.group_resync_throttled(account_id, group_key, now_ms) {
+            tracing::warn!(
+                target: "kt_signal_connector::groupdiag",
+                stage = "group_resync_throttled",
+                "group resync suppressed by 5min TTL"
+            );
             return cached;
         }
+        tracing::warn!(
+            target: "kt_signal_connector::groupdiag",
+            stage = "group_resync_attempt",
+            "group resync calling engine listGroups"
+        );
         if !self.note_group_resync_attempt(account_id, group_key, now_ms) {
             return cached;
         }
@@ -8677,6 +8706,11 @@ impl RuntimeSupervisor {
                 requesting,
                 pending,
             }) => {
+                tracing::warn!(
+                    target: "kt_signal_connector::groupdiag",
+                    stage = "group_resync_refreshed",
+                    "engine returned the group; replaying backfilled read"
+                );
                 let store = Arc::clone(&self.store);
                 let account = account_id.to_string();
                 let group = group_key.to_string();
