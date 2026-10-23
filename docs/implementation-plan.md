@@ -10,6 +10,26 @@
   backs both up.
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.252 (2026-10-24; §4.237 the group-link capture's
+  nested fallback — batch M, ledger §29.44: the engine's own listGroups
+  face (the only runtime, ADR 0003) projects the addFromInviteLink word
+  only inside its accessControl object (engine P5 `b991076`;
+  accessControl{attributes, members, addFromInviteLink, memberLabel}),
+  never at the top level, so the §4.180 top-level-only capture stayed
+  absent on every engine-mode sync and the desktop's group-link face
+  answered its unsynced placeholder permanently — the batch-H discovery
+  item ②. When the top-level word is absent the capture now falls back
+  to the nested accessControl.addFromInviteLink word under the exact
+  §4.180 vocabulary and collapse rules (ANY / ADMINISTRATOR /
+  UNSATISFIABLE captured; MEMBER is not a link-join state, UNKNOWN is
+  the engine's unparsed fallback, and every malformed value collapses to
+  absent); the top-level word keeps precedence when a face carries both
+  (the pinned signal-cli JsonGroup shape). No wire change and no
+  groups.get read-face change — linkAccess projection byte-identical;
+  stored rows converge through the next sync exactly like every other
+  captured flag. The nested position is also the official client's own
+  read position: GroupLinkManagement.dom.tsx:46-53 derives
+  hasGroupLink/approval from conversation.accessControl.addFromInviteLink.)
 - Contract revision: 1.216 (2026-10-21; §4.216 the message-granular read
   watermark: `messages.markRead` / `messages.syncRead` gain the optional
   `messageId` read-position target. Present = the conversation's
@@ -15828,6 +15848,24 @@ word: an enabled link implies materialized password material upstream, so
 `linkAccess ∈ {ANY, ADMINISTRATOR}` is the honest projection of the whole
 official condition onto the word the engine exposes.
 
+**The nested fallback (contract 1.252, §4.237).** The paragraph above
+describes the pinned signal-cli JsonGroup, whose top-level
+`addFromInviteLink` the original capture read. The engine's own
+listGroups face — the only runtime (ADR 0003) — never carries that
+top-level key: it projects the word inside its accessControl object (P5
+`b991076`), which is also the official client's own read position
+(GroupLinkManagement.dom.tsx:46-53 derives hasGroupLink/approval from
+conversation.accessControl.addFromInviteLink). Engine-mode syncs
+therefore stored no linkAccess at all, and the desktop's group-link face
+sat on its unsynced placeholder permanently (the batch-H discovery item
+②, ledger §29.36.6). The capture now falls back to the nested
+`accessControl.addFromInviteLink` word when — and only when — the
+top-level word is absent, under the identical §4.180 vocabulary and
+collapse rules (MEMBER/UNKNOWN/malformed drop); the top-level word keeps
+precedence for the legacy face, and the `groups.get linkAccess`
+projection is byte-identical — the row converges through the next sync
+exactly like every other captured flag.
+
 **The write face.** `groups.update resetLink: true` has answered
 CAPABILITY_UNAVAILABLE since 1.115 named the key — the engine's
 `updateGroup` actually carries the `inviteLinkPassword` arm (raw bytes
@@ -18864,3 +18902,31 @@ obsoleteConversationNumber?}`；`{conversationTitle}` 由桌面读会话行
 群行缺席；`message_request_accepted_derives_official_factor_weights`
 扩展）；引擎 `project_contact_entry_shapes` 新签名/两键形状；桌面纯模块
 与 source-lock（signalMessageRequestState/Wiring spec）。
+
+## §4.237 群链接捕获嵌套回退（linkAccess ← accessControl.addFromInviteLink · 契约 1.252 · 批 M · 台账 §29.44）
+
+**根因（批 H §29.36.6 发现项②的源码级闭环）**：engine `listGroups` 条目
+自 P5（`b991076`）把链接权限词投影在 `accessControl` 对象内
+（`accessControl{attributes, members, addFromInviteLink, memberLabel}`，
+词表 = engine `access_level_name`：UNKNOWN/ANY/MEMBER/ADMINISTRATOR/
+UNSATISFIABLE），顶层 `addFromInviteLink` 键在 engine 形状中永不存在；
+§4.180 捕获只读顶层 → engine 模式 `linkAccess` 恒缺席，桌面群链接面板
+（`hasGroupLink`/approval 派生；官方读位本就是嵌套的
+conversation.accessControl.addFromInviteLink，
+GroupLinkManagement.dom.tsx:46-53）恒「未同步」。
+
+**修复（capture 单点，wire 与读面零改动）**：`group_extra_json` 在顶层词
+缺席时回退读嵌套 `accessControl.addFromInviteLink`，词表与塌缩口径与
+§4.180 完全一致（ANY/ADMINISTRATOR/UNSATISFIABLE 收；MEMBER 非链接加入
+态、UNKNOWN 为 engine 未解析兜底——连同一切坏形状塌缩缺席，未知绝不撒
+谎）；顶层词在场时恒优先（pinned signal-cli JsonGroup 形状，零回归；
+顶层在场但词表外 = 该面塌缩，不跨面混合猜测）。
+`groups.get linkAccess` 投影逐字节不变（读 stored `linkAccess` 键），
+存量行随下一次 sync 收敛——与其他捕获位同一收敛纪律。
+
+**测试**：§4.180 捕获块新增嵌套臂（嵌套三官方词入 linkAccess；嵌套
+UNKNOWN/MEMBER/坏值塌缩；坏 accessControl 形状不致败；两词同场顶层
+优先；顶层坏词 + 嵌套好词 = 键缺席的不混合臂）；§4.231 三臂钉形断言
+随批翻正——批 H 时代「嵌套 addFromInviteLink 永不入 linkAccess」钉住的
+正是本节修的 P0 恒缺席，三臂对象仍只收三门词（addFromInviteLink 不混
+入三臂对象，§4.180 边界不变），其嵌套词改按本节回退入 linkAccess。
