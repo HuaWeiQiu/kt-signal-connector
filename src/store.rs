@@ -1294,6 +1294,24 @@ fn aci_for_peer_key_on(
     Ok(aci)
 }
 
+/// The §4.229 mirror of [`aci_for_peer_key_on`]: the peer key the identity
+/// bridge holds under one ACI — the number the receive chain (§4.37) or the
+/// contacts sync (§4.144) last observed for it. PK(account, aci) with
+/// INSERT OR REPLACE, so at most one row answers.
+fn phone_key_for_aci_on(
+    conn: &Connection,
+    account_id: &str,
+    aci: &str,
+) -> Result<Option<String>, StoreError> {
+    conn.query_row(
+        "SELECT peer_key FROM peer_identities WHERE account_id=?1 AND aci=?2 LIMIT 1",
+        params![account_id, aci],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| StoreError::Unavailable(Some(error)))
+}
+
 /// The alternate spelling of a phone-shaped key (contract 1.146, §4.144):
 /// `+`-prefixed E.164 against bare digits, the two forms the identity
 /// writers spell the same number in. None for a key that is not
@@ -1563,6 +1581,20 @@ fn conversation_identifiers(
     if crate::engine::is_uuid_shaped(peer_key) {
         return Ok(ConversationIdentifiers {
             service_id: Some(peer_key.to_string()),
+            // §4.229（契约 1.219，直聊标题 JOIN 键归一批）：e164 腿跨桥补齐——
+            // sealed-sender 直聊行以 ACI 为键，收路（§4.37）/同步批（§4.144）
+            // 在 peer_identities 桥里持有的号码按 §4.129 家族补号码面；
+            // 两种拼法归一 `+` 前缀 wire 词形，非号码键（不该出现在桥里）
+            // 诚实缺席，绝不发明。
+            e164: phone_key_for_aci_on(conn, account_id, peer_key)?.and_then(|key| {
+                if key.starts_with('+') {
+                    Some(key)
+                } else if !key.is_empty() && key.chars().all(|c| c.is_ascii_digit()) {
+                    Some(format!("+{key}"))
+                } else {
+                    None
+                }
+            }),
             ..ConversationIdentifiers::default()
         });
     }
@@ -10233,13 +10265,46 @@ impl Store {
                     )
                     .optional()
                     .map_err(|error| StoreError::Unavailable(Some(error)))?;
-                if let Some(current) = existing
-                    && title_should_upgrade(&current, entry.title)
+                let existing_title = existing.as_deref();
+                if let Some(current) = existing_title
+                    && title_should_upgrade(current, entry.title)
                 {
                     title_stmt
                         .execute(params![id, entry.title])
                         .map_err(|error| StoreError::Unavailable(Some(error)))?;
                     changed.push(id);
+                } else if existing_title.is_none() && conversation_kind == "direct" {
+                    // §4.229（契约 1.219，直聊标题升级 JOIN 键归一批）：号码键的
+                    // 联系人条目与 ACI 键的在用直聊行（sealed-sender 信封只投影
+                    // sourceUuid，§4.37 建行）id 不同源——本条目拼写派生的 id
+                    // 探不到它，标题升级永不命中（§29.2 头像批同词发现的写面
+                    // 孪生）。经 §4.190 身份梯（桥行由 §4.37/§4.144 写下）按
+                    // peer_key 探在用行，同一 title_should_upgrade 闸：掩码/占位
+                    // 才升，真名绝不覆盖；升级行进 `changed`，
+                    // conversation.changed 事件面照旧（§4.135）。
+                    let identities =
+                        peer_identity_set(&transaction, account_id, peer_key).unwrap_or_default();
+                    for key in identities.iter().filter(|key| *key != peer_key) {
+                        let bridged = transaction
+                            .query_row(
+                                "SELECT id, title FROM conversations
+                                  WHERE account_id=?1 AND kind='direct' AND peer_key=?2",
+                                params![account_id, key],
+                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                            )
+                            .optional()
+                            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                        let Some((bridged_id, current)) = bridged else {
+                            continue;
+                        };
+                        if title_should_upgrade(&current, entry.title) {
+                            title_stmt
+                                .execute(params![bridged_id, entry.title])
+                                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                            changed.push(bridged_id);
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -10369,13 +10434,46 @@ impl Store {
                     )
                     .optional()
                     .map_err(|error| StoreError::Unavailable(Some(error)))?;
-                if let Some(current) = existing
-                    && title_should_upgrade(&current, entry.title)
+                let existing_title = existing.as_deref();
+                if let Some(current) = existing_title
+                    && title_should_upgrade(current, entry.title)
                 {
                     title_stmt
                         .execute(params![id, entry.title])
                         .map_err(|error| StoreError::Unavailable(Some(error)))?;
                     changed.push(id);
+                } else if existing_title.is_none() && conversation_kind == "direct" {
+                    // §4.229（契约 1.219，直聊标题升级 JOIN 键归一批）：号码键的
+                    // 联系人条目与 ACI 键的在用直聊行（sealed-sender 信封只投影
+                    // sourceUuid，§4.37 建行）id 不同源——本条目拼写派生的 id
+                    // 探不到它，标题升级永不命中（§29.2 头像批同词发现的写面
+                    // 孪生）。经 §4.190 身份梯（桥行由 §4.37/§4.144 写下）按
+                    // peer_key 探在用行，同一 title_should_upgrade 闸：掩码/占位
+                    // 才升，真名绝不覆盖；升级行进 `changed`，
+                    // conversation.changed 事件面照旧（§4.135）。
+                    let identities =
+                        peer_identity_set(&transaction, account_id, peer_key).unwrap_or_default();
+                    for key in identities.iter().filter(|key| *key != peer_key) {
+                        let bridged = transaction
+                            .query_row(
+                                "SELECT id, title FROM conversations
+                                  WHERE account_id=?1 AND kind='direct' AND peer_key=?2",
+                                params![account_id, key],
+                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                            )
+                            .optional()
+                            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                        let Some((bridged_id, current)) = bridged else {
+                            continue;
+                        };
+                        if title_should_upgrade(&current, entry.title) {
+                            title_stmt
+                                .execute(params![bridged_id, entry.title])
+                                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                            changed.push(bridged_id);
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -11740,6 +11838,38 @@ fn conversation_naming_material(
     peer_key: &str,
 ) -> (Option<String>, Option<String>) {
     let contact_kind = if kind == "group" { "group" } else { "contact" };
+    if let Some(material) = contacts_material_at(conn, account_id, contact_kind, peer_key) {
+        return material;
+    }
+    // §4.229（契约 1.219，直聊标题 JOIN 键归一批）：同一人双行不同键——
+    // contacts 缓存行以号码为键（pull/passive 同步 number 优先，§6.5/§4.122），
+    // 在用直聊行以 ACI 为键（sealed-sender 信封普遍只投影 sourceUuid，
+    // §4.37 收路建行）→ 裸 peer_key 等值 JOIN 必 miss → systemName/username
+    // 恒缺席 → 桌面命名梯（systemName→title→profile→e164→username）全空、
+    // 掩码标题弃用后落「未知联系人」。经 peer_identities 桥（同一收路
+    // §4.37 / 同一同步批 §4.144 写下）展开 §4.190 身份梯再探；桥读失败
+    // 降级缺席（lossy，conversation_identifiers_lossy 同纪律）——缺席仍
+    // 诚实，命名查询永不掀翻整页。
+    if kind == "direct" {
+        let identities = peer_identity_set(conn, account_id, peer_key).unwrap_or_default();
+        for key in identities.iter().filter(|key| *key != peer_key) {
+            if let Some(material) = contacts_material_at(conn, account_id, contact_kind, key) {
+                return material;
+            }
+        }
+    }
+    (None, None)
+}
+
+/// One contacts-cache probe of the naming material (title + username extra)
+/// at an exact peer key — `None` when no row sits at that key. The masked /
+/// placeholder judgments stay the write face's `title_should_upgrade` twins.
+fn contacts_material_at(
+    conn: &Connection,
+    account_id: &str,
+    contact_kind: &str,
+    peer_key: &str,
+) -> Option<(Option<String>, Option<String>)> {
     let row = conn
         .query_row(
             "SELECT title, extra FROM contacts
@@ -11747,18 +11877,17 @@ fn conversation_naming_material(
             params![account_id, contact_kind, peer_key],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
         )
-        .optional();
-    let Ok(Some((title, extra))) = row else {
-        return (None, None);
-    };
-    let trimmed = title.trim();
+        .optional()
+        .ok()
+        .flatten()?;
+    let trimmed = row.0.trim();
     // 掩码形 / 占位词不是名字材料（与 title_should_upgrade 同判）。
     let system_name = (!trimmed.is_empty()
         && !trimmed.contains("***")
         && trimmed != "group"
         && trimmed != "contact")
         .then(|| trimmed.to_owned());
-    (system_name, extra_username(extra.as_deref()))
+    Some((system_name, extra_username(row.1.as_deref())))
 }
 /// Prefer real display names over masked peer ids / placeholders.
 fn title_should_upgrade(current: &str, candidate: &str) -> bool {
@@ -23334,6 +23463,147 @@ mod tests {
         assert_eq!(
             store.peer_keys_for_aci(&other.id, "aci-1").unwrap(),
             vec!["+15555550300".to_string()]
+        );
+    }
+
+    /// §4.229（契约 1.219，直聊标题 JOIN 键归一批）：contacts 缓存行（号码
+    /// 键，同步 number 优先）与在用直聊行（ACI 键，sealed-sender 信封只投影
+    /// sourceUuid）经 peer_identities 桥归一——命名材料（systemName）与
+    /// e164 腿跨桥命中；桥缺席时保持诚实缺席（旧行为零变化）。
+    #[test]
+    fn direct_summary_material_crosses_the_identity_bridge() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let aci = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", aci, "aaa***ee")
+            .unwrap();
+        // 桥缺席：材料诚实缺席（修复前的老形状，绝不发明）。
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.system_name, None);
+        assert_eq!(summary.e164, None);
+        // 手机通讯录同步的两行：contacts 行（号码键，§4.122）+ 桥行
+        // （ACI→号码，§4.144）。
+        store
+            .upsert_contact(&account.id, "contact", "+15555550101", "菲菲 林", None, 10)
+            .unwrap();
+        store
+            .upsert_peer_identity(&account.id, aci, "+15555550101")
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.system_name.as_deref(), Some("菲菲 林"));
+        assert_eq!(summary.e164.as_deref(), Some("+15555550101"));
+        assert_eq!(summary.service_id.as_deref(), Some(aci));
+        // 列表面与单行面同梯（同一 helper 家族）。
+        let listed = store
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].system_name.as_deref(), Some("菲菲 林"));
+        // 桥行裸数字拼法归一 `+` 前缀 wire 词形（§4.144 两种拼法）。
+        store
+            .upsert_peer_identity(&account.id, aci, "15555550101")
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.e164.as_deref(), Some("+15555550101"));
+    }
+
+    /// §4.229（契约 1.219）写面：被动同步批（号码键条目）经桥探到 ACI 键的
+    /// 在用直聊行——掩码/占位标题升级且 changed 携真实行 id
+    /// （conversation.changed 事件面因此能带上它）；真名绝不覆盖。
+    #[test]
+    fn passive_contact_sync_upgrades_the_aci_keyed_conversation_title() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let aci = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", aci, "aaa***ee")
+            .unwrap();
+        store
+            .upsert_peer_identity(&account.id, aci, "+15555550101")
+            .unwrap();
+        let entries = [SyncedContact {
+            kind: "contact",
+            peer_key: "+15555550101",
+            title: "菲菲 林",
+            extra: None,
+        }];
+        let changed = store
+            .upsert_passive_contacts(&account.id, &entries, 20)
+            .unwrap();
+        assert_eq!(changed, vec![conversation.id.clone()]);
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.title, "菲菲 林");
+        // 真名不覆盖：再同步的另一个名字不落行、不进 changed。
+        let renamed = [SyncedContact {
+            kind: "contact",
+            peer_key: "+15555550101",
+            title: "另一个名字",
+            extra: None,
+        }];
+        let changed = store
+            .upsert_passive_contacts(&account.id, &renamed, 30)
+            .unwrap();
+        assert!(changed.is_empty());
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.title, "菲菲 林");
+    }
+
+    /// §4.229（契约 1.219）pull 面：§6.5 的 60s 拉与被动面共享同一升级臂——
+    /// 号码键条目跨桥升 ACI 键行，sync 标记照旧落。
+    #[test]
+    fn pulled_contact_sync_upgrades_the_aci_keyed_conversation_title() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let aci = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", aci, "aaa***ee")
+            .unwrap();
+        store
+            .upsert_peer_identity(&account.id, aci, "+15555550101")
+            .unwrap();
+        let entries = [SyncedContact {
+            kind: "contact",
+            peer_key: "+15555550101",
+            title: "菲菲 林",
+            extra: None,
+        }];
+        let changed = store
+            .upsert_synced_contacts(&account.id, &entries, 20)
+            .unwrap();
+        assert_eq!(changed, vec![conversation.id.clone()]);
+        assert_eq!(
+            store
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "菲菲 林"
         );
     }
 
