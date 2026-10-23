@@ -896,6 +896,28 @@ pub struct ConversationSummary {
     /// all (fresh row, link-time import gap, any history the connector does
     /// not hold) projects false — honest absence, never invented.
     pub has_user_initiated_outbound: bool,
+    /// Contract 1.221 (§4.231): the direct conversation's profile-sharing
+    /// factor — the stored `mrr_factors_json.profileSharing` bit the engine's
+    /// `listContacts` answer now exposes (the official `profileSharing`
+    /// trusted-contact weight of `isConversationAccepted`). Present only when
+    /// the factor stamp carries it (a pre-1.221 row or an engine that did not
+    /// expose the flag leaves the key absent); group rows stay absent — the
+    /// official groupV1-only factor has no group-v2 read face (§4.58 hole).
+    /// The desktop consumes it for the official `isMissingRequiredProfileSharing`
+    /// gate (MandatoryProfileSharingActions.dom.tsx) together with
+    /// [`Self::in_system_contacts`]; absent means unknown, never false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_sharing: Option<bool>,
+    /// Contract 1.221 (§4.231): the direct conversation's system-contact
+    /// factor — the inverted stored `mrr_factors_json.hidden` bit (the
+    /// official `isInSystemContacts` trusted-contact weight). Present only
+    /// when the factor stamp carries `hidden`; absent means unknown (a
+    /// pre-1.221 stamp, the probed-absent `{}` marker, or any group row).
+    /// Together with [`Self::profile_sharing`] it is the honest data plane
+    /// for the desktop's MandatoryProfileSharing gate; the connector never
+    /// invents a false bit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_system_contacts: Option<bool>,
     /// Contract 1.138 (§4.129): the row's protocol identifiers, derived at
     /// read time from the peer key's shape so the desktop's `!` selector
     /// faces (`*ServiceIdEndsWith` / `*E164EndsWith` / `*GroupIdEndsWith`)
@@ -1209,20 +1231,72 @@ fn derive_message_request_accepted(
         || (kind == "direct" && factors.hidden == Some(false))
 }
 
-/// Contract 1.65 (§4.58): the accepted state for one conversation row — the
+/// Contract 1.221 (§4.231): one row's message-request projection — the
+/// accepted bit (1.65) plus the two trusted-contact factors the desktop's
+/// MandatoryProfileSharing gate reads (official `profileSharing` /
+/// `isInSystemContacts`). The factors are **absent** unless the engine's
+/// factor stamp actually carries them: a pre-1.221 row, the probed-absent
+/// `{}` marker, and every group row answer `None`, never an invented
+/// false. The accepted bit keeps the 1.65 derivation exactly (the factors
+/// only become wire material — they never change acceptance here).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MrrProjection {
+    accepted: bool,
+    profile_sharing: Option<bool>,
+    in_system_contacts: Option<bool>,
+}
+
+fn derive_mrr_projection(
+    kind: &str,
+    is_self: bool,
+    has_data: bool,
+    has_outgoing: bool,
+    factors: MrrFactors,
+) -> MrrProjection {
+    let accepted = derive_message_request_accepted(kind, is_self, has_data, has_outgoing, factors);
+    if kind == "direct" {
+        // Official acceptConversation writes the contact's profile-sharing
+        // bit as part of the ACCEPT response (SyncHelper's profile-sharing
+        // flip the §4.56 contract records). Our zero-local-write face never
+        // stores that flip, so an authoritative ACCEPT stamp projects
+        // profileSharing=true here — otherwise the accepted conversation
+        // would re-open the MandatoryProfileSharing gate forever (the stored
+        // enrich bit predates the accept and stays false until the next
+        // re-stamp). A non-ACCEPT row keeps the engine bit verbatim.
+        let profile_sharing = if factors.accept_response == Some(true) {
+            Some(true)
+        } else {
+            factors.profile_sharing
+        };
+        MrrProjection {
+            accepted,
+            profile_sharing,
+            in_system_contacts: factors.hidden.map(|hidden| !hidden),
+        }
+    } else {
+        MrrProjection {
+            accepted,
+            profile_sharing: None,
+            in_system_contacts: None,
+        }
+    }
+}
+
+/// Contract 1.221 (§4.231): the projection for one conversation row — the
 /// stored factor stamp plus the message window in one guarded lookup, called
 /// from the post-map loops the 1.27/1.60 projections run (the row closures
 /// answer rusqlite, so the fallible derivation rides the already-held guard
 /// after the rows collect). Shared by the list page and the single-row
 /// summary so a reloaded window and an event-driven refresh can never
-/// disagree (the 1.60 discipline).
-fn conversation_message_request_accepted(
+/// disagree (the 1.60 discipline); the factor faces ride the same query, no
+/// second read.
+fn conversation_mrr_projection(
     conn: &Connection,
     account_id: &str,
     conversation_id: &str,
     kind: &str,
     is_self: bool,
-) -> Result<bool, StoreError> {
+) -> Result<MrrProjection, StoreError> {
     let (factors_json, has_data, has_outgoing): (Option<String>, i64, i64) = conn
         .query_row(
             "SELECT mrr_factors_json,
@@ -1241,7 +1315,7 @@ fn conversation_message_request_accepted(
             },
         )
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
-    Ok(derive_message_request_accepted(
+    Ok(derive_mrr_projection(
         kind,
         is_self,
         has_data != 0,
@@ -4180,6 +4254,10 @@ impl Store {
                         // Contract 1.71 (§4.63): derived in the same post-map
                         // loop (below), the same read-time family.
                         has_user_initiated_outbound: false,
+                        // Contract 1.221 (§4.231): the trusted-contact factor
+                        // pair, filled by the same post-map loop.
+                        profile_sharing: None,
+                        in_system_contacts: None,
                         service_id: identifiers.service_id,
                         pni: None,
                         e164: identifiers.e164,
@@ -4211,13 +4289,11 @@ impl Store {
             // Contract 1.65 (§4.58): the same read-time accepted derivation
             // the single-row summary applies, over the same held guard — a
             // reloaded page and an event-driven window cannot disagree.
-            item.message_request_accepted = conversation_message_request_accepted(
-                &conn,
-                account_id,
-                &item.id,
-                item.kind,
-                item.is_self,
-            )?;
+            let mrr =
+                conversation_mrr_projection(&conn, account_id, &item.id, item.kind, item.is_self)?;
+            item.message_request_accepted = mrr.accepted;
+            item.profile_sharing = mrr.profile_sharing;
+            item.in_system_contacts = mrr.in_system_contacts;
             // Contract 1.71 (§4.63): the whole-history outbound bit, the same
             // post-map loop, the same guard.
             item.has_user_initiated_outbound =
@@ -10067,6 +10143,10 @@ impl Store {
                         // Contract 1.71 (§4.63): derived in the same post-map
                         // match (below), the same read-time family.
                         has_user_initiated_outbound: false,
+                        // Contract 1.221 (§4.231): the trusted-contact factor
+                        // pair, filled by the same post-map match.
+                        profile_sharing: None,
+                        in_system_contacts: None,
                         service_id: identifiers.service_id,
                         pni: None,
                         e164: identifiers.e164,
@@ -10120,13 +10200,16 @@ impl Store {
                 // derivation the list applies — the summary that rides
                 // conversation.changed carries the key, so an event-driven
                 // window and a full reload cannot disagree.
-                summary.message_request_accepted = conversation_message_request_accepted(
+                let mrr = conversation_mrr_projection(
                     &conn,
                     account_id,
                     conversation_id,
                     summary.kind,
                     summary.is_self,
                 )?;
+                summary.message_request_accepted = mrr.accepted;
+                summary.profile_sharing = mrr.profile_sharing;
+                summary.in_system_contacts = mrr.in_system_contacts;
                 // Contract 1.71 (§4.63): the whole-history outbound bit —
                 // the summary that rides conversation.changed carries it so
                 // an event-driven window and a full reload cannot disagree.
@@ -26713,6 +26796,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(summary.message_request_accepted);
+        // Contract 1.221 (§4.231): no factor stamp yet — both trusted-contact
+        // keys stay absent (unknown, not false).
+        assert_eq!(summary.profile_sharing, None);
+        assert_eq!(summary.in_system_contacts, None);
 
         // Only-incoming window, no stamp: the honest pending.
         store
@@ -26744,6 +26831,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(summary.message_request_accepted);
+        // Contract 1.221 (§4.231): the trusted-contact pair rides the same
+        // summary — profileSharing stamped true, hidden=true inverted to
+        // inSystemContacts=false.
+        assert_eq!(summary.profile_sharing, Some(true));
+        assert_eq!(summary.in_system_contacts, Some(false));
 
         // hidden=false (a system contact) alone accepts it.
         assert!(
@@ -26760,6 +26852,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(summary.message_request_accepted);
+        // The re-stamp drops profileSharing (absent key, never false) and
+        // flips the system-contact face to true.
+        assert_eq!(summary.profile_sharing, None);
+        assert_eq!(summary.in_system_contacts, Some(true));
 
         // hidden=true with no other factor flips back to pending.
         assert!(
@@ -26776,6 +26872,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!summary.message_request_accepted);
+        assert_eq!(summary.in_system_contacts, Some(false));
 
         // An outgoing row accepts it regardless of the factors
         // (sentMessageCount > 0).
@@ -26863,6 +26960,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(summary.message_request_accepted);
+        // Contract 1.221 (§4.231): group rows never project the direct-only
+        // trusted-contact pair (honest hole, not false).
+        assert_eq!(summary.profile_sharing, None);
+        assert_eq!(summary.in_system_contacts, None);
     }
 
     /// The stamp degrades honestly: a malformed payload parses as the
@@ -27030,7 +27131,39 @@ mod tests {
                 .unwrap();
             let wire = serde_json::to_value(&summary).unwrap();
             assert_eq!(wire["messageRequestAccepted"], expected);
+            // Contract 1.221 (§4.231): the trusted-contact pair is absent-key
+            // until a factor stamp exists (unknown is never serialized false).
+            assert!(wire.get("profileSharing").is_none());
+            assert!(wire.get("inSystemContacts").is_none());
         }
+        // After an engine stamp both keys ride the summary as plain booleans.
+        assert!(
+            store
+                .set_conversation_mrr_factors_for_peer(
+                    &account.id,
+                    "+15555550101",
+                    r#"{"hidden":false,"profileSharing":false}"#,
+                )
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &pending.id)
+            .unwrap()
+            .unwrap();
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["profileSharing"], false);
+        assert_eq!(wire["inSystemContacts"], true);
+        // The list page shares the same post-map projection (no second truth).
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        let page_wire = serde_json::to_value(&page.items).unwrap();
+        let pending_row = page_wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == pending.id.as_str())
+            .unwrap();
+        assert_eq!(pending_row["profileSharing"], false);
+        assert_eq!(pending_row["inSystemContacts"], true);
         let page = store.list_conversations(&account.id, 10, None).unwrap();
         let wire = serde_json::to_value(&page.items).unwrap();
         let rows = wire.as_array().unwrap();
@@ -27100,6 +27233,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(summary.message_request_accepted);
+        // Contract 1.221 (§4.231): ACCEPT implies the official profile-sharing
+        // flip (zero-local-write face), so the Mandatory gate stays closed.
+        assert_eq!(summary.profile_sharing, Some(true));
 
         // The merge discipline: a re-stamp of the enrich trio keeps the
         // accept pair, and the trio itself is the enrich's truth verbatim.
@@ -27120,6 +27256,9 @@ mod tests {
             summary.message_request_accepted,
             "the accept stamp survives the enrich re-stamp"
         );
+        // Even an enrich trio that says profileSharing=false cannot re-open
+        // the gate on an accepted row: the ACCEPT projection wins.
+        assert_eq!(summary.profile_sharing, Some(true));
         // The reverse order also merges: an accept face fired after the trio
         // keeps the trio keys.
         assert!(

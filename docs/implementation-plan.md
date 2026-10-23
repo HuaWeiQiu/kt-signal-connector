@@ -18675,3 +18675,48 @@ UUID 键直聊行上可能开始出现（材料全部来自本机已持有的桥
 **测试**：读面跨桥（systemName/e164 命中 + 列表/单行同梯 + 裸数字桥拼法
 归一 + 桥缺席诚实缺席）；写面 passive/pull 双路（changed 携真实行 id +
 真名不覆盖）。
+
+## §4.231 消息请求 trusted-contact 因子对投影（profileSharing / inSystemContacts，契约 1.221 · 台账 §29.29）
+
+**背景（官方锚，AGPL 只读零抄码）**：官方消息请求态的 trusted-contact
+权重来自 `isConversationAccepted.preload.ts:21-82`（`profileSharing` /
+`isInSystemContacts`），桌面强制资料共享门
+`conversations.dom.ts:1346-1365 isMissingRequiredProfileSharing` 直接吃这
+两位；`MandatoryProfileSharingActions.dom.tsx:103-141` 是它的 composer
+替换面（屏蔽/删除/继续三钮）。connector 自 1.65（§4.58）起已有
+`mrr_factors_json` 的 {hidden, profileSharing, blocked} 三键，但摘要只
+投影了推导后的 `messageRequestAccepted`，两位因子本身没有 wire 面——
+桌面无法诚实判定门（不得把缺席当 false）。
+
+**变更（wire additive，读时投影，零新存储）**：
+
+- 直聊行摘要新增 optional `profileSharing: boolean`——即
+  `mrr_factors_json.profileSharing`；键存在 = 引擎 `listContacts` 条目
+  显式携带该位，缺席 = 未知（pre-1.221 行 / probed-absent 空对象 / 群行），
+  绝不发明 false。
+- 直聊行摘要新增 optional `inSystemContacts: boolean`——即
+  `!mrr_factors_json.hidden`（官方 `isInSystemContacts` 因子，hidden=false
+  = 通讯录联系人）。
+- 两键都由既有 `conversation_mrr_projection` 单点读时投影（与
+  `messageRequestAccepted` 同一 guarded lookup，列表页与单行
+  `conversation.changed` 摘要零分叉）；群行恒缺席（官方 groupV1-only 因子
+  在 groupV2 无读面，§4.58 诚实缺位延续）。
+- ACCEPT 位优先：1.70 的 authoritative `acceptResponseType=true` 投影
+  `profileSharing=true`——官方 acceptConversation 本身就会翻转该位，而本
+  链路零本地写不保存该翻转；不做此投影，已接受会话会在 enrich 旧戳
+  （false）上永久重开 MandatoryProfileSharing 门。非 ACCEPT 行仍按引擎
+  位 verbatim。
+- 引擎侧数据源（kt-signal-engine 同批）：`listContacts` 条目 additive
+  `isHidden`（contacts 同步行 false / 非通讯录 profile 行 true）与
+  `profileSharing`（Storage Service 联系人 whitelist 位，记录缺席 = 键
+  缺席）；connector 既有 `mrr_factors_stamp` 消费腿零改动。
+
+**桌面消费**：`isMissingRequiredProfileSharing` 的 KT 投影
+（`signalMandatoryProfileSharingRequired`）只在两键显式 false ∧ 有消息
+∧ 直聊 ∧ 非 self/终止/拉黑时渲染 MandatoryProfileSharing 替换面；键缺席
+零渲染。
+
+**测试**：connector store 单测（同摘要两键随因子戳翻转、缺席保持缺席、
+群行缺席；`message_request_accepted_derives_official_factor_weights`
+扩展）；引擎 `project_contact_entry_shapes` 新签名/两键形状；桌面纯模块
+与 source-lock（signalMessageRequestState/Wiring spec）。
