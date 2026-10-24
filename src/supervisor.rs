@@ -4011,7 +4011,7 @@ impl RuntimeSupervisor {
                 } else {
                     0
                 };
-                // Contract 1.259 (§4.243): the verified probe only widens the
+                // Contract 1.260 (§4.244): the verified probe only widens the
                 // trigger further — read when the title and factor fast paths
                 // would both otherwise skip the engine call (one full
                 // `listIdentities` read stamps the whole account, so the
@@ -4100,7 +4100,7 @@ impl RuntimeSupervisor {
         })
         .await
         .map_err(|_| StoreError::Unavailable(None))?;
-        // Contract 1.259 (§4.243): the verified storage-consumption leg —
+        // Contract 1.260 (§4.244): the verified storage-consumption leg —
         // the same one engine window, one full read-only `listIdentities`
         // round trip (the recipient omitted, the pinned
         // ListIdentitiesCommand full-account face). Every named peer's direct
@@ -6549,7 +6549,7 @@ impl RuntimeSupervisor {
                     )));
                 }
             };
-            // Contract 1.259 (§4.243): the write-through stamp word — the
+            // Contract 1.260 (§4.244): the write-through stamp word — the
             // official `#_setVerified` arm writes the protocol store AND
             // lands the record (`DataWriter.updateConversation`), so the
             // projection the render reads is the deterministic post-image of
@@ -11493,7 +11493,7 @@ fn find_contact_display_name(items: &[Value], peer_key: &str) -> Option<String> 
 /// [`find_contact_display_name`] runs, exposed for the §4.58 factor stamp so
 /// both consumers of one listContacts answer can never disagree about which
 /// identity a row is addressed by. First present non-empty identity wins.
-/// Contract 1.259 (§4.243): the pinned upstream `trustLevel` vocabulary
+/// Contract 1.260 (§4.244): the pinned upstream `trustLevel` vocabulary
 /// (TrustLevel.java:5-8) — the only words the identity trust leg stamps.
 /// An engine answer outside the vocabulary is not stored (the row keeps
 /// NULL and the sweep answers the probed-absent marker): the connector

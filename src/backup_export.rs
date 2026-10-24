@@ -736,7 +736,7 @@ fn write_lines(
             if row.has_quote {
                 counters.skipped_quotes += 1;
             }
-            // Attachment face (S13, contract 1.260): descriptors ride the
+            // Attachment face (S13, contract 1.262): descriptors ride the
             // line with the pointer face — the §4.38 v2 locator shape
             // verbatim (the project_pointer_common isomorph; the engine's
             // frame builder is its exact inverse). Entries that cannot build
@@ -811,7 +811,7 @@ fn rich_has_view_once(rich_json: Option<&str>) -> bool {
         .any(|key| rich.get(key).and_then(Value::as_bool).unwrap_or(false))
 }
 
-/// The row's artifact attachment entries (S13, contract 1.260): descriptors
+/// The row's artifact attachment entries (S13, contract 1.262): descriptors
 /// (`attachments_json`) joined with their index-aligned locator faces
 /// (`attachment_locators`), projected into the §4.38 v2 locator shape —
 /// `project_pointer_common`'s output keys verbatim, because the engine's
@@ -3151,7 +3151,7 @@ mod tests {
         assert_eq!(first.file_name, second.file_name);
     }
     // ------------------------------------------------------------------
-    // S13 (contract 1.260): the section-4.46 v1 line set grows the
+    // S13 (contract 1.262): the section-4.46 v1 line set grows the
     // attachment rows - the pointer face is the section-4.38 v2 locator
     // shape verbatim (project_pointer_common isomorph), entries that
     // cannot build a valid official frame stay honest holes counted per

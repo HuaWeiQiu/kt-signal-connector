@@ -9201,9 +9201,9 @@ impl ConnectorService {
         let author = match message.direction {
             "outgoing" => account.signal_account.clone(),
             _ if conversation.kind == "group" => {
-                // Contract 1.191 (§4.191), amended by 1.259 (S12): the group
+                // Contract 1.191 (§4.191), amended by 1.261 (S12): the group
                 // arm needs the member ACI. Two capture seats carry it — the
-                // live envelope ingest (sourceUuid verbatim) and, since 1.259,
+                // live envelope ingest (sourceUuid verbatim) and, since 1.261,
                 // the history import (the archive's `authorId` recipient ACI,
                 // the official importer's own preservation posture). The
                 // conversation's peer key addresses the group, not the
@@ -13250,7 +13250,7 @@ impl ConnectorService {
         Ok(event)
     }
 
-    /// Contract 1.103 (§4.84), widened by 1.259 (§4.243, 批 Z4 · S11):
+    /// Contract 1.103 (§4.84), widened by 1.260 (§4.244, 批 Z4 · S11):
     /// forward one `syncMessage.verified` projection — the account's own
     /// linked device settled a peer's safety-number trust state (the official
     /// SyncMessage.verified face) — AND converge the verified storage
@@ -13282,7 +13282,7 @@ impl ConnectorService {
             &verified.destination_uuid,
             verified.destination_number.as_deref(),
         )?;
-        // Contract 1.259 (§4.243): the convergence stamp — the sync state
+        // Contract 1.260 (§4.244): the convergence stamp — the sync state
         // word maps onto the pinned trust vocabulary (the official
         // SyncMessage.verified states: verified=VERIFIED trust arm,
         // default=first-use trust restored, unverified=explicit distrust)
@@ -19458,7 +19458,7 @@ pub(crate) fn group_migrate_result_from_engine(
     })
 }
 
-/// Contract 1.259 (§4.243): the sync verified state word → the pinned
+/// Contract 1.260 (§4.244): the sync verified state word → the pinned
 /// `trustLevel` vocabulary map (TrustLevel.java:5-8) — the official
 /// SyncMessage.verified states: `verified` = the VERIFIED arm,
 /// `default` = first-use trust restored (TRUSTED_UNVERIFIED, the
@@ -29382,7 +29382,7 @@ mod tests {
     /// the peer/ACI ladder, group incoming → the captured member ACI); one
     /// unknown, zero-stamp, system, or capture-less row refuses the whole
     /// batch before any engine call, as do empty and over-cap lists.
-    // S12x1.191 gold pin (contract 1.259): the group inbound row landed by
+    // S12x1.191 gold pin (contract 1.260): the group inbound row landed by
     // the REAL import chain carries the archive's member ACI, so the
     // section-4.191 backfill prepared frame names the protocol identity -
     // the 1.191 honest INVALID_REQUEST now converges to rows whose archive

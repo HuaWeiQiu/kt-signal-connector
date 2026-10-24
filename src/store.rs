@@ -246,7 +246,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   dim_wallpaper_in_dark_mode INTEGER,
   color_from_primary INTEGER,
   mrr_factors_json TEXT,
-  -- 契约 1.259（§4.243）：identities 信任词戳——钉定上游 listIdentities
+  -- 契约 1.260（§4.244）：identities 信任词戳——钉定上游 listIdentities
   -- trustLevel 三值词原词，或 `{}` probed-absent 官方 DEFAULT 面。NULL =
   -- 从未探明（读侧缺席键 = 未知，绝不发明 false），永不回填历史行
   -- （mrr_factors_json 同纪律）。
@@ -927,7 +927,7 @@ pub struct ConversationSummary {
     /// desktop retires its inversion derivation when it consumes this key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden: Option<bool>,
-    /// Contract 1.259 (§4.243, 批 Z4 · S11): the verified storage-projection
+    /// Contract 1.260 (§4.244, 批 Z4 · S11): the verified storage-projection
     /// bit — the official `ConversationAttributes.verified` contact-record
     /// face (ts/model-types.d.ts:477; the official copies the protocol-store
     /// trust onto the record in `updateVerified` and lands it with
@@ -939,7 +939,7 @@ pub struct ConversationSummary {
     /// storage-consumption faces and projected additively: `true` =
     /// verified, `false` = probed-unverified (the probed-absent `{}`
     /// marker folds to the official DEFAULT face), absent = unknown (never
-    /// probed, a group row, the self row, any pre-1.259 connector). Direct
+    /// probed, a group row, the self row, any pre-1.260 connector). Direct
     /// non-self rows only; the desktop reads this key first and demotes the
     /// `identities.get` async read to the fallback (the S11 structure-diff
     /// closure).
@@ -1628,7 +1628,7 @@ fn conversation_mrr_projection(
     ))
 }
 
-/// Contract 1.259 (§4.243): the verified bit projection over one row's
+/// Contract 1.260 (§4.244): the verified bit projection over one row's
 /// identity trust stamp. NULL and any malformed payload answer absent — a
 /// hostile or partial stamp can never fail a summary read (the §4.50
 /// appendix discipline). The probed-absent `{}` marker folds to `false`:
@@ -1645,7 +1645,7 @@ fn identity_verified_bit_of_stamp(stamp: Option<&str>) -> Option<bool> {
         .map(|object| object.get("trustLevel").and_then(Value::as_str) == Some("TRUSTED_VERIFIED"))
 }
 
-/// Contract 1.259 (§4.243): the summary read face — one row's stamp read
+/// Contract 1.260 (§4.244): the summary read face — one row's stamp read
 /// and projected. Group rows and the self row answer absent without a
 /// query (the official record never carries a group/self verified face);
 /// a row gone mid-page answers absent (the post-map tolerance family).
@@ -2323,7 +2323,7 @@ pub struct MessageRecord {
     /// outgoing rows (the account's own number is the protocol face there),
     /// system rows, pre-1.191 rows, and import rows whose archive recipient
     /// carries no ACI — the capture is verbatim (the §4.38 import keeps the
-    /// archive's member identity, contract 1.259; official posture:
+    /// archive's member identity, contract 1.261; official posture:
     /// Signal-Android ChatItemArchiveImporter.kt:179-184 maps
     /// `chatItem.authorId` to the local recipient and skips the item when it
     /// cannot), never backfilled, never invented.
@@ -2338,7 +2338,7 @@ pub struct MessageRecord {
     /// on outgoing/system/pre-1.191/capture-less import rows: an absent key is
     /// "no protocol identity captured", never a guessed one. Import rows
     /// whose archive recipient carries the member ACI capture it verbatim
-    /// (contract 1.259) and project the key like live rows.
+    /// (contract 1.261) and project the key like live rows.
     #[serde(rename = "authorAci", skip_serializing_if = "Option::is_none")]
     pub author_aci: Option<String>,
     /// The own-story sync transcript bit (contract 1.160, §4.158): true only
@@ -2491,7 +2491,7 @@ pub struct BackupMessageRow {
     pub admin_deleted: bool,
     pub has_quote: bool,
     pub attachments_json: Option<String>,
-    /// The row's locator faces (S13, contract 1.260): the JSON array of
+    /// The row's locator faces (S13, contract 1.262): the JSON array of
     /// [`HistoryAttachmentLocator`] the §4.38 import ingested, index-aligned
     /// with `attachments_json`. Raw cell — the caller parses (a malformed
     /// cell is that caller's skip decision, the store stays a dumb read).
@@ -4241,7 +4241,7 @@ impl Store {
         Ok(updated > 0)
     }
 
-    /// Contract 1.259 (§4.243): stamp one direct conversation's identity
+    /// Contract 1.260 (§4.244): stamp one direct conversation's identity
     /// trust word — the storage-consumption landing the official
     /// `updateVerified` → `DataWriter.updateConversation` record write
     /// mirrors. The word is the pinned upstream `trustLevel` verbatim
@@ -4268,7 +4268,7 @@ impl Store {
         Ok(updated > 0)
     }
 
-    /// Contract 1.259 (§4.243): stamp by conversation id — the
+    /// Contract 1.260 (§4.244): stamp by conversation id — the
     /// write-through arms (`identities.verify` success, the §4.84
     /// verifiedChanged convergence) resolve the row by id, not by peer
     /// spelling. Direct rows only, the same 1:1 gate.
@@ -4290,7 +4290,7 @@ impl Store {
         Ok(updated > 0)
     }
 
-    /// Contract 1.259 (§4.243): the probed-absent marker (`{}`) for direct
+    /// Contract 1.260 (§4.244): the probed-absent marker (`{}`) for direct
     /// rows the engine's full `listIdentities` answer did not name — the
     /// official DEFAULT face (no identity row yet presents unverified), and
     /// the marker that keeps the enrich trigger self-extinguishing (a
@@ -4315,7 +4315,7 @@ impl Store {
         Ok(updated)
     }
 
-    /// Contract 1.259 (§4.243): the enrich trigger count — direct rows whose
+    /// Contract 1.260 (§4.244): the enrich trigger count — direct rows whose
     /// identity stamp is still NULL (never probed). Self rows are excluded
     /// (they never stamp, the empty peer key), so the count self-extinguishes
     /// after one full pass: the answer's rows carry their word, the rest
@@ -4762,7 +4762,7 @@ impl Store {
                         removal_stage: None,
                         shared_group_names: None,
                         hidden: None,
-                        // Contract 1.259 (§4.243): the verified projection
+                        // Contract 1.260 (§4.244): the verified projection
                         // bit, filled in the same post-map loop, the same
                         // read-time family.
                         verified: None,
@@ -4825,7 +4825,7 @@ impl Store {
             // Contract 1.257 (§4.242): the verbatim hidden stamp — the
             // inversion stays on in_system_contacts alone.
             item.hidden = mrr.hidden;
-            // Contract 1.259 (§4.243): the verified storage-projection bit —
+            // Contract 1.260 (§4.244): the verified storage-projection bit —
             // the same post-map loop, the same read-time family.
             item.verified = conversation_identity_verified_bit(
                 &conn,
@@ -8540,7 +8540,7 @@ impl Store {
                             // batch writer lands the importer's flag beside
                             // the intact row, exactly the live posture.
                             i64::from(record.admin_deleted),
-                            // The S12 capture (contract 1.259): the import
+                            // The S12 capture (contract 1.261): the import
                             // row carries the archive's member ACI exactly
                             // like the live ingest capture rides its column.
                             record.author_aci,
@@ -10701,7 +10701,7 @@ impl Store {
                         removal_stage: None,
                         shared_group_names: None,
                         hidden: None,
-                        // Contract 1.259 (§4.243): the verified projection
+                        // Contract 1.260 (§4.244): the verified projection
                         // bit, filled in the same post-map match, the same
                         // read-time family.
                         verified: None,
@@ -10800,7 +10800,7 @@ impl Store {
                 // Contract 1.257 (§4.242): the verbatim hidden stamp — the
                 // inversion stays on in_system_contacts alone.
                 summary.hidden = mrr.hidden;
-                // Contract 1.259 (§4.243): the verified storage-projection
+                // Contract 1.260 (§4.244): the verified storage-projection
                 // bit — the same post-map match, the same read-time family.
                 summary.verified = conversation_identity_verified_bit(
                     &conn,
@@ -13474,7 +13474,7 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
     if current < 41 {
-        // 契约 1.259（§4.243，批 Z4 · S11 verified 存储投影）：
+        // 契约 1.260（§4.244，批 Z4 · S11 verified 存储投影）：
         // conversations.identity_verified_json 列——identities 信任词戳
         // （钉定上游 listIdentities trustLevel 三值词原词 / `{}`
         // probed-absent 官方 DEFAULT 面）。NULL = 从未探明（读侧 wire 缺席
@@ -17138,7 +17138,7 @@ mod tests {
         }
     }
 
-    /// Contract 1.259 (§4.243): the verified storage-projection bit reads the
+    /// Contract 1.260 (§4.244): the verified storage-projection bit reads the
     /// identity trust stamp — TRUSTED_VERIFIED is the true arm, the other
     /// two pinned words and the probed-absent `{}` are the false arm (the
     /// official DEFAULT face), a never-probed row answers absent (never

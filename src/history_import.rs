@@ -602,7 +602,7 @@ impl<'a> Importer<'a> {
             }
             return Ok(());
         }
-        // The row author's protocol identity (S12, contract 1.259): the
+        // The row author's protocol identity (S12, contract 1.261): the
         // archive frame carries the member identity — `authorId` resolves to
         // a staged recipient whose `aci` is the same lowercase hyphenated
         // UUID a live envelope's `sourceUuid` carries — and the capture is
@@ -610,7 +610,7 @@ impl<'a> Importer<'a> {
         // name-source key both read. The official importer preserves exactly
         // this identity (Signal-Android ChatItemArchiveImporter.kt:179-184:
         // `chatItem.authorId → fromLocalRecipientId`, missing = the whole
-        // item honestly skipped); the pre-1.259 import dropped it, which made
+        // item honestly skipped); the pre-1.261 import dropped it, which made
         // every group inbound row refuse backfill with the 1.191 honest
         // INVALID_REQUEST ("no resolvable protocol identity"). That ruling
         // stands for rows whose archive recipient carries no ACI — the capture
@@ -4843,7 +4843,7 @@ mod tests {
         );
     }
     // ------------------------------------------------------------------
-    // S12 (contract 1.259): imported inbound rows capture the archive
+    // S12 (contract 1.261): imported inbound rows capture the archive
     // member ACI - the official importer preserves exactly this identity
     // (Signal-Android ChatItemArchiveImporter.kt:179-184,
     // chatItem.authorId -> local recipient; unresolvable = the item is
