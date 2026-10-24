@@ -123,6 +123,11 @@ const DELIVERY_RECEIPT_QUEUE_CAP: usize = 512;
 /// refetch kick lossily (the desktop's own on-demand pull is the convergence
 /// backstop).
 const AVATAR_REFRESH_QUEUE_CAP: usize = 32;
+/// 契约 1.270（§4.254 · 批 Z14）：单轮头像 backfill 的目标帽——contacts
+/// sync 落库后一轮扫描最多入队的缓存缺席 direct 行数。有界纪律沿用
+/// avatar-refresh 队列（lossy try_send，满即弃；对端无头像的负答由
+/// UNAVAILABLE 幂等清位承载，下一轮 sync 前不重复触发）。
+const AVATAR_BACKFILL_CAP: usize = 24;
 
 /// §4.163 contacts.sync wall-clock budget: the whole face — engine resolve,
 /// the two read-only listings, and the store upsert transaction — must answer
@@ -631,6 +636,10 @@ pub struct RuntimeSupervisor {
     /// queue drops the refetch kick, never the receive (the next profile
     /// change or the desktop's own on-demand pull converges).
     avatar_refresh_rx: StdMutex<Option<mpsc::Receiver<(String, String)>>>,
+    /// 契约 1.270（§4.254 · 批 Z14）：头像 backfill kick 用的队列发送端
+    /// clone（队列本体在 `new` 创建；persistence loop 持原版发送端，本
+    /// 字段供 contacts-sync 落库后的 backfill 臂 try_send，lossy 同纪律）。
+    avatar_backfill_tx: mpsc::Sender<(String, String)>,
     /// The avatar-refresh worker; never held across an await.
     avatar_refresh_worker: StdMutex<Option<JoinHandle<()>>>,
     /// §4.123 outbox drain: the receiver side of the lossy drain-kick channel
@@ -785,6 +794,10 @@ impl RuntimeSupervisor {
         // drains it through the getAvatar read lane. Bounded and lossy.
         let (avatar_refresh_tx, avatar_refresh_rx) =
             mpsc::channel::<(String, String)>(AVATAR_REFRESH_QUEUE_CAP);
+        // 契约 1.270（§4.254 · 批 Z14）：backfill kick 的发送端 clone——原版
+        // 发送端 move 进 persistence loop，本 clone 存 supervisor 字段供
+        // contacts-sync 落库后的 backfill 臂 try_send（lossy 同纪律）。
+        let avatar_backfill_tx = avatar_refresh_tx.clone();
         // §4.123 outbox drain: the cap-1 lossy kick channel the engine-landed
         // hooks send on; the worker (spawned later by the registry) owns the
         // receiver and otherwise paces itself on the due schedules + tick.
@@ -853,6 +866,7 @@ impl RuntimeSupervisor {
             delivery_receipt_rx: StdMutex::new(Some(delivery_receipt_rx)),
             delivery_receipt_worker: StdMutex::new(None),
             avatar_refresh_rx: StdMutex::new(Some(avatar_refresh_rx)),
+            avatar_backfill_tx,
             avatar_refresh_worker: StdMutex::new(None),
             outbox_drain_rx: StdMutex::new(Some(outbox_drain_rx)),
             outbox_drain_tx,
@@ -1265,6 +1279,37 @@ impl RuntimeSupervisor {
                 // cached either way (the clear already ran), the next
                 // profile change or the desktop's own pull retries.
             }
+        }
+    }
+
+    /// 契约 1.270（§4.254 · 批 Z14 · S6 头像生命周期⑦）：contacts sync 落
+    /// 库后的一轮 backfill——扫缓存缺席的 direct 行（有界
+    /// AVATAR_BACKFILL_CAP），逐条经既有 avatar-refresh 队列入队，worker
+    /// 端走 getAvatar 读 lane 全链（prepare → 引擎只读调用 → 结果闸 →
+    /// service commit 闸 → ConversationChanged 推送）。lossy：队满即弃
+    /// （桌面按需拉取是兜底）；UNAVAILABLE 负答由既有幂等清位承载。群行
+    /// 不入目标集（群头像走 GroupChanged 事件 kick）。
+    async fn kick_avatar_backfill(&self, account_id: &str) {
+        let targets = {
+            let store = Arc::clone(&self.store);
+            let account_id = account_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                store.avatar_backfill_targets(&account_id, AVATAR_BACKFILL_CAP as u32)
+            })
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+        };
+        let Some(targets) = targets else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+        for conversation_id in targets {
+            let _ = self
+                .avatar_backfill_tx
+                .try_send((account_id.to_string(), conversation_id));
         }
     }
 
@@ -9762,7 +9807,7 @@ impl RuntimeSupervisor {
                 });
             }
         }
-        tokio::time::timeout(CONTACTS_SYNC_BUDGET, async {
+        let outcome = tokio::time::timeout(CONTACTS_SYNC_BUDGET, async {
             let engine = self.running_engine().await?;
             sync_contacts_with(&self.service, &engine, account_id, &self.host_events).await
         })
@@ -9775,7 +9820,13 @@ impl RuntimeSupervisor {
                 "contacts sync exceeded its budget; retry later",
                 true,
             )))
-        })
+        });
+        if outcome.is_ok() {
+            // 契约 1.270（§4.254 · 批 Z14）：真实落库（非 60s 节流早退）后
+            // 一轮头像 backfill——首轮链接/换机/重启后的冷缓存收敛点。
+            self.kick_avatar_backfill(account_id).await;
+        }
+        outcome
     }
 }
 

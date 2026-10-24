@@ -173,6 +173,8 @@
   memo family's (§4.170 untouched).)
 - Contract revision: 1.263 (2026-10-24; §4.247 the incoming-call kind face — batch Z3, ledger §29.80: the official video-call protocol half gets its wire word — the legacy offer frame's proto `Offer.type` the engine already projects as the words `audio`|`video` (offer_type_json, mod.rs offer arm, test :19483-19489) rides the `call.incoming` event additively as `callKind`. The official desktop learns `isVideoCall` from RingRTC's offer parse; on the modern opaque face that bit lives inside the RingRTC-serialized bytes and is unreachable connector-side, so the key stays absent and the desktop's truth-adoption path is the sidecar `call.state` `hasVideo` face (the RingRTC Call.isVideoCall the sidecar already projects) — the wire word covers the legacy face, the truth path covers the modern one, and the banner never invents a kind. Absent-key additive: pre-1.263 hosts read the event byte-identically.)
 - Contract revision: 1.264 (2026-10-24; §4.248 the group-call era receive face — batch Z3, ledger §29.80: the official `handleGroupCallUpdateMessage` posture (background.preload.ts:3534-3563) gets its receive half — the engine's live `DataMessage.groupCallUpdate {eraId}` projection (field 19, mod.rs Q4 arm) routed as a control face (no renderable row, zero persistence — the official consumes the message as `peekNotConnectedGroupCall({conversationId})` and nothing else) and forwarded as the transient `call.groupCallUpdate` event {accountId, conversationId, eraId}. Group context only (the official gate `message.groupV2 && type===GROUP`): an era-less, oversized (the §4.108 send gate's own 256-char cap), or groupless update drops the face — the official warn-and-ignore leg — and the envelope keeps its pre-existing fall-through, so the 1:1 leg stays byte-identical. The send side already rode `calls.sendGroupCallUpdate` (§4.108); this closes the loop: join arm sends the era update, receivers peek and light the header Join face from the peek truth. Transient like `call.incoming`: a missed delivery stays missed, the next era update re-triggers (the official peek-refresh posture).)
+- Contract revision: 1.270 (2026-10-24; §4.254 the avatar backfill face — batch Z14, ledger §29.105, S6 avatar lifecycle ⑦: after a real contacts.sync lands (the 60s throttle early-return never fires this), the supervisor scans direct conversation rows whose conversation_avatars cache entry is absent (bounded 24/round, store avatar_backfill_targets, stable id order, group rows never targeted — group avatars keep the GroupChanged event kick) and enqueues each through the existing avatar-refresh queue. The worker drains them through the exact getAvatar read lane (prepare → read-only engine call → result gate → service commit gate → ConversationChanged push), so a peer photo that never hit any of the four pull moments (profile-change event, group-avatar change, lightbox click, OS-notification avatar) converges on the next sync. Lossy discipline unchanged: a full queue drops, an honest AVATAR_UNAVAILABLE clears idempotently, transient errors retry on the next sync. Zero wire change; pre-1.270 hosts byte-identical.)
+- Contract revision: 1.269 (2026-10-24; §4.253 the direct-peer key-shape gate — batch Z14, ledger §29.105: a prepare-send addressed with direct semantics (kind=direct or contact, text and attachment peer arms) accepts only protocol-shaped peerKeys — a ServiceId (ACI/PNI UUID) or a phone key (+spelled or bare digits); a group master key base64 arriving under direct semantics answers INVALID_REQUEST fail-closed instead of minting a peer_key=<group key> direct conversation row (the audited root of the user-reported greyed Message button: that row's identifiers derive all-absent and the desktop member-card three-key ladder can never resolve it). Group targets must ride kind=group; the contacts.list row set stays untouched — the compose contacts/groups two-section face is deliberate and the group rows' click chain opens group conversations. Zero wire-shape change; pre-1.269 hosts byte-identical apart from the honest refusal.)
 - Contract revision: 1.268 (2026-10-24; §4.252 the hidden write-back
   face — batch Z12, ledger §29.77 S16: the two-repo contract's connector
   half — at the throttled listContacts enrich (the §4.58 stamp
@@ -19909,3 +19911,36 @@ None（未知绝不折 false，store 读面单测钉形）。
 **wire**：零行变化（引擎 RPC additive，pre-1.268 宿主逐字节同形）。
 **测试**：纯面四臂（初写/翻转/同值不收/缺席与 uuid 缺席不收 + 帽 16）+
 store 三态读面 + 回写臂接线源码锁（enrich 内联）。
+
+## §4.253 direct 对端键词形闸（契约 1.269 · 批 Z14 · 台账 §29.105）
+
+prepare-send 以 direct 语义（kind=direct/contact，文本面 prepare_send_text_to_peer
+与附件面 resolve AttachmentSendTarget::Peer 臂）寻址时，对端键只认协议词形：
+ServiceId（ACI/PNI UUID）或电话键（+前缀/裸数字）。群 master key base64 混入
+direct 语义答 INVALID_REQUEST fail-closed——不再 mint peer_key=群 key 的怪
+direct 行（该行 identifiers 反查全缺席，桌面成员卡三键寻址梯恒 miss：用户
+实测「消息钮置灰」实案的审计根因）。群目标必须走 kind=group 臂。
+contacts.list 行集**不收窄**——桌面 compose「联系人/群组」双分区是有意产品
+面，群行点击链走群会话打开（selectContact 的 group kind 直达群臂）。
+
+**wire**：零行变化（拒收面，schema 不动）。
+**测试**：send_by_peer_rejects_group_key_in_direct_semantics（群键文本面
+INVALID_REQUEST + 直聊行未被 mint + 附件 peer 臂同闸 + ACI/电话键直通）。
+
+## §4.254 头像 backfill 触发编排（契约 1.270 · 批 Z14 · S6 ⑦ · 台账 §29.105）
+
+字节链四环（engine 拉/存指针+getAvatar、connector 读线+commit 闸+wire 投影、
+桌面索引+渲染降级）在位且互相咬合；断点=conversation_avatars 缓存无首次/
+兜底填充源（四时机外冷启动缺口：首轮链接/换机/重启后群成员缓存恒空 →
+wire 无 avatarUrl → 桌面色块）。本批补 connector 侧编排：contacts.sync 真实
+落库后一轮 backfill（store avatar_backfill_targets 读缓存缺席 direct 行，帽
+24/轮、行 id 稳定序、群行恒不入——群头像保持 GroupChanged 事件 kick），逐条
+入队既有 avatar-refresh 队列，worker 端走 getAvatar 读 lane 全链（prepare →
+只读引擎调用 → 结果闸 → commit 闸 → ConversationChanged 推送）。lossy 纪律
+不变：队满即弃（桌面按需拉取兜底）；UNAVAILABLE 幂等清位；瞬态失败随下一
+轮 sync 收敛。
+
+**wire**：零行变化（纯编排，schema 不动）。
+**测试**：store 钉形 avatar_backfill_targets_miss_only_direct_rows（缺席
+direct 入集/已缓存不入/群行不入/帽有界）+ 编排接线源码锁（sync_contacts
+成功臂 kick_avatar_backfill 内联）。

@@ -3029,6 +3029,22 @@ impl ConnectorService {
             }
         };
         validate_opaque_id(peer.peer_key, "peerKey")?;
+        // 契约 1.269（§4.253 · 批 Z14）：direct 语义的对端键只认协议词形
+        // （ACI/PNI UUID 或电话键）——群 master key base64 混进来（宿主把
+        // compose 群组行当联系人直发）会 mint 出 peer_key=群 key 的怪
+        // direct 行（成员卡三键寻址梯恒 miss 的实案根因）。fail-closed：
+        // 群目标必须走 kind="group" 臂。
+        if kind == "direct"
+            && !crate::engine::is_uuid_shaped(peer.peer_key)
+            && !peer.peer_key.starts_with('+')
+            && !peer.peer_key.chars().all(|c| c.is_ascii_digit())
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "direct peerKey must be a ServiceId (ACI/PNI) or a phone number — group keys belong to kind=group",
+                false,
+            )));
+        }
         let peer_title = peer
             .peer_title
             .map(str::trim)
@@ -3511,6 +3527,19 @@ impl ConnectorService {
                     }
                 };
                 validate_opaque_id(peer.peer_key, "peerKey")?;
+                // 契约 1.269（§4.253 · 批 Z14）：同文本发送面的 direct 键词
+                // 形闸（群键混入 direct 语义 fail-closed，防怪 direct 行）。
+                if kind == "direct"
+                    && !crate::engine::is_uuid_shaped(peer.peer_key)
+                    && !peer.peer_key.starts_with('+')
+                    && !peer.peer_key.chars().all(|c| c.is_ascii_digit())
+                {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "direct peerKey must be a ServiceId (ACI/PNI) or a phone number — group keys belong to kind=group",
+                        false,
+                    )));
+                }
                 let peer_title = peer
                     .peer_title
                     .map(str::trim)
@@ -24730,6 +24759,115 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// 契约 1.269（§4.253 · 批 Z14）：direct 语义的对端键词形闸——群
+    /// master key base64 混进 kind=direct/contact 时 fail-closed（不 mint
+    /// 怪 direct 行），UUID/电话键直通。附件 peer 臂同闸同词。
+    #[test]
+    fn send_by_peer_rejects_group_key_in_direct_semantics() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+
+        // 群 key base64 拒收（文本面）。
+        assert!(matches!(
+            service.prepare_send_text_to_peer(
+                &account.id,
+                &PeerTarget {
+                    kind: "contact",
+                    peer_key: "D4DyutMEtvpawXahRoFH/5KPjE/z7ThINwByaAh7Zfw=",
+                    peer_title: Some("Group Mistyped as Contact"),
+                },
+                "hello",
+                "gate-req-1",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            Err(ServiceError::Api(ref api))
+                if api.code == "INVALID_REQUEST"
+        ));
+        // 直聊行未被 mint。
+        assert!(
+            service
+                .list_conversations(&account.id, 10, None)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+
+        // 附件 peer 臂同闸（payload 校验先于上行——INVALID_REQUEST 只能
+        // 出自词形闸；若闸缺席会走 ensure mint 后才在附件描述符校验失败，
+        // 行集断言兜底）。
+        let peer = AttachmentSendTarget::Peer(PeerTarget {
+            kind: "direct",
+            peer_key: "D4DyutMEtvpawXahRoFH/5KPjE/z7ThINwByaAh7Zfw=",
+            peer_title: None,
+        });
+        assert!(matches!(
+            service.prepare_send_attachment(
+                &account.id,
+                &peer,
+                "gate-req-2",
+                "aGVsbG8=",
+                5,
+                Some("fixture.bin"),
+                Some("application/octet-stream"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            ),
+            Err(ServiceError::Api(ref api))
+                if api.code == "INVALID_REQUEST"
+        ));
+        assert!(
+            service
+                .list_conversations(&account.id, 10, None)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+
+        // 协议词形直通：ACI UUID 与 +电话键都放行（不 mint 判定走发送臂
+        // 既有链，这里只断言闸不拒）。
+        for key in ["0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10", "+15555550111"] {
+            let probe = PeerTarget {
+                kind: "contact",
+                peer_key: key,
+                peer_title: None,
+            };
+            // 附件臂文件缺失先于上游——不落到 mint 判定即证明过了词形闸；
+            // 若词形闸误拒会返回 INVALID_REQUEST（同 code），故以文本面
+            // prepare 的 Dispatch 形为准。
+            let prepared = service.prepare_send_text_to_peer(
+                &account.id,
+                &probe,
+                "shape probe",
+                &format!("gate-req-{key}"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                matches!(&prepared, Ok(PreparedSend::Dispatch { .. })),
+                "protocol-shaped key {key} must pass the gate"
+            );
+        }
     }
 
     #[test]

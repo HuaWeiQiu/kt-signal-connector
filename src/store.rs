@@ -12020,6 +12020,10 @@ impl Store {
         let shared_index = shared_group_index(&conn, account_id)?;
         let mut stmt = conn
             .prepare(
+                // 批 Z14 审计记档：本读面同时供桌面「联系人/群组」双分区
+                // （compose 面有意面，群组行点击走群链）——行集收窄会砍
+                // 群分区产品面，不收。怪 direct 行的防复发闸在发送面
+                // （契约 1.269 §4.253：direct 语义拒绝群键 peerKey）。
                 "SELECT id, kind, peer_key, title, extra
                  FROM contacts
                  WHERE account_id=?1
@@ -12165,6 +12169,41 @@ impl Store {
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(())
+    }
+
+    /// 契约 1.270（§4.254 · 批 Z14 · S6 头像生命周期⑦）：direct 会话行的头像
+    /// backfill 目标读——缓存缺席的 direct 行（对端有照片但从未命中任何拉取
+    /// 时机：profile 变更事件/群头像变更事件/灯箱点击/OS 通知头像四源之外的
+    /// 冷启动缺口）。纯 store 读，bounded by the caller's cap；排序用行 id 稳
+    /// 定序（同一轮内确定面，风暴不重排）。群行不入目标集（群头像走既有
+    /// GroupChanged 事件 kick，本面只收敛成员直聊面）。
+    pub fn avatar_backfill_targets(
+        &self,
+        account_id: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id
+                 FROM conversations c
+                 LEFT JOIN conversation_avatars a
+                   ON a.conversation_id = c.id AND a.account_id = c.account_id
+                 WHERE c.account_id = ?1
+                   AND c.kind = 'direct'
+                   AND a.conversation_id IS NULL
+                 ORDER BY c.id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id, limit.clamp(1, 64) as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
     }
 
     /// 契约 1.217（§29.2）：缓存失效面——上游头像被移除（setProfile null
@@ -23662,6 +23701,44 @@ mod tests {
             store.list_contacts(&account.id, None, 10, Some("c1:other-account:contact:+1")),
             Err(StoreError::InvalidCursor)
         ));
+    }
+
+    /// 契约 1.270（§4.254 · 批 Z14 · S6 头像生命周期⑦）：backfill 目标读
+    /// 三臂——缓存缺席 direct 行入集、群行恒不入、已缓存行不再重复。
+    #[test]
+    fn avatar_backfill_targets_miss_only_direct_rows() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let cold = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Cold Direct")
+            .unwrap();
+        let warm = store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Warm Direct")
+            .unwrap();
+        let group = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "Group")
+            .unwrap();
+        store
+            .upsert_conversation_avatar(
+                &account.id,
+                &warm.id,
+                "data:image/png;base64,aGVsbG8=",
+                5,
+                0,
+            )
+            .unwrap();
+
+        let targets = store.avatar_backfill_targets(&account.id, 24).unwrap();
+        assert_eq!(targets, vec![cold.id.clone()]);
+        assert!(!targets.contains(&warm.id));
+        assert!(!targets.contains(&group.id));
+
+        // 有界：帽截断按行 id 稳定序。
+        let capped = store.avatar_backfill_targets(&account.id, 0).unwrap();
+        assert!(capped.is_empty() || capped.len() <= 1);
     }
 
     #[test]
