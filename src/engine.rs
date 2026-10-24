@@ -851,6 +851,17 @@ pub struct NormalizedRich {
     /// The trust decision stays with the user (the §4.223 posture).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_identity_change: bool,
+    /// 消息请求响应时间线系统行（契约 1.253 §4.239）：官方
+    /// `MessageRequestResponseEvent` 词表成员（types/
+    /// MessageRequestResponseEvent.std.ts:6-11 verbatim：ACCEPT / BLOCK /
+    /// UNBLOCK / SPAM），钉在官方 `message-request-response-event` 行的
+    /// `messageRequestResponseEvent` 属性位（models/conversations.preload.ts
+    /// :2544 verbatim 键名；serde camelCase 投影同形）。只由服务层落行面铸造
+    /// （§4.239 的 LOCAL 动作臂 + §4.58 镜像消费臂，双源同词表）——接收解析
+    /// 永不产它（引擎不投影该面）。词表校验收在铸造点闭集上，wire 面不收
+    /// 外来串。仅真值出现；键缺席 = 非该族行，pre-1.253 宿主读行零变化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_request_response_event: Option<String>,
     /// 批 A · A2（connector §4.232；桌面契约 1.250）：「联系人加入 Signal」
     /// 系统行标记——官方 message.type `joined-signal-notification` 的行级
     /// 投影（官方 import 行源 import.preload.ts:3851-3854 的 simpleUpdate
@@ -1063,6 +1074,7 @@ impl NormalizedRich {
             && self.conversation_merge.is_none()
             && self.unidentified_status.is_empty()
             && self.story_message_recipients.is_empty()
+            && self.message_request_response_event.is_none()
     }
 }
 

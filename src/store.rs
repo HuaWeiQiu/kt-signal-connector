@@ -3984,6 +3984,39 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// Contract 1.253 (§4.239): the raw `messageRequestResponseType` member
+    /// a conversation's factor stamp carries — the mirror-row gate's prior
+    /// state (the official `didResponseChange =
+    /// response !== currentMessageRequestState` reads the raw member, not
+    /// the collapsed ACCEPT bit). `None` = never received (the official
+    /// `attr || 0` UNKNOWN default's KT reading) or a non-direct row. Reads
+    /// the same `mrr_factors_json` stamp the setter writes — one source, no
+    /// second truth (the §4.50 appendix discipline).
+    pub fn conversation_accept_response_member(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<u8>, StoreError> {
+        let conn = self.lock_conn()?;
+        let current: Option<Option<String>> = conn
+            .query_row(
+                "SELECT mrr_factors_json FROM conversations
+                 WHERE id=?1 AND account_id=?2 AND kind='direct'",
+                params![conversation_id, account_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let factors = current
+            .and_then(|json| serde_json::from_str::<Value>(json.as_deref().unwrap_or("")).ok())
+            .and_then(|value| {
+                value
+                    .get("acceptResponseTypeMember")
+                    .and_then(Value::as_u64)
+            });
+        Ok(factors.and_then(|value| u8::try_from(value).ok()))
+    }
+
     /// Contract 1.138 (§4.131): merge the authoritative blocked bit into one
     /// direct conversation's factor stamp. Two writers share the face — the
     /// §4.47 `conversations.setBlocked` write-back (the upstream write

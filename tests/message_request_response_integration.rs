@@ -281,8 +281,8 @@ async fn message_request_response_faces_round_trip_and_gate_the_mirror() {
         "the incoming-only fixture row is pending before any mirror"
     );
 
-    // The authoritative ACCEPT mirror: no message row, and the refreshed
-    // summary flips the wire key.
+    // The authoritative ACCEPT mirror: the §4.239 timeline row lands, and
+    // the refreshed summary flips the wire key.
     fs::write(
         signal_data.join(".fixture-emit-envelopes.json"),
         json!({ "envelopes": [
@@ -310,7 +310,9 @@ async fn message_request_response_faces_round_trip_and_gate_the_mirror() {
         "the ACCEPT mirror must ride conversation.changed with the accepted state"
     );
 
-    // No message row was created by the mirror.
+    // The §4.239 row: exactly one bodyless system row carrying the ACCEPT
+    // word (contract revision 1.253; the pre-1.253 "no row" posture is
+    // superseded by the official addMessageRequestResponseEventMessage).
     let rows = request(
         &mut client,
         "rows-after-accept",
@@ -322,13 +324,24 @@ async fn message_request_response_faces_round_trip_and_gate_the_mirror() {
         }),
     )
     .await;
+    let created: Vec<&Value> = rows["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["sentAt"].as_u64().unwrap_or(0) >= 1727000010000)
+        .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "the ACCEPT mirror lands exactly one system row: {rows:?}"
+    );
+    let mrr_row = created[0];
+    assert_eq!(mrr_row["direction"], "system");
+    assert_eq!(mrr_row["status"], "system");
+    assert_eq!(mrr_row["messageRequestResponseEvent"], "ACCEPT");
     assert!(
-        rows["result"]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["sentAt"].as_u64().unwrap_or(0) < 1727000010000),
-        "the mirror must not create message rows: {rows:?}"
+        mrr_row["body"].is_null(),
+        "the official row is bodyless: {mrr_row}"
     );
 
     // The DELETE twin (member 2) stamps the terminal not-accepted back, and
@@ -491,14 +504,21 @@ async fn message_request_response_faces_round_trip_and_gate_the_mirror() {
         }),
     )
     .await;
-    assert!(
-        rows["result"]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["sentAt"].as_u64().unwrap_or(0) < 1727000010000),
-        "hostile shapes create no rows either: {rows:?}"
-    );
+    // Hostile shapes create no rows either: the MRR row family stays exactly
+    // the two §4.239 rows the legitimate mirrors minted (ACCEPT + BLOCK).
+    let mrr_rows: Vec<&Value> = rows["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row.get("messageRequestResponseEvent").is_some())
+        .collect();
+    assert_eq!(mrr_rows.len(), 2, "hostile shapes create no rows: {rows:?}");
+    let mut words: Vec<&str> = mrr_rows
+        .iter()
+        .map(|row| row["messageRequestResponseEvent"].as_str().unwrap())
+        .collect();
+    words.sort_unstable();
+    assert_eq!(words, vec!["ACCEPT", "BLOCK"]);
 
     // The wire semantics elsewhere: a summary the receive face never names
     // keeps its window-derived answer. The linked account's own group row
