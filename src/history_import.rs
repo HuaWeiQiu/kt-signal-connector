@@ -287,7 +287,9 @@ pub fn run_import(
         return Err(ImportFailure::Cancelled);
     }
     // A crashed predecessor's scratch never leaks into this run: the stage
-    // clears on entry, and the exit path below leaves the tables empty.
+    // clears on entry. The exit path keeps a completed run's recipient
+    // registry (the S21 backfill source) and clears a failed run's partial
+    // stage.
     if let Err(failure) = store
         .clear_history_stage(account_id)
         .map_err(ImportFailure::from)
@@ -306,7 +308,18 @@ pub fn run_import(
     let inner = pass_one(store, account_id, archive, abort).and_then(|()| {
         Importer::new(store, account_id, signal_account, &mut counters, abort).run(archive)
     });
-    let _ = store.clear_history_stage(account_id);
+    // S21 (contract 1.262 §4.245): a COMPLETED import keeps the staged
+    // recipient rows — the archive's recipient → ACI registry is the durable
+    // mapping source the sender-identity backfill (schema v41) rebuilds
+    // from, and the only honest one once the archive frames are gone — and
+    // drops the chat scratch. A FAILED run clears the whole stage: a partial
+    // stage is neither a mapping nor a resumable one (the next entry clears
+    // it anyway).
+    if inner.is_err() {
+        let _ = store.clear_history_stage(account_id);
+    } else {
+        let _ = store.clear_history_chat_stage(account_id);
+    }
     match inner {
         Ok(()) => {
             store.complete_history_import(
@@ -616,9 +629,26 @@ impl<'a> Importer<'a> {
         // stands for rows whose archive recipient carries no ACI — the capture
         // here is verbatim, never invented (no E.164 fallback into an ACI
         // column).
-        let (sender_id, alt_sender_id, sender_name, author_source, import_author_aci) =
+        // The row sender identity (S12 capture + S21 identity form, contract
+        // 1.259/1.262): the archive frame carries the member identity —
+        // `authorId` resolves to a staged recipient whose `aci` is the same
+        // lowercase hyphenated UUID a live envelope's `sourceUuid` carries.
+        // When that ACI exists the row lands it VERBATIM as `sender_id` (the
+        // protocol identity the desktop's member card, direct-row ladder and
+        // avatar index all key on — official parity:
+        // Signal-Android ChatItemArchiveImporter.kt:179-184 maps
+        // `chatItem.authorId` to the local recipient; missing = the whole
+        // item honestly skipped). A recipient without an ACI (e164-only)
+        // keeps the derived ingest hash — the capture is verbatim, never
+        // invented (no E.164 fallback into an identity column). The
+        // `alt_sender_ids` hashes keep the pre-1.262 identity tuple total:
+        // rows a previous import or a live envelope stored under either
+        // hash form dedupe against the ACI-form row (and vice versa).
+        // `author_aci` stays the §4.191/§4.202 capture (the backfill arm
+        // and the wire `authorAci` key read it).
+        let (sender_id, alt_sender_ids, sender_name, author_source, import_author_aci) =
             if direction == "outgoing" {
-                (self.account_id.to_string(), None, None, None, None)
+                (self.account_id.to_string(), Vec::new(), None, None, None)
             } else {
                 let Some(author_id) = value.get("authorId").and_then(Value::as_u64) else {
                     self.counters.skipped_messages += 1;
@@ -632,17 +662,30 @@ impl<'a> Importer<'a> {
                     self.counters.skipped_messages += 1;
                     return Ok(());
                 };
-                let alt = recipient_alt_source(&author)
-                    .map(|alt| stable_hash_id(&[self.account_id, chat.kind, &alt]));
                 let name = non_empty(&author.name)
                     .map(|name| truncate_utf8_bytes(name, SENDER_NAME_CHARS));
-                (
-                    stable_hash_id(&[self.account_id, chat.kind, &source]),
-                    alt,
-                    name,
-                    Some(source),
-                    author.aci.clone(),
-                )
+                if let Some(aci) = author.aci.clone() {
+                    // S21: the ACI is the row sender. The legacy hash forms
+                    // (e164-keyed and ACI-keyed) ride as dedupe candidates so
+                    // the identity tuple stays total across import/live/
+                    // pre-1.262 rows.
+                    let mut alts = Vec::with_capacity(2);
+                    if let Some(e164) = &author.e164 {
+                        alts.push(stable_hash_id(&[self.account_id, chat.kind, e164]));
+                    }
+                    alts.push(stable_hash_id(&[self.account_id, chat.kind, &aci]));
+                    (aci, alts, name, Some(source), author.aci.clone())
+                } else {
+                    // Honest hash: no protocol identity in the archive
+                    // recipient (e164-only) — never invented.
+                    (
+                        stable_hash_id(&[self.account_id, chat.kind, &source]),
+                        Vec::new(),
+                        name,
+                        Some(source),
+                        None,
+                    )
+                }
             };
         // The §4.38 expansion item faces (contract 1.81): view-once, story
         // reply, poll, payment and gift badge ride the row as bounded rich
@@ -751,9 +794,9 @@ impl<'a> Importer<'a> {
                 raw.to_string()
             }
         });
-        let quote = self.quote_snapshot(value)?;
+        let (quote, quote_author_aci) = self.quote_snapshot(value)?;
         let quote_message_id = if let Some(quote) = &quote {
-            self.quote_target(&chat, quote)?
+            self.quote_target(&chat, quote, quote_author_aci.as_deref())?
         } else {
             None
         };
@@ -910,7 +953,7 @@ impl<'a> Importer<'a> {
         self.batch.push(HistoryImportInsert {
             record,
             preview,
-            alt_sender_id,
+            alt_sender_ids,
             locators,
         });
         if let Some(pinned_at) = value
@@ -1013,7 +1056,7 @@ impl<'a> Importer<'a> {
         self.batch.push(HistoryImportInsert {
             record,
             preview,
-            alt_sender_id: None,
+            alt_sender_ids: Vec::new(),
             locators: Vec::new(),
         });
         if self.batch.len() >= BATCH_MESSAGES {
@@ -1265,7 +1308,7 @@ impl<'a> Importer<'a> {
         self.batch.push(HistoryImportInsert {
             record,
             preview,
-            alt_sender_id: None,
+            alt_sender_ids: Vec::new(),
             locators: Vec::new(),
         });
         if self.batch.len() >= BATCH_MESSAGES {
@@ -1296,6 +1339,8 @@ impl<'a> Importer<'a> {
         sent_at: u64,
         archive_direction: &str,
     ) -> Result<(), ImportFailure> {
+        // 群通知行的署名保持 §4.38 哈希形（行身份稳定、通知行不进成员卡
+        // 寻址梯——S21 的 ACI 形只属于方向性气泡行）。
         let (sender_id, alt_sender_id) = if archive_direction == "outgoing" {
             (self.account_id.to_string(), None)
         } else {
@@ -1376,7 +1421,7 @@ impl<'a> Importer<'a> {
         self.batch.push(HistoryImportInsert {
             record,
             preview,
-            alt_sender_id,
+            alt_sender_ids: alt_sender_id.into_iter().collect(),
             locators: Vec::new(),
         });
         if self.batch.len() >= BATCH_MESSAGES {
@@ -1555,29 +1600,40 @@ impl<'a> Importer<'a> {
     /// author source, with the preview text on the receive ladder. A quote
     /// whose author or timestamp cannot be resolved drops the snapshot — the
     /// message itself still imports.
-    fn quote_snapshot(&self, value: &Value) -> Result<Option<NormalizedQuote>, ImportFailure> {
+    /// The return pair carries the quoted author's raw ACI beside the face
+    /// (contract 1.262 §4.245): the snapshot keeps the §4.38 source form
+    /// (number-first) on the wire, while the raw ACI gives the target
+    /// resolver the sender form ACI-verbatim rows land under.
+    fn quote_snapshot(
+        &self,
+        value: &Value,
+    ) -> Result<(Option<NormalizedQuote>, Option<String>), ImportFailure> {
         let Some(quote) = value.get("quote") else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let id = quote
             .get("targetSentTimestamp")
             .and_then(Value::as_u64)
             .filter(|id| *id > 0);
+        let mut author_aci = None;
         let author = match quote.get("authorId").and_then(Value::as_u64) {
             Some(author_id) => match self.store.history_recipient(self.account_id, author_id)? {
-                Some(recipient) => recipient_source(&recipient, self.signal_account),
+                Some(recipient) => {
+                    author_aci = recipient.aci.clone();
+                    recipient_source(&recipient, self.signal_account)
+                }
                 None => None,
             },
             None => None,
         };
         let (Some(id), Some(author)) = (id, author) else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let text = quote
             .get("text")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        Ok(Some(NormalizedQuote {
+        let snapshot = NormalizedQuote {
             id,
             author,
             text: truncate_utf8_bytes(text, MAX_HOST_TEXT_PREVIEW_BYTES),
@@ -1586,7 +1642,8 @@ impl<'a> Importer<'a> {
             // different wire shape and stay unparsed this revision — the
             // empty vec serializes as an absent key, the same pre-1.100 row.
             attachments: Vec::new(),
-        }))
+        };
+        Ok((Some(snapshot), author_aci))
     }
 
     /// Resolve the quoted row when it is already in the store — imported by
@@ -1598,6 +1655,7 @@ impl<'a> Importer<'a> {
         &self,
         chat: &ResolvedChat,
         quote: &NormalizedQuote,
+        author_aci: Option<&str>,
     ) -> Result<Option<String>, ImportFailure> {
         let author_id = stable_hash_id(&[self.account_id, chat.kind, &quote.author]);
         // Direct-chat quotes name the conversation peer; the legacy slot
@@ -1609,7 +1667,14 @@ impl<'a> Importer<'a> {
                 && record.conversation_id == chat.conversation_id
                 && record.sent_at == quote.id
                 && match record.direction {
-                    "incoming" => record.sender_id == author_id || record.sender_id == legacy_id,
+                    // Contract 1.262 §4.245: ACI-verbatim rows land the raw
+                    // ACI as their sender — the third candidate keeps the
+                    // target ladder total across both forms.
+                    "incoming" => {
+                        record.sender_id == author_id
+                            || record.sender_id == legacy_id
+                            || Some(record.sender_id.as_str()) == author_aci
+                    }
                     "outgoing" => record.sender_id == self.account_id,
                     _ => false,
                 }
@@ -1624,6 +1689,18 @@ impl<'a> Importer<'a> {
             &author_id,
             &legacy_id,
         )? {
+            return Ok(Some(record.id));
+        }
+        if let Some(aci) = author_aci
+            && let Some(record) = self.store.message_by_signal_identity(
+                self.account_id,
+                &chat.conversation_id,
+                "incoming",
+                quote.id,
+                aci,
+                aci,
+            )?
+        {
             return Ok(Some(record.id));
         }
         if let Some(record) = self.store.message_by_signal_identity(
@@ -2569,8 +2646,8 @@ mod tests {
                     &conversation,
                     "incoming",
                     sent_at,
+                    ALICE_ACI,
                     &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                    &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
                 )
                 .unwrap()
                 .expect("imported row")
@@ -2605,9 +2682,9 @@ mod tests {
                 &conversation,
                 "incoming",
                 "1000",
-                &stable_hash_id(&[&account.id, "direct", ALICE_E164])
+                ALICE_ACI
             ]),
-            "identity discipline unchanged"
+            "identity discipline unchanged (S21: the ACI is the row sender)"
         );
         let wire: serde_json::Value =
             serde_json::to_value(&full.attachments).expect("wire descriptor");
@@ -2709,8 +2786,8 @@ mod tests {
                 &conversation,
                 "incoming",
                 1000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
             )
             .unwrap()
             .expect("imported row");
@@ -2770,8 +2847,8 @@ mod tests {
                 &conversation,
                 "incoming",
                 1000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
             )
             .unwrap()
             .expect("imported row");
@@ -2829,8 +2906,8 @@ mod tests {
                 &conversation,
                 "incoming",
                 1000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
             )
             .unwrap()
             .expect("row");
@@ -3069,12 +3146,24 @@ mod tests {
         assert_eq!(row.attempts, 1);
         assert_eq!(row.imported_messages, 7);
         assert_eq!(row.error_class, None);
-        // The staging scratch rests empty between runs.
+        // S21 (contract 1.262 §4.245): the completed run keeps the staged
+        // recipient registry — the durable recipient→ACI mapping the store's
+        // v41 sender-identity backfill rebuilds from. The chat edge is
+        // pass-2 scratch and rests empty between runs.
         assert!(
             store
                 .history_chat_recipient(&account.id, 10)
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(
+            store
+                .history_recipient(&account.id, 1)
+                .unwrap()
+                .expect("staged recipient kept for the backfill mapping")
+                .aci
+                .as_deref(),
+            Some(ALICE_ACI)
         );
 
         // The skeleton conversation is reused, never duplicated.
@@ -3086,8 +3175,8 @@ mod tests {
                 &alice_conversation,
                 "incoming",
                 1000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
             )
             .unwrap()
             .expect("imported incoming row");
@@ -3139,8 +3228,8 @@ mod tests {
                 &alice_conversation,
                 "incoming",
                 5000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
             )
             .unwrap()
             .expect("tombstone row");
@@ -3154,8 +3243,8 @@ mod tests {
                 &alice_conversation,
                 "incoming",
                 6000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
             )
             .unwrap()
             .expect("attachment row");
@@ -3180,8 +3269,8 @@ mod tests {
                 &group_conversation,
                 "incoming",
                 7000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "group", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "group", ALICE_ACI]),
             )
             .unwrap()
             .expect("group row");
@@ -3194,8 +3283,8 @@ mod tests {
                 &group_conversation,
                 "incoming",
                 7500,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "group", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "group", ALICE_ACI]),
             )
             .unwrap()
             .expect("oversized row");
@@ -3446,8 +3535,8 @@ mod tests {
                 &conversation.id,
                 "incoming",
                 1000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
             )
             .unwrap()
             .expect("restored row");
@@ -3722,8 +3811,8 @@ mod tests {
                 &alice_conversation,
                 "incoming",
                 1000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
             )
             .unwrap()
             .expect("regular row");
@@ -3850,8 +3939,8 @@ mod tests {
                     &conversation,
                     "incoming",
                     sent_at,
+                    ALICE_ACI,
                     &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                    &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
                 )
                 .unwrap()
                 .expect("imported sticker row")
@@ -3964,8 +4053,8 @@ mod tests {
                 &conversation,
                 "incoming",
                 1000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
             )
             .unwrap()
             .expect("imported sticker row");
@@ -4135,8 +4224,8 @@ mod tests {
                     &conversation,
                     "incoming",
                     sent_at,
+                    ALICE_ACI,
                     &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                    &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
                 )
                 .unwrap()
                 .expect("imported contact row")
@@ -4343,8 +4432,8 @@ mod tests {
                     &conversation,
                     "system",
                     sent_at,
+                    ALICE_ACI,
                     &stable_hash_id(&[&account.id, "group", ALICE_E164]),
-                    &stable_hash_id(&[&account.id, "group", ALICE_ACI]),
                 )
                 .unwrap()
                 .expect("group notice row")
@@ -4512,8 +4601,8 @@ mod tests {
                     &conversation,
                     "incoming",
                     sent_at,
+                    ALICE_ACI,
                     &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                    &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
                 )
                 .unwrap()
                 .expect("imported expansion row")
@@ -4735,8 +4824,8 @@ mod tests {
                 &conversation,
                 "incoming",
                 1000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
             )
             .unwrap()
             .expect("poll row");
@@ -4760,8 +4849,8 @@ mod tests {
                 &group_conversation,
                 "incoming",
                 3000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "group", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "group", ALICE_ACI]),
             )
             .unwrap()
             .expect("group reply row");
@@ -4818,8 +4907,8 @@ mod tests {
                 &conversation,
                 "incoming",
                 1000,
+                ALICE_ACI,
                 &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
-                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
             )
             .unwrap()
             .expect("capped poll row");
@@ -4867,15 +4956,17 @@ mod tests {
         assert!(counters.imported >= 5);
 
         let row = |conversation: &str, direction: &str, sent_at: u64, kind: &str| {
-            let primary = stable_hash_id(&[&account.id, kind, ALICE_E164]);
-            let alt = stable_hash_id(&[&account.id, kind, ALICE_ACI]);
+            // 契约 1.262 §4.245：入站导入行 sender_id = 成员 ACI verbatim；
+            // 旧哈希形（号码键）保留为 legacy 候选。
+            let primary = ALICE_ACI;
+            let alt = stable_hash_id(&[&account.id, kind, ALICE_E164]);
             store
                 .message_by_signal_identity(
                     &account.id,
                     conversation,
                     direction,
                     sent_at,
-                    &primary,
+                    primary,
                     &alt,
                 )
                 .unwrap()
@@ -4893,6 +4984,15 @@ mod tests {
             "group",
         );
         assert_eq!(group_row.author_aci.as_deref(), Some(ALICE_ACI));
+        // S21 (contract 1.262 §4.245): the row sender IS the protocol
+        // identity — the wire senderId carries the member ACI verbatim, the
+        // exact form the desktop member-card ladder's direct-row /
+        // protocol-word-form / avatar arms key on. The Z2 capture rides
+        // beside it as the authorAci key.
+        assert_eq!(group_row.sender_id, ALICE_ACI);
+        let group_wire = serde_json::to_value(&group_row).unwrap();
+        assert_eq!(group_wire["senderId"], serde_json::json!(ALICE_ACI));
+        assert_eq!(group_wire["authorAci"], serde_json::json!(ALICE_ACI));
 
         // Direct inbound captures the same member identity (the section-4.202
         // wire key serves the desktop name sources there too).
@@ -4903,6 +5003,7 @@ mod tests {
             "direct",
         );
         assert_eq!(direct_row.author_aci.as_deref(), Some(ALICE_ACI));
+        assert_eq!(direct_row.sender_id, ALICE_ACI);
 
         // Outgoing rows stay NULL (the account's own number is the protocol
         // face there).
@@ -4979,10 +5080,10 @@ mod tests {
         assert_eq!(counters.imported, 1);
 
         let group = group_conversation_id(&account.id);
-        let primary = stable_hash_id(&[&account.id, "group", ALICE_E164]);
-        let alt = stable_hash_id(&[&account.id, "group", ALICE_ACI]);
+        let primary = ALICE_ACI;
+        let alt = stable_hash_id(&[&account.id, "group", ALICE_E164]);
         let row = store
-            .message_by_signal_identity(&account.id, &group, "incoming", 1000, &primary, &alt)
+            .message_by_signal_identity(&account.id, &group, "incoming", 1000, primary, &alt)
             .unwrap()
             .expect("v2 media row");
         // The S12 capture rides the v2 flavor too - backfill-reachable - and
@@ -5047,5 +5148,100 @@ mod tests {
             .unwrap()
             .expect("number-only row");
         assert_eq!(row.author_aci, None);
+        // Honest hash (contract 1.262 §4.245): a recipient without an ACI
+        // keeps the derived ingest sender — the ACI form is never invented —
+        // and the wire authorAci key stays absent.
+        assert_eq!(row.sender_id, sender);
+        let wire = serde_json::to_value(&row).unwrap();
+        assert!(wire.get("authorAci").is_none());
+    }
+
+    /// Contract 1.262 (§4.245, S21): the full legacy-store chain. A store
+    /// holding pre-1.262 rows (hash sender, no capture) and the staged
+    /// archive recipient table reopens through the v41 backfill — every
+    /// mapped row upgrades to the ACI verbatim — and a rerun of the same
+    /// archive then folds onto the upgraded rows as duplicates (the identity
+    /// tuple with the ACI-form primary), never fresh rows.
+    #[tokio::test]
+    async fn reimport_after_sender_identity_backfill_counts_duplicates() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(&archive, &standard_archive());
+        let first =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        assert!(first.imported >= 5);
+
+        // Simulate the pre-1.262 store: every inbound row back on its legacy
+        // hash form with the capture stripped, and the schema marker on 40 so
+        // the reopen executes the v41 data backfill.
+        let legacy_hash = stable_hash_id(&[&account.id, "group", ALICE_E164]);
+        let group_conversation = group_conversation_id(&account.id);
+        {
+            let conn = store.conn();
+            conn.execute(
+                "UPDATE messages SET sender_id = ?2, author_aci = NULL
+                 WHERE direction='incoming' AND sender_id = ?1 AND conversation_id = ?3",
+                rusqlite::params![ALICE_ACI, legacy_hash, group_conversation],
+            )
+            .unwrap();
+            conn.execute("UPDATE meta SET value='40' WHERE key='schema_version'", [])
+                .unwrap();
+        }
+        drop(store);
+
+        // Reopen: the backfill upgrades the rows again.
+        let store = Arc::new(
+            Store::open(
+                &temp.path().join("store"),
+                Some(StoreKey::from_bytes(TEST_KEY_BYTES)),
+            )
+            .unwrap(),
+        );
+        {
+            let conn = store.conn();
+            let mut stmt = conn.prepare("SELECT id, conversation_id, sender_id, author_aci FROM messages WHERE direction='incoming'").unwrap();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(r) = rows.next().unwrap() {
+                eprintln!(
+                    "DEBUG21 id={} conv={} sender={} author={:?}",
+                    r.get::<_, String>(0).unwrap(),
+                    r.get::<_, String>(1).unwrap(),
+                    r.get::<_, String>(2).unwrap(),
+                    r.get::<_, Option<String>>(3).unwrap()
+                );
+            }
+            eprintln!(
+                "DEBUG21 legacy_hash={legacy_hash} group_conv={group_conversation} acct={}",
+                account.id
+            );
+        }
+        let upgraded = store
+            .message_by_signal_identity(
+                &account.id,
+                &group_conversation_id(&account.id),
+                "incoming",
+                7000,
+                ALICE_ACI,
+                &legacy_hash,
+            )
+            .unwrap()
+            .expect("backfilled row");
+        assert_eq!(upgraded.sender_id, ALICE_ACI);
+        assert_eq!(upgraded.author_aci.as_deref(), Some(ALICE_ACI));
+
+        // The rerun folds onto the upgraded rows — every landable row lands
+        // as a duplicate (the identity tuple answers for the ACI-form
+        // sender), zero fresh rows.
+        let second =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(
+            second.skipped_messages,
+            first.imported + first.skipped_messages
+        );
     }
 }

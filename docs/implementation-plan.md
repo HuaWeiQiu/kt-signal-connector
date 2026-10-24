@@ -18,6 +18,22 @@
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
 - Contract revision: 1.262 (2026-10-24; S13 §4.46 amendment — the v1 line
+- Contract revision: 1.262 (2026-10-25; S21 §4.245 amendment — imported
+  inbound rows land the archive member ACI **as the row sender**:
+  `senderId` on the wire becomes the recipient ACI verbatim (the same
+  lowercase hyphenated form a live envelope's `sourceUuid` speaks) when
+  the archive recipient carries one; recipients without an ACI keep the
+  derived ingest hash honestly. The identity tuple stays total across
+  sender forms (import dedupe carries the legacy hash forms as
+  candidates; the live receive dedupe learns the raw `sourceUuid`
+  candidate), the quote-target ladder learns the ACI form, a completed
+  import keeps the staged recipient registry (the durable mapping
+  source), and the store's schema-v41 one-shot backfill upgrades
+  pre-1.262 rows in place. Official posture: the desktop's member
+  identity is the protocol identity (`getSourceServiceId`,
+  message.preload.ts:257) — the 64-hex local hash is a KT ingest face
+  the protocol never spoke.
+- Contract revision: 1.260 (2026-10-24; S13 §4.46 amendment — the v1 line
   set grows the attachment rows: `chat_item` lines may carry
   `attachments[]` with the §4.38 v2 pointer face verbatim (the
   `project_pointer_common` isomorph: `contentType/fileName/size/width/
@@ -13308,8 +13324,10 @@ either face keeps the pre-1.148 behavior byte-for-byte).
   - *running* (the connector's NDJSON import pass holds the group slot): the
     cancel flips the run's cooperative abort flag (checked between archive
     lines and between write batches), so the pass exits within one batch, its
-    stage scratch clears on the normal exit path, and the run lands
-    `failed` with the new `cancelled` error class carrying its partial
+    stage scratch clears on the failure exit path (contract 1.262 §4.245:
+    only a COMPLETED run keeps the staged recipient registry — the v41
+    backfill's mapping source — and drops just the chat scratch), and the
+    run lands `failed` with the new `cancelled` error class carrying its partial
     counters — the same honest ledger every other failed run writes. The
     cancel itself additionally flips only a still-`running` row to
     `failed`/`cancelled` through one conditional `UPDATE ... WHERE
@@ -19944,3 +19962,57 @@ wire 无 avatarUrl → 桌面色块）。本批补 connector 侧编排：contact
 **测试**：store 钉形 avatar_backfill_targets_miss_only_direct_rows（缺席
 direct 入集/已缓存不入/群行不入/帽有界）+ 编排接线源码锁（sync_contacts
 成功臂 kick_avatar_backfill 内联）。
+## §4.245 导入行发送者身份落 ACI + 存量回填（契约 1.262 · 批 Z17/S21 · 台账 §29.105 追记）
+
+官方锚：桌面成员身份 = **协议身份**——消息作者 `getSourceServiceId`
+（`ts/state/selectors/message.preload.ts:257`）返回信封 ACI；成员卡
+（ContactModal）寻址、头像索引、direct 行 JOIN 全部键在 ACI/E.164 词形
+上。本地 64-hex ingest 哈希是协议从未说过的 KT 私有面。
+
+我方根因（S21 结构）：§4.38 导入链把入站行 sender 落成
+`stable_hash_id([account, kind, source])` 派生哈希（与 live 同族的
+ingest privacy hash）——桌面成员卡 member id 显示该哈希、作者协议身份
+`authorAci` 在 1.259（§4.243）前缺席 → 桌面四臂寻址梯（direct 行 /
+头像索引 / 协议词形 / UUID 臂）全 miss：消息钮置灰 + 头像色块，成员
+有直聊会话也跨不过键形差。§4.243 只修了新增捕获（author_aci 列），
+存量行的哈希 id 未回填。
+
+修复（两段）：
+
+1. **导入时（§4.38 入站臂）**：归档 recipient 带 ACI → 行 sender_id
+   = ACI verbatim（小写连字 UUID，与 live 信封 sourceUuid、桌面协议
+   词形同形）；recipient 无 ACI（e164-only）→ 诚实保持派生哈希，绝不
+   发明。去重候选（`alt_sender_ids`，≤2）携带两种旧哈希形（号码键/
+   ACI 键）——pre-1.262 导入行与 live 行无论以哪一形落库都折叠为同一
+   Signal 消息，重导幂等不破。出站行（sender=账号 id）、system 行族、
+   群通知行（§4.38 哈希形、不进成员卡梯）零变化。
+
+2. **存量回填（store schema v41 一次性任务）**：映射源 = 导入完成后
+   **保留**的 staged recipient 表（§4.38 暂存表——本契约起成功导入
+   不再清空 recipient 行，仅清 chat scratch；失败导入仍整表清）。
+   对每个带 ACI 的 contact recipient 重建四种旧哈希候选
+   （direct/group × 号码键/ACI 键），把 `direction='incoming'` 且
+   sender 命中候选的行升格：`sender_id=ACI`、
+   `author_aci=COALESCE(author_aci, ACI)`。诚实边界：无 ACI 的
+   recipient 不进映射；outgoing/system 行不在筛内；行 id（quote 链
+   锚）不动；升格后 sender 为 36 字符 ACI 形与 64 字符哈希候选形状
+   不相交 + 迁移梯每库一次 = 幂等双保险。
+
+配套（identity tuple 总性闭环）：
+
+- live receive 去重第三候选：信封 `sourceUuid`（raw ACI 形）——
+  导入窗竞态（同一条消息既在归档又被 live 重放）不再撞出重复行。
+- quote-target 梯（§4.38 click-to-scroll）：in-batch 与 store 两臂补
+  ACI 形候选，引用环不因 sender 形升格而断。
+
+**wire**：导入入站行 `senderId` 值形变化（哈希 → ACI verbatim，映射
+可用时）；键形仍为 string，schema 零变化；`authorAci`（§4.202）语义
+不变。桌面零改动——id 变 ACI 后四臂梯自然全通（直聊行/头像索引/
+协议词形全命中）。
+**测试**：导入行 sender=ACI + wire senderId/authorAci 双键钉形
+（群/直聊）；e164-only 作者诚实哈希 + authorAci 键缺席钉形；存量回填
+迁移钉形（pre-Z2 哈希行 + Z2 捕获行双臂升格、e164-only 行/outgoing
+行零触碰、行 id 不动、二次重开零命中）；回填后重导全折叠为重复
+（imported=0）；live 重放（source=号码 + sourceUuid=ACI）对 ACI 形
+导入行去重单行钉形；S12 金钉（prepared 帧 author=成员 ACI）随批
+加 sender=ACI 断言。

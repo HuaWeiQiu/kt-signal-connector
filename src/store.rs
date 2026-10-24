@@ -8929,6 +8929,22 @@ impl Store {
         Ok(())
     }
 
+    /// Drop the completed run's pass-2 chat scratch while KEEPING the staged
+    /// recipient rows (contract 1.262 §4.245): the recipient registry is the
+    /// durable recipient→ACI mapping the schema-v41 sender-identity backfill
+    /// rebuilds from — the only honest source once the archive frames are
+    /// gone. The chat edge (chat id → recipient id + timer) is pure pass-2
+    /// scratch and rests empty between runs.
+    pub fn clear_history_chat_stage(&self, account_id: &str) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "DELETE FROM history_import_stage_chats WHERE account_id=?1",
+                params![account_id],
+            )
+            .map(|_| ())
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
     /// One staged conversation identity (pass-2 point lookup): the chat's
     /// recipient row joined through the staging scratch, plus the chat
     /// frame's timer in ms (§4.41) — `None` when the frame stated none.
@@ -9004,13 +9020,15 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         for row in rows {
             let record = &row.record;
-            // Identity dedupe across the number/ACI duality: live receive may
-            // have stored this Signal message under the number-derived sender
-            // hash while the import resolved the ACI form (or the reverse), so
-            // both candidate hashes qualify as "already stored".
-            let sender_clause = match row.alt_sender_id {
-                Some(_) => "IN (?5, ?6)",
-                None => "IN (?5)",
+            // Identity dedupe across the sender forms (contract 1.262
+            // §4.245): live receive may have stored this Signal message under
+            // a hash form (number-keyed or ACI-keyed) while the import landed
+            // the ACI verbatim — and pre-1.262 import rows are hash-form — so
+            // every candidate qualifies as "already stored".
+            let sender_clause = match row.alt_sender_ids.len() {
+                0 => "IN (?5)",
+                1 => "IN (?5, ?6)",
+                _ => "IN (?5, ?6, ?7)",
             };
             let sql = format!(
                 "SELECT id, attachments_json FROM messages
@@ -9030,7 +9048,7 @@ impl Store {
                     &sent_at,
                     &record.sender_id,
                 ];
-                if let Some(alt) = &row.alt_sender_id {
+                for alt in row.alt_sender_ids.iter().take(2) {
                     all_params.push(alt);
                 }
                 stmt.query_row(all_params.as_slice(), |row| {
@@ -14201,6 +14219,24 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         )
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
+    if current < 41 {
+        // 契约 1.262（§4.245，S21 存量回填）：1.262 之前导入的入站行把发送者
+        // 落成归档派生哈希（§4.38 ingest privacy hash——桌面成员卡 member id
+        // 显示该哈希、作者协议身份 authorAci 在 Z2 前缺席），桌面四臂寻址梯
+        // （直聊行/头像索引/协议词形/UUID 臂）全 miss。归档 recipient 暂存表
+        // （history_import_stage_recipients，导入完成后仍在手）携带官方
+        // Contact.aci，映射可整表重建：对每个带 ACI 的 contact recipient，
+        // 把「该账号入站行中 sender_id 等于两种旧哈希形（号码键/ACI 键）」的
+        // 行升格为 ACI verbatim（wire senderId=ACI，桌面梯自然全通），并补
+        // COALESCE 缺席的 author_aci 捕获。诚实边界：无 ACI 的 recipient 行
+        // 不进映射（保持哈希，绝不发明）；outgoing（sender=账号 id）与
+        // system 行不在 direction='incoming' 筛内；e164-only 的群/联系人
+        // 行零触碰。幂等双保险：迁移梯每库只跑一次，且升格后 sender_id 为
+        // 36 字符 ACI 形、与 64 字符哈希候选形状不相交——重开零命中。
+        // 行 id（含旧哈希的 stable id）保持不动：引用该行的 quote_message_id
+        // /事件链不迁移自愈。
+        backfill_import_sender_aci(conn)?;
+    }
     if current < 39 {
         // 契约 1.218（§29.3，到期主动擦除）：messages.is_erased 列——官方
         // eraseMessageContents（cleanup.preload.ts:63-105）的行内旗标对位
@@ -14329,6 +14365,107 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         params![SCHEMA_VERSION.to_string()],
     )
     .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(())
+}
+
+/// The S21 one-shot backfill (contract 1.262 §4.245): rebuild the archive
+/// recipient → ACI map from the staged recipient table and upgrade legacy
+/// hash-form inbound senders to the ACI verbatim. Bounded three passes —
+/// read the map, scan inbound rows, apply the matched updates — and honest
+/// on every edge: recipients without an ACI never enter the map, outgoing
+/// and system rows sit outside the direction filter, and an already-ACI
+/// sender can never equal a hash candidate (36-char UUID vs 64-char hex),
+/// which makes a rerun a zero-hit no-op even before the ladder gate does.
+fn backfill_import_sender_aci(conn: &Connection) -> Result<(), StoreError> {
+    let mut map: BTreeMap<(String, String), String> = BTreeMap::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT account_id, aci, e164
+                 FROM history_import_stage_recipients
+                 WHERE kind='contact' AND aci IS NOT NULL",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+        {
+            let account_id: String = row
+                .get(0)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let aci: String = row
+                .get(1)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let e164: Option<String> = row
+                .get(2)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            // Both legacy hash forms (the number-keyed one — pre-1.262
+            // imports and live envelopes that spoke the number — and the
+            // ACI-keyed one — pre-1.262 ACI-only imports and live envelopes
+            // that spoke the ACI) across both chat kinds a contact author's
+            // rows can carry: direct and group (the hash input includes the
+            // kind, so each is its own candidate).
+            for kind in ["direct", "group"] {
+                if let Some(e164) = &e164 {
+                    map.insert(
+                        (
+                            account_id.clone(),
+                            stable_hash_id(&[&account_id, kind, e164]),
+                        ),
+                        aci.clone(),
+                    );
+                }
+                map.insert(
+                    (
+                        account_id.clone(),
+                        stable_hash_id(&[&account_id, kind, &aci]),
+                    ),
+                    aci.clone(),
+                );
+            }
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    let mut updates: Vec<(String, String)> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, account_id, sender_id FROM messages WHERE direction='incoming'")
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+        {
+            let id: String = row
+                .get(0)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let account_id: String = row
+                .get(1)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let sender_id: String = row
+                .get(2)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if let Some(aci) = map.get(&(account_id, sender_id)) {
+                updates.push((id, aci.clone()));
+            }
+        }
+    }
+    for (id, aci) in updates {
+        conn.execute(
+            "UPDATE messages
+             SET sender_id=?2, author_aci=COALESCE(author_aci, ?2)
+             WHERE id=?1 AND sender_id != ?2",
+            params![id, aci],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
     Ok(())
 }
 
@@ -14695,13 +14832,15 @@ pub struct HistoryStageChat {
 
 /// One import batch row: the message record carries the resolved
 /// conversation/direction/sender identity, the preview is the
-/// conversation-summary projection, and `alt_sender_id` covers the
-/// number/ACI duality — a stored row matching either sender hash counts
-/// as the same Signal message.
+/// conversation-summary projection, and `alt_sender_ids` keeps the
+/// identity tuple total across sender forms (contract 1.262 §4.245): a
+/// stored row matching the ACI sender or any of the legacy hash forms
+/// (e164-keyed / ACI-keyed, pre-1.262 import or live receive) counts as
+/// the same Signal message. Bounded at two by construction.
 pub struct HistoryImportInsert {
     pub record: MessageRecord,
     pub preview: Option<String>,
-    pub alt_sender_id: Option<String>,
+    pub alt_sender_ids: Vec<String>,
     /// Contract 1.55 (§4.38 attachv2): the archive attachments' ingest-side
     /// pointer faces, aligned by index with `record.attachments`. Key
     /// material rides this field and the internal `attachment_locators`
@@ -25604,6 +25743,191 @@ mod tests {
             Store::open(temp.path(), Some(wrong)),
             Err(StoreError::StoreKeyRejected)
         ));
+    }
+
+    /// Contract 1.262 (§4.245, S21): the one-shot sender-identity backfill.
+    /// A store holding pre-1.262 import rows (sender = the derived ingest
+    /// hash, authorAci absent or captured) and the staged archive recipient
+    /// table reopens with every mapped row upgraded to the ACI verbatim;
+    /// honest edges stay untouched (an e164-only recipient's row, the
+    /// outgoing row) and the row id never moves (quote links survive).
+    #[test]
+    fn sender_identity_backfill_maps_legacy_hash_rows_to_the_member_aci() {
+        const ACI: &str = "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b";
+        const E164: &str = "+15550000001";
+        const E164_ONLY: &str = "+15550000009";
+        let temp = TempDir::new().unwrap();
+        let record = |account_id: &str,
+                      conversation: &str,
+                      sender: &str,
+                      author: Option<&str>,
+                      sent_at: u64,
+                      direction: &'static str| MessageRecord {
+            is_erased: false,
+            delete_failed: false,
+            required_protocol_version: None,
+            author_aci: author.map(str::to_string),
+            id: stable_hash_id(&[
+                "signal-message-v2",
+                account_id,
+                conversation,
+                direction,
+                &sent_at.to_string(),
+                sender,
+            ]),
+            account_id: account_id.to_string(),
+            conversation_id: conversation.to_string(),
+            direction,
+            sender_id: sender.to_string(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: Some(1),
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            admin_deleted: false,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        let seeded = {
+            let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+            let account = store
+                .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+                .unwrap();
+            let account_id = account.id.clone();
+            // The mapped recipient's conversation (chat_identity discipline:
+            // contacts key on the number when the archive knows it).
+            let conv = store
+                .ensure_conversation(&account_id, "direct", E164, "alice")
+                .unwrap();
+            let conv_only = store
+                .ensure_conversation(&account_id, "direct", E164_ONLY, "num")
+                .unwrap();
+            // The archive recipient table is still in hand — the mapping
+            // source the backfill rebuilds from.
+            store
+                .stage_history_recipients(
+                    &account_id,
+                    &[HistoryStageRecipient {
+                        id: 1,
+                        kind: "contact".to_string(),
+                        name: "Alice".to_string(),
+                        aci: Some(ACI.to_string()),
+                        e164: Some(E164.to_string()),
+                        master_key: None,
+                    }],
+                )
+                .unwrap();
+            // pre-Z2 row: hash-e164 sender, no capture.
+            let legacy = record(
+                &account_id,
+                &conv.id,
+                &stable_hash_id(&[&account_id, "direct", E164]),
+                None,
+                1000,
+                "incoming",
+            );
+            store.insert_message(&legacy, None, None, true).unwrap();
+            // Z2 row: hash-aci sender, capture present.
+            let z2 = record(
+                &account_id,
+                &conv.id,
+                &stable_hash_id(&[&account_id, "direct", ACI]),
+                Some(ACI),
+                2000,
+                "incoming",
+            );
+            store.insert_message(&z2, None, None, true).unwrap();
+            // e164-only recipient row: its recipient has no ACI — untouched.
+            let honest = record(
+                &account_id,
+                &conv_only.id,
+                &stable_hash_id(&[&account_id, "direct", E164_ONLY]),
+                None,
+                3000,
+                "incoming",
+            );
+            store.insert_message(&honest, None, None, true).unwrap();
+            // outgoing: the account is the sender — untouched.
+            let outgoing = record(&account_id, &conv.id, &account_id, None, 4000, "outgoing");
+            store.insert_message(&outgoing, None, None, true).unwrap();
+            let legacy_id = legacy.id.clone();
+            let z2_id = z2.id.clone();
+            let honest_id = honest.id.clone();
+            let outgoing_id = outgoing.id.clone();
+            let conv_id = conv.id.clone();
+            let conv_only_id = conv_only.id.clone();
+            // Downgrade the marker so the reopen reruns the ladder at 40 and
+            // executes the v41 data backfill exactly as a real old store
+            // would.
+            store
+                .conn()
+                .execute("UPDATE meta SET value='40' WHERE key='schema_version'", [])
+                .unwrap();
+            (
+                account_id,
+                legacy_id,
+                z2_id,
+                honest_id,
+                outgoing_id,
+                conv_id,
+                conv_only_id,
+            )
+        };
+        let (account_id, legacy_id, z2_id, honest_id, outgoing_id, conv_id, conv_only_id) = seeded;
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let row = |conversation: &str, id: &str| {
+            store
+                .message_by_id(&account_id, conversation, id)
+                .unwrap()
+                .expect("row survives the migration")
+        };
+        // Both legacy forms upgrade to the ACI verbatim; the capture fills
+        // where absent and the id (the quote-link anchor) never moves.
+        let upgraded_legacy = row(&conv_id, &legacy_id);
+        assert_eq!(upgraded_legacy.sender_id, ACI);
+        assert_eq!(upgraded_legacy.author_aci.as_deref(), Some(ACI));
+        assert_eq!(upgraded_legacy.id, legacy_id);
+        let upgraded_z2 = row(&conv_id, &z2_id);
+        assert_eq!(upgraded_z2.sender_id, ACI);
+        assert_eq!(upgraded_z2.author_aci.as_deref(), Some(ACI));
+        // Honest edges untouched.
+        assert_eq!(
+            row(&conv_only_id, &honest_id).sender_id,
+            stable_hash_id(&[&account_id, "direct", E164_ONLY])
+        );
+        assert_eq!(row(&conv_only_id, &honest_id).author_aci, None);
+        assert_eq!(row(&conv_id, &outgoing_id).sender_id, account_id);
+        // Idempotent: a second open is a zero-hit no-op.
+        drop(store);
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let again = store
+            .message_by_id(&account_id, &conv_id, &legacy_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.sender_id, ACI);
+        assert_eq!(again.author_aci.as_deref(), Some(ACI));
     }
 
     #[test]
