@@ -4720,6 +4720,7 @@
             "message.viewOnceOpened",
             "message.expired",
             "call.incoming",
+            "call.groupCallUpdate",
             "call.groupIncoming",
             "story.received",
             "story.viewed",
@@ -4948,6 +4949,37 @@
                   "payload": {
                     "type": "object",
                     "description": "The engine's projected signaling face verbatim: {opaque, urgency, destinationDeviceId} on the modern face, the projected frame under its own key (offer/answer/busy/hangup) or {iceUpdate: [...]} on the legacy faces. The connector never parses the RingRTC content."
+                  },
+                  "callKind": {
+                    "type": "string",
+                    "enum": ["audio", "video"],
+                    "description": "Contract revision 1.263 (\u00a74.247, capability call-signaling \u2014 no new capability bit): the legacy offer frame's proto video bit lifted out of the payload \u2014 the engine projects Offer.type as the words audio|video (offer_type_json), and the connector surfaces it verbatim as the additive event word the desktop banner consumes (the official IncomingCallBar isVideoCall protocol half, IncomingCallBar.dom.tsx:193/:315-341). Present only when the event type is the legacy offer face and the engine projected a listed word; the modern opaque face carries the bit inside the RingRTC-serialized bytes \u2014 unreachable here, so the key stays absent and the desktop adopts the RingRTC truth from the sidecar call.state hasVideo face instead. Absent-key additive: pre-1.263 hosts read the event byte-identically."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "call.groupCallUpdate" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "conversationId", "eraId"],
+                "description": "Contract revision 1.264 (\u00a74.248, capability call-signaling \u2014 no new capability bit): the group-call era trigger \u2014 the engine's live DataMessage.groupCallUpdate {eraId} receive projection (field 19, the official group-call start/end signaling) routed as a control face, never a renderable row: the official handleGroupCallUpdateMessage posture (background.preload.ts:3534-3563) consumes the message as peekNotConnectedGroupCall({conversationId}) and nothing else. This event is that trigger's pipe half \u2014 the desktop peeks the group (RingRTC peekGroupCall over the SFU with the \u00a74.73 proof/member material) and lights the conversation-header Join face from the peek truth; the send side already rode calls.sendGroupCallUpdate (\u00a74.108). Group context only: the official gate is message.groupV2 && type===GROUP, so an era-less, oversized (\u2265256-char eraId, the send gate's own cap), or groupless update drops the face entirely (the official warn-and-ignore leg \u2014 the envelope keeps its pre-existing fall-through and the 1:1 leg is byte-identical). Transient like call.incoming: nothing persists, nothing self-heals; a missed delivery stays missed (the official peek-refresh posture re-triggers on the next update).",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "conversationId": { "$ref": "#/$defs/opaqueId" },
+                  "eraId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "The RingRTC group-call era identity string, forwarded verbatim \u2014 the same identity domain the \u00a74.108 send face gates."
                   }
                 }
               }
