@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 40;
+const SCHEMA_VERSION: i64 = 41;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -246,6 +246,11 @@ CREATE TABLE IF NOT EXISTS conversations (
   dim_wallpaper_in_dark_mode INTEGER,
   color_from_primary INTEGER,
   mrr_factors_json TEXT,
+  -- 契约 1.259（§4.243）：identities 信任词戳——钉定上游 listIdentities
+  -- trustLevel 三值词原词，或 `{}` probed-absent 官方 DEFAULT 面。NULL =
+  -- 从未探明（读侧缺席键 = 未知，绝不发明 false），永不回填历史行
+  -- （mrr_factors_json 同纪律）。
+  identity_verified_json TEXT,
   read_watermark_ms INTEGER,
   report_spam_token TEXT,
   UNIQUE(account_id, kind, peer_key),
@@ -922,6 +927,24 @@ pub struct ConversationSummary {
     /// desktop retires its inversion derivation when it consumes this key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden: Option<bool>,
+    /// Contract 1.259 (§4.243, 批 Z4 · S11): the verified storage-projection
+    /// bit — the official `ConversationAttributes.verified` contact-record
+    /// face (ts/model-types.d.ts:477; the official copies the protocol-store
+    /// trust onto the record in `updateVerified` and lands it with
+    /// `DataWriter.updateConversation`, the storage projection the render
+    /// then reads synchronously). Ours is the connector's identity trust
+    /// stamp (`identity_verified_json` — the pinned upstream `trustLevel`
+    /// word verbatim; TRUSTED_VERIFIED is the official
+    /// `verified === Verified.VERIFIED` arm), stamped at the
+    /// storage-consumption faces and projected additively: `true` =
+    /// verified, `false` = probed-unverified (the probed-absent `{}`
+    /// marker folds to the official DEFAULT face), absent = unknown (never
+    /// probed, a group row, the self row, any pre-1.259 connector). Direct
+    /// non-self rows only; the desktop reads this key first and demotes the
+    /// `identities.get` async read to the fallback (the S11 structure-diff
+    /// closure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
     /// Contract 1.65 (§4.58): the conversation's message-request accepted
     /// state, derived at read time with the official
     /// `isConversationAccepted` factor weights over the material this chain
@@ -1603,6 +1626,50 @@ fn conversation_mrr_projection(
         has_outgoing != 0,
         mrr_factors_of(factors_json.as_deref()),
     ))
+}
+
+/// Contract 1.259 (§4.243): the verified bit projection over one row's
+/// identity trust stamp. NULL and any malformed payload answer absent — a
+/// hostile or partial stamp can never fail a summary read (the §4.50
+/// appendix discipline). The probed-absent `{}` marker folds to `false`:
+/// the official record's DEFAULT arm (a peer the upstream has not created
+/// an identity row for yet presents unverified once `updateVerified` ran —
+/// the `safeGetVerified` DEFAULT fallback face). A stored word compares
+/// against the pinned three-value `trustLevel` vocabulary
+/// (TrustLevel.java:5-8): only TRUSTED_VERIFIED is the official verified
+/// arm (`verified === Verified.VERIFIED`).
+fn identity_verified_bit_of_stamp(stamp: Option<&str>) -> Option<bool> {
+    stamp
+        .and_then(|stamp| serde_json::from_str::<Value>(stamp).ok())
+        .and_then(|value| value.as_object().cloned())
+        .map(|object| object.get("trustLevel").and_then(Value::as_str) == Some("TRUSTED_VERIFIED"))
+}
+
+/// Contract 1.259 (§4.243): the summary read face — one row's stamp read
+/// and projected. Group rows and the self row answer absent without a
+/// query (the official record never carries a group/self verified face);
+/// a row gone mid-page answers absent (the post-map tolerance family).
+fn conversation_identity_verified_bit(
+    conn: &Connection,
+    account_id: &str,
+    conversation_id: &str,
+    kind: &str,
+    is_self: bool,
+) -> Result<Option<bool>, StoreError> {
+    if kind != "direct" || is_self {
+        return Ok(None);
+    }
+    let stamp: Option<String> = conn
+        .query_row(
+            "SELECT identity_verified_json FROM conversations
+             WHERE id=?1 AND account_id=?2",
+            params![conversation_id, account_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::Unavailable(Some(error)))?
+        .flatten();
+    Ok(identity_verified_bit_of_stamp(stamp.as_deref()))
 }
 
 /// Contract 1.71 (§4.63): the whole-history outbound row presence for one
@@ -4164,6 +4231,105 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// Contract 1.259 (§4.243): stamp one direct conversation's identity
+    /// trust word — the storage-consumption landing the official
+    /// `updateVerified` → `DataWriter.updateConversation` record write
+    /// mirrors. The word is the pinned upstream `trustLevel` verbatim
+    /// (UNTRUSTED | TRUSTED_UNVERIFIED | TRUSTED_VERIFIED); the connector
+    /// interprets it only at read time (`identity_verified_bit_of_stamp`).
+    /// Direct rows only (trust is a 1:1 face, the §4.61 gate grammar);
+    /// the peer-key spelling follows the caller's key (the engine answer's
+    /// uuid/number spellings each stamp their own row form).
+    pub fn set_conversation_identity_verified_for_peer(
+        &self,
+        account_id: &str,
+        peer_key: &str,
+        trust_level: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let stamp = serde_json::json!({ "trustLevel": trust_level }).to_string();
+        let updated = conn
+            .execute(
+                "UPDATE conversations SET identity_verified_json=?1
+                 WHERE account_id=?2 AND kind='direct' AND peer_key=?3",
+                params![stamp, account_id, peer_key],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(updated > 0)
+    }
+
+    /// Contract 1.259 (§4.243): stamp by conversation id — the
+    /// write-through arms (`identities.verify` success, the §4.84
+    /// verifiedChanged convergence) resolve the row by id, not by peer
+    /// spelling. Direct rows only, the same 1:1 gate.
+    pub fn set_conversation_identity_verified_for_conversation(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        trust_level: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let stamp = serde_json::json!({ "trustLevel": trust_level }).to_string();
+        let updated = conn
+            .execute(
+                "UPDATE conversations SET identity_verified_json=?1
+                 WHERE account_id=?2 AND id=?3 AND kind='direct'",
+                params![stamp, account_id, conversation_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(updated > 0)
+    }
+
+    /// Contract 1.259 (§4.243): the probed-absent marker (`{}`) for direct
+    /// rows the engine's full `listIdentities` answer did not name — the
+    /// official DEFAULT face (no identity row yet presents unverified), and
+    /// the marker that keeps the enrich trigger self-extinguishing (a
+    /// never-stamped row would re-fire the probe window forever). Self rows
+    /// (empty peer key) stay NULL — they never project the bit.
+    pub fn stamp_identity_verified_absent_rows(
+        &self,
+        account_id: &str,
+    ) -> Result<usize, StoreError> {
+        let conn = self.lock_conn()?;
+        let updated = conn
+            .execute(
+                "UPDATE conversations SET identity_verified_json='{}'
+                 WHERE account_id=?1 AND kind='direct'
+                   AND identity_verified_json IS NULL AND peer_key != ''
+                   AND peer_key != (SELECT signal_account FROM accounts WHERE id=?1)
+                   AND peer_key != COALESCE(
+                         (SELECT aci FROM accounts WHERE id=?1), '')",
+                params![account_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(updated)
+    }
+
+    /// Contract 1.259 (§4.243): the enrich trigger count — direct rows whose
+    /// identity stamp is still NULL (never probed). Self rows are excluded
+    /// (they never stamp, the empty peer key), so the count self-extinguishes
+    /// after one full pass: the answer's rows carry their word, the rest
+    /// carry `{}`. The count mirrors `count_direct_conversations_without_
+    /// mrr_factors`'s probe-widening shape without its window weights (a
+    /// trust stamp needs no data window — the identity read is the probe).
+    pub fn count_direct_conversations_without_identity_verified(
+        &self,
+        account_id: &str,
+    ) -> Result<i64, StoreError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT count(*) FROM conversations
+             WHERE account_id=?1 AND kind='direct'
+               AND identity_verified_json IS NULL AND peer_key != ''
+               AND peer_key != (SELECT signal_account FROM accounts WHERE id=?1)
+               AND peer_key != COALESCE(
+                     (SELECT aci FROM accounts WHERE id=?1), '')",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
     /// Contract 1.70 (§4.58 consume batch): merge the authoritative
     /// `messageRequestResponseType` face into one direct conversation's
     /// factor stamp. The stamp is read-modify-written so the sync face never
@@ -4482,7 +4648,7 @@ impl Store {
                         notify_for_replies_if_muted, show_unread_reminders,
                         conversation_color, custom_color, custom_color_id, auto_bubble_color,
                         wallpaper_preset, wallpaper_photo_pointer_base64, dim_wallpaper_in_dark_mode,
-                        color_from_primary
+                        color_from_primary, identity_verified_json
                  FROM conversations
                  WHERE account_id=?1
                    AND (
@@ -4586,6 +4752,10 @@ impl Store {
                         removal_stage: None,
                         shared_group_names: None,
                         hidden: None,
+                        // Contract 1.259 (§4.243): the verified projection
+                        // bit, filled in the same post-map loop, the same
+                        // read-time family.
+                        verified: None,
                         // Contract 1.65 (§4.58): derived after the row maps
                         // (page lookup below), the same post-map loop.
                         message_request_accepted: false,
@@ -4645,6 +4815,15 @@ impl Store {
             // Contract 1.257 (§4.242): the verbatim hidden stamp — the
             // inversion stays on in_system_contacts alone.
             item.hidden = mrr.hidden;
+            // Contract 1.259 (§4.243): the verified storage-projection bit —
+            // the same post-map loop, the same read-time family.
+            item.verified = conversation_identity_verified_bit(
+                &conn,
+                account_id,
+                &item.id,
+                item.kind,
+                item.is_self,
+            )?;
             // Contract 1.71 (§4.63): the whole-history outbound bit, the same
             // post-map loop, the same guard.
             item.has_user_initiated_outbound =
@@ -10428,7 +10607,7 @@ impl Store {
                         notify_for_replies_if_muted, show_unread_reminders,
                         conversation_color, custom_color, custom_color_id, auto_bubble_color,
                         wallpaper_preset, wallpaper_photo_pointer_base64, dim_wallpaper_in_dark_mode,
-                        color_from_primary
+                        color_from_primary, identity_verified_json
                  FROM conversations WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
                 |row| {
@@ -10507,6 +10686,10 @@ impl Store {
                         removal_stage: None,
                         shared_group_names: None,
                         hidden: None,
+                        // Contract 1.259 (§4.243): the verified projection
+                        // bit, filled in the same post-map match, the same
+                        // read-time family.
+                        verified: None,
                         // Contract 1.65 (§4.58): derived after the row maps
                         // (single-row match below), the same post-map loop.
                         message_request_accepted: false,
@@ -10602,6 +10785,15 @@ impl Store {
                 // Contract 1.257 (§4.242): the verbatim hidden stamp — the
                 // inversion stays on in_system_contacts alone.
                 summary.hidden = mrr.hidden;
+                // Contract 1.259 (§4.243): the verified storage-projection
+                // bit — the same post-map match, the same read-time family.
+                summary.verified = conversation_identity_verified_bit(
+                    &conn,
+                    account_id,
+                    conversation_id,
+                    summary.kind,
+                    summary.is_self,
+                )?;
                 // Contract 1.256 (§4.241): the same reverse lookup the list
                 // face runs — one scan over the group cache, direct non-self
                 // rows carry the titles.
@@ -13265,6 +13457,26 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         );
         conn.execute(&sql, [])
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
+    if current < 41 {
+        // 契约 1.259（§4.243，批 Z4 · S11 verified 存储投影）：
+        // conversations.identity_verified_json 列——identities 信任词戳
+        // （钉定上游 listIdentities trustLevel 三值词原词 / `{}`
+        // probed-absent 官方 DEFAULT 面）。NULL = 从未探明（读侧 wire 缺席
+        // 键 = 未知，绝不发明 false）；永不回填历史行（过去的信任态只来自
+        // 当时的引擎应答，mrr_factors_json 同纪律）。盖章面 = throttled
+        // listContacts enrich 的 listIdentities 消费腿（存储消费落位）+
+        // identities.verify 写穿 + §4.84 verifiedChanged 收敛臂；wire
+        // additive verified 位由读侧从本列投影（S11：官方 verified 属
+        // 联系人存储投影，我方=渲染时 identities.get 异步读——本列落位后
+        // 桌面异步读退役为兜底）。
+        if !table_has_column(conn, "conversations", "identity_verified_json")? {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN identity_verified_json TEXT",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
     }
     if current < 40 {
         // 契约 1.217（§29.2，头像字节面）：conversation_avatars 缓存表——
@@ -16908,6 +17120,190 @@ mod tests {
         for row in wire.as_array().unwrap() {
             let expected = row["id"] == direct.id;
             assert_eq!(row.get("hidden").is_some(), expected, "row {}", row["id"]);
+        }
+    }
+
+    /// Contract 1.259 (§4.243): the verified storage-projection bit reads the
+    /// identity trust stamp — TRUSTED_VERIFIED is the true arm, the other
+    /// two pinned words and the probed-absent `{}` are the false arm (the
+    /// official DEFAULT face), a never-probed row answers absent (never
+    /// invented); group and self rows stay absent on every arm; both stamp
+    /// shapes land (peer key and conversation id); the wire carries the key
+    /// only when the bit exists.
+    #[test]
+    fn verified_bit_reads_the_identity_trust_stamp() {
+        // Pure projection arms first (the §4.50 hostile-stamp discipline).
+        assert_eq!(identity_verified_bit_of_stamp(None), None);
+        assert_eq!(identity_verified_bit_of_stamp(Some("not json")), None);
+        assert_eq!(identity_verified_bit_of_stamp(Some("[]")), None);
+        assert_eq!(identity_verified_bit_of_stamp(Some("{}")), Some(false));
+        assert_eq!(
+            identity_verified_bit_of_stamp(Some(r#"{"trustLevel":"TRUSTED_VERIFIED"}"#)),
+            Some(true)
+        );
+        assert_eq!(
+            identity_verified_bit_of_stamp(Some(r#"{"trustLevel":"TRUSTED_UNVERIFIED"}"#)),
+            Some(false)
+        );
+        assert_eq!(
+            identity_verified_bit_of_stamp(Some(r#"{"trustLevel":"UNTRUSTED"}"#)),
+            Some(false)
+        );
+
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550103", "C")
+            .unwrap();
+        let direct_uuid = store
+            .ensure_conversation(
+                &account.id,
+                "direct",
+                "11111111-1111-4111-8111-111111111111",
+                "U",
+            )
+            .unwrap();
+        let fresh = store
+            .ensure_conversation(&account.id, "direct", "+15555550104", "F")
+            .unwrap();
+        let group = store
+            .ensure_conversation(&account.id, "group", "Z3Jw", "Group")
+            .unwrap();
+        let self_row = store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "Note to self")
+            .unwrap();
+
+        // Never probed: absent on both faces (unknown, never a false).
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.verified, None);
+        let listed = store.list_conversations(&account.id, 20, None).unwrap();
+        let row = listed.items.iter().find(|row| row.id == direct.id).unwrap();
+        assert_eq!(row.verified, None);
+
+        // TRUSTED_VERIFIED via the peer-key stamp shape: the true arm.
+        store
+            .set_conversation_identity_verified_for_peer(
+                &account.id,
+                "+15555550103",
+                "TRUSTED_VERIFIED",
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.verified, Some(true));
+
+        // The other two words via the conversation-id stamp shape: the
+        // false arm both times (official unverified presentation).
+        store
+            .set_conversation_identity_verified_for_conversation(
+                &account.id,
+                &direct_uuid.id,
+                "TRUSTED_UNVERIFIED",
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &direct_uuid.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.verified, Some(false));
+        store
+            .set_conversation_identity_verified_for_conversation(
+                &account.id,
+                &direct_uuid.id,
+                "UNTRUSTED",
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &direct_uuid.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.verified, Some(false));
+
+        // Group and self rows: absent on every arm (no stamp face, no read).
+        store
+            .set_conversation_identity_verified_for_conversation(
+                &account.id,
+                &group.id,
+                "TRUSTED_VERIFIED",
+            )
+            .unwrap();
+        store
+            .set_conversation_identity_verified_for_conversation(
+                &account.id,
+                &self_row.id,
+                "TRUSTED_VERIFIED",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .conversation_summary(&account.id, &group.id)
+                .unwrap()
+                .unwrap()
+                .verified,
+            None
+        );
+        assert_eq!(
+            store
+                .conversation_summary(&account.id, &self_row.id)
+                .unwrap()
+                .unwrap()
+                .verified,
+            None
+        );
+
+        // The sweep: the never-probed row takes the probed-absent `{}`
+        // marker (the official DEFAULT face, false), self rows stay NULL,
+        // and the trigger count self-extinguishes.
+        assert_eq!(
+            store
+                .count_direct_conversations_without_identity_verified(&account.id)
+                .unwrap(),
+            1
+        );
+        let swept = store
+            .stamp_identity_verified_absent_rows(&account.id)
+            .unwrap();
+        assert_eq!(swept, 1);
+        assert_eq!(
+            store
+                .count_direct_conversations_without_identity_verified(&account.id)
+                .unwrap(),
+            0
+        );
+        let summary = store
+            .conversation_summary(&account.id, &fresh.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.verified, Some(false));
+        assert_eq!(
+            store
+                .conversation_summary(&account.id, &self_row.id)
+                .unwrap()
+                .unwrap()
+                .verified,
+            None
+        );
+
+        // Wire shape: verified serializes only when the bit exists.
+        let listed = store.list_conversations(&account.id, 20, None).unwrap();
+        let wire = serde_json::to_value(&*listed.items).unwrap();
+        for row in wire.as_array().unwrap() {
+            let expected = matches!(
+                row["id"].as_str(),
+                Some(id) if id == direct.id || id == direct_uuid.id || id == fresh.id
+            );
+            assert_eq!(row.get("verified").is_some(), expected, "row {}", row["id"]);
+            if expected {
+                assert!(row["verified"].is_boolean(), "row {}", row["id"]);
+            }
         }
     }
 

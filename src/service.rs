@@ -13245,24 +13245,28 @@ impl ConnectorService {
         Ok(event)
     }
 
-    /// Contract 1.103 (§4.84): forward one `syncMessage.verified` projection
-    /// — the account's own linked device settled a peer's safety-number trust
-    /// state (the official SyncMessage.verified face). Pure forwarding, by
-    /// three honest counts: the engine already applied the state to its own
-    /// authoritative sidecar store before projecting (the write happened
-    /// upstream of this face), the connector store carries no trust bit to
-    /// mirror into (conversations/contacts/peer_identities are all
-    /// trust-less — §4.84 records the discretion), and the host's own
-    /// reconciliation path is the §4.61 `identities.get` read-through. The
-    /// one enrichment is the §4.81 resolution family: the destination walks
-    /// the number/ACI rungs and the destination's own number rides first when
-    /// the projection resolved one — a hit carries the local `conversationId`
-    /// (the id form the desktop addresses), a miss stays conversation-less
-    /// and the record still forwards (the official client drops its
-    /// no-conversation sync; this connector forwards the state change and
-    /// lets the host join — the trust state is self-describing by its
-    /// destination). Transient: nothing persists, nothing self-heals; a
-    /// missed delivery converges through the next `identities.get` read.
+    /// Contract 1.103 (§4.84), widened by 1.259 (§4.243, 批 Z4 · S11):
+    /// forward one `syncMessage.verified` projection — the account's own
+    /// linked device settled a peer's safety-number trust state (the official
+    /// SyncMessage.verified face) — AND converge the verified storage
+    /// projection: the resolved direct row carries the mapped trust word the
+    /// moment the event lands (the official `conversation.updateVerified`
+    /// record-write mirror; the §4.84 "connector carries no trust bit"
+    /// discretion is retired by the S11 data plane). The engine already
+    /// applied the state to its own authoritative sidecar store before
+    /// projecting (the write happened upstream of this face); the stamp is
+    /// the deterministic word-map of the event's own state, warn-silent, and
+    /// the reconciliation path stays the §4.61 `identities.get`
+    /// read-through for the desktop's fallback arm. The resolution family is
+    /// the §4.81 ladder: the destination walks the number/ACI rungs and the
+    /// destination's own number rides first when the projection resolved
+    /// one — a hit carries the local `conversationId` (the id form the
+    /// desktop addresses), a miss stays conversation-less and the record
+    /// still forwards (the official client drops its no-conversation sync;
+    /// this connector forwards the state change and lets the host join —
+    /// the trust state is self-describing by its destination). A missed
+    /// delivery converges through the next enrich window's `listIdentities`
+    /// pass.
     fn apply_sync_verified(
         &mut self,
         account: &AccountRow,
@@ -13273,6 +13277,23 @@ impl ConnectorService {
             &verified.destination_uuid,
             verified.destination_number.as_deref(),
         )?;
+        // Contract 1.259 (§4.243): the convergence stamp — the sync state
+        // word maps onto the pinned trust vocabulary (the official
+        // SyncMessage.verified states: verified=VERIFIED trust arm,
+        // default=first-use trust restored, unverified=explicit distrust)
+        // and lands on the resolved direct row. Direct rows only (the sync
+        // never names a group with trust semantics, the §4.61 gate).
+        if let Some(conversation) = conversation.as_ref()
+            && conversation.kind == "direct"
+        {
+            let _ = self
+                .store
+                .set_conversation_identity_verified_for_conversation(
+                    &account.id,
+                    &conversation.id,
+                    identity_trust_word_of_sync_state(verified.state),
+                );
+        }
         Ok(vec![HostSideEvent::IdentityVerifiedChanged {
             account_id: account.id.clone(),
             destination_uuid: verified.destination_uuid.clone(),
@@ -19430,6 +19451,22 @@ pub(crate) fn group_migrate_result_from_engine(
         group_id: group_id.to_string(),
         revision,
     })
+}
+
+/// Contract 1.259 (§4.243): the sync verified state word → the pinned
+/// `trustLevel` vocabulary map (TrustLevel.java:5-8) — the official
+/// SyncMessage.verified states: `verified` = the VERIFIED arm,
+/// `default` = first-use trust restored (TRUSTED_UNVERIFIED, the
+/// `safeGetVerified` DEFAULT arm's trust-word form), `unverified` =
+/// explicit distrust (UNTRUSTED). The state grammar is fail-closed
+/// upstream (`normalized_sync_verified` accepts only the three words), so
+/// the map is total over the receive face.
+fn identity_trust_word_of_sync_state(state: &str) -> &'static str {
+    match state {
+        "verified" => "TRUSTED_VERIFIED",
+        "default" => "TRUSTED_UNVERIFIED",
+        _ => "UNTRUSTED",
+    }
 }
 
 /// Project the engine's `listIdentities` answer onto the wire shape (contract
@@ -29901,6 +29938,19 @@ mod tests {
     /// array is the honest `identity: null` (never an error); a record
     /// missing its non-nullable core is a protocol defect, not a no-identity
     /// answer.
+    #[test]
+    fn identity_trust_word_maps_the_sync_states() {
+        assert_eq!(
+            identity_trust_word_of_sync_state("verified"),
+            "TRUSTED_VERIFIED"
+        );
+        assert_eq!(
+            identity_trust_word_of_sync_state("default"),
+            "TRUSTED_UNVERIFIED"
+        );
+        assert_eq!(identity_trust_word_of_sync_state("unverified"), "UNTRUSTED");
+    }
+
     #[test]
     fn identity_projection_maps_pinned_record_and_empty_list() {
         // Full record: every field round-trips, camelCase on the wire.
