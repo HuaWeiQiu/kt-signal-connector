@@ -529,8 +529,21 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
             }
         }
     }
-    serve(listener, payload.secret, runtime).await?;
-    Ok(())
+    // 会话终局即退（outbound_evidence 诊断批根因修复）：serve 返回就是进程
+    // 终态——有界 teardown（HOST_SHUTDOWN_TIMEOUT 预算 + 子进程收割）已在
+    // serve 内跑完，宿主断开 / ctrl_c / 父进程消失三出口在此汇合。这里必须
+    // 显式定局退出，不能走隐式 Runtime drop：a9e5cd9 的 P0 parent-watch 是
+    // blocking 任务，按设计只在 launcher 死亡时返回；launcher 仍活着时
+    // （真实桌面正常活着重启会话、测试 harness）隐式 drop 在
+    // BlockingPool::shutdown 上永久挂死，「host 断开即退」失锚（探针实测
+    // 25s+ 不退；栈采样 main 卡 BlockingPool Condvar、blocking 线程卡
+    // parent::wait_for_parent_exit nanosleep）。与既有两处 process::exit
+    // 纪律同构（上方错误出口 exit(1)；parent-down 出口 exit(0)）：
+    // flock/管道随进程由内核回收，engine 子进程 stdin EOF 自退。
+    match serve(listener, payload.secret, runtime).await {
+        Ok(()) => std::process::exit(0),
+        Err(error) => Err(error)?,
+    }
 }
 
 /// The P0 exit path: the launcher is gone, so the connector must not outlive
