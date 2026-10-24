@@ -6356,6 +6356,23 @@ impl RuntimeSupervisor {
                         .and_then(Value::as_array)
                         .ok_or(ServiceError::Engine(EngineError::Protocol))?,
                 );
+                // 契约 1.253（§4.238）：BLOCK 行的先态门在盖章前读——官方
+                // blockConversation → applyMessageRequestResponse 的
+                // didBlockChange = hasBlock(response) ≠ isBlocked()（先态），
+                // 已屏蔽会话的重复 block 不铸行。§4.47 是 KT 所有屏蔽路径
+                // （请求区/信息页/头部菜单）的同一写面，官方对位全部走
+                // blockConversation thunk（ConversationDetails.dom.tsx:779 同
+                // 一出口），全局落行 = 官方同构。params.blocked=false 是官方
+                // 素 unblock（unblock() 更新块清单，不经
+                // applyMessageRequestResponse，UNBLOCK 行只由「被屏蔽会话的
+                // accept」铸造）——不落行，记档对照。落行 warn-only（§4.226
+                // 纪律：云应答是主面，行只是持久回声）。
+                let prior_blocked = self
+                    .store
+                    .conversation_summary(&params.account_id, &params.conversation_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|summary| summary.blocked);
                 // Contract 1.138 (§4.131): the local mirror follows the
                 // upstream write — the direct row's factor stamp carries the
                 // blocked bit (a group row stamps nothing, §4.45 pull stays
@@ -6364,14 +6381,15 @@ impl RuntimeSupervisor {
                 // window converge without a re-read. Best-effort like the
                 // expire-timer mirror: a mirror failure only costs the next
                 // event its freshness, the cloud answer stays the face.
-                if self
+                let stamped = self
                     .store
                     .set_conversation_blocked_factor(
                         &params.account_id,
                         &params.conversation_id,
                         params.blocked,
                     )
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                if stamped
                     && let Some(conversation) = self
                         .store
                         .conversation_summary(&params.account_id, &params.conversation_id)
@@ -6381,6 +6399,48 @@ impl RuntimeSupervisor {
                     let _ = self
                         .host_events
                         .send(HostSideEvent::ConversationChanged(conversation));
+                }
+                if params.blocked && !prior_blocked {
+                    let store = Arc::clone(&self.store);
+                    let account_id = params.account_id.clone();
+                    let conversation_id = params.conversation_id.clone();
+                    match blocking_service(move || {
+                        crate::service::store_land_message_request_row(
+                            &store,
+                            &account_id,
+                            &conversation_id,
+                            crate::service::MrrRowEvent::Block,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Some(row_event)) => {
+                            let _ = self.host_events.send(row_event);
+                            // A group row stamps nothing (the §4.131 store
+                            // posture) — the row's own changed push keeps the
+                            // list window convergent all the same.
+                            if !stamped
+                                && let Some(conversation) = self
+                                    .store
+                                    .conversation_summary(
+                                        &params.account_id,
+                                        &params.conversation_id,
+                                    )
+                                    .ok()
+                                    .flatten()
+                            {
+                                let _ = self
+                                    .host_events
+                                    .send(HostSideEvent::ConversationChanged(conversation));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            kind = "message_request_row",
+                            class = error.class(),
+                            "block landed no timeline row; the upstream answer stands"
+                        ),
+                    }
                 }
                 Ok(blocked)
             }
@@ -6790,7 +6850,57 @@ impl RuntimeSupervisor {
             .call("sendMessageRequestResponse", upstream, CallClass::Mutating)
             .await
         {
-            Ok(_) => Ok(MessageRequestOutcome { status }),
+            Ok(_) => {
+                // 契约 1.253（§4.238）：LOCAL 动作臂的时间线系统行——官方次序
+                // 是「先本地落行（LOCAL 源），再上行 sync」（ducks/
+                // conversations.preload.ts:3779-3787
+                // syncMessageRequestResponse），上行已答 = 官方动作已定局，
+                // 本臂补本地持久行。accept 的事件词按官方 didUnblock 映射
+                // （applyMessageRequestResponse:2600-2607：被屏蔽会话的
+                // accept = UNBLOCK 行）；delete = 官方 DELETE——上游即删会话
+                // 语义，官方 DELETE 臂不铸行（:2616-2638 只铸 ACCEPT/BLOCK/
+                // SPAM 三臂），落行无渲染面，诚实不落（记档对照）。落行
+                // warn-only：行只是持久回声，动作应答是主面（§4.226 纪律）。
+                if request_type == "accept" {
+                    let store = Arc::clone(&self.store);
+                    let account_id = params.account_id.clone();
+                    let conversation_id = params.conversation_id.clone();
+                    match blocking_service(move || {
+                        crate::service::store_land_message_request_row(
+                            &store,
+                            &account_id,
+                            &conversation_id,
+                            crate::service::MrrRowEvent::Accept,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Some(row_event)) => {
+                            let _ = self.host_events.send(row_event);
+                            // The list face rides the refreshed summary (the
+                            // row is the conversation's new last message): the
+                            // changed push follows the row (§4.238 row-then-
+                            // summary order), read AFTER the insert so it
+                            // never predates the row.
+                            if let Ok(Some(conversation)) = self
+                                .store
+                                .conversation_summary(&params.account_id, &params.conversation_id)
+                            {
+                                let _ = self
+                                    .host_events
+                                    .send(HostSideEvent::ConversationChanged(conversation));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            kind = "message_request_row",
+                            class = error.class(),
+                            "accept landed no timeline row; the action answer stands"
+                        ),
+                    }
+                }
+                Ok(MessageRequestOutcome { status })
+            }
             Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
                 "SEND_OUTCOME_UNKNOWN",
                 "mutating request has an unknown outcome",

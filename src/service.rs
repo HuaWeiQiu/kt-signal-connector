@@ -26,6 +26,32 @@ const MRR_RESPONSE_TYPE_ACCEPT: u8 = 1;
 const MRR_RESPONSE_TYPE_BLOCK: u8 = 3;
 const MRR_RESPONSE_TYPE_BLOCK_AND_DELETE: u8 = 4;
 const MRR_RESPONSE_TYPE_BLOCK_AND_SPAM: u8 = 6;
+/// The SPAM member of the same enum (§4.238 mirror-row gate): the official
+/// `hasSpam` reads SPAM beside BLOCK_AND_SPAM
+/// (ts/models/conversations.preload.ts:2568-2572).
+const MRR_RESPONSE_TYPE_SPAM: u8 = 5;
+
+/// The official `hasBlock` member test (§4.238 mirror-row gate verbatim:
+/// BLOCK / BLOCK_AND_DELETE / BLOCK_AND_SPAM —
+/// ts/models/conversations.preload.ts:2574-2582).
+fn mrr_has_block(response_type: u8) -> bool {
+    matches!(
+        response_type,
+        MRR_RESPONSE_TYPE_BLOCK
+            | MRR_RESPONSE_TYPE_BLOCK_AND_DELETE
+            | MRR_RESPONSE_TYPE_BLOCK_AND_SPAM
+    )
+}
+
+/// The official `hasSpam` member test (§4.238 mirror-row gate verbatim:
+/// SPAM / BLOCK_AND_SPAM — ts/models/conversations.preload.ts:2568-2572).
+fn mrr_has_spam(response_type: u8) -> bool {
+    matches!(
+        response_type,
+        MRR_RESPONSE_TYPE_SPAM | MRR_RESPONSE_TYPE_BLOCK_AND_SPAM
+    )
+}
+
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
@@ -13590,6 +13616,70 @@ impl ConnectorService {
             );
             return Ok(Vec::new());
         }
+        // 契约 1.253（§4.238）镜像行腿（官方 MRR_SYNC 源）：先读先态（原始成员
+        // + blocked 位）再盖章——官方 applyMessageRequestResponse 的四道闸
+        // (models/conversations.preload.ts:2586-2640) 逐字投影：
+        // didResponseChange = response ≠ 先态原始成员（先态缺席 = 官方
+        // `attr || 0` 的 UNKNOWN 缺省 → 任何已知成员都算变化）；ACCEPT 行
+        // （MRR_SYNC 非 STORAGE_SERVICE，无 viaStorageServiceSync 抑制臂）
+        // didUnblock = 先态 blocked → UNBLOCK : ACCEPT；BLOCK 行门
+        // hasBlock(response) ∧ !先态 blocked（didBlockChange）；SPAM 行门
+        // hasSpam(response) ∧ !hasSpam(先态)（didSpamChange）；DELETE 无行。
+        // 多铸臂按官方 messageCountFromEnvelope 同刻有序（同一 now_ms 逐臂
+        // +1 保 sent_at 单调，行 id 含事件词永不互撞）。
+        let prior = self
+            .store
+            .conversation_summary(&account.id, &conversation.id)?;
+        let prior_blocked = prior.is_some_and(|summary| summary.blocked);
+        let prior_member = self
+            .store
+            .conversation_accept_response_member(&account.id, &conversation.id)?;
+        let did_response_change = prior_member != Some(response_type);
+        let mut events = Vec::new();
+        if did_response_change {
+            let mut message_count: u64 = 0;
+            if response_type == MRR_RESPONSE_TYPE_ACCEPT {
+                let event = if prior_blocked {
+                    MrrRowEvent::Unblock
+                } else {
+                    MrrRowEvent::Accept
+                };
+                if let Some(row_event) = store_land_message_request_row_at(
+                    &self.store,
+                    &account.id,
+                    &conversation.id,
+                    event,
+                    now_ms().saturating_add(message_count),
+                )? {
+                    events.push(row_event);
+                }
+                message_count += 1;
+            }
+            if mrr_has_block(response_type) && !prior_blocked {
+                if let Some(row_event) = store_land_message_request_row_at(
+                    &self.store,
+                    &account.id,
+                    &conversation.id,
+                    MrrRowEvent::Block,
+                    now_ms().saturating_add(message_count),
+                )? {
+                    events.push(row_event);
+                }
+                message_count += 1;
+            }
+            if mrr_has_spam(response_type)
+                && !prior_member.is_some_and(mrr_has_spam)
+                && let Some(row_event) = store_land_message_request_row_at(
+                    &self.store,
+                    &account.id,
+                    &conversation.id,
+                    MrrRowEvent::Spam,
+                    now_ms().saturating_add(message_count),
+                )?
+            {
+                events.push(row_event);
+            }
+        }
         // The authoritative stamp: exactly the ACCEPT presence the official
         // factor weight reads (`messageRequestResponseType === ACCEPT`,
         // isConversationAccepted.preload.ts:33-39), plus the raw member so a
@@ -13606,19 +13696,15 @@ impl ConnectorService {
         // §4.47 write's and the enrich's own `isBlocked` to clear), so a
         // masked conversation shows the blocked bit on the next summary,
         // whichever linked device composed the block.
-        if matches!(
-            response_type,
-            MRR_RESPONSE_TYPE_BLOCK
-                | MRR_RESPONSE_TYPE_BLOCK_AND_DELETE
-                | MRR_RESPONSE_TYPE_BLOCK_AND_SPAM
-        ) {
+        if mrr_has_block(response_type) {
             self.store
                 .set_conversation_blocked_factor(&account.id, &conversation.id, true)?;
         }
         // The summary always re-pushes (idempotent convergence, the
         // GroupTimerUpdate discipline) even when the stamp did not change —
-        // a lagging window must still converge.
-        let mut events = Vec::new();
+        // a lagging window must still converge. Row events ride ahead of the
+        // summary so the desktop renders the timeline row and the list state
+        // in one pass (the §4.226 row-then-frame order).
         if let Some(summary) = self
             .store
             .conversation_summary(&account.id, &conversation.id)?
@@ -13627,6 +13713,164 @@ impl ConnectorService {
         }
         Ok(events)
     }
+}
+
+/// 契约 1.253（§4.238）的行事件闭集：官方 `MessageRequestResponseEvent`
+/// 词表（types/MessageRequestResponseEvent.std.ts:6-11 verbatim）。铸造点
+/// 只收这四个成员——wire 面不收外来串，引擎不投影该面，词表外的 proto
+/// 成员（UNKNOWN/DELETE/BLOCK_AND_*）永不进此枚举。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MrrRowEvent {
+    Accept,
+    Block,
+    Unblock,
+    Spam,
+}
+
+impl MrrRowEvent {
+    /// The wire word verbatim (the official attribute value the desktop's
+    /// `isSignalMessageRequestResponseEvent` gate reads).
+    fn word(self) -> &'static str {
+        match self {
+            MrrRowEvent::Accept => "ACCEPT",
+            MrrRowEvent::Block => "BLOCK",
+            MrrRowEvent::Unblock => "UNBLOCK",
+            MrrRowEvent::Spam => "SPAM",
+        }
+    }
+}
+
+/// 契约 1.253（§4.238）：消息请求响应时间线系统行的单一铸造面——动作臂
+/// （conversations.acceptRequest / conversations.setBlocked 的 §4.238 半）
+/// 与镜像臂（§4.58）共用。官方行形态（models/conversations.preload.ts
+/// :2491-2552 addMessageRequestResponseEventMessage）：无正文、已读态、
+/// `messageRequestResponseEvent` 属性位、sent_at = 动作/信封时刻（+
+/// messageCountFromEnvelope 保同刻多行有序）。幂等键 =
+/// account+conversation+"mrr"+事件词+sent_at（重放同一刻折叠为一行，
+/// INSERT OR IGNORE 纪律）；不同动作不同时刻各落一行（官方
+/// didResponseChange 每次状态变化都铸——block→unblock→block 三行是官方
+/// 行为）。行 direction=system/status=system（§4.44 群通知行同族）；
+/// sender 面 = 会话 peer_key 逐字（桌面统一名字解析权威的注册键，ACCEPT
+/// 臂 {name} join 材料同 §4.226 家族姿态）。返回 None = 会话未解析或幂等
+/// 重放（无行、无事件）。
+pub(crate) fn store_land_message_request_row(
+    store: &Store,
+    account_id: &str,
+    conversation_id: &str,
+    event: MrrRowEvent,
+) -> Result<Option<HostSideEvent>, ServiceError> {
+    // The official didUnblock mapping lives here so every LOCAL accept arm
+    // single-sources it (applyMessageRequestResponse:2600-2607: a blocked
+    // conversation's accept = the UNBLOCK word; unblocked = ACCEPT). The
+    // mirror arm computes the word itself off the prior it already reads and
+    // calls the _at twin directly — one mapping, one source.
+    let event = if event == MrrRowEvent::Accept {
+        let blocked = store
+            .conversation_summary(account_id, conversation_id)?
+            .is_some_and(|summary| summary.blocked);
+        if blocked {
+            MrrRowEvent::Unblock
+        } else {
+            MrrRowEvent::Accept
+        }
+    } else {
+        event
+    };
+    store_land_message_request_row_at(store, account_id, conversation_id, event, now_ms())
+}
+
+/// The clock-injection twin of [`store_land_message_request_row`]: the
+/// mirror arm's same-envelope multi-mint legs advance the stamp by the
+/// official `messageCountFromEnvelope` ordinal, and the tests pin replay
+/// and ordering faces on a fixed clock.
+pub(crate) fn store_land_message_request_row_at(
+    store: &Store,
+    account_id: &str,
+    conversation_id: &str,
+    event: MrrRowEvent,
+    sent_at: u64,
+) -> Result<Option<HostSideEvent>, ServiceError> {
+    let Some(_account) = store.account_by_id(account_id)? else {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    };
+    let Some(conversation) = store.conversation_by_id(account_id, conversation_id)? else {
+        return Ok(None);
+    };
+    let word = event.word();
+    // 幂等键（§4.226 同族）：同刻同事件的重放折叠为一行。
+    let id = stable_hash_id(&[
+        "signal-message-v2",
+        account_id,
+        &conversation.id,
+        "mrr",
+        word,
+        &sent_at.to_string(),
+    ]);
+    let sender_id = conversation.peer_key.clone();
+    let rich = crate::engine::NormalizedRich {
+        message_request_response_event: Some(word.to_string()),
+        ..Default::default()
+    };
+    let message = MessageRecord {
+        is_erased: false,
+        delete_failed: false,
+        required_protocol_version: None,
+        author_aci: None,
+        id,
+        account_id: account_id.to_string(),
+        conversation_id: conversation.id.clone(),
+        direction: "system",
+        sender_id,
+        // The notice row carries no author-name copy — the desktop joins its
+        // name ladder from the sender face (the system-row family posture,
+        // §4.226/§4.75 verbatim).
+        sender_name: None,
+        mentions_self: false,
+        sent_at,
+        received_at: Some(now_ms()),
+        // The official row is bodyless (the event word is the whole content);
+        // the preview copy stays off the wire (the desktop renders the notice
+        // from the word list). text_retrievable keeps the family's true face.
+        text: None,
+        text_bytes: None,
+        text_truncated: false,
+        text_retrievable: true,
+        status: "system",
+        client_request_id: None,
+        quote_message_id: None,
+        quote_snapshot: None,
+        quote: None,
+        attachments: Vec::new(),
+        rich: Some(rich),
+        edited_at: None,
+        reactions: Vec::new(),
+        edits: Vec::new(),
+        delivered_at: None,
+        read_at: None,
+        viewed_at: None,
+        send_outcomes: None,
+        admin_deleted: false,
+        sticker: None,
+        // The notice row never sweeps (§4.41 posture): the columns stay NULL
+        // — a message-request answer carries no deadline of its own.
+        expire_seconds: None,
+        expire_start_at: None,
+        server_guid: None,
+        server_timestamp: None,
+        is_story: false,
+        story_message: None,
+    };
+    let inserted = store.insert_message(&message, None, None, false)?;
+    if !inserted {
+        return Ok(None);
+    }
+    // The row event alone — the caller owns the summary push so its
+    // conversation.changed always reads AFTER the caller's own stamps (the
+    // mirror arm stamps the factors between the row and the push; a mint-side
+    // summary would predate them and lie about the state).
+    Ok(Some(HostSideEvent::MessageUpserted(
+        project_message_for_host(message),
+    )))
 }
 
 // Store-backed read paths below: the single implementation behind the
@@ -43482,14 +43726,16 @@ mod tests {
         assert!(events.is_empty(), "an unknown group converges nothing");
     }
 
-    /// Contract 1.70 (§4.58 consume batch): the message-request response sync
-    /// consumption. An ACCEPT mirror stamps the authoritative factor on the
-    /// resolved direct conversation (the ACI ladder: raw ACI → the recorded
-    /// ACI→peer-key mapping) and rides `conversation.changed` with the
-    /// accepted state; a non-ACCEPT member (DELETE) stamps the terminal
-    /// not-accepted; a mirror naming nothing local converges nothing; a
-    /// group-threaded mirror is refused (groups carry no request); no message
-    /// row is ever created.
+    /// Contract 1.70 (§4.58 consume batch) + 1.253 (§4.238 row legs): the
+    /// message-request response sync consumption. An ACCEPT mirror stamps the
+    /// authoritative factor on the resolved direct conversation (the ACI
+    /// ladder: raw ACI → the recorded ACI→peer-key mapping), rides
+    /// `conversation.changed` with the accepted state, and lands the
+    /// §4.238 timeline system row (the official MRR_SYNC mint, gate
+    /// didResponseChange); a non-ACCEPT member (DELETE) stamps the terminal
+    /// not-accepted and mints no row (the official DELETE has no mint arm);
+    /// a mirror naming nothing local converges nothing; a group-threaded
+    /// mirror is refused (groups carry no request).
     #[test]
     fn ingest_message_request_response_stamps_the_authoritative_factor() {
         let (_temp, mut service) = service();
@@ -43564,12 +43810,30 @@ mod tests {
         let events = service
             .ingest_receive(base.clone(), crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, HostSideEvent::MessageUpserted(_))),
-            "a response mirror is not a message row"
+        // §4.238: the mirror mints the bodyless system row beside the stamp
+        // (the official MRR_SYNC mint — row first, then the summary).
+        let upserted = events
+            .iter()
+            .filter_map(|event| match event {
+                HostSideEvent::MessageUpserted(row) => Some(row),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            upserted.len(),
+            1,
+            "exactly the §4.238 row rides: {events:?}"
         );
+        assert_eq!(upserted[0].direction, "system");
+        assert_eq!(upserted[0].status, "system");
+        assert_eq!(
+            upserted[0]
+                .rich
+                .as_ref()
+                .and_then(|rich| rich.message_request_response_event.as_deref()),
+            Some("ACCEPT")
+        );
+        assert!(upserted[0].text.is_none(), "the official row is bodyless");
         let changed = events
             .iter()
             .find_map(|event| match event {
@@ -43741,6 +44005,278 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(after.blocked, "a non-BLOCK verb never rewrites the mask");
+    }
+
+    /// 契约 1.253（§4.238）：mint 面钉形——行形态官方逐字
+    /// （direction=system/status=system、无正文、事件词闭集、sender=会话
+    /// peer_key）、事件对（MessageUpserted + ConversationChanged）、同刻重放
+    /// 幂等（INSERT OR IGNORE 折叠）、未解析会话诚实 None、已读态不入未读。
+    #[test]
+    fn message_request_row_mint_faces_and_replay_idempotence() {
+        let (_temp, mut service) = service();
+        let (account, direct) = linked_account_and_conversation(&mut service);
+        let store = service.store_ref();
+
+        // The mint answers the row event alone — the caller owns the summary
+        // push (the mirror arm stamps between the row and its changed).
+        let row_event =
+            store_land_message_request_row(store, &account.id, &direct.id, MrrRowEvent::Accept)
+                .unwrap()
+                .expect("the first mint lands");
+        let HostSideEvent::MessageUpserted(row) = &row_event else {
+            panic!("the mint answers the row upsert, got {row_event:?}");
+        };
+        assert_eq!(row.direction, "system");
+        assert_eq!(row.status, "system");
+        assert_eq!(row.sender_id, direct.peer_key, "the name-join face");
+        assert!(row.text.is_none(), "the official row is bodyless");
+        assert!(row.text_retrievable);
+        assert_eq!(row.expire_seconds, None, "the notice never sweeps");
+        assert_eq!(
+            row.rich
+                .as_ref()
+                .and_then(|rich| rich.message_request_response_event.as_deref()),
+            Some("ACCEPT")
+        );
+
+        // The same-clock replay folds onto the landed row (the INSERT OR
+        // IGNORE idempotence): no second row, no events.
+        let replay = store_land_message_request_row_at(
+            store,
+            &account.id,
+            &direct.id,
+            MrrRowEvent::Accept,
+            row.sent_at,
+        )
+        .unwrap();
+        assert!(replay.is_none(), "a same-stamp replay is a no-op");
+
+        // The word list is the closed official family; each word rides its
+        // own row at its own stamp.
+        for (event, word) in [
+            (MrrRowEvent::Block, "BLOCK"),
+            (MrrRowEvent::Unblock, "UNBLOCK"),
+            (MrrRowEvent::Spam, "SPAM"),
+        ] {
+            let minted = store_land_message_request_row_at(
+                store,
+                &account.id,
+                &direct.id,
+                event,
+                row.sent_at + 1,
+            )
+            .unwrap()
+            .expect("each distinct stamp mints");
+            let HostSideEvent::MessageUpserted(minted_row) = &minted else {
+                panic!("the mint answers the row upsert, got {minted:?}");
+            };
+            assert_eq!(
+                minted_row
+                    .rich
+                    .as_ref()
+                    .and_then(|rich| rich.message_request_response_event.as_deref()),
+                Some(word)
+            );
+        }
+
+        // The didUnblock mapping single-sources in the face: a blocked
+        // conversation's accept mints the UNBLOCK word (the official
+        // applyMessageRequestResponse arm), an unblocked one ACCEPT.
+        store
+            .set_conversation_blocked_factor(&account.id, &direct.id, true)
+            .unwrap();
+        let blocked_accept =
+            store_land_message_request_row(store, &account.id, &direct.id, MrrRowEvent::Accept)
+                .unwrap()
+                .expect("the blocked accept still mints");
+        let HostSideEvent::MessageUpserted(blocked_row) = &blocked_accept else {
+            panic!("the mint answers the row upsert, got {blocked_accept:?}");
+        };
+        assert_eq!(
+            blocked_row
+                .rich
+                .as_ref()
+                .and_then(|rich| rich.message_request_response_event.as_deref()),
+            Some("UNBLOCK")
+        );
+        store
+            .set_conversation_blocked_factor(&account.id, &direct.id, false)
+            .unwrap();
+        let unblocked_accept =
+            store_land_message_request_row(store, &account.id, &direct.id, MrrRowEvent::Accept)
+                .unwrap()
+                .expect("the unblocked accept mints too");
+        let HostSideEvent::MessageUpserted(unblocked_row) = &unblocked_accept else {
+            panic!("the mint answers the row upsert, got {unblocked_accept:?}");
+        };
+        assert_eq!(
+            unblocked_row
+                .rich
+                .as_ref()
+                .and_then(|rich| rich.message_request_response_event.as_deref()),
+            Some("ACCEPT")
+        );
+
+        // An unknown conversation answers the honest None (no row, no lie).
+        assert!(
+            store_land_message_request_row(
+                store,
+                &account.id,
+                "no-such-conversation",
+                MrrRowEvent::Accept,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // The read-neutral landing: the notice never counts as unread (the
+        // official readStatus=Read mint).
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.unread_count, 0);
+    }
+
+    /// 契约 1.253（§4.238）：镜像臂的官方四闸逐字——didResponseChange（同值
+    /// 重放不铸）、didUnblock（先态 blocked 的 ACCEPT → UNBLOCK 词）、
+    /// didBlockChange（先态 blocked 的 BLOCK 臂不铸）、didSpamChange（先态
+    /// spam 家族的 SPAM 臂不铸）、DELETE 无行（官方 DELETE 无铸行臂）、
+    /// BLOCK_AND_SPAM 在 blocked 先态下只补 SPAM 臂。
+    #[test]
+    fn message_request_mirror_rows_follow_official_gates() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_peer_identity(
+                &account.id,
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "+15555550101",
+            )
+            .unwrap();
+        let mut incoming = expire_record_fixture(&account.id, &direct.id, "mrr-rows");
+        incoming.sent_at = 10;
+        service
+            .store_ref()
+            .insert_message(&incoming, None, None, false)
+            .unwrap();
+
+        let mirror = |response_type: u8| NormalizedReceive {
+            required_protocol_version: None,
+            timestamp: Some(1727000000000),
+            content_kind: "control",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: None,
+            source_uuid: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+            peer_name: None,
+            group_id: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: Some(ControlReceive::MessageRequestResponse {
+                response_type,
+                thread_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
+                group_id: None,
+            }),
+        };
+        let words = |service: &mut ConnectorService| -> Vec<String> {
+            // list_messages answers newest-first; the mint order is ascending
+            // sent_at, so read the page oldest-first.
+            let mut rows = service
+                .list_messages(&account.id, &direct.id, 50, None)
+                .unwrap()
+                .items;
+            rows.reverse();
+            rows.iter()
+                .filter_map(|row| {
+                    row.rich
+                        .as_ref()
+                        .and_then(|rich| rich.message_request_response_event.clone())
+                })
+                .collect()
+        };
+
+        // didResponseChange: the fresh ACCEPT mints; the same-value replay
+        // (the idempotent re-stamp posture) mints nothing.
+        service
+            .ingest_receive(mirror(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(words(&mut service), vec!["ACCEPT"]);
+        service
+            .ingest_receive(mirror(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(words(&mut service), vec!["ACCEPT"], "same member, no row");
+
+        // didBlockChange: the BLOCK mirror on an unblocked conversation mints
+        // the row and flips the mask (state → 3).
+        service
+            .ingest_receive(mirror(3), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(words(&mut service), vec!["ACCEPT", "BLOCK"]);
+        // The same-value BLOCK replay mints nothing (didResponseChange false;
+        // the prior blocked bit would silence the BLOCK arm anyway).
+        service
+            .ingest_receive(mirror(3), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(words(&mut service), vec!["ACCEPT", "BLOCK"]);
+
+        // didUnblock: the ACCEPT on a blocked conversation (state 3 → 1, the
+        // official block-then-accept composition) reads UNBLOCK — the gate
+        // reads the prior bit before the stamps.
+        service
+            .ingest_receive(mirror(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(words(&mut service), vec!["ACCEPT", "BLOCK", "UNBLOCK"]);
+
+        // DELETE mints no row (the official DELETE has no mint arm), even
+        // across a real member change.
+        service
+            .ingest_receive(mirror(2), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(words(&mut service), vec!["ACCEPT", "BLOCK", "UNBLOCK"]);
+
+        // BLOCK_AND_SPAM on a still-blocked conversation (DELETE never clears
+        // the mask — 盖真不盖假): the BLOCK arm stays silent (no
+        // didBlockChange) and the SPAM arm mints once.
+        service
+            .ingest_receive(mirror(6), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(
+            words(&mut service),
+            vec!["ACCEPT", "BLOCK", "UNBLOCK", "SPAM"]
+        );
+
+        // didSpamChange: SPAM after a spam-family member mints nothing.
+        service
+            .ingest_receive(mirror(5), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(
+            words(&mut service),
+            vec!["ACCEPT", "BLOCK", "UNBLOCK", "SPAM"],
+            "the spam family gate holds"
+        );
     }
 
     /// Contract 1.138 (§4.130): the local draft write lane — bounds, the

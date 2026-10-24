@@ -17,6 +17,26 @@
   document for the official anchor and the event mapping.
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.253 (2026-10-24; §4.238 the message-request
+  response timeline system row — batch O, ledger §29.46: the official
+  desktop persists a bodyless `message-request-response-event` row on
+  every request-state change it applies
+  (models/conversations.preload.ts:2491-2552 addMessageRequestResponse-
+  EventMessage, local composition order = local row first, sync up
+  second, ducks/conversations.preload.ts:3779-3787); the connector now
+  lands the same row on its two apply faces — the §4.56 action arms
+  (accept → ACCEPT, or UNBLOCK when the conversation is blocked, the
+  official didUnblock mapping; setBlocked(true) → BLOCK, the official
+  blockConversation composition all KT block paths share; DELETE mints
+  no row officially and none here) and the §4.58 mirror consume arm
+  (MRR_SYNC gates verbatim: didResponseChange, didUnblock, didBlockChange,
+  didSpamChange). The row is direction=system/status=system, bodyless,
+  and carries the closed `MessageRequestResponseEvent` word
+  (ACCEPT/BLOCK/UNBLOCK/SPAM) as the flattened rich key
+  `messageRequestResponseEvent` — the exact key the desktop's batch-G
+  chrome and notice word list already consume (icons thread/block/
+  thread/spam). No wire removal: absent keys stay absent, pre-1.253
+  hosts read rows byte-identically.)
 - Contract revision: 1.252 (2026-10-24; §4.237 the group-link capture's
   nested fallback — batch M, ledger §29.44: the engine's own listGroups
   face (the only runtime, ADR 0003) projects the addFromInviteLink word
@@ -18990,3 +19010,72 @@ UNKNOWN/MEMBER/坏值塌缩；坏 accessControl 形状不致败；两词同场�
 随批翻正——批 H 时代「嵌套 addFromInviteLink 永不入 linkAccess」钉住的
 正是本节修的 P0 恒缺席，三臂对象仍只收三门词（addFromInviteLink 不混
 入三臂对象，§4.180 边界不变），其嵌套词改按本节回退入 linkAccess。
+
+## §4.238 消息请求响应时间线系统行（accept/block 落行 + §4.58 镜像行 · 契约 1.253 · 批 O · 台账 §29.46）
+
+**官方锚（Signal-Desktop 8.31.0-alpha.1 @abe80d3，AGPL 只读零抄码）**：
+官方在每次消息请求状态落地时持久一条无正文的
+`message-request-response-event` 行（models/conversations.preload.ts
+:2491-2552 addMessageRequestResponseEventMessage：type
+'message-request-response-event'、属性 `messageRequestResponseEvent`
+= 事件词、sent_at = 动作/信封时刻 + messageCountFromEnvelope、
+readStatus=Read、seenStatus NotApplicable），渲染 =
+MessageRequestResponseNotification.dom.tsx:37-120（ACCEPT·UNBLOCK →
+icon thread / BLOCK → block / SPAM → spam；ACCEPT 群/无署名臂
+icu:…__Message--Accepted、直聊署名臂 …-Contact-Title、BLOCK/UNBLOCK
+直聊/群分臂、SPAM 单词表）。铸行闸 = applyMessageRequestResponse
+（:2559-2640）：didResponseChange 总闸 + ACCEPT 臂（`!viaStorageServiceSync
+|| didUnblock`；didUnblock = response==ACCEPT ∧ isBlocked → 事件词
+UNBLOCK else ACCEPT）+ BLOCK 臂（hasBlock ∧ didBlockChange）+ SPAM 臂
+（hasSpam ∧ didSpamChange）；**DELETE 不铸行**（会话即删，:2616-2638
+只铸三臂）。本地动作次序 = 先本地落行（LOCAL 源）后上行 sync（ducks/
+conversations.preload.ts:3779-3787 syncMessageRequestResponse）。
+
+**KT 双臂**：
+
+1. **LOCAL 动作臂**（§4.56/§4.47 写后真相）：
+   - `conversations.acceptRequest` 成功 → ACCEPT 行（会话 blocked 位
+     真值 → UNBLOCK 行，官方 didUnblock 映射逐字）。
+   - `conversations.setBlocked` blocked=true 成功 → BLOCK 行（先态
+     blocked 位门在盖章前读——重复 block 不铸行；§4.47 是 KT 全部屏蔽
+     路径的同一写面，官方对位（请求区/信息页/头部菜单）全部走
+     blockConversation thunk → 全局铸行 = 官方同构）。
+   - `conversations.declineRequest`（官方 DELETE）/ setBlocked
+     blocked=false（官方素 unblock，不经理 applyMessageRequestResponse，
+     UNBLOCK 行只由「被屏蔽会话的 accept」铸造）→ **不铸行**，记档
+     对照（官方 DELETE 无通知行；素 unblock 无行）。
+   - 落行 warn-only（§4.226 纪律）：动作应答是主面，行只是持久回声。
+2. **§4.58 镜像消费臂**（MRR_SYNC 源）：既有 consume 批加行腿——先态
+   读面（原始成员 `conversation_accept_response_member` + 摘要
+   blocked 位）→ 官方四闸逐字（didResponseChange = response ≠ 先态
+   原始成员，先态缺席 = 官方 `attr || 0` UNKNOWN 缺省；ACCEPT 臂无
+   viaStorageServiceSync 抑制——MRR_SYNC 非 STORAGE_SERVICE；
+   didUnblock/didBlockChange/didSpamChange 同官方）。多臂同刻按官方
+   messageCountFromEnvelope 序 +1 保 sent_at 单调。
+
+**行形态（官方 verbatim）**：direction=system/status=system（§4.44 群
+通知行同族）、**无正文**（官方行只带事件位；列表预览同官方为空——
+与 §4.226 安全码行的 text 面不同形，该面官方有群通知正文源，本面官方
+无正文）、已读态不入未读（insert unread=false）、
+sender 面 = 会话 peer_key 逐字（桌面统一名字解析权威注册键，ACCEPT
+直聊臂 {name} join 材料；system-row 家族姿态，无 sender_name）。
+rich 面 = **词表闭集枚举**（MrrRowEvent：ACCEPT/BLOCK/UNBLOCK/SPAM）
+经 serde flatten 钉在行级 `messageRequestResponseEvent` 键——与桌面
+批 G chrome（signalSystemRowChrome 请求四臂 icon 映射）和
+signalSystemNotice 四臂文案词表的消费键逐字同名。幂等键 =
+account+conversation+"mrr"+事件词+sent_at（同刻重放 INSERT OR IGNORE
+折叠；不同动作不同时刻各一行——官方 didResponseChange 每次状态变化
+都铸）。镜像臂引擎信封不带 sync 时间戳，sent_at 退本机时钟（§4.226
+同款诚实退化，记档）。
+
+**wire**：additive absent-key——`messageRequestResponseEvent` 键此前
+恒缺席，本批起消息请求动作/镜像行开始携带；既有行与普通行零变化，
+pre-1.253 宿主读行逐字节同形。
+
+**测试**：mint 面钉形（accept→ACCEPT / blocked accept→UNBLOCK /
+block→BLOCK / 同刻重放幂等 / 未解析会话 None / 行方向状态键词表逐
+字 / MessageUpserted+ConversationChanged 事件对）；镜像臂官方四闸
+（didResponseChange 假不铸 / ACCEPT 先态 blocked→UNBLOCK / BLOCK 先
+态门 / BLOCK_AND_SPAM 双臂齐铸 / SPAM 先态 spam 不重铸 / DELETE 无
+行）；桌面消费键（chrome icon 四臂 + 文案四臂）在桌面批 G 分支
+spec 已钉，本批 wire 键与其同名对表。
