@@ -9201,15 +9201,20 @@ impl ConnectorService {
         let author = match message.direction {
             "outgoing" => account.signal_account.clone(),
             _ if conversation.kind == "group" => {
-                // Contract 1.191 (§4.191): the group arm needs the member ACI,
-                // and only the ingest capture carries it — the conversation's
-                // peer key addresses the group, not the member, so no ladder
-                // can invent the answer. A pre-1.191 row (no capture) answers
-                // honestly INVALID_REQUEST here instead of spending an engine
-                // call on an author the engine must refuse — the row's
-                // `sender_id` is the ingest privacy hash, a local-only face
-                // the engine's `resolve_author_aci` rejects on all three of
-                // its arms, and the 1.175 batch fed it to this seat verbatim.
+                // Contract 1.191 (§4.191), amended by 1.259 (S12): the group
+                // arm needs the member ACI. Two capture seats carry it — the
+                // live envelope ingest (sourceUuid verbatim) and, since 1.259,
+                // the history import (the archive's `authorId` recipient ACI,
+                // the official importer's own preservation posture). The
+                // conversation's peer key addresses the group, not the
+                // member, so no ladder can invent the answer. A capture-less
+                // row (pre-1.191 live rows, import rows whose archive
+                // recipient carries no ACI) answers honestly INVALID_REQUEST
+                // here instead of spending an engine call on an author the
+                // engine must refuse — the row's `sender_id` is the ingest
+                // privacy hash, a local-only face the engine's
+                // `resolve_author_aci` rejects on all three of its arms, and
+                // the 1.175 batch fed it to this seat verbatim.
                 match message.author_aci.as_deref().filter(|aci| !aci.is_empty()) {
                     Some(aci) => aci.to_string(),
                     None => {
@@ -29377,6 +29382,103 @@ mod tests {
     /// the peer/ACI ladder, group incoming → the captured member ACI); one
     /// unknown, zero-stamp, system, or capture-less row refuses the whole
     /// batch before any engine call, as do empty and over-cap lists.
+    // S12x1.191 gold pin (contract 1.259): the group inbound row landed by
+    // the REAL import chain carries the archive's member ACI, so the
+    // section-4.191 backfill prepared frame names the protocol identity -
+    // the 1.191 honest INVALID_REQUEST now converges to rows whose archive
+    // recipient carries no ACI (the official skip posture).
+    #[test]
+    fn imported_group_row_backfills_through_its_captured_member_aci() {
+        let temp = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(
+                &temp.path().join("store"),
+                Some(crate::store::StoreKey::from_bytes([0x6B; 32])),
+            )
+            .unwrap(),
+        );
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        const MEMBER_ACI: &str = "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b";
+        const GROUP_MASTER: &str = "ZmFrZS1ncm91cA==";
+        let engine_dir = temp.path().join("engine-data");
+        let account_dir = engine_dir.join("accounts").join("lk-z2");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        std::fs::write(
+            engine_dir.join("engine-state.json"),
+            "{\"version\":2,\"accounts\":[{\"number\":\"+15555550100\",\"dir\":\"accounts/lk-z2\"}]}",
+        )
+        .unwrap();
+        let archive = account_dir.join("history-import.ndjson");
+        std::fs::write(
+            &archive,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                serde_json::json!({"type": "recipient", "id": 1, "kind": "contact",
+                    "name": "Alice", "aci": MEMBER_ACI, "e164": "+15550000001"}),
+                serde_json::json!({"type": "recipient", "id": 2, "kind": "group",
+                    "name": "Ops", "masterKey": GROUP_MASTER}),
+                serde_json::json!({"type": "chat", "id": 11, "recipientId": 2}),
+                serde_json::json!({"type": "message", "chatId": 11, "authorId": 1,
+                        "dateSent": 7000, "direction": "incoming", "text": "media",
+                        "attachments": [
+                            {"contentType": "image/png", "fileName": "p.png", "flag": 0,
+                                "size": 64,
+                                "locator": {"key": "MDEyMzQ1Njc4OWFiY2RlZg==",
+                                    "cdnKey": "ABCDEFG", "cdnNumber": 2,
+                                    "uploadTimestamp": 1760000000000u64,
+                                    "plaintextHash": "0123456789abcdef0123456789abcdef"}}]}
+                ),
+            ),
+        )
+        .unwrap();
+        crate::history_import::run_import(
+            &store,
+            &account.id,
+            "+15555550100",
+            &archive,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let conversation_id = stable_hash_id(&[&account.id, "group", GROUP_MASTER]);
+        let sender = stable_hash_id(&[&account.id, "group", "+15550000001"]);
+        let alt_sender = stable_hash_id(&[&account.id, "group", MEMBER_ACI]);
+        let row = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation_id,
+                "incoming",
+                7000,
+                &sender,
+                &alt_sender,
+            )
+            .unwrap()
+            .expect("imported group row");
+        assert_eq!(
+            row.author_aci.as_deref(),
+            Some(MEMBER_ACI),
+            "the capture is the backfill seat's only answer"
+        );
+
+        let service = ConnectorService::new(store.clone());
+        let prepared = service
+            .prepare_request_attachment_backfill(&AttachmentBackfillRequestParams {
+                account_id: account.id.clone(),
+                conversation_id,
+                message_id: row.id,
+            })
+            .unwrap();
+        assert_eq!(
+            prepared["author"],
+            serde_json::json!(MEMBER_ACI),
+            "the prepared frame names the member ACI - the hash never rides"
+        );
+        assert_eq!(prepared["groupId"], serde_json::json!(GROUP_MASTER));
+        assert_eq!(prepared["account"], serde_json::json!("+15555550100"));
+        assert_eq!(prepared["sentTimestamp"], serde_json::json!(7000u64));
+    }
     #[test]
     fn prepare_delete_for_me_messages_ladders_row_authors() {
         let (_temp, mut service) = service();

@@ -17,6 +17,30 @@
   document for the official anchor and the event mapping.
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.262 (2026-10-24; S13 §4.46 amendment — the v1 line
+  set grows the attachment rows: `chat_item` lines may carry
+  `attachments[]` with the §4.38 v2 pointer face verbatim (the
+  `project_pointer_common` isomorph: `contentType/fileName/size/width/
+  height/caption/blurHash/incrementalMac+chunkSize` +
+  `locator{key,cdnKey,cdnNumber,uploadTimestamp,digest|plaintextHash}`, plus
+  the official `MessageAttachment.Flag` words `voiceMessage`/`borderless`/
+  `gif`), the engine projects each entry into the official
+  `MessageAttachment{pointer,flag,...}` frame and the official validator is
+  the shared referee — entries that cannot build a valid frame (no
+  integrity face; digest form without the transit pair; half transit/mac
+  pairs) stay honest holes: dropped at artifact build, the row counts
+  `skippedAttachments` once, and media-only rows (empty body + projectable
+  attachment) now export (official `StandardMessage`: text absent +
+  attachments present is valid.)
+- Contract revision: 1.261 (2026-10-24; S12
+  §4.38 amendment — imported inbound rows capture the archive's member ACI:
+  the §4.38 import resolves `authorId` to its staged recipient and stores
+  the recipient ACI verbatim into `messages.author_aci`, so group inbound
+  import rows satisfy the §4.191 backfill arm and the §4.202 `authorAci`
+  name-source key; the capture never invents — rows whose archive recipient
+  carries no ACI keep the 1.191 honest INVALID_REQUEST posture. Official
+  posture: Signal-Android ChatItemArchiveImporter.kt:179-184.)
+
 - Contract revision: 1.255 (2026-10-24; §4.240 the group removal-stage
   face — batch W, ledger §29.67: the official
   `ConversationAttributes.removalStage` state machine
@@ -82,7 +106,7 @@
   the avatar member of the group change word list); the refreshed or
   honestly-cleared projection rides `conversation.changed`. No wire
   removal anywhere: pre-1.258 hosts read every face byte-identically.)
-- Contract revision: 1.259 (2026-10-24; §4.243 the verified storage-projection
+- Contract revision: 1.260 (2026-10-24; §4.244 the verified storage-projection
   face — batch Z4, ledger §29.81, the §29.77 structure-list S11 closure:
   the official `verified` belongs to the contact storage projection
   (`ConversationAttributes.verified` number, ts/model-types.d.ts:477;
@@ -111,9 +135,9 @@
   plane). The wire carries the additive absent-key `verified` bit on
   direct non-self summary rows (true = verified, false = probed-unverified
   including the `{}` DEFAULT fold, absent = unknown — never probed, a
-  group row, the self row, or a pre-1.259 connector); the desktop reads the
+  group row, the self row, or a pre-1.260 connector); the desktop reads the
   projection first and demotes the `identities.get` async read to the
-  fallback (the S11 repair's render side). Pre-1.259 hosts read every row
+  fallback (the S11 repair's render side). Pre-1.260 hosts read every row
   byte-identically.)
 - Contract revision: 1.254 (2026-10-24; §4.38 the archive-import media
   face close-out — batch U, ledger §29.64: the engine's v2 export already
@@ -507,7 +531,19 @@
   `sourceUuid` member ACI, never backfilled — a capture-less pre-1.191
   row answers honest `INVALID_REQUEST` instead of spending an engine
   call the engine must refuse), outgoing rows keep the account's own
-  number. Zero wire change: the author seat is engine-bound. Closes the
+  number. Zero wire change: the author seat is engine-bound.
+
+**1.261 amendment (S12, 2026-10-24).** The capture set grows a second
+seat: the §4.38 history import now resolves the archive frame's
+`authorId` to its staged recipient and stores that recipient's ACI
+verbatim into the same `messages.author_aci` column (the official
+importer preserves exactly this identity — Signal-Android
+ChatItemArchiveImporter.kt:179-184 — and skips the item when the
+recipient cannot be resolved). Group inbound import rows therefore
+satisfy this arm and reach the backfill, and the honest
+`INVALID_REQUEST` set shrinks to rows whose archive recipient carries
+no ACI — the capture stays verbatim, never invented (no E.164 fallback
+into an ACI column). See §4.245. Closes the
   desktop "无法下载媒体" Timeout-popup family the diagnosis batch
   convicted on the inbound arms; the regression was born with the
   request face itself at §4.175 and became user-visible from ~1.178.)
@@ -5674,7 +5710,12 @@ the wire registration (request-frame method enum, host dispatch literals,
 `ENGINE_STRUCTURED_ERROR_CODES` allowlist plus the connector-local `BACKUP_SNAPSHOT_MISSING`
 `ApiError` literal, schema method-enum entries, allOf param branches, and error-enum entries)
 and the code: `src/backup_export.rs` (artifact builder + snapshot caretaker + backup file
-handle table), the supervisor faces, the registry routing, and the tests. The schema-consistency
+handle table), the supervisor faces, the registry routing, and the tests.
+
+**1.262 amendment (S13, 2026-10-24).** The v1 line set grows the
+attachment rows — `chat_item` lines may carry `attachments[]` with the
+§4.38 v2 pointer face verbatim (see §4.246 for the full face, the
+counter semantics, and the engine-side fail-closed mirror). The schema-consistency
 gates pass both ways: method enum ↔ dispatch literals, error enum ↔ `ApiError` literals.
 
 - IPC shape (engine-side ruling, backup-export-contract §10.1): file-artifact handoff + engine
@@ -19473,7 +19514,7 @@ pre-1.257 宿主逐字节同形。
 **测试**：verbatim 三臂（true/false/无戳）+ 反演面不动钉形 + 群行缺席 +
 wire 缺席键钉形。
 
-## §4.243 会话行 verified 存储投影位（契约 1.259 · 批 Z4 · 台账 §29.81）
+## §4.244 会话行 verified 存储投影位（契约 1.260 · 批 Z4 · 台账 §29.81）
 
 官方锚：`verified` 属联系人存储投影——`ConversationAttributes.verified`
 数值字段（ts/model-types.d.ts:477），`updateVerified()` 从 protocol store
@@ -19500,12 +19541,85 @@ default→TRUSTED_UNVERIFIED / unverified→UNTRUSTED；§4.84「无信任位可
 
 **wire**：摘要行 additive absent-key `verified` 位（直聊非 self 行；
 true=已验证、false=已探明未验证（含 `{}` DEFAULT 折叠）、缺席=未知
-——群行/self 行/pre-1.259 连接器/从未探明）；读侧
+——群行/self 行/pre-1.260 连接器/从未探明）；读侧
 `identity_verified_bit_of_stamp` 单源投影（TRUSTED_VERIFIED 即官方
-verified 臂，malformed 戳 = 缺席，§4.50 纪律）。pre-1.259 宿主逐字节
+verified 臂，malformed 戳 = 缺席，§4.50 纪律）。pre-1.260 宿主逐字节
 同形。桌面消费：成员卡/About 卡/信息页安全码行读投影位先行，
 identities.get 异步读退役为兜底（位缺席时）。
 **测试**：读投影四臂（TRUSTED_VERIFIED→true / 其余词→false / `{}`→
 false / NULL→缺席）+ 群行/self 行缺席 + 戳写穿（peer 键与 conversation
 键两形）+ 盲扫 `{}` 自熄计数 + verify 写穿两臂 + §4.84 收敛词映射
 三臂。
+
+## §4.245 导入行补 author_aci 捕获（契约 1.261 · 批 Z2 · 台账 §29.79 · S12）
+
+官方锚：Signal-Android `ChatItemArchiveImporter.kt:179-184` ——
+`chatItem.authorId → fromLocalRecipientId`，解析不到即整 item 诚实跳过
+（`ImportSkips.fromRecipientNotFound`）：官方导入行保留归档帧的作者身份。
+
+我方根因：1.191（§4.191）把群入站行的 author 席位收敛到
+`messages.author_aci` 捕获列，但该捕获只有 live 信封一腿（sourceUuid
+逐字）；导入链落行时 `author_aci: None` 硬编码——全部群入站导入行落进
+1.191 的诚实拒集合，backfill（`attachments.requestBackfill`）结构性
+不可达。1.191 拍板行为随本条翻（台账 §29.77 S12）。
+
+修复：§4.38 导入链 `message_record` 入站臂在既有 author 解析梯上逐字
+捕获 `recipient.aci`（stage 层已规范小写连字 UUID，与 live 信封
+sourceUuid 同形）入列；出站行保持 NULL（账号本机号即协议面）。**捕获
+永不发明**——归档 recipient 无 ACI（e164-only 等）的行保持 NULL，1.191
+诚实 `INVALID_REQUEST` 对该集合原样生效；不发明 E.164 回落（ACI 列的
+语义即 serviceId，§4.202 wire `authorAci` 键的桌面名字源按 serviceId
+索引）。附带收口：store.rs `author_aci` 字段文档的「history-import 行
+恒 NULL」条款翻转；历史导入 staging INSERT 补 `author_aci` 列（此前该
+写面根本不落列——live 行同列的写通路无恙）。
+
+**wire**：零新增键（§4.202 `authorAci` 投影既有，导入行自此带值）。
+**测试**：v1/v2 导入行捕获钉形（群/直聊/出站三臂 + v1 附件行占位完整）
++ e164-only 诚实拒保留钉形 + service 金钉（真实导入链落行的群入站行 →
+`prepare_request_attachment_backfill` prepared 帧 author=成员 ACI，
+hash 永不出席）。
+
+## §4.246 v1 行集扩附件行（契约 1.262 · 批 Z2 · 台账 §29.79 · S13）
+
+官方锚：官方快照含附件——Android 恢复端按帧内 `MessageAttachment`
+指针重建媒体（`FilePointer.LocatorInfo` transit 三件套 + integrity），
+libsignal message-backup 校验器锁面：`MessageAttachment.pointer` 必备
+（`NoFilePointer`）、LocatorInfo integrity 必备
+（`MissingIntegrityCheck`）、`plaintextHash ⇒ key`（content/key 梯）、
+`digest ⇒ key+transit 对`（`EncryptedDigestMissingTransitInfo`）、
+cdnKey/cdnNumber 同进同退（`TransitCdnMismatch`）、uploadTimestamp 仅随
+cdn 对、增量 MAC 成对且非空（`IncrementalMacMismatch`）；文本缺席 +
+附件在场 = 合法纯媒体消息（`standard_message.rs:88-107`）。
+
+我方根因：§4.46 v1 行集（`backup-export-input.ndjson`）chat_item 行
+body-only——附件描述子整行丢弃（`skippedAttachments` 计数），§10.2
+既定边界（批 U 记档移交）。产出快照重导（§4.68 官方快照导入 → §4.38
+NDJSON → run_import）行无附件占位、不产生下载请求；官方同格式快照则
+附件完整。
+
+修复：connector `build_artifact` 附件投影（S13）——描述子
+（`attachments_json`）与其 index-aligned locator 面
+（`attachment_locators` 列）合流，按 §4.38 v2 locator 面**同形**投影
+（引擎出方向 `project_pointer_common` 的键逐字：`contentType/fileName/
+size/width/height/caption/blurHash/incrementalMac+chunkSize +
+locator{key,cdnKey,cdnNumber,uploadTimestamp,digest|plaintextHash}`，另
+投影官方 `MessageAttachment.Flag` 词（voiceMessage/borderless/gif，
+store 三布尔按枚举序映射）；官方帧造不成的条目 = 诚实洞：建工件时丢弃
+并逐行计 `skippedAttachments` 一次（行本体照常出行）；media-only 行
+（空 body + 可投影附件）自此出行（官方纯媒体消息形）。引擎侧
+（`backup/artifact.rs` + `backup/frames.rs`，S13 引擎半边）：chat_item
+行解析 `attachments[]`（deny_unknown_fields 不破旧行）→ 官方校验规则
+逐条 fail-closed 前置（跳条决策只在 connector，引擎永不静默吞）→
+`MessageAttachment{pointer,flag,was_downloaded}` 帧（§6.1/§6.2 扩面
+登记，§10.2 行格式/帽值表同步）。环回重导腿零改动自愈：快照 →
+§4.68 收向 → `export_frames_loop` 附件投影（`project_pointer_common`
+复用）→ connector locator ingest（1.55+）。
+
+**wire**：`backups.exportStatus` 计数语义收紧——`skippedAttachments` =
+「有描述子但附件面未能全量入行」的行数（逐行一次），可全量投影的行
+不再计数；导出工件为引擎内部过渡工件，宿主 wire 零变化。
+**测试**：build_artifact 混合行/纯媒体行/v1 行三臂钉形（locator 面
+逐键断言、cdn0 合法透传、无戳不落键、v1 行无 attachments 键）+ 计数
+语义钉形；引擎侧 golden+附件行官方校验钉形、纯媒体行校验钉形、
+无-integrity fail-closed 钉形、**工件→官方帧→官方 reader→NDJSON 环回
+逐键钉形**（locator key/cdn 三件/plaintextHash 往返不变形）。

@@ -2321,8 +2321,12 @@ pub struct MessageRecord {
     /// protocol has never spoken) and must never ride a prepared frame in its
     /// place. Connector-internal — never serialized onto the wire. NULL on
     /// outgoing rows (the account's own number is the protocol face there),
-    /// system rows, pre-1.191 rows, and history-import rows (the archive face
-    /// carries no member identity — never backfilled, §4.191).
+    /// system rows, pre-1.191 rows, and import rows whose archive recipient
+    /// carries no ACI — the capture is verbatim (the §4.38 import keeps the
+    /// archive's member identity, contract 1.259; official posture:
+    /// Signal-Android ChatItemArchiveImporter.kt:179-184 maps
+    /// `chatItem.authorId` to the local recipient and skips the item when it
+    /// cannot), never backfilled, never invented.
     ///
     /// Contract 1.202 (§4.202): also projected onto the host wire as the
     /// additive `authorAci` key — the **protocol identity** the desktop's
@@ -2331,9 +2335,10 @@ pub struct MessageRecord {
     /// a display name from it can never match; official parity is
     /// `getSourceServiceId` (ts/state/selectors/message.preload.ts:257),
     /// which returns the envelope ACI for incoming rows. Absent (not null)
-    /// on outgoing/system/pre-1.191 rows: an absent key is "no protocol
-    /// identity captured", never a guessed one. Internal history-import rows
-    /// keep it NULL and therefore project no key either.
+    /// on outgoing/system/pre-1.191/capture-less import rows: an absent key is
+    /// "no protocol identity captured", never a guessed one. Import rows
+    /// whose archive recipient carries the member ACI capture it verbatim
+    /// (contract 1.259) and project the key like live rows.
     #[serde(rename = "authorAci", skip_serializing_if = "Option::is_none")]
     pub author_aci: Option<String>,
     /// The own-story sync transcript bit (contract 1.160, §4.158): true only
@@ -2486,6 +2491,11 @@ pub struct BackupMessageRow {
     pub admin_deleted: bool,
     pub has_quote: bool,
     pub attachments_json: Option<String>,
+    /// The row's locator faces (S13, contract 1.260): the JSON array of
+    /// [`HistoryAttachmentLocator`] the §4.38 import ingested, index-aligned
+    /// with `attachments_json`. Raw cell — the caller parses (a malformed
+    /// cell is that caller's skip decision, the store stays a dumb read).
+    pub attachment_locators_json: Option<String>,
     pub rich_json: Option<String>,
     pub sticker_json: Option<String>,
 }
@@ -7506,7 +7516,7 @@ impl Store {
             .prepare(
                 "SELECT direction, sender_id, sent_at, received_at, body, body_truncated,
                         status, admin_deleted, quote_message_id, attachments_json,
-                        rich_json, sticker_json
+                        attachment_locators, rich_json, sticker_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2
                  ORDER BY sent_at ASC, id ASC",
@@ -7525,8 +7535,9 @@ impl Store {
                     admin_deleted: row.get::<_, i64>(7)? != 0,
                     has_quote: row.get::<_, Option<String>>(8)?.is_some(),
                     attachments_json: row.get(9)?,
-                    rich_json: row.get(10)?,
-                    sticker_json: row.get(11)?,
+                    attachment_locators_json: row.get(10)?,
+                    rich_json: row.get(11)?,
+                    sticker_json: row.get(12)?,
                 })
             })
             .map_err(|error| StoreError::Unavailable(Some(error)))?
@@ -8481,9 +8492,9 @@ impl Store {
                         client_request_id, quote_message_id, quote_snapshot, attachments_json,
                         attachment_locators, rich_json, edited_at, sender_name, mentions_self,
                         sticker_json, expire_seconds, expire_start_at, expire_at, server_guid,
-                        server_timestamp, admin_deleted
+                        server_timestamp, admin_deleted, author_aci
                      ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, NULL, ?12,
-                              ?13, ?14, ?21, ?20, NULL, ?15, ?16, ?22, ?17, ?18, ?19, NULL, NULL, ?23)",
+                              ?13, ?14, ?21, ?20, NULL, ?15, ?16, ?22, ?17, ?18, ?19, NULL, NULL, ?23, ?24)",
                     params![
                             record.id,
                             record.account_id,
@@ -8529,6 +8540,10 @@ impl Store {
                             // batch writer lands the importer's flag beside
                             // the intact row, exactly the live posture.
                             i64::from(record.admin_deleted),
+                            // The S12 capture (contract 1.259): the import
+                            // row carries the archive's member ACI exactly
+                            // like the live ingest capture rides its column.
+                            record.author_aci,
                         ],
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
