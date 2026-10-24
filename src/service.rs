@@ -18,12 +18,19 @@ use crate::engine::{
 };
 /// The official ACCEPT member of the `messageRequestResponseType` enum
 /// (`SignalService.proto:666-678`): the member the §4.58 factor weight reads.
-const MRR_RESPONSE_TYPE_ACCEPT: u8 = 1;
+pub(crate) const MRR_RESPONSE_TYPE_ACCEPT: u8 = 1;
+/// The official DELETE member of the same enum (contract 1.258, §4.56
+/// action-arm stamp): the decline face's terminal verb — the official
+/// deleteConversation thunk syncs DELETE and stamps the factor locally
+/// (ts/state/ducks/conversations.preload.ts:4144-4165 → the model's
+/// unconditional `messageRequestResponseType: response` write,
+/// ts/models/conversations.preload.ts:2638-2640).
+pub(crate) const MRR_RESPONSE_TYPE_DELETE: u8 = 2;
 /// The BLOCK family of the same enum (§4.131): the members that close the
 /// request by masking the sender — each stamps the conversation's blocked
 /// bit (the official `handleMessageTypeResponse` block branch masks the
 /// conversation for the member verbs the desktop's block composition uses).
-const MRR_RESPONSE_TYPE_BLOCK: u8 = 3;
+pub(crate) const MRR_RESPONSE_TYPE_BLOCK: u8 = 3;
 const MRR_RESPONSE_TYPE_BLOCK_AND_DELETE: u8 = 4;
 const MRR_RESPONSE_TYPE_BLOCK_AND_SPAM: u8 = 6;
 /// The SPAM member of the same enum (§4.239 mirror-row gate): the official
@@ -11156,6 +11163,7 @@ impl ConnectorService {
             response_type,
             thread_aci,
             group_id,
+            timestamp,
         } = &control
         {
             return self.apply_message_request_response(
@@ -11163,6 +11171,7 @@ impl ConnectorService {
                 *response_type,
                 thread_aci.as_deref(),
                 group_id.as_deref(),
+                *timestamp,
             );
         }
         // Contract 1.100 (§4.81 D2 consume batch): the read/viewed sync also
@@ -13688,32 +13697,16 @@ impl ConnectorService {
         response_type: u8,
         thread_aci: Option<&str>,
         group_id: Option<&str>,
+        timestamp: Option<u64>,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
         // Resolution: the group leg keys a group row directly; the ACI leg
-        // walks the same ladder the view-once open sync runs.
+        // walks the same ladder the view-once open sync runs (extracted as
+        // direct_conversation_for_aci — batch X · S6① shares it with the
+        // avatar-refresh arm).
         let (kind, peer_key) = if let Some(group_id) = group_id {
             ("group", group_id.to_string())
         } else if let Some(aci) = thread_aci {
-            let mut peer_keys = vec![aci.to_string()];
-            peer_keys.extend(self.store.peer_keys_for_aci(&account.id, aci)?);
-            let digits = address_digits(aci);
-            if !digits.is_empty() {
-                for key in self.store.contact_peer_keys(&account.id)? {
-                    let candidate = address_digits(&key);
-                    if !candidate.is_empty() && candidate.ends_with(&digits) {
-                        peer_keys.push(key);
-                    }
-                }
-            }
-            peer_keys.sort();
-            peer_keys.dedup();
-            let Some(peer_key) = peer_keys.into_iter().find_map(|peer_key| {
-                self.store
-                    .conversation_by_peer(&account.id, "direct", &peer_key)
-                    .ok()
-                    .flatten()
-                    .map(|_| peer_key)
-            }) else {
+            let Some((_, peer_key)) = self.direct_conversation_for_aci(&account.id, aci)? else {
                 tracing::warn!(
                     kind = "message_request_response",
                     "response sync matched no local conversation; dropped"
@@ -13761,6 +13754,15 @@ impl ConnectorService {
             .store
             .conversation_accept_response_member(&account.id, &conversation.id)?;
         let did_response_change = prior_member != Some(response_type);
+        // Contract 1.258 (§4.58 additive · batch X · S7②): the mirror-row
+        // clock is the sync moment the engine now projects (the sync
+        // envelope's own timestamp — the official MRR_SYNC row's
+        // `sent_at = sentAt` source, background.preload.ts:3803 →
+        // conversations.preload.ts:2513-2518). A pre-1.258 engine answers no
+        // key and the clock degrades to the local one exactly as the §4.239
+        // batch recorded; the multi-arm `messageCountFromEnvelope` offset
+        // keeps its per-arm +1 on either base.
+        let sent_at_base = timestamp.unwrap_or_else(now_ms);
         let mut events = Vec::new();
         if did_response_change {
             let mut message_count: u64 = 0;
@@ -13775,7 +13777,7 @@ impl ConnectorService {
                     &account.id,
                     &conversation.id,
                     event,
-                    now_ms().saturating_add(message_count),
+                    sent_at_base.saturating_add(message_count),
                 )? {
                     events.push(row_event);
                 }
@@ -13787,7 +13789,7 @@ impl ConnectorService {
                     &account.id,
                     &conversation.id,
                     MrrRowEvent::Block,
-                    now_ms().saturating_add(message_count),
+                    sent_at_base.saturating_add(message_count),
                 )? {
                     events.push(row_event);
                 }
@@ -13800,7 +13802,7 @@ impl ConnectorService {
                     &account.id,
                     &conversation.id,
                     MrrRowEvent::Spam,
-                    now_ms().saturating_add(message_count),
+                    sent_at_base.saturating_add(message_count),
                 )?
             {
                 events.push(row_event);
@@ -13839,6 +13841,111 @@ impl ConnectorService {
         }
         Ok(events)
     }
+
+    /// Batch X · S6①: the direct-conversation resolution ladder shared by
+    /// the §4.58 mirror arm and the avatar-refresh arm — the view-once
+    /// ladder gated to the direct thread (the ACI itself, the recorded
+    /// ACI→peer-key mappings, then the contacts digit-suffix matches).
+    /// Returns the resolved conversation id and the peer key it resolved
+    /// through; `None` when nothing local matches (the caller decides
+    /// drop vs skip).
+    fn direct_conversation_for_aci(
+        &self,
+        account_id: &str,
+        aci: &str,
+    ) -> Result<Option<(String, String)>, ServiceError> {
+        let mut peer_keys = vec![aci.to_string()];
+        peer_keys.extend(self.store.peer_keys_for_aci(account_id, aci)?);
+        let digits = address_digits(aci);
+        if !digits.is_empty() {
+            for key in self.store.contact_peer_keys(account_id)? {
+                let candidate = address_digits(&key);
+                if !candidate.is_empty() && candidate.ends_with(&digits) {
+                    peer_keys.push(key);
+                }
+            }
+        }
+        peer_keys.sort();
+        peer_keys.dedup();
+        Ok(peer_keys.into_iter().find_map(|peer_key| {
+            self.store
+                .conversation_by_peer(account_id, "direct", &peer_key)
+                .ok()
+                .flatten()
+                .map(|conversation| (conversation.id, peer_key))
+        }))
+    }
+
+    /// Batch X · S6① (S6 头像生命周期 ① 失效重拉时机): one receive batch's
+    /// stale-avatar targets, resolved and invalidated under the service
+    /// lock. A peer profile change (the engine's `contactProfileUpdated`
+    /// projection — the official profileKeyUpdate face's hasChanged gate
+    /// already fired engine-side, background.preload.ts:2938-2970) resolves
+    /// through the direct ladder; a group change batch keys its
+    /// conversation and gates on the official GroupV2ChangeDetailType
+    /// avatar member (the GroupAvatarUpdate analog). The stale cache entry
+    /// clears best-effort so no window serves a possibly-stale avatarUrl
+    /// between the event and the worker's refetch; a profile change with
+    /// no cached bytes still queues the pull (the official
+    /// hasChanged → getProfiles arm is unconditional). Pure returns — the
+    /// engine call stays with the supervisor's bounded worker.
+    pub fn stale_avatar_targets(&self, events: &[HostSideEvent]) -> Vec<(String, String)> {
+        let mut targets = Vec::new();
+        for event in events {
+            match event {
+                HostSideEvent::ContactProfileUpdated {
+                    account_id, aci, ..
+                } => {
+                    let Ok(Some((conversation_id, _))) =
+                        self.direct_conversation_for_aci(account_id, aci)
+                    else {
+                        continue;
+                    };
+                    let _ = self
+                        .store
+                        .clear_conversation_avatar(account_id, &conversation_id);
+                    targets.push((account_id.clone(), conversation_id));
+                }
+                HostSideEvent::GroupChanged {
+                    account_id,
+                    conversation_id,
+                    changes,
+                    ..
+                } => {
+                    if !group_avatar_change_present(changes) {
+                        continue;
+                    }
+                    let _ = self
+                        .store
+                        .clear_conversation_avatar(account_id, conversation_id);
+                    targets.push((account_id.clone(), conversation_id.clone()));
+                }
+                _ => {}
+            }
+        }
+        targets
+    }
+}
+
+/// Batch X · S6①: the official GroupV2ChangeDetailType avatar member in the
+/// engine's groupChanged change list (contract 1.100 §4.81 D3 word list;
+/// engine groups.rs projects `{type: "avatar", removed: bool}`) — the
+/// GroupAvatarUpdate analog. The official desktop refetches the group
+/// avatar when the change carries the member and drops the cached file on
+/// the removed form (applyMessageRequestResponse's applyNewAvatar arm and
+/// setAndMaybeFetchProfileAvatar's absent-avatarUrl clear are the same
+/// lifecycle). Bounded shape read: non-array or member-less shapes read as
+/// absent (the event forwards verbatim regardless — this gate only decides
+/// the connector's own refetch).
+pub(crate) fn group_avatar_change_present(changes: &Value) -> bool {
+    changes
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.get("type").and_then(Value::as_str) == Some("avatar"))
+        })
+        .unwrap_or(false)
 }
 
 /// 契约 1.253（§4.239）的行事件闭集：官方 `MessageRequestResponseEvent`
@@ -44241,6 +44348,7 @@ mod tests {
                 response_type: 1,
                 thread_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
                 group_id: None,
+                timestamp: None,
             }),
         };
 
@@ -44314,6 +44422,7 @@ mod tests {
                 response_type: 2,
                 thread_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
                 group_id: None,
+                timestamp: None,
             }),
             ..base.clone()
         };
@@ -44351,6 +44460,7 @@ mod tests {
                 response_type: 1,
                 thread_aci: Some("99999999-9999-9999-9999-999999999999".into()),
                 group_id: None,
+                timestamp: None,
             }),
             ..base_shape_for_unknown_test()
         };
@@ -44368,6 +44478,7 @@ mod tests {
                 response_type: 1,
                 thread_aci: None,
                 group_id: Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=".into()),
+                timestamp: None,
             }),
             ..base_shape_for_unknown_test()
         };
@@ -44378,6 +44489,200 @@ mod tests {
                 .is_empty(),
             "groups carry no request to accept"
         );
+    }
+
+    /// Contract 1.258 (§4.58 additive · batch X · S7②): the mirror row's
+    /// clock is the projected sync moment — the row lands with
+    /// `sent_at = timestamp` (+ the multi-arm offset), not the local wall
+    /// clock. A control face without the additive key keeps the recorded
+    /// local-clock degradation (covered by the sibling tests above, which
+    /// assert shape only).
+    #[test]
+    fn ingest_message_request_response_row_sent_at_rides_projected_sync_moment() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut incoming = expire_record_fixture(&account.id, &direct.id, "mrr-ts");
+        incoming.sent_at = 10;
+        service
+            .store_ref()
+            .insert_message(&incoming, None, None, false)
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_peer_identity(
+                &account.id,
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "+15555550101",
+            )
+            .unwrap();
+        let sync_moment = 1_700_000_000_123_u64;
+        let stamped = NormalizedReceive {
+            required_protocol_version: None,
+            timestamp: Some(1_727_000_000_000),
+            content_kind: "control",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: None,
+            source_uuid: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+            peer_name: None,
+            group_id: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: Some(ControlReceive::MessageRequestResponse {
+                response_type: 1,
+                thread_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
+                group_id: None,
+                timestamp: Some(sync_moment),
+            }),
+        };
+        let events = service
+            .ingest_receive(stamped, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let row = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(row) => Some(row),
+                _ => None,
+            })
+            .expect("the mirror row rides");
+        // The official MRR_SYNC mint: sent_at = the sync envelope's own
+        // timestamp (responseInfo.timestamp), zero arms appended on a pure
+        // ACCEPT face.
+        assert_eq!(row.sent_at, sync_moment);
+    }
+
+    /// Batch X · S6①: the stale-avatar target classifier — a peer profile
+    /// change resolves through the direct ladder and clears the cached
+    /// entry; a group change batch gates on the official avatar member;
+    /// non-avatar group changes and unresolvable ACIs queue nothing.
+    #[test]
+    fn stale_avatar_targets_classify_receive_batch_events() {
+        assert!(group_avatar_change_present(
+            &serde_json::json!([{"type": "avatar", "removed": false}])
+        ));
+        assert!(group_avatar_change_present(&serde_json::json!([
+            {"type": "member-added"},
+            {"type": "avatar", "removed": true}
+        ])));
+        assert!(!group_avatar_change_present(&serde_json::json!([
+            {"type": "member-added"}
+        ])));
+        assert!(!group_avatar_change_present(
+            &serde_json::json!({"type": "avatar"})
+        ));
+        assert!(!group_avatar_change_present(&serde_json::json!("avatar")));
+
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_conversation_avatar(
+                &account.id,
+                &direct.id,
+                "data:image/png;base64,QQ==",
+                1,
+                crate::link::now_ms(),
+            )
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_peer_identity(
+                &account.id,
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "+15555550101",
+            )
+            .unwrap();
+        let events = vec![HostSideEvent::ContactProfileUpdated {
+            account_id: account.id.clone(),
+            aci: "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into(),
+            timestamp: Some(1_727_000_000_000),
+        }];
+        let targets = service.stale_avatar_targets(&events);
+        assert_eq!(
+            targets,
+            vec![(account.id.clone(), direct.id.clone())],
+            "the profile change resolves to the direct row"
+        );
+        assert!(
+            service
+                .store_ref()
+                .conversation_avatar(&account.id, &direct.id)
+                .unwrap()
+                .is_none(),
+            "the stale cache entry cleared"
+        );
+
+        // An ACI nothing local resolves queues nothing.
+        let unknown = vec![HostSideEvent::ContactProfileUpdated {
+            account_id: account.id.clone(),
+            aci: "99999999-9999-9999-9999-999999999999".into(),
+            timestamp: None,
+        }];
+        assert!(service.stale_avatar_targets(&unknown).is_empty());
+
+        // A group change with the avatar member targets its conversation;
+        // a batch without it queues nothing.
+        let group = service
+            .store_ref()
+            .ensure_conversation(
+                &account.id,
+                "group",
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+                "Group",
+            )
+            .unwrap();
+        let group_avatar = vec![HostSideEvent::GroupChanged {
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            revision: 7,
+            changes: serde_json::json!([{"type": "avatar", "removed": false}]),
+            editor: None,
+            expire_timer_seconds: None,
+        }];
+        assert_eq!(
+            service.stale_avatar_targets(&group_avatar),
+            vec![(account.id.clone(), group.id.clone())],
+        );
+        let group_other = vec![HostSideEvent::GroupChanged {
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            revision: 8,
+            changes: serde_json::json!([{"type": "member-added"}]),
+            editor: None,
+            expire_timer_seconds: None,
+        }];
+        assert!(service.stale_avatar_targets(&group_other).is_empty());
     }
 
     /// Contract 1.138 (§4.131): the BLOCK family verbs (3/4/6) stamp the
@@ -44423,6 +44728,7 @@ mod tests {
                 response_type: 3,
                 thread_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
                 group_id: None,
+                timestamp: None,
             }),
             ..base_shape_for_unknown_test()
         };
@@ -44451,6 +44757,7 @@ mod tests {
                 response_type: 2,
                 thread_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
                 group_id: None,
+                timestamp: None,
             }),
             ..base_shape_for_unknown_test()
         };
@@ -44657,6 +44964,7 @@ mod tests {
                 response_type,
                 thread_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
                 group_id: None,
+                timestamp: None,
             }),
         };
         let words = |service: &mut ConnectorService| -> Vec<String> {

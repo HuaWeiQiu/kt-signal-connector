@@ -1432,10 +1432,20 @@ pub enum ControlReceive {
     /// one of the two is present (the proto oneof). No message row exists for
     /// the notification; the service layer stamps the authoritative factor
     /// and the summary rides `conversation.changed`.
+    ///
+    /// Contract 1.258 (§4.58 additive, batch X · S7②): `timestamp` rides the
+    /// engine's additive sync-moment projection (the sync envelope's own
+    /// timestamp — the official MRR_SYNC row's `sent_at = sentAt` source,
+    /// background.preload.ts:3803 → conversations.preload.ts:2513-2518). The
+    /// proto member itself carries no time, so pre-1.258 engines answer no
+    /// key and the mirror-row clock degrades to the local one exactly as
+    /// before (the recorded §4.239 degradation); a malformed value reads as
+    /// absent (an additive key never fails the face).
     MessageRequestResponse {
         response_type: u8,
         thread_aci: Option<String>,
         group_id: Option<String>,
+        timestamp: Option<u64>,
     },
     /// Story receives (contract 1.76, §4.67): the engine's envelope-level
     /// `storyMessage` projection — the official Content.storyMessage=8 face.
@@ -4356,6 +4366,10 @@ fn normalized_message_request_response(
         response_type,
         thread_aci: resolved.0,
         group_id: resolved.1,
+        // Contract 1.258 (§4.58 additive): the sync-moment key rides when the
+        // engine projected it and reads as absent otherwise (pre-1.258
+        // engines) or when malformed (an additive key never fails the face).
+        timestamp: face.get("timestamp").and_then(Value::as_u64),
     })
 }
 
@@ -15657,10 +15671,49 @@ mod tests {
                 response_type,
                 thread_aci,
                 group_id,
+                timestamp,
             } => {
                 assert_eq!(response_type, 1);
                 assert_eq!(thread_aci.as_deref(), Some(THREAD_ACI));
                 assert!(group_id.is_none());
+                // Pre-1.258 engine posture: no additive key rides, the mirror
+                // clock stays the recorded local-clock degradation.
+                assert!(timestamp.is_none());
+            }
+            other => panic!("unexpected control: {other:?}"),
+        }
+
+        // Contract 1.258 (§4.58 additive): the engine's sync-moment key rides
+        // verbatim; a malformed value reads as absent (an additive key never
+        // fails the face).
+        let stamped = normalize(json!({
+            "messageRequestResponse": {
+                "threadAci": THREAD_ACI,
+                "messageRequestResponseType": 1,
+                "timestamp": 1727000000123u64,
+            }
+        }));
+        match stamped.control.expect("stamped face") {
+            ControlReceive::MessageRequestResponse {
+                response_type,
+                timestamp,
+                ..
+            } => {
+                assert_eq!(response_type, 1);
+                assert_eq!(timestamp, Some(1_727_000_000_123));
+            }
+            other => panic!("unexpected control: {other:?}"),
+        }
+        let malformed = normalize(json!({
+            "messageRequestResponse": {
+                "threadAci": THREAD_ACI,
+                "messageRequestResponseType": 1,
+                "timestamp": "not-a-number",
+            }
+        }));
+        match malformed.control.expect("malformed-timestamp face") {
+            ControlReceive::MessageRequestResponse { timestamp, .. } => {
+                assert!(timestamp.is_none(), "malformed additive key reads absent");
             }
             other => panic!("unexpected control: {other:?}"),
         }

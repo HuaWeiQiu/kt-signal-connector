@@ -53,6 +53,35 @@
   through the `inSystemContacts` inversion, which stays verbatim beside
   it for pre-1.257 consumers. Wire additive, byte-identical rows behind
   the stamp.)
+- Contract revision: 1.258 (2026-10-24; batch X — S6 avatar lifecycle +
+  S7 request-state factor, ledger §29.68. Three faces: (a) §4.56
+  action-arm factor stamp — `conversations.acceptRequest` /
+  `declineRequest` / the `setBlocked(true)` arm stamp the authoritative
+  `acceptResponseType` factor synchronously with the upstream answer
+  (the official action device is the truth source: the local
+  composition runs before the sync goes up,
+  ducks/conversations.preload.ts:3779-3787, and the sync echo never
+  returns to the action device, so the §4.239 batch's recorded
+  reload-window degradation closes; members ACCEPT=1 / DELETE=2 /
+  BLOCK=3 verbatim, models/conversations.preload.ts:2638-2640's
+  unconditional local write). Direct rows only (the store grammar);
+  the plain `setBlocked(false)` unblock stamps nothing (the official
+  applyMessageRequestResponse never runs for it). (b) §4.58 mirror
+  face additive: the engine's `syncMessage.messageRequestResponse`
+  projection carries `timestamp` = the sync envelope's own moment (the
+  official MRR_SYNC row's `sent_at = sentAt` source,
+  background.preload.ts:3803 → conversations.preload.ts:2513-2518) —
+  mirror rows stop degrading to the local clock on 1.258+ engines;
+  pre-1.258 engines answer no key and the recorded degradation stays.
+  (c) S6 avatar lifecycle (the L2 handover): a peer profile change
+  (`contactProfileUpdated`, contract 1.134 §4.117) and a group change
+  batch carrying the official GroupV2ChangeDetailType avatar member
+  now invalidate the cached avatar and refetch through the getAvatar
+  read lane on a bounded background worker (the official
+  hasChanged → getProfiles face, background.preload.ts:2938-2970, and
+  the avatar member of the group change word list); the refreshed or
+  honestly-cleared projection rides `conversation.changed`. No wire
+  removal anywhere: pre-1.258 hosts read every face byte-identically.)
 - Contract revision: 1.254 (2026-10-24; §4.38 the archive-import media
   face close-out — batch U, ledger §29.64: the engine's v2 export already
   projects `width`/`height` on every attachment line
@@ -5827,6 +5856,27 @@ NOT in this batch: it needs connector-side per-message `serverGuid` persistence 
 received rows, which lands with the row-level persistence batch — recorded here as the
 §4.47 backlog item.
 
+**Amended by contract 1.258 (batch X, ledger §29.68) — the avatar lifecycle (S6①, the L2
+handover)**: the cached-avatar face grows the invalidation half its §29.2/L2 batch
+recorded as pending. Two receive-batch faces now invalidate the cached entry and refetch
+through this section's own read lane (prepare → engine `getAvatar` → result-face gate →
+commit gate) on a bounded background worker: (a) a peer profile change — the engine's
+`contactProfileUpdated` projection (§4.117), whose engine-side profile-key idempotence gate
+is the official `hasChanged` arm (background.preload.ts:2938-2970: `setProfileKey` hasChanged
+→ `getProfiles()`); (b) a group change batch carrying the official GroupV2ChangeDetailType
+avatar member (`{"type":"avatar","removed":…}`, the GroupAvatarUpdate analog of the §4.81 D3
+word list). The stale entry clears before the refetch so no window serves a possibly-stale
+`avatarUrl` in between; a committed refetch (or an honest `AVATAR_UNAVAILABLE` clear) rides
+`conversation.changed` so open windows repaint without a re-read. Lossy by design: a full
+refetch queue drops the kick (the desktop's on-demand pull of this section is the
+convergence backstop), and an unreachable engine drops it silently. The engine-side
+self-avatar read face (S6②, the same ledger entry): `getAvatar` on the account's own ACI
+falls back to the registration data's profile key when the contacts-synced
+`profile_keys` slot is empty — the slot never carries self, which is why `setProfile`
+followed by a self read answered `AVATAR_UNAVAILABLE`; the official posture is that own
+avatar material is locally known (the model keeps it from the upload), so the read face
+answers it instead of inventing an absence.
+
 Local validation ladder: `accountId` through the opaque-id validator and resolved to the
 owning proxy group; `conversationId` 1..256 chars and resolved to the conversation row;
 `kind` against the three-value enum (setBlocked); `blocked` required boolean (setBlocked,
@@ -6660,12 +6710,21 @@ additionally flips the contact's profile-sharing bit upstream
   USER_ERROR folds into the plain `UPSTREAM_ERROR` like every account-domain method. An
   indeterminate outcome answers `SEND_OUTCOME_UNKNOWN` and is never retried (unknown send
   results are terminal, the AGENTS.md discipline).
-- Zero local writes: the request state converges through the receive side — a synced
-  `messageRequestResponse` envelope on the account (`ReceiveMessageHandler.java:413-424`
-  projects type/groupId/person; the official desktop consumes the same event and stamps
-  `messageRequestResponseType` locally, deriving the accepted state with
-  `isConversationAccepted.preload.ts:21-82`) stamps the contact row's accepted flag in the
-  §4.56 desktop projection below. The connector itself persists nothing.
+- ~~Zero local writes~~ **Amended by contract 1.258 (batch X, ledger §29.68) — the
+  action-arm factor stamp**: the original revision converged the request state purely
+  through the receive side, but the official composition stamps the action device
+  locally *before* the sync goes up (ducks/conversations.preload.ts:3779-3787) and the
+  sync echo never returns to the action device — a pure-receive connector left the
+  authoritative factor unset on its own actions and the accepted derivation fell back
+  to the window weights after a reload (the §4.239 batch's recorded degradation). The
+  accept / decline arms now stamp the factor synchronously with the upstream answer
+  (ACCEPT=1 accepted / DELETE=2 terminal, the model's unconditional
+  `messageRequestResponseType: response` write, models/conversations.preload.ts:2638-2640),
+  and the `setBlocked(true)` arm stamps the BLOCK=3 member the official
+  `blockConversation` thunk composes; the plain `setBlocked(false)` unblock stamps
+  nothing (applyMessageRequestResponse never runs for it). Direct rows only (the
+  §4.58 store grammar). The receive-side stamp below remains the second half of the
+  convergence (a linked device's action still arrives as the mirror).
 - Desktop gating: capability `message-requests` (new tag). A desktop without the tag keeps
   its current rendering (zero calls); contract 1.61 wire consumers are unaffected.
 
@@ -6864,6 +6923,17 @@ always-serialized bool (the muted/pinned/isSelf discipline, both values
 meaningful). A desktop consumes the key as authoritative the moment it is
 present and keeps its local window derivation only for pre-1.65 connectors
 where the key is absent.
+
+**Amended by contract 1.258 (batch X, ledger §29.68) — the mirror face's sync moment**: the
+engine's `syncMessage.messageRequestResponse` projection (the §4.239 mirror-row source)
+now carries an additive `timestamp` key = the sync envelope's own moment. The official
+proto member carries no time; the official MRR_SYNC row's `sent_at` is the sync event's
+`sentAt` (background.preload.ts:3803 → the row's `timestamp = responseInfo.timestamp`,
+models/conversations.preload.ts:2513-2518) — the sync envelope's sent timestamp. On a
+1.258+ engine the connector's mirror rows take their clock from the projected key and
+stop degrading to the local wall clock (the §4.239 batch's recorded degradation); a
+pre-1.258 engine answers no key, the key never fails the face when malformed, and the
+mirror row keeps the recorded local-clock fallback.
 
 Reachability record (2026-10-06, all anchors read from the pinned trees):
 

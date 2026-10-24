@@ -115,6 +115,14 @@ const EXPIRE_SWEEP_STARTUP_SETTLE: Duration = Duration::from_secs(5);
 /// bounded, lossy by design — a full queue drops the job, never the receive.
 const DELIVERY_RECEIPT_QUEUE_CAP: usize = 512;
 
+/// Batch X · S6①: the stale-avatar refetch queue cap. Profile-change and
+/// group-avatar-change events are rare by protocol construction (the engine's
+/// profile-key idempotence gate and the group change batches bound them); the
+/// cap absorbs a storm without unbounded growth, and a full queue drops the
+/// refetch kick lossily (the desktop's own on-demand pull is the convergence
+/// backstop).
+const AVATAR_REFRESH_QUEUE_CAP: usize = 32;
+
 /// §4.163 contacts.sync wall-clock budget: the whole face — engine resolve,
 /// the two read-only listings, and the store upsert transaction — must answer
 /// inside it or the request folds to the retryable timeout face. Without a
@@ -616,6 +624,14 @@ pub struct RuntimeSupervisor {
     delivery_receipt_rx: StdMutex<Option<mpsc::Receiver<DeliveryReceiptJob>>>,
     /// The delivery-receipt worker; never held across an await.
     delivery_receipt_worker: StdMutex<Option<JoinHandle<()>>>,
+    /// Batch X · S6①: the bounded avatar-refresh queue's receiver, taken by
+    /// `spawn_avatar_refresh_worker` (the queue itself is created in `new`;
+    /// the persistence loop holds the sender). Bounded and lossy — a full
+    /// queue drops the refetch kick, never the receive (the next profile
+    /// change or the desktop's own on-demand pull converges).
+    avatar_refresh_rx: StdMutex<Option<mpsc::Receiver<(String, String)>>>,
+    /// The avatar-refresh worker; never held across an await.
+    avatar_refresh_worker: StdMutex<Option<JoinHandle<()>>>,
     /// §4.123 outbox drain: the receiver side of the lossy drain-kick channel
     /// (cap 1 — a send that finds it full means a pass is already pending),
     /// taken by `spawn_outbox_worker`; and the single worker slot. The
@@ -761,6 +777,13 @@ impl RuntimeSupervisor {
         // queue drops the receipt job, never the receive.
         let (delivery_receipt_tx, delivery_receipt_rx) =
             mpsc::channel::<DeliveryReceiptJob>(DELIVERY_RECEIPT_QUEUE_CAP);
+        // Batch X · S6①: the stale-avatar refetch queue the persistence loop
+        // feeds (profile change / group avatar change targets, resolved and
+        // invalidated under the service lock by the service's
+        // stale_avatar_targets); the worker spawned later by the registry
+        // drains it through the getAvatar read lane. Bounded and lossy.
+        let (avatar_refresh_tx, avatar_refresh_rx) =
+            mpsc::channel::<(String, String)>(AVATAR_REFRESH_QUEUE_CAP);
         // §4.123 outbox drain: the cap-1 lossy kick channel the engine-landed
         // hooks send on; the worker (spawned later by the registry) owns the
         // receiver and otherwise paces itself on the due schedules + tick.
@@ -782,6 +805,7 @@ impl RuntimeSupervisor {
             group_id.clone(),
             media.as_ref().map(|media| media.governor().clone()),
             delivery_receipt_tx,
+            avatar_refresh_tx,
             Arc::clone(&receive_evidence),
         ));
         // Contract 1.21: authorization failures observed on this group's
@@ -827,6 +851,8 @@ impl RuntimeSupervisor {
             expire_sweeper: StdMutex::new(None),
             delivery_receipt_rx: StdMutex::new(Some(delivery_receipt_rx)),
             delivery_receipt_worker: StdMutex::new(None),
+            avatar_refresh_rx: StdMutex::new(Some(avatar_refresh_rx)),
+            avatar_refresh_worker: StdMutex::new(None),
             outbox_drain_rx: StdMutex::new(Some(outbox_drain_rx)),
             outbox_drain_tx,
             outbox_worker: StdMutex::new(None),
@@ -1137,6 +1163,107 @@ impl RuntimeSupervisor {
         });
         if let Ok(mut slot) = self.delivery_receipt_worker.lock() {
             *slot = Some(worker);
+        }
+    }
+
+    /// Batch X · S6① (S6 头像生命周期 ① 失效重拉时机): take the bounded
+    /// avatar-refresh queue and drain it — one (account, conversation) kick
+    /// per profile-change / group-avatar-change face, refetched through the
+    /// exact read lane the desktop's `conversations.getAvatar` uses (the
+    /// §4.47 prepare face, the read-only engine call, the result-face gate,
+    /// the service commit gate) so the cache converges through one writer
+    /// discipline. Lossy end to end: an unreachable engine or a full queue
+    /// drops the kick (the desktop's on-demand pull is the backstop), an
+    /// honest UNAVAILABLE clears the entry idempotently (the L2
+    /// negative-chain discipline), and a committed byte set pushes the
+    /// refreshed summary so open windows repaint without a re-read.
+    pub fn spawn_avatar_refresh_worker(self: &Arc<Self>) {
+        let Some(receiver) = self
+            .avatar_refresh_rx
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        else {
+            return;
+        };
+        let supervisor = Arc::clone(self);
+        let worker = tokio::spawn(async move {
+            let mut receiver = receiver;
+            while let Some((account_id, conversation_id)) = receiver.recv().await {
+                supervisor
+                    .refresh_conversation_avatar(&account_id, &conversation_id)
+                    .await;
+            }
+        });
+        if let Ok(mut slot) = self.avatar_refresh_worker.lock() {
+            *slot = Some(worker);
+        }
+    }
+
+    /// Batch X · S6①: one background avatar refetch — the getAvatar lane
+    /// minus the IPC boundary (the phases of the desktop-facing
+    /// `get_avatar` above, verbatim order). Never logs bytes or identities
+    /// (§4.47); every failure face is a content-free warn at most.
+    async fn refresh_conversation_avatar(&self, account_id: &str, conversation_id: &str) {
+        let Ok(engine) = self.running_engine().await else {
+            return;
+        };
+        let upstream = {
+            let service = self.service.lock().await;
+            match service.prepare_conversations_get_avatar(account_id, conversation_id) {
+                Ok(upstream) => upstream,
+                Err(_) => return,
+            }
+        };
+        match engine
+            .call("getAvatar", upstream, CallClass::ReadOnly)
+            .await
+        {
+            Ok(result) => {
+                let Ok(download) = avatar_from_engine(&result) else {
+                    return;
+                };
+                let service = self.service.lock().await;
+                let committed = service
+                    .commit_conversation_avatar(
+                        account_id,
+                        conversation_id,
+                        &download.data_uri,
+                        download.byte_size,
+                    )
+                    .is_ok();
+                if committed
+                    && let Ok(Some(conversation)) =
+                        self.store.conversation_summary(account_id, conversation_id)
+                {
+                    let _ = self
+                        .host_events
+                        .send(HostSideEvent::ConversationChanged(conversation));
+                }
+            }
+            Err(EngineError::UpstreamCode {
+                code: "AVATAR_UNAVAILABLE",
+                ..
+            }) => {
+                // The honest no-avatar answer (peer/group has none or the
+                // profile key went missing): the idempotent clear keeps the
+                // projection absent, and the changed push lets any open
+                // window drop the stale bytes in the same pass.
+                let service = self.service.lock().await;
+                let _ = service.clear_conversation_avatar(account_id, conversation_id);
+                if let Ok(Some(conversation)) =
+                    self.store.conversation_summary(account_id, conversation_id)
+                {
+                    let _ = self
+                        .host_events
+                        .send(HostSideEvent::ConversationChanged(conversation));
+                }
+            }
+            Err(_) => {
+                // Transient (FETCH_FAILED / TOO_LARGE / lifecycle): nothing
+                // cached either way (the clear already ran), the next
+                // profile change or the desktop's own pull retries.
+            }
         }
     }
 
@@ -6435,6 +6562,30 @@ impl RuntimeSupervisor {
                         params.blocked,
                     )
                     .unwrap_or(false);
+                // 契约 1.258（§4.56 动作臂盖章 · 批 X · S7①）：官方
+                // blockConversation thunk = applyMessageRequestResponse(BLOCK)
+                //（ducks/conversations.preload.ts:4073-4127），无条件写
+                // messageRequestResponseType = BLOCK 成员
+                //（models/conversations.preload.ts:2638-2640）——§4.47 是 KT
+                // 全部屏蔽路径的同一写面，§4.56 因子随同一臂盖章（accepted=
+                // false + 原始成员 BLOCK=3）。direct 限定（store 闸，官方
+                // 请求语义不落群行）；params.blocked=false 是官方素 unblock
+                //（applyMessageRequestResponse 不运行），不盖章记档。best-
+                // effort：失败降镜像/读面收敛。
+                if params.blocked
+                    && let Err(error) = self.store.set_conversation_accept_response_factor(
+                        &params.account_id,
+                        &params.conversation_id,
+                        false,
+                        crate::service::MRR_RESPONSE_TYPE_BLOCK,
+                    )
+                {
+                    tracing::warn!(
+                        kind = "message_request_factor",
+                        class = error.class(),
+                        "block stamped no request factor; the mirror path converges"
+                    );
+                }
                 if stamped
                     && let Some(conversation) = self
                         .store
@@ -6942,6 +7093,47 @@ impl RuntimeSupervisor {
                             kind = "message_request_row",
                             class = error.class(),
                             "accept landed no timeline row; the action answer stands"
+                        ),
+                    }
+                }
+                // 契约 1.258（§4.56 动作臂盖章 · 批 X · S7①）：动作设备即真相
+                // 源——官方动作次序「先本地落行/盖章、再上行 sync」
+                //（ducks/conversations.preload.ts:3779-3787），sync 只发对端
+                // 设备、动作臂永不经镜像回流盖章，§4.239 批记档的「本机
+                // accept 后因子不经镜像回流、重载后 accepted 派生回落窗口
+                // 权重」窗口由此闭合：accept → ACCEPT 位 true + 原始成员 1，
+                // decline → DELETE 成员 2（官方 deleteConversation thunk 的
+                // DELETE stamp 同源，models/conversations.preload.ts:2638-2640
+                // 无条件写）。§4.58 存储闸直连同款写面（direct 限定，官方
+                // 请求语义不落群行）；best-effort——盖章失败降下次镜像/读面
+                // 收敛，动作应答仍是主面。
+                {
+                    let accepted = request_type == "accept";
+                    let member = if accepted {
+                        crate::service::MRR_RESPONSE_TYPE_ACCEPT
+                    } else {
+                        crate::service::MRR_RESPONSE_TYPE_DELETE
+                    };
+                    match self.store.set_conversation_accept_response_factor(
+                        &params.account_id,
+                        &params.conversation_id,
+                        accepted,
+                        member,
+                    ) {
+                        Ok(_) => {
+                            if let Ok(Some(conversation)) = self
+                                .store
+                                .conversation_summary(&params.account_id, &params.conversation_id)
+                            {
+                                let _ = self
+                                    .host_events
+                                    .send(HostSideEvent::ConversationChanged(conversation));
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            kind = "message_request_factor",
+                            class = error.class(),
+                            "action stamped no request factor; the mirror path converges"
                         ),
                     }
                 }
@@ -11008,6 +11200,7 @@ fn emit_forwarded(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_persistence_loop(
     mut receives: mpsc::Receiver<QueuedReceive>,
     service: Arc<Mutex<ConnectorService>>,
@@ -11015,6 +11208,7 @@ async fn receive_persistence_loop(
     owner_group: String,
     media_governor: Option<MediaGovernor>,
     delivery_receipts: mpsc::Sender<DeliveryReceiptJob>,
+    avatar_refresh: mpsc::Sender<(String, String)>,
     receive_evidence: Arc<AtomicU64>,
 ) {
     let mut storage_unavailable = false;
@@ -11096,6 +11290,27 @@ async fn receive_persistence_loop(
                     {
                         // Queue full: drop the receipt, never block the
                         // receive pipeline.
+                    }
+                    // Batch X · S6① (S6 头像生命周期 ① 失效重拉时机): the
+                    // same landed batch may carry stale-avatar faces — a
+                    // peer profile change (contactProfileUpdated) or a group
+                    // change batch with the official avatar member. The
+                    // service resolves and invalidates under its lock (the
+                    // store half of the lifecycle); the bounded worker
+                    // refetches through the getAvatar read lane and the
+                    // commit gate (the byte half). Lossy on a full queue.
+                    if !events.is_empty() {
+                        let targets = {
+                            let guard = service.lock().await;
+                            guard.stale_avatar_targets(&events)
+                        };
+                        for target in targets {
+                            if avatar_refresh.try_send(target).is_err() {
+                                tracing::debug!(
+                                    "avatar refresh queue full or closed; dropping this kick (the next profile change or the desktop's own pull converges)"
+                                );
+                            }
+                        }
                     }
                     break;
                 }

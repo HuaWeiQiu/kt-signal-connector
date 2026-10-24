@@ -831,6 +831,7 @@ fn build_slot(
     supervisor.spawn_delivery_receipt_worker();
     supervisor.spawn_outbox_worker();
     supervisor.spawn_background_sync_worker();
+    supervisor.spawn_avatar_refresh_worker();
     supervisor.spawn_expire_sweeper();
     let routing = Arc::new(crate::registry::ProxyGroupSlot::new(
         account_id.clone(),
