@@ -602,32 +602,48 @@ impl<'a> Importer<'a> {
             }
             return Ok(());
         }
-        let (sender_id, alt_sender_id, sender_name, author_source) = if direction == "outgoing" {
-            (self.account_id.to_string(), None, None, None)
-        } else {
-            let Some(author_id) = value.get("authorId").and_then(Value::as_u64) else {
-                self.counters.skipped_messages += 1;
-                return Ok(());
+        // The row author's protocol identity (S12, contract 1.259): the
+        // archive frame carries the member identity — `authorId` resolves to
+        // a staged recipient whose `aci` is the same lowercase hyphenated
+        // UUID a live envelope's `sourceUuid` carries — and the capture is
+        // what the §4.191 group backfill arm and the §4.202 `authorAci`
+        // name-source key both read. The official importer preserves exactly
+        // this identity (Signal-Android ChatItemArchiveImporter.kt:179-184:
+        // `chatItem.authorId → fromLocalRecipientId`, missing = the whole
+        // item honestly skipped); the pre-1.259 import dropped it, which made
+        // every group inbound row refuse backfill with the 1.191 honest
+        // INVALID_REQUEST ("no resolvable protocol identity"). That ruling
+        // stands for rows whose archive recipient carries no ACI — the capture
+        // here is verbatim, never invented (no E.164 fallback into an ACI
+        // column).
+        let (sender_id, alt_sender_id, sender_name, author_source, import_author_aci) =
+            if direction == "outgoing" {
+                (self.account_id.to_string(), None, None, None, None)
+            } else {
+                let Some(author_id) = value.get("authorId").and_then(Value::as_u64) else {
+                    self.counters.skipped_messages += 1;
+                    return Ok(());
+                };
+                let Some(author) = self.store.history_recipient(self.account_id, author_id)? else {
+                    self.counters.skipped_messages += 1;
+                    return Ok(());
+                };
+                let Some(source) = recipient_source(&author, self.signal_account) else {
+                    self.counters.skipped_messages += 1;
+                    return Ok(());
+                };
+                let alt = recipient_alt_source(&author)
+                    .map(|alt| stable_hash_id(&[self.account_id, chat.kind, &alt]));
+                let name = non_empty(&author.name)
+                    .map(|name| truncate_utf8_bytes(name, SENDER_NAME_CHARS));
+                (
+                    stable_hash_id(&[self.account_id, chat.kind, &source]),
+                    alt,
+                    name,
+                    Some(source),
+                    author.aci.clone(),
+                )
             };
-            let Some(author) = self.store.history_recipient(self.account_id, author_id)? else {
-                self.counters.skipped_messages += 1;
-                return Ok(());
-            };
-            let Some(source) = recipient_source(&author, self.signal_account) else {
-                self.counters.skipped_messages += 1;
-                return Ok(());
-            };
-            let alt = recipient_alt_source(&author)
-                .map(|alt| stable_hash_id(&[self.account_id, chat.kind, &alt]));
-            let name =
-                non_empty(&author.name).map(|name| truncate_utf8_bytes(name, SENDER_NAME_CHARS));
-            (
-                stable_hash_id(&[self.account_id, chat.kind, &source]),
-                alt,
-                name,
-                Some(source),
-            )
-        };
         // The §4.38 expansion item faces (contract 1.81): view-once, story
         // reply, poll, payment and gift badge ride the row as bounded rich
         // faces; the admin-deleted face is the row's own tombstone flag. All
@@ -782,7 +798,7 @@ impl<'a> Importer<'a> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             required_protocol_version: None,
-            author_aci: None,
+            author_aci: import_author_aci,
             id: message_id,
             account_id: self.account_id.to_string(),
             conversation_id: chat.conversation_id.clone(),
@@ -4825,5 +4841,211 @@ mod tests {
             poll.votes.is_empty(),
             "the overflowing entry's vote dangles"
         );
+    }
+    // ------------------------------------------------------------------
+    // S12 (contract 1.259): imported inbound rows capture the archive
+    // member ACI - the official importer preserves exactly this identity
+    // (Signal-Android ChatItemArchiveImporter.kt:179-184,
+    // chatItem.authorId -> local recipient; unresolvable = the item is
+    // honestly skipped). The 1.191 honest-reject set shrinks to rows whose
+    // archive recipient carries no ACI - the capture is verbatim, never
+    // invented.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn imported_inbound_rows_capture_the_archive_member_aci() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(&archive, &standard_archive());
+
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        assert!(counters.imported >= 5);
+
+        let row = |conversation: &str, direction: &str, sent_at: u64, kind: &str| {
+            let primary = stable_hash_id(&[&account.id, kind, ALICE_E164]);
+            let alt = stable_hash_id(&[&account.id, kind, ALICE_ACI]);
+            store
+                .message_by_signal_identity(
+                    &account.id,
+                    conversation,
+                    direction,
+                    sent_at,
+                    &primary,
+                    &alt,
+                )
+                .unwrap()
+                .expect("imported row")
+        };
+
+        // The group inbound row is the S12 heart: the section-4.191 backfill
+        // arm reads exactly this capture, so the row is backfill-reachable
+        // (the service-side gold pin asserts the prepared frame names the
+        // ACI).
+        let group_row = row(
+            &group_conversation_id(&account.id),
+            "incoming",
+            7000,
+            "group",
+        );
+        assert_eq!(group_row.author_aci.as_deref(), Some(ALICE_ACI));
+
+        // Direct inbound captures the same member identity (the section-4.202
+        // wire key serves the desktop name sources there too).
+        let direct_row = row(
+            &alice_conversation_id(&account.id),
+            "incoming",
+            1000,
+            "direct",
+        );
+        assert_eq!(direct_row.author_aci.as_deref(), Some(ALICE_ACI));
+
+        // Outgoing rows stay NULL (the account's own number is the protocol
+        // face there).
+        // Outgoing lookup keys on the store sender face: the account id
+        // itself (imported outgoing rows carry it, no member hash).
+        let outgoing = store
+            .message_by_signal_identity(
+                &account.id,
+                &alice_conversation_id(&account.id),
+                "outgoing",
+                2000,
+                &account.id,
+                &account.id,
+            )
+            .unwrap()
+            .expect("outgoing import row");
+        assert_eq!(outgoing.author_aci, None);
+
+        // The v1 attachment row (metadata descriptors, no locator): the
+        // capture still lands - flavor-independent - and the v1 attachment
+        // placeholder face stays complete (two descriptors, zero locators).
+        let v1_media = row(
+            &alice_conversation_id(&account.id),
+            "incoming",
+            6000,
+            "direct",
+        );
+        assert_eq!(v1_media.author_aci.as_deref(), Some(ALICE_ACI));
+        assert_eq!(v1_media.attachments.len(), 2);
+        assert!(
+            store
+                .history_attachment_locators(&account.id, &v1_media.id)
+                .unwrap()
+                .is_empty(),
+            "v1 rows carry no locator faces"
+        );
+    }
+
+    #[tokio::test]
+    async fn imported_v2_rows_capture_member_aci_and_locator_faces() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                group().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                serde_json::json!({"type": "chat", "id": 11, "recipientId": 2}).to_string(),
+                // The section-4.38 v2 pointer face: transit triple + plaintextHash.
+                serde_json::json!({
+                    "type": "message", "chatId": 11, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming", "text": "v2 media",
+                    "attachments": [{
+                        "contentType": "image/png", "fileName": "p.png", "flag": 0,
+                        "size": 64, "width": 320, "height": 240,
+                        "locator": {
+                            "key": "MDEyMzQ1Njc4OWFiY2RlZg==", "cdnKey": "ABCDEFG",
+                            "cdnNumber": 2, "uploadTimestamp": 1760000000000u64,
+                            "plaintextHash": "0123456789abcdef0123456789abcdef"
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        assert_eq!(counters.imported, 1);
+
+        let group = group_conversation_id(&account.id);
+        let primary = stable_hash_id(&[&account.id, "group", ALICE_E164]);
+        let alt = stable_hash_id(&[&account.id, "group", ALICE_ACI]);
+        let row = store
+            .message_by_signal_identity(&account.id, &group, "incoming", 1000, &primary, &alt)
+            .unwrap()
+            .expect("v2 media row");
+        // The S12 capture rides the v2 flavor too - backfill-reachable - and
+        // the locator face landed complete for the download ladder.
+        assert_eq!(row.author_aci.as_deref(), Some(ALICE_ACI));
+        let locators = store
+            .history_attachment_locators(&account.id, &row.id)
+            .unwrap();
+        assert_eq!(locators.len(), 1);
+        let locator = &locators[0];
+        assert_eq!(locator.cdn_key.as_deref(), Some("ABCDEFG"));
+        assert_eq!(locator.cdn_number, Some(2));
+        assert_eq!(
+            locator.plaintext_hash.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[tokio::test]
+    async fn e164_only_archive_authors_stay_honestly_rejected() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                // An archive author with no ACI - the capture stays NULL and
+                // the row keeps the 1.191 honest INVALID_REQUEST posture
+                // (never an invented identity in an ACI column).
+                serde_json::json!({
+                    "type": "recipient", "id": 1, "kind": "contact", "name": "Num",
+                    "e164": "+15550000009"
+                })
+                .to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming", "text": "number only"
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        assert_eq!(counters.imported, 1);
+
+        let conversation = stable_hash_id(&[&account.id, "direct", "+15550000009"]);
+        let sender = stable_hash_id(&[&account.id, "direct", "+15550000009"]);
+        let row = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation,
+                "incoming",
+                1000,
+                &sender,
+                &sender,
+            )
+            .unwrap()
+            .expect("number-only row");
+        assert_eq!(row.author_aci, None);
     }
 }

@@ -736,10 +736,23 @@ fn write_lines(
             if row.has_quote {
                 counters.skipped_quotes += 1;
             }
-            if row.attachments_json.is_some() {
+            // Attachment face (S13, contract 1.260): descriptors ride the
+            // line with the pointer face — the §4.38 v2 locator shape
+            // verbatim (the project_pointer_common isomorph; the engine's
+            // frame builder is its exact inverse). Entries that cannot build
+            // a valid official frame are the honest hole: the official
+            // MessageAttachment requires a FilePointer with an integrity
+            // check (libsignal file.rs NoFilePointer/MissingIntegrityCheck;
+            // plaintextHash⇒key, digest⇒key+transit pair), so a
+            // metadata-only entry would fail the whole snapshot. A row that
+            // lost any entry counts `skippedAttachments` once; a fully
+            // projected row does not (nothing was skipped).
+            let (attachment_entries, attachments_dropped) = project_row_attachments(&row);
+            if attachments_dropped {
                 counters.skipped_attachments += 1;
             }
-            let Some(body) = row.body.as_deref().filter(|body| !body.is_empty()) else {
+            let body = row.body.as_deref().unwrap_or("");
+            if body.is_empty() && attachment_entries.is_empty() {
                 counters.skipped_rows += 1;
                 continue;
             };
@@ -762,7 +775,7 @@ fn write_lines(
                 counters.skipped_rows += 1;
                 continue;
             };
-            writer.write_line(&json!({
+            let mut line = json!({
                 "type": "chat_item",
                 "chat": chat_id,
                 "author": author,
@@ -770,7 +783,11 @@ fn write_lines(
                 "direction": row.direction,
                 "dateReceived": row.received_at.unwrap_or(row.sent_at),
                 "body": body,
-            }))?;
+            });
+            if !attachment_entries.is_empty() {
+                line["attachments"] = json!(attachment_entries);
+            }
+            writer.write_line(&line)?;
         }
     }
 
@@ -792,6 +809,138 @@ fn rich_has_view_once(rich_json: Option<&str>) -> bool {
     ["viewOnce", "viewOnceInvalid"]
         .iter()
         .any(|key| rich.get(key).and_then(Value::as_bool).unwrap_or(false))
+}
+
+/// The row's artifact attachment entries (S13, contract 1.260): descriptors
+/// (`attachments_json`) joined with their index-aligned locator faces
+/// (`attachment_locators`), projected into the §4.38 v2 locator shape —
+/// `project_pointer_common`'s output keys verbatim, because the engine's
+/// frame builder (backup/artifact.rs `build_attachment`) is its exact
+/// inverse and the official validator (libsignal message-backup file.rs) is
+/// the shared referee. Returns `(entries, dropped)`: a row that lost any
+/// entry (malformed columns, broken index alignment, or a pointer face that
+/// cannot build a valid official frame) answers `dropped = true` — the
+/// row's `skippedAttachments` cause, exported body intact.
+fn project_row_attachments(row: &crate::store::BackupMessageRow) -> (Vec<Value>, bool) {
+    let Some(raw) = row.attachments_json.as_deref() else {
+        return (Vec::new(), false);
+    };
+    let Ok(attachments) = serde_json::from_str::<Vec<crate::engine::NormalizedAttachment>>(raw)
+    else {
+        return (Vec::new(), true);
+    };
+    let locators: Vec<crate::store::HistoryAttachmentLocator> = row
+        .attachment_locators_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let mut dropped = false;
+    let mut entries = Vec::with_capacity(attachments.len());
+    for (index, attachment) in attachments.iter().enumerate() {
+        match project_attachment_entry(attachment, locators.get(index)) {
+            Some(entry) => entries.push(entry),
+            None => dropped = true,
+        }
+    }
+    (entries, dropped)
+}
+
+/// One entry of the artifact attachment face. `None` = the entry cannot
+/// build a valid official frame and is the row's honest hole: the official
+/// MessageAttachment requires a FilePointer whose LocatorInfo carries an
+/// integrity check (libsignal file.rs `MissingIntegrityCheck`), the
+/// plaintextHash form additionally requires the key (the official
+/// content/key ladder), and the digest form requires key + transit pair
+/// (`EncryptedDigestMissingTransitInfo`/`MissingKey`) with the cdn pair
+/// all-or-nothing (`TransitCdnMismatch`).
+fn project_attachment_entry(
+    attachment: &crate::engine::NormalizedAttachment,
+    locator: Option<&crate::store::HistoryAttachmentLocator>,
+) -> Option<Value> {
+    let mut entry = serde_json::Map::new();
+    if let Some(content_type) = attachment.content_type.as_deref().filter(|t| !t.is_empty()) {
+        entry.insert("contentType".into(), json!(content_type));
+    }
+    if let Some(filename) = attachment.filename.as_deref().filter(|f| !f.is_empty()) {
+        entry.insert("fileName".into(), json!(filename));
+    }
+    if let Some(size) = attachment.size {
+        entry.insert("size".into(), json!(size));
+    }
+    // The official MessageAttachment.Flag is mutually exclusive; the store's
+    // three booleans project in the enum's own order, absence = Flag::None
+    // (no key — the engine's frame builder maps it back one to one).
+    if attachment.is_voice_note {
+        entry.insert("flag".into(), json!("voiceMessage"));
+    } else if attachment.is_borderless {
+        entry.insert("flag".into(), json!("borderless"));
+    } else if attachment.is_gif {
+        entry.insert("flag".into(), json!("gif"));
+    }
+    if let Some(width) = attachment.width {
+        entry.insert("width".into(), json!(width));
+    }
+    if let Some(height) = attachment.height {
+        entry.insert("height".into(), json!(height));
+    }
+    if let Some(caption) = attachment.caption.as_deref().filter(|c| !c.is_empty()) {
+        entry.insert("caption".into(), json!(caption));
+    }
+    if let Some(blur_hash) = attachment.blur_hash.as_deref().filter(|b| !b.is_empty()) {
+        entry.insert("blurHash".into(), json!(blur_hash));
+    }
+    // The incremental pair rides both-or-neither (the §4.88 ingest drops a
+    // half pair, so this join is exact).
+    if let (Some(mac), Some(chunk)) = (&attachment.incremental_mac, attachment.chunk_size) {
+        entry.insert("incrementalMac".into(), json!(mac));
+        entry.insert("chunkSize".into(), json!(chunk));
+    }
+    let locator = locator?;
+    let key = locator.key.as_deref().filter(|key| !key.is_empty())?;
+    let plaintext_hash = locator
+        .plaintext_hash
+        .as_deref()
+        .filter(|hash| !hash.is_empty());
+    let digest = locator
+        .digest
+        .as_deref()
+        .filter(|digest| !digest.is_empty());
+    let integrity = if plaintext_hash.is_some() {
+        "plaintextHash"
+    } else if digest.is_some() {
+        "digest"
+    } else {
+        return None;
+    };
+    let transit = match (locator.cdn_key.as_deref(), locator.cdn_number) {
+        (None, None) => None,
+        (Some(cdn_key), Some(cdn_number)) if !cdn_key.is_empty() => Some((cdn_key, cdn_number)),
+        _ => return None,
+    };
+    if integrity == "digest" && transit.is_none() {
+        return None;
+    }
+    let mut face = serde_json::Map::new();
+    face.insert("key".into(), json!(key));
+    if let Some((cdn_key, cdn_number)) = transit {
+        face.insert("cdnKey".into(), json!(cdn_key));
+        face.insert("cdnNumber".into(), json!(cdn_number));
+        // The upload stamp rides the transit pair only (the official
+        // UnexpectedTransitCdnUploadTimestamp rule).
+        if let Some(timestamp) = locator.upload_timestamp.filter(|ts| *ts > 0) {
+            face.insert("uploadTimestamp".into(), json!(timestamp));
+        }
+    }
+    match integrity {
+        "plaintextHash" => {
+            face.insert("plaintextHash".into(), json!(plaintext_hash.unwrap()));
+        }
+        _ => {
+            face.insert("digest".into(), json!(digest.unwrap()));
+        }
+    }
+    entry.insert("locator".into(), Value::Object(face));
+    Some(Value::Object(entry))
 }
 
 // -------------------------------------------------------------------------
@@ -3000,5 +3149,157 @@ mod tests {
         // reclaims the same name through the caretaker's collision
         // preemption — never two addressable products.
         assert_eq!(first.file_name, second.file_name);
+    }
+    // ------------------------------------------------------------------
+    // S13 (contract 1.260): the section-4.46 v1 line set grows the
+    // attachment rows - the pointer face is the section-4.38 v2 locator
+    // shape verbatim (project_pointer_common isomorph), entries that
+    // cannot build a valid official frame stay honest holes counted per
+    // row, and a media-only row (empty body, projectable attachment) is
+    // exported like the official standard_message validator allows.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn artifact_lines_carry_the_pointer_face_and_honest_holes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(
+                &temp.path().join("store"),
+                Some(crate::store::StoreKey::from_bytes([0x7A; 32])),
+            )
+            .unwrap(),
+        );
+        let account = store
+            .upsert_account_from_signal("+15555550077", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        // The engine registry + account dir (the artifact lands beside the
+        // engine's own history-import.ndjson, section-10.2 layout).
+        let engine_dir = temp.path().join("engine-data");
+        let account_dir = engine_dir.join("accounts").join("lk-z2");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        std::fs::write(
+            engine_dir.join("engine-state.json"),
+            "{\"version\":2,\"accounts\":[{\"number\":\"+15555550077\",\"dir\":\"accounts/lk-z2\"}]}",
+        )
+        .unwrap();
+
+        // Three imported rows through the real import pass: a mixed row
+        // (one projectable pointer + one metadata-only descriptor = the
+        // honest hole), a media-only row (empty body, projectable), and a
+        // v1 row (metadata-only only).
+        let archive = account_dir.join("history-import.ndjson");
+        std::fs::write(
+            &archive,
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n",
+                serde_json::json!({"type": "recipient", "id": 1, "kind": "contact",
+                    "name": "Alice", "e164": "+15550000001"}),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}),
+                serde_json::json!({"type": "message", "chatId": 10, "authorId": 1,
+                "dateSent": 1000, "direction": "incoming", "text": "mix",
+                "attachments": [
+                    {"contentType": "image/png", "fileName": "p.png", "flag": 0,
+                        "size": 64, "width": 320, "height": 240,
+                        "locator": {"key": "MDEyMzQ1Njc4OWFiY2RlZg==",
+                            "cdnKey": "ABCDEFG", "cdnNumber": 2,
+                            "uploadTimestamp": 1760000000000u64,
+                            "plaintextHash": "0123456789abcdef0123456789abcdef"}},
+                    {"contentType": "video/mp4", "fileName": "v.mp4", "flag": 0,
+                        "size": 12}
+                ]}),
+                serde_json::json!({"type": "message", "chatId": 10, "authorId": 1,
+                "dateSent": 2000, "direction": "incoming",
+                "attachments": [
+                    {"contentType": "audio/aac", "fileName": "n.m4a", "flag": 1,
+                        "size": 9,
+                        "locator": {"key": "MDEyMzQ1Njc4OWFiY2RlZg==",
+                            "cdnKey": "BBCDEFGH", "cdnNumber": 0,
+                            "plaintextHash": "fedcba9876543210fedcba9876543210"}}
+                ]}),
+                serde_json::json!({"type": "message", "chatId": 10, "authorId": 1,
+                    "dateSent": 3000, "direction": "incoming", "text": "v1",
+                    "attachments": [
+                        {"contentType": "application/pdf", "fileName": "d.pdf",
+                            "flag": 0, "size": 7}]})
+            ),
+        )
+        .unwrap();
+        let counters = crate::history_import::run_import(
+            &store,
+            &account.id,
+            "+15555550077",
+            &archive,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            counters.imported, 3,
+            "media-only rows land (attachment body class)"
+        );
+
+        let skip = build_artifact(&store, &engine_dir, &account.id, "+15555550077").unwrap();
+        assert_eq!(
+            skip.skipped_attachments, 2,
+            "the mixed row and the v1 row each lost an entry - counted once per row"
+        );
+        assert_eq!(skip.skipped_rows, 0, "every row rode the line set");
+
+        let artifact =
+            std::fs::read_to_string(account_dir.join("backup-export-input.ndjson")).unwrap();
+        let item_at = |sent_at: u64| {
+            artifact
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|value| value["type"] == "chat_item" && value["dateSent"] == sent_at)
+                .expect("chat item line")
+        };
+
+        // The mixed row: the projectable entry rides the v2 locator face
+        // verbatim; the metadata-only sibling is the honest absence.
+        let mixed = item_at(1000);
+        assert_eq!(mixed["body"], "mix");
+        let entries = mixed["attachments"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "the pointer-less sibling dropped");
+        let face = &entries[0];
+        assert_eq!(face["contentType"], "image/png");
+        assert_eq!(face["fileName"], "p.png");
+        assert_eq!(face["size"], 64);
+        assert_eq!(face["width"], 320);
+        assert_eq!(face["height"], 240);
+        let locator = &face["locator"];
+        assert_eq!(locator["key"], "MDEyMzQ1Njc4OWFiY2RlZg==");
+        assert_eq!(locator["cdnKey"], "ABCDEFG");
+        assert_eq!(locator["cdnNumber"], 2);
+        assert_eq!(locator["uploadTimestamp"], 1_760_000_000_000u64);
+        assert_eq!(locator["plaintextHash"], "0123456789abcdef0123456789abcdef");
+
+        // The media-only row: body empty, attachment complete - the
+        // official StandardMessage shape (text absent, attachments present).
+        let media_only = item_at(2000);
+        assert_eq!(media_only["body"], "");
+        let media_entries = media_only["attachments"].as_array().unwrap();
+        assert_eq!(media_entries.len(), 1);
+        assert_eq!(
+            media_entries[0]["flag"], "voiceMessage",
+            "the live flag booleans project as the official enum words"
+        );
+        assert_eq!(
+            media_entries[0]["locator"]["cdnNumber"], 0,
+            "cdn0 is a legal transit face and rides verbatim"
+        );
+        assert_eq!(
+            media_entries[0]["locator"]["plaintextHash"],
+            "fedcba9876543210fedcba9876543210"
+        );
+        assert!(
+            media_entries[0]["locator"].get("uploadTimestamp").is_none(),
+            "no stamp, no key - the official unexpected-timestamp rule"
+        );
+
+        // The v1 row: body intact, no attachments key at all (the honest
+        // hole is the counter, never a fake placeholder line).
+        let v1 = item_at(3000);
+        assert_eq!(v1["body"], "v1");
+        assert!(v1.get("attachments").is_none());
     }
 }
