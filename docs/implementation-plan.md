@@ -82,7 +82,20 @@
   the avatar member of the group change word list); the refreshed or
   honestly-cleared projection rides `conversation.changed`. No wire
   removal anywhere: pre-1.258 hosts read every face byte-identically.)
-- Contract revision: 1.259 (2026-10-24; §4.243 the conversation-level
+- Contract revision: 1.261 (2026-10-24; §4.245 the session-reset
+  timeline face — batch Z12, ledger §29.77 S15: the engine's
+  `engine.sessionReset` {account, peerAci, word: endSession |
+  chatSessionRefresh, sentAt} notification (the official two-word
+  session-reset receive projection — the peer END_SESSION envelope and the
+  own-decrypt-failure moment) lands a persisted direct-conversation system
+  row per word arm (`isResetSession` / `isChatSessionRefreshed`, the
+  desktop's 1.181 wire keys — the batch-C recorded light-up condition).
+  The direct ladder resolves the peer (the §4.58 batch-X ladder); an
+  unresolvable ACI lands nothing (no conversation invented for an
+  unattributed peer); the idempotency key folds engine replays
+  (account+conversation+sessionReset+word+sentAt). Wire additive,
+  pre-1.261 hosts read byte-identical rows.)
+
   report face — batch Z12, ledger §29.90: `conversations.reportSpam`
   {accountId, conversationId, block} = the official reportSpam /
   blockAndReportSpam thunks
@@ -19495,3 +19508,24 @@ unknown = SEND_OUTCOME_UNKNOWN 永不重试；落地腿 warn-only（§4.239 纪�
 **测试**：阶梯钉形（≤3/最新序/DISTINCT/非出站/guid 空跳过举报面）+ 直聊闸
 （群行 INVALID_REQUEST）+ block 词分流（spam/blockAndSpam）+ 落地门三臂
 （Spam 行/BLOCK 行/因子盖章）+ token 携带。
+
+## §4.245 会话重置时间线行（契约 1.261 · 批 Z12 · S15 · 台账 §29.77）
+
+官方锚：解密失败→自动 session reset + ChatSessionRefreshed 行；对端
+END_SESSION→ResetSession 行（批 C §29.30 审计结论，upstream 只读取证）。
+引擎半（4184c7d）：收流识别 END_SESSION 信封/解密失败时刻 → additive 通知
+`engine.sessionReset` {account, peerAci, word: endSession |
+chatSessionRefresh, sentAt}（引擎侧 strict-parse 词表测试钉形）。
+
+connector 消费半：EngineEvent::SessionReset 变体 + 方法名 parse 臂（词表
+闭集二值、四面 strict、坏形 → unknownNotification 警告绝不猜发）+
+forward_session_reset 落行面——直聊阶梯（batch-X §4.58 ladder）解析 peer，
+rich 词臂 endSession→isResetSession / chatSessionRefresh→isChatSessionRefreshed
+（桌面 wire 键契约 1.181 已在，行到手系统行即亮——批 C 记档 1 的点亮条件）；
+幂等键 account+conversation+sessionReset+word+sentAt 重放折叠；解析不到
+直聊落零行（绝不为未归属 ACI 造会话）。落行 warn-only（行只是持久回声）。
+
+**wire**：system 行 rich additive `isResetSession`/`isChatSessionRefreshed`
+（互斥单词臂；仅真值出现）；pre-1.261 宿主读行零变化。
+**测试**：parse 词表钉形（双词臂 + 三坏形 → unknownNotification）+ 落行
+双词臂/互斥/幂等重放/未知 ACI 零行。

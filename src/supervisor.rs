@@ -11233,6 +11233,21 @@ async fn engine_event_watch_loop(
                 };
                 emit_forwarded(&host_events, forwarded);
             }
+            Ok(EngineEvent::SessionReset {
+                account,
+                peer_aci,
+                word,
+                sent_at,
+            }) => {
+                // 契约 1.261 §4.245（批 Z12 · S15）：引擎 session-reset 投影的
+                // 消费臂——官方两类 session-reset 时间线系统行落地面（词臂
+                // endSession/chatSessionRefresh → 桌面 wire 键 1.181）。
+                let forwarded = {
+                    let guard = service.lock().await;
+                    guard.forward_session_reset(&account, &peer_aci, &word, sent_at)
+                };
+                emit_forwarded(&host_events, forwarded);
+            }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,

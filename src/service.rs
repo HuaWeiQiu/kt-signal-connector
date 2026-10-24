@@ -9901,6 +9901,150 @@ impl ConnectorService {
         Ok(events)
     }
 
+    /// 契约 1.261（§4.245 · 批 Z12 · S15）：`engine.sessionReset` 通知的
+    /// 消费臂——官方两类 session-reset 事件的时间线系统行落地面。账号解析
+    /// 失败 warn-only 丢弃（账号域瞬态车道纪律）；行落直聊（direct 阶梯同
+    /// §4.58 头像臂），rich 词臂 endSession→isResetSession /
+    /// chatSessionRefresh→isChatSessionRefreshed（桌面 wire 键契约 1.181
+    /// 已在，数据到手即亮——批 C §29.30 记档 1 的点亮条件）。幂等键折叠
+    /// account+conversation+sessionReset+word+sentAt（引擎重放同刻折叠为
+    /// 一行）。落行 warn-only：行只是持久回声，桌面 wire 键随行到手即主面。
+    pub fn forward_session_reset(
+        &self,
+        signal_account: &str,
+        peer_aci: &str,
+        word: &str,
+        sent_at: u64,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some(account) =
+            self.resolve_account_transient(signal_account, "engine.sessionReset")?
+        else {
+            return Ok(Vec::new());
+        };
+        let row_events = self
+            .persist_session_reset_row(&account.id, peer_aci, word, sent_at)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    kind = "session_reset_row",
+                    class = error.class(),
+                    "session-reset timeline row skipped; the notification stands"
+                );
+                None
+            });
+        Ok(row_events.unwrap_or_default())
+    }
+
+    /// One session-reset observation's persisted timeline echo: resolve the
+    /// peer's ACI to a local direct conversation (the batch-X direct ladder)
+    /// and land the system row with the word arm's wire key. `Ok(None)` — an
+    /// unresolvable peer or a replay — lands nothing.
+    fn persist_session_reset_row(
+        &self,
+        account_id: &str,
+        peer_aci: &str,
+        word: &str,
+        sent_at: u64,
+    ) -> Result<Option<Vec<HostSideEvent>>, ServiceError> {
+        if peer_aci.is_empty() {
+            return Ok(None);
+        }
+        let Some((conversation_id, _peer_key)) =
+            self.direct_conversation_for_aci(account_id, peer_aci)?
+        else {
+            return Ok(None);
+        };
+        // 幂等键（§4.239 同族）：account+conversation+sessionReset+词+sentAt
+        // ——引擎重放（同刻）折叠为一行，INSERT OR IGNORE 纪律。
+        let id = stable_hash_id(&[
+            "signal-message-v2",
+            account_id,
+            &conversation_id,
+            "sessionReset",
+            word,
+            &sent_at.to_string(),
+        ]);
+        let (text, rich) = if word == "endSession" {
+            (
+                "安全号码已变更，会话已重置".to_string(),
+                crate::engine::NormalizedRich {
+                    is_reset_session: true,
+                    ..Default::default()
+                },
+            )
+        } else {
+            (
+                "聊天会话已刷新".to_string(),
+                crate::engine::NormalizedRich {
+                    is_chat_session_refreshed: true,
+                    ..Default::default()
+                },
+            )
+        };
+        let Some(conversation) = self
+            .store
+            .conversation_by_id(account_id, &conversation_id)?
+        else {
+            return Ok(None);
+        };
+        let message = MessageRecord {
+            is_erased: false,
+            delete_failed: false,
+            required_protocol_version: None,
+            author_aci: None,
+            id,
+            account_id: account_id.to_string(),
+            conversation_id: conversation.id.clone(),
+            direction: "system",
+            sender_id: conversation.peer_key.clone(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: Some(now_ms()),
+            text: Some(text.clone()),
+            text_bytes: Some(text.len().min(u32::MAX as usize) as u32),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "system",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(rich),
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            admin_deleted: false,
+            sticker: None,
+            // The notice row never sweeps (§4.41 posture): the columns stay
+            // NULL — a session-reset notice carries no deadline of its own.
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        let inserted = self.store.insert_message(&message, None, None, false)?;
+        if !inserted {
+            return Ok(None);
+        }
+        let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
+            message,
+        ))];
+        if let Some(summary) = self
+            .store
+            .conversation_summary(account_id, &conversation_id)?
+        {
+            events.push(HostSideEvent::ConversationChanged(summary));
+        }
+        Ok(Some(events))
+    }
+
     /// One identity-changed observation's persisted timeline echo: resolve
     /// the peer's ACI to a local direct conversation and land the system
     /// row (the group-notice precedent). `Ok(None)` — an empty ACI or an
@@ -35278,6 +35422,85 @@ mod tests {
             .unwrap();
         assert_eq!(replay.len(), 1);
         assert!(matches!(&replay[0], HostSideEvent::IdentityChanged { .. }));
+    }
+
+    /// 契约 1.261（§4.245 · 批 Z12 · S15）：engine.sessionReset 落库半——
+    /// 词臂 endSession→isResetSession / chatSessionRefresh→
+    /// isChatSessionRefreshed 两键互斥；直聊阶梯解析（batch-X direct
+    /// ladder）；幂等键 account+conversation+sessionReset+词+sentAt 重放
+    /// 折叠；解析不到直聊落零行（不为未归属 ACI 造会话）。
+    #[test]
+    fn session_reset_lands_the_word_arm_rows() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        const ACI: &str = "11111111-1111-1111-1111-111111111111";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, ACI, &conversation.peer_key)
+            .unwrap();
+
+        const SENT_AT: u64 = 1_729_600_100_000;
+        // 词臂① endSession → isResetSession 行。
+        let events = service
+            .forward_session_reset("+15555550100", ACI, "endSession", SENT_AT)
+            .unwrap();
+        let [
+            HostSideEvent::MessageUpserted(row),
+            HostSideEvent::ConversationChanged(_),
+        ] = &events[..]
+        else {
+            panic!("expected row events, got {events:?}");
+        };
+        assert_eq!(row.direction, "system");
+        assert_eq!(row.status, "system");
+        assert_eq!(row.conversation_id, conversation.id);
+        assert_eq!(row.sent_at, SENT_AT);
+        let rich = row.rich.as_ref().unwrap();
+        assert!(rich.is_reset_session);
+        assert!(!rich.is_chat_session_refreshed);
+        assert_eq!(
+            row.id,
+            stable_hash_id(&[
+                "signal-message-v2",
+                &account.id,
+                &conversation.id,
+                "sessionReset",
+                "endSession",
+                &SENT_AT.to_string(),
+            ])
+        );
+
+        // 词臂② chatSessionRefresh → isChatSessionRefreshed 行（两键互斥）。
+        let events = service
+            .forward_session_reset("+15555550100", ACI, "chatSessionRefresh", SENT_AT + 1)
+            .unwrap();
+        let [
+            HostSideEvent::MessageUpserted(row),
+            HostSideEvent::ConversationChanged(_),
+        ] = &events[..]
+        else {
+            panic!("expected row events, got {events:?}");
+        };
+        let rich = row.rich.as_ref().unwrap();
+        assert!(rich.is_chat_session_refreshed);
+        assert!(!rich.is_reset_session);
+
+        // 引擎侧重放（同刻同词）折叠：零行零 changed。
+        let replay = service
+            .forward_session_reset("+15555550100", ACI, "endSession", SENT_AT)
+            .unwrap();
+        assert!(replay.is_empty());
+
+        // 未知 ACI：解析不到直聊，落零行（不为未归属 ACI 造会话）。
+        let unknown = service
+            .forward_session_reset(
+                "+15555550100",
+                "99999999-9999-9999-9999-999999999999",
+                "endSession",
+                SENT_AT + 2,
+            )
+            .unwrap();
+        assert!(unknown.is_empty());
     }
 
     /// 解析不到本地直会话（未知 ACI / 空 ACI）时只转发观测帧，落零行——
