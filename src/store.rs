@@ -4117,6 +4117,34 @@ impl Store {
     /// response or blocked state and the write faces can never clobber the
     /// trio (an engine answer that does carry `isBlocked` still wins, the
     /// cloud truth at enrich time).
+    /// 契约 1.262（§4.246 · 批 Z12 · S16）：会话行戳内 hidden 位的读取——
+    /// 回写引擎存储的变化检测读面（prev 与 item 位异同判定）。戳缺席/坏形
+    /// = None（未知，绝不折成 false——三态保真与批 B 口径同源）。
+    pub fn conversation_hidden_bit(
+        &self,
+        account_id: &str,
+        peer_key: &str,
+    ) -> Result<Option<bool>, StoreError> {
+        let conn = self.lock_conn()?;
+        let current = conn
+            .query_row(
+                "SELECT mrr_factors_json FROM conversations
+                 WHERE account_id=?1 AND kind='direct' AND peer_key=?2",
+                params![account_id, peer_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .flatten();
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        let hidden = serde_json::from_str::<Value>(&current)
+            .ok()
+            .and_then(|value| value.get("hidden").and_then(Value::as_bool));
+        Ok(hidden)
+    }
+
     pub fn set_conversation_mrr_factors_for_peer(
         &self,
         account_id: &str,
@@ -16357,6 +16385,61 @@ mod tests {
     /// trio re-stamp when the incoming trio does not name `blocked`, an
     /// engine answer that does name it wins, and a group row is nobody's
     /// trio stamp (the §4.45 pull stays the group authority).
+    /// 契约 1.262（§4.246 · 批 Z12 · S16）：戳内 hidden 位读取三态——
+    /// true/false 显式、戳缺席/无 hidden 键 = None（未知不折 false）。
+    #[test]
+    fn conversation_hidden_bit_reads_the_stamp_tri_state() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        // 无戳 = None（未知）。
+        assert_eq!(
+            store
+                .conversation_hidden_bit(&account.id, "+15555550101")
+                .unwrap(),
+            None
+        );
+        // 显式 hidden 位逐字读出。
+        store
+            .set_conversation_mrr_factors_for_peer(
+                &account.id,
+                "+15555550101",
+                r#"{"hidden":true,"profileSharing":false}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .conversation_hidden_bit(&account.id, "+15555550101")
+                .unwrap(),
+            Some(true)
+        );
+        store
+            .set_conversation_mrr_factors_for_peer(
+                &account.id,
+                "+15555550101",
+                r#"{"hidden":false}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .conversation_hidden_bit(&account.id, "+15555550101")
+                .unwrap(),
+            Some(false)
+        );
+        // 未知群行/号码不存在的行 = None（绝不冒充 false）。
+        assert_eq!(
+            store
+                .conversation_hidden_bit(&account.id, "+15555559999")
+                .unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn blocked_stamp_survives_the_enrich_and_yields_to_engine_truth() {
         let temp = TempDir::new().unwrap();

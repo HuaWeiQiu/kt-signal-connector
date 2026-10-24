@@ -4053,9 +4053,10 @@ impl RuntimeSupervisor {
         let items = result.as_array().cloned().unwrap_or_default();
         // The row updates are store-only; they run batched on the blocking
         // pool without the service lock.
-        tokio::task::spawn_blocking({
+        let write_backs = tokio::task::spawn_blocking({
             let store = Arc::clone(&self.store);
             let account_id = account_id.to_string();
+            let items = items.clone();
             move || {
                 for (peer_key, _title) in peers {
                     if let Some(name) = find_contact_display_name(&items, &peer_key) {
@@ -4086,10 +4087,38 @@ impl RuntimeSupervisor {
                         &factors,
                     );
                 }
+                // 契约 1.262（§4.246 · 批 Z12 · S16）：回写目标的变化检测
+                // rides the same blocking pass（store 读共用线程池）。
+                hidden_write_back_targets(&items, &|uuid| {
+                    store
+                        .conversation_hidden_bit(&account_id, uuid)
+                        .unwrap_or(None)
+                })
             }
         })
         .await
         .map_err(|_| StoreError::Unavailable(None))?;
+        // 引擎存储回写（两仓契约的 connector 半）：有界/轮（纯面帽 16），
+        // best-effort warn-only——丢失的回写让引擎读臂暂退批 W 反演近似，
+        // 下一次 hidden 变化自然再火，绝不阻断 enrich。uuid = 引擎
+        // allRecipients 条目的 ServiceId 串；号码键行无 uuid 永不收集。
+        for (peer_aci, hidden) in &write_backs {
+            let upstream = json!({
+                "account": number,
+                "peerAci": peer_aci,
+                "hidden": hidden,
+            });
+            if let Err(error) = engine
+                .call("setConversationHidden", upstream, CallClass::ReadOnly)
+                .await
+            {
+                tracing::warn!(
+                    kind = "conversation_hidden_write_back",
+                    class = error.class(),
+                    "engine hidden write-back skipped; the read arms keep the batch-W approximation",
+                );
+            }
+        }
         Ok(())
     }
 
@@ -11520,6 +11549,39 @@ fn find_contact_display_name(items: &[Value], peer_key: &str) -> Option<String> 
 /// [`find_contact_display_name`] runs, exposed for the §4.58 factor stamp so
 /// both consumers of one listContacts answer can never disagree about which
 /// identity a row is addressed by. First present non-empty identity wins.
+/// 契约 1.262（§4.246 · 批 Z12 · S16）：回写引擎存储的变化检测纯面——
+/// item 显式携带 isHidden 位 ∧ 既有戳位不同（prev != item 位；None=戳
+/// 缺席/未知，按变化收集——初写与翻转同路）→ 收集 (uuid, hidden)（引擎
+/// setConversationHidden 只收 ACI，
+/// uuid 非 ACI 形的条目诚实跳过）。有界 CAP/轮，余量留给下一节流窗口。
+/// isHidden 缺席的条目（引擎读面未携带）绝不产生目标（未知不冒充变化）。
+pub(crate) fn hidden_write_back_targets(
+    items: &[Value],
+    prev_of: &dyn Fn(&str) -> Option<bool>,
+) -> Vec<(String, bool)> {
+    const HIDDEN_WRITE_BACK_CAP: usize = 16;
+    let mut targets = Vec::new();
+    for item in items {
+        if targets.len() >= HIDDEN_WRITE_BACK_CAP {
+            break;
+        }
+        let hidden = item.get("isHidden").and_then(Value::as_bool);
+        let Some(hidden) = hidden else {
+            continue;
+        };
+        let Some(uuid) = item.get("uuid").and_then(Value::as_str) else {
+            continue;
+        };
+        // prev = 既有戳位（None = 戳缺席/未知——按变化收集，初写与翻转同路；
+        // store 读失败同形收敛，warn 由调用面承担）。
+        let prev = prev_of(uuid);
+        if prev != Some(hidden) {
+            targets.push((uuid.to_string(), hidden));
+        }
+    }
+    targets
+}
+
 fn contact_item_peer_key(item: &Value) -> Option<&str> {
     ["number", "uuid", "numberUuid"].iter().find_map(|key| {
         item.get(*key)
@@ -11858,6 +11920,7 @@ fn story_from_engine(result: &Value) -> Result<StorySendResult, ServiceError> {
 
 #[cfg(test)]
 mod tests {
+    use super::hidden_write_back_targets;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
@@ -12900,6 +12963,55 @@ mod tests {
             Some("abcd1234-0000-0000-0000-000000000000")
         );
         assert_eq!(contact_item_peer_key(&json!({"name": "x"})), None);
+    }
+
+    /// 契约 1.262（§4.246 · 批 Z12 · S16）：回写目标纯面四臂——显式位 ∧
+    /// 变化（初写 None→true/false 与翻转 true→false 都收）；显式位 ∧ 同值
+    /// 不收；isHidden 缺席不收（未知绝不冒充变化）；uuid 缺席不收（引擎面
+    /// 只收 ACI）；帽 16/轮（余量留下一节流窗口）。
+    #[test]
+    fn hidden_write_back_targets_collect_changed_bits_only() {
+        let item = |uuid: &str, is_hidden: Option<bool>| {
+            let mut object = serde_json::json!({ "uuid": uuid });
+            if let Some(hidden) = is_hidden {
+                object["isHidden"] = serde_json::json!(hidden);
+            }
+            object
+        };
+        let prevs: std::collections::HashMap<&str, Option<bool>> = [
+            ("new-hidden", None),
+            ("same-false", Some(false)),
+            ("flip-true", Some(false)),
+            ("flip-false", Some(true)),
+            ("same-true", Some(true)),
+        ]
+        .into_iter()
+        .collect();
+        let prev_of = |uuid: &str| prevs.get(uuid).copied().flatten();
+        let items = vec![
+            item("new-hidden", Some(true)),
+            item("same-false", Some(false)),
+            item("flip-true", Some(true)),
+            item("flip-false", Some(false)),
+            item("same-true", Some(true)),
+            item("unknown-arm", None),
+            serde_json::json!({ "isHidden": true }),
+        ];
+        let targets = hidden_write_back_targets(&items, &prev_of);
+        assert_eq!(
+            targets,
+            vec![
+                ("new-hidden".to_string(), true),
+                ("flip-true".to_string(), true),
+                ("flip-false".to_string(), false),
+            ]
+        );
+        // 帽 16/轮：17 个变化目标只收前 16。
+        let flood: Vec<serde_json::Value> = (0..17)
+            .map(|index| item(&format!("u{index}"), Some(true)))
+            .collect();
+        let targets = hidden_write_back_targets(&flood, &|_| None);
+        assert_eq!(targets.len(), 16);
     }
 
     #[tokio::test]

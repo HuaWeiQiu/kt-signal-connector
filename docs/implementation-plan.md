@@ -82,7 +82,19 @@
   the avatar member of the group change word list); the refreshed or
   honestly-cleared projection rides `conversation.changed`. No wire
   removal anywhere: pre-1.258 hosts read every face byte-identically.)
-- Contract revision: 1.261 (2026-10-24; §4.245 the session-reset
+- Contract revision: 1.262 (2026-10-24; §4.246 the hidden write-back
+  face — batch Z12, ledger §29.77 S16: the two-repo contract's connector
+  half — at the throttled listContacts enrich (the §4.58 stamp
+  moment), items whose `isHidden` bit is explicit and differs from the
+  row's stored stamp bit collect as bounded (16/cycle) best-effort
+  `setConversationHidden` {account, peerAci, hidden} engine writes
+  (ACI-keyed rows only — number-keyed items have no uuid and never
+  collect; the engine's own storage keeps the §4.246 kv truth the
+  engine's read arms project). Warn-only: a lost write degrades the
+  engine read arms to the batch-W inversion approximation until the next
+  hidden change and never blocks the enrich. No wire row changes:
+  pre-1.262 hosts byte-identical.)
+
   timeline face — batch Z12, ledger §29.77 S15: the engine's
   `engine.sessionReset` {account, peerAci, word: endSession |
   chatSessionRefresh, sentAt} notification (the official two-word
@@ -19529,3 +19541,19 @@ rich 词臂 endSession→isResetSession / chatSessionRefresh→isChatSessionRefr
 （互斥单词臂；仅真值出现）；pre-1.261 宿主读行零变化。
 **测试**：parse 词表钉形（双词臂 + 三坏形 → unknownNotification）+ 落行
 双词臂/互斥/幂等重放/未知 ACI 零行。
+
+## §4.246 hidden 回写引擎存储（契约 1.262 · 批 Z12 · S16 · 台账 §29.77）
+
+两仓契约（§29.77 S16 修复形态「connector 落位时写引擎存储」）：引擎半 =
+per-account store.db kv per-peer 版本化键 + `setConversationHidden`
+{account, peerAci, hidden} 恰三键 strict-parse（引擎侧分支，conversation_hidden
+模块 + listContacts 两读臂）。connector 半 = 节流 enrich（§4.58 盖章时刻）
+的回写臂：item 显式 isHidden 位 ∧ 行既有戳位不同（None=未知也收——初写与
+翻转同路）→ 纯面收集（帽 16/轮，uuid=引擎 ServiceId 串；号码键行无 uuid
+永不收集）→ 引擎写 best-effort warn-only（丢失回写让引擎读臂暂退批 W 反演
+近似，下一次 hidden 变化再火，绝不阻断 enrich）。三态纪律：戳缺席/无键 =
+None（未知绝不折 false，store 读面单测钉形）。
+
+**wire**：零行变化（引擎 RPC additive，pre-1.262 宿主逐字节同形）。
+**测试**：纯面四臂（初写/翻转/同值不收/缺席与 uuid 缺席不收 + 帽 16）+
+store 三态读面 + 回写臂接线源码锁（enrich 内联）。
