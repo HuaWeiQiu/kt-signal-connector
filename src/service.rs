@@ -10170,7 +10170,7 @@ impl ConnectorService {
         // §4.91: the flush key the landed row's sender projects — captured
         // before the record consumes `sender_id` by move.
         let flush_sender_id = sender_id.clone();
-        if let Some(existing) = self.store.message_by_signal_identity(
+        let mut existing = self.store.message_by_signal_identity(
             &account.id,
             &conversation.id,
             direction,
@@ -10181,7 +10181,30 @@ impl ConnectorService {
             } else {
                 &legacy_sender_id
             },
-        )? {
+        )?;
+        // Contract 1.262 (§4.245): an archive-imported row lands the member
+        // ACI verbatim as its sender. A live envelope that replays the same
+        // Signal message (the import-window race the identity tuple exists
+        // for) hashes its source, which can never equal the raw ACI form —
+        // the envelope's sourceUuid rides as the third candidate so the
+        // tuple stays total across both sender forms.
+        if existing.is_none()
+            && direction == "incoming"
+            && let Some(source_uuid) = receive
+                .source_uuid
+                .as_deref()
+                .filter(|value| !value.is_empty())
+        {
+            existing = self.store.message_by_signal_identity(
+                &account.id,
+                &conversation.id,
+                direction,
+                sent_at,
+                source_uuid,
+                source_uuid,
+            )?;
+        }
+        if let Some(existing) = existing {
             // The row identity already landed. This replay must still
             // converge its attachment faces: the row may be a post-relink
             // restore copy with no descriptors, while this envelope carries
@@ -29299,15 +29322,16 @@ mod tests {
         .unwrap();
 
         let conversation_id = stable_hash_id(&[&account.id, "group", GROUP_MASTER]);
-        let sender = stable_hash_id(&[&account.id, "group", "+15550000001"]);
-        let alt_sender = stable_hash_id(&[&account.id, "group", MEMBER_ACI]);
+        // 契约 1.262 §4.245：导入行 sender_id = 成员 ACI verbatim。
+        let sender = MEMBER_ACI;
+        let alt_sender = stable_hash_id(&[&account.id, "group", "+15550000001"]);
         let row = store
             .message_by_signal_identity(
                 &account.id,
                 &conversation_id,
                 "incoming",
                 7000,
-                &sender,
+                sender,
                 &alt_sender,
             )
             .unwrap()
@@ -29317,6 +29341,8 @@ mod tests {
             Some(MEMBER_ACI),
             "the capture is the backfill seat's only answer"
         );
+        // S21 (contract 1.262 §4.245): the row sender IS the member ACI.
+        assert_eq!(row.sender_id, MEMBER_ACI);
 
         let service = ConnectorService::new(store.clone());
         let prepared = service
@@ -29334,6 +29360,101 @@ mod tests {
         assert_eq!(prepared["groupId"], serde_json::json!(GROUP_MASTER));
         assert_eq!(prepared["account"], serde_json::json!("+15555550100"));
         assert_eq!(prepared["sentTimestamp"], serde_json::json!(7000u64));
+    }
+
+    /// Contract 1.262 (§4.245, S21): the identity tuple stays total across
+    /// sender forms. An archive-imported row lands the member ACI verbatim;
+    /// a live envelope that replays the same Signal message (the
+    /// import-window race) hashes its source — the envelope sourceUuid rides
+    /// as the third dedupe candidate, so the replay folds onto the imported
+    /// row instead of landing a duplicate.
+    #[test]
+    fn live_replay_dedupes_against_aci_form_import_rows() {
+        let temp = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(
+                &temp.path().join("store"),
+                Some(crate::store::StoreKey::from_bytes([0x6B; 32])),
+            )
+            .unwrap(),
+        );
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        const MEMBER_ACI: &str = "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b";
+        const MEMBER_E164: &str = "+15550000001";
+        const GROUP_MASTER: &str = "ZmFrZS1ncm91cA==";
+        let archive = temp.path().join("history-import.ndjson");
+        std::fs::write(
+            &archive,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                serde_json::json!({"type": "recipient", "id": 1, "kind": "contact",
+                    "name": "Alice", "aci": MEMBER_ACI, "e164": MEMBER_E164}),
+                serde_json::json!({"type": "recipient", "id": 2, "kind": "group",
+                    "name": "Ops", "masterKey": GROUP_MASTER}),
+                serde_json::json!({"type": "chat", "id": 11, "recipientId": 2}),
+                serde_json::json!({"type": "message", "chatId": 11, "authorId": 1,
+                        "dateSent": 7000, "direction": "incoming", "text": "archived"})
+            ),
+        )
+        .unwrap();
+        crate::history_import::run_import(
+            &store,
+            &account.id,
+            "+15555550100",
+            &archive,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let mut service = ConnectorService::new(store.clone());
+        // The live replay: same group conversation, same stamp, source
+        // spelled as the number while the envelope carries the member ACI.
+        let replay = NormalizedReceive {
+            required_protocol_version: None,
+            timestamp: Some(7000),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some(MEMBER_E164.into()),
+            source_uuid: Some(MEMBER_ACI.into()),
+            peer_name: None,
+            group_id: Some(GROUP_MASTER.into()),
+            text: Some("archived".into()),
+            text_bytes: Some(8),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+        };
+        assert!(
+            service
+                .ingest_receive(replay, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty(),
+            "the replay dedupes - no duplicate row lands"
+        );
+        // Exactly one incoming row remains for the stamp.
+        let conversation_id = stable_hash_id(&[&account.id, "group", GROUP_MASTER]);
+        let page = store
+            .list_messages(&account.id, &conversation_id, 50, None)
+            .unwrap();
+        let incoming: Vec<_> = page
+            .items
+            .iter()
+            .filter(|row| row.direction == "incoming" && row.sent_at == 7000)
+            .collect();
+        assert_eq!(incoming.len(), 1, "one row, not two");
+        assert_eq!(incoming[0].sender_id, MEMBER_ACI);
     }
     #[test]
     fn prepare_delete_for_me_messages_ladders_row_authors() {
