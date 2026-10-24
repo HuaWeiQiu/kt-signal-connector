@@ -41,12 +41,12 @@ use crate::service::{
     ChatFoldersListParams, ChatFoldersSetRecordsParams, ContactsListParams,
     ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsClearDraftParams,
     ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
-    ConversationsGetStateParams, ConversationsListParams, ConversationsSaveDraftParams,
-    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
-    ConversationsSetStateParams, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
-    GroupsCancelJoinRequestParams, GroupsCommonParams, GroupsCreateParams, GroupsGetParams,
-    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
-    GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
+    ConversationsGetStateParams, ConversationsListParams, ConversationsReportSpamParams,
+    ConversationsSaveDraftParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
+    ConversationsSetPinnedParams, ConversationsSetStateParams, GroupsApproveJoinRequestsParams,
+    GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams, GroupsCommonParams,
+    GroupsCreateParams, GroupsGetParams, GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams,
+    GroupsMigrateParams, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
     GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
     HistoryAttachmentDownloadParams, HistoryImportCancelParams, HistoryImportRetryParams,
     HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
@@ -4264,6 +4264,28 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                         "messages.reportSpam",
                         "params",
                         "invalid messages.reportSpam params",
+                    ),
+                ),
+            }
+        }
+        "conversations.reportSpam" => {
+            match serde_json::from_value::<ConversationsReportSpamParams>(request.params) {
+                Ok(params) => match runtime.report_conversation_spam(params).await {
+                    Ok(result) => match serde_json::to_value(result) {
+                        Ok(value) => HostResponse::success(request_id, value),
+                        Err(_) => HostResponse::failure(
+                            request_id,
+                            ApiError::new("INTERNAL_ERROR", "result serialization failed", false),
+                        ),
+                    },
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "conversations.reportSpam",
+                        "params",
+                        "invalid conversations.reportSpam params",
                     ),
                 ),
             }

@@ -2846,6 +2846,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.report_spam(params).await
     }
 
+    /// conversations.reportSpam (contract revision 1.259, §4.243, capability
+    /// report-spam): the conversation-level report routes through the
+    /// account's owning supervisor like every other mutating face.
+    pub async fn report_conversation_spam(
+        &self,
+        params: crate::service::ConversationsReportSpamParams,
+    ) -> Result<crate::service::ConversationsReportSpamResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.report_conversation_spam(params).await
+    }
+
     pub async fn set_local_alias(
         &self,
         params: crate::service::ContactsSetLocalAliasParams,

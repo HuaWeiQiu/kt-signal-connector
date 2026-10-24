@@ -32,11 +32,11 @@ pub(crate) const MRR_RESPONSE_TYPE_DELETE: u8 = 2;
 /// conversation for the member verbs the desktop's block composition uses).
 pub(crate) const MRR_RESPONSE_TYPE_BLOCK: u8 = 3;
 const MRR_RESPONSE_TYPE_BLOCK_AND_DELETE: u8 = 4;
-const MRR_RESPONSE_TYPE_BLOCK_AND_SPAM: u8 = 6;
+pub(crate) const MRR_RESPONSE_TYPE_BLOCK_AND_SPAM: u8 = 6;
 /// The SPAM member of the same enum (§4.239 mirror-row gate): the official
 /// `hasSpam` reads SPAM beside BLOCK_AND_SPAM
 /// (ts/models/conversations.preload.ts:2568-2572).
-const MRR_RESPONSE_TYPE_SPAM: u8 = 5;
+pub(crate) const MRR_RESPONSE_TYPE_SPAM: u8 = 5;
 
 /// The official `hasBlock` member test (§4.239 mirror-row gate verbatim:
 /// BLOCK / BLOCK_AND_DELETE / BLOCK_AND_SPAM —
@@ -4989,6 +4989,80 @@ impl ConnectorService {
             upstream["token"] = json!(token);
         }
         Ok(PreparedReportSpam { upstream, pairs })
+    }
+
+    /// `conversations.reportSpam` (contract revision 1.259, §4.243,
+    /// capability report-spam): the conversation-level report ladder —
+    /// the official `reportSpam` / `blockAndReportSpam` thunks
+    /// (state/ducks/conversations.preload.ts:3862-3922 / :3924-3990):
+    /// resolve the direct conversation, walk the reportable guid ladder
+    /// (`getMessageServerGuidsForSpam`, sql/Server.node.ts:9012-9027 —
+    /// DISTINCT non-outgoing rows with a server guid, most recent first,
+    /// the server's cap of 3), and prepare both upstream faces: the MRR
+    /// sync word (SPAM / BLOCK_AND_SPAM — the official
+    /// `syncMessageRequestResponse` argument) and the engine report call
+    /// (`addReportSpamJob`'s `{aci, serverGuids, token}` face — the token
+    /// rides exactly as the §4.48 read reads it). A group conversation is
+    /// refused before anything travels: the official group report resolves
+    /// the added-by sender's direct conversation first
+    /// (getDirectConversationForReportSpam) and this chain holds no
+    /// added-by data plane (the captured roster carries id/uuid/name only,
+    /// §4.39/§4.241) — the honest refusal beats a mis-addressed report.
+    /// An empty ladder keeps the MRR face (the official sync runs
+    /// regardless) and skips the report call — never a fabricated guid.
+    pub fn prepare_conversations_report_spam(
+        &self,
+        params: &ConversationsReportSpamParams,
+    ) -> Result<PreparedConversationsReportSpam, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        validate_opaque_id(&params.conversation_id, "conversationId")?;
+        if params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        if conversation.kind != "direct" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversations.reportSpam addresses a direct conversation",
+                false,
+            )));
+        }
+        let target_aci = self.report_target_aci(&account.id, &conversation.peer_key)?;
+        let mrr_word = if params.block { "blockAndSpam" } else { "spam" };
+        let mut mrr_upstream = self
+            .prepare_conversations_message_request(&params.account_id, &params.conversation_id)?;
+        if let Some(object) = mrr_upstream.as_object_mut() {
+            object.insert("type".to_string(), json!(mrr_word));
+        }
+        let guids = self
+            .store
+            .server_guids_for_spam(&account.id, &conversation.id)?;
+        let report_upstream = if guids.is_empty() {
+            None
+        } else {
+            let mut upstream = json!({
+                "account": account.signal_account,
+                "targetAci": target_aci,
+                "serverGuids": guids,
+            });
+            if let Some(token) = self
+                .store
+                .conversation_report_token(&account.id, &conversation.id)?
+            {
+                upstream["token"] = json!(token);
+            }
+            Some(upstream)
+        };
+        Ok(PreparedConversationsReportSpam {
+            mrr_upstream,
+            report_upstream,
+        })
     }
 
     /// The report address (contract revision 1.49, §4.48): a UUID-shaped
@@ -13973,6 +14047,86 @@ impl MrrRowEvent {
     }
 }
 
+/// 契约 1.259（§4.243 · 批 Z12）：conversations.reportSpam 的本地落地面——官方
+/// applyMessageRequestResponse LOCAL 臂（models/conversations.preload.ts
+/// :2559-2680）的逐门投影：先态读在盖章前（与镜像臂同序），
+/// didResponseChange = response ≠ 先态原始成员；SPAM 行门 =
+/// hasSpam(response) ∧ !hasSpam(先态)（didSpamChange）；BLOCK 行门 =
+/// hasBlock(response) ∧ !先态 blocked（didBlockChange）；盖章 =
+/// messageRequestResponseType = response 成员（无条件写，:2638-2640
+/// 同源） + blocked 族掩码位（§4.131）；行先后总览（§4.226）。
+/// 与镜像臂（§4.58）同一门形，只是钟面取本地 now_ms（动作臂
+/// 无信封时刻，§4.239 先例）。返回本地事件序列（行事件 + changed
+/// 推阅），发送归调用方（supervisor 宿主通道）。
+pub(crate) fn land_local_report_response(
+    store: &Store,
+    account_id: &str,
+    conversation_id: &str,
+    response_type: u8,
+) -> Result<Vec<HostSideEvent>, ServiceError> {
+    // The request-family store grammar (§4.56/§1.258: direct rows only —
+    // the official request semantics never land on group rows): the
+    // upstream face already refuses groups, this gate keeps the local
+    // landing honest even for a caller that bypassed it.
+    if store
+        .conversation_by_id(account_id, conversation_id)?
+        .is_none_or(|conversation| conversation.kind != "direct")
+    {
+        return Ok(Vec::new());
+    }
+    let prior = store.conversation_summary(account_id, conversation_id)?;
+    let prior_blocked = prior.is_some_and(|summary| summary.blocked);
+    let prior_member = store.conversation_accept_response_member(account_id, conversation_id)?;
+    let did_response_change = prior_member != Some(response_type);
+    let mut events = Vec::new();
+    if did_response_change {
+        let mut message_count: u64 = 0;
+        if mrr_has_block(response_type) && !prior_blocked {
+            if let Some(row_event) = store_land_message_request_row_at(
+                store,
+                account_id,
+                conversation_id,
+                MrrRowEvent::Block,
+                now_ms().saturating_add(message_count),
+            )? {
+                events.push(row_event);
+            }
+            message_count += 1;
+        }
+        if mrr_has_spam(response_type)
+            && !prior_member.is_some_and(mrr_has_spam)
+            && let Some(row_event) = store_land_message_request_row_at(
+                store,
+                account_id,
+                conversation_id,
+                MrrRowEvent::Spam,
+                now_ms().saturating_add(message_count),
+            )?
+        {
+            events.push(row_event);
+        }
+    }
+    // The authoritative stamp: the raw member word rides the §4.56 factor
+    // (accepted=false — the report family never accepts), exactly the
+    // mirror arm's stamp face.
+    store.set_conversation_accept_response_factor(
+        account_id,
+        conversation_id,
+        false,
+        response_type,
+    )?;
+    // The blocked-family mask stamp (§4.131): the BLOCK_AND_SPAM word
+    // masks the sender on this device the same way a linked device's
+    // block does.
+    if mrr_has_block(response_type) {
+        store.set_conversation_blocked_factor(account_id, conversation_id, true)?;
+    }
+    if let Some(summary) = store.conversation_summary(account_id, conversation_id)? {
+        events.push(HostSideEvent::ConversationChanged(summary));
+    }
+    Ok(events)
+}
+
 /// 契约 1.253（§4.239）：消息请求响应时间线系统行的单一铸造面——动作臂
 /// （conversations.acceptRequest / conversations.setBlocked 的 §4.239 半）
 /// 与镜像臂（§4.58）共用。官方行形态（models/conversations.preload.ts
@@ -17193,6 +17347,42 @@ pub const REPORT_SPAM_MESSAGE_IDS_LIMIT: usize = 64;
 pub struct PreparedReportSpam {
     pub upstream: Value,
     pub pairs: Vec<(String, String)>,
+}
+
+/// `conversations.reportSpam` params (contract revision 1.259, §4.243,
+/// capability report-spam): the addressing pair plus the official
+/// report-and-block choice — `block: true` is the official
+/// `blockAndReportSpam` thunk (the BLOCK_AND_SPAM word), `block: false`
+/// the plain `reportSpam` thunk (the SPAM word).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationsReportSpamParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub block: bool,
+}
+
+/// The `conversations.reportSpam` result: `status` is the whole MRR sync
+/// face (the official report thunks answer nothing to the UI — the toast
+/// is the desktop's), and `reported` projects the engine's report count for
+/// the ladder guids (0 when the conversation had no reportable rows — the
+/// official empty job face, honestly skipped).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationsReportSpamResult {
+    pub status: &'static str,
+    pub reported: u64,
+}
+
+/// The prepared `conversations.reportSpam` call (contract revision 1.259,
+/// §4.243): the MRR sync upstream (the engine's pinned native
+/// `sendMessageRequestResponse` face carrying the SPAM / BLOCK_AND_SPAM
+/// word) and the optional report upstream (`None` when the ladder found no
+/// reportable rows — the engine report call is skipped, never sent empty).
+#[derive(Debug)]
+pub struct PreparedConversationsReportSpam {
+    pub mrr_upstream: Value,
+    pub report_upstream: Option<Value>,
 }
 
 /// `calls.sendSignal` params (contract revision 1.53, §4.49): `type` is the
@@ -35627,6 +35817,289 @@ mod tests {
             prepared.upstream["token"],
             serde_json::json!("dG9rZW4tYWJj")
         );
+    }
+
+    /// §4.243 (the conversation-level report, batch Z12): the guid ladder
+    /// mirrors getMessageServerGuidsForSpam verbatim — distinct non-outgoing
+    /// rows with a server guid, received_at DESC / sent_at DESC, the
+    /// server's cap of 3; the MRR face carries the official SPAM /
+    /// BLOCK_AND_SPAM word; an empty ladder keeps the MRR face and skips
+    /// the report call; a group conversation is refused before anything
+    /// travels.
+    #[test]
+    fn conversations_report_spam_walks_the_official_guid_ladder() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let aci = "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10";
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", aci, "Peer")
+            .unwrap();
+        // Five candidates: three newest incoming with guids (10/20/30 by
+        // received_at), one older incoming with a guid (must fall outside
+        // the cap of 3), one outgoing with a guid (the official
+        // `type IS NOT 'outgoing'` filter), and one incoming without a
+        // guid (never a candidate, never invented).
+        fn row(
+            account_id: &str,
+            conversation_id: &str,
+            id: &str,
+            direction: &'static str,
+            guid: Option<&str>,
+            received_at: Option<u64>,
+        ) -> MessageRecord {
+            let mut record = expire_record_fixture(account_id, conversation_id, id);
+            record.direction = direction;
+            record.server_guid = guid.map(str::to_string);
+            record.received_at = received_at;
+            record.sent_at = received_at.unwrap_or(0);
+            record
+        }
+        let store = service.store_ref();
+        store
+            .insert_message(
+                &row(
+                    &account.id,
+                    &direct.id,
+                    "m-old",
+                    "incoming",
+                    Some("guid-old"),
+                    Some(5),
+                ),
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        store
+            .insert_message(
+                &row(
+                    &account.id,
+                    &direct.id,
+                    "m1",
+                    "incoming",
+                    Some("guid-1"),
+                    Some(10),
+                ),
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        store
+            .insert_message(
+                &row(
+                    &account.id,
+                    &direct.id,
+                    "m2",
+                    "incoming",
+                    Some("guid-2"),
+                    Some(20),
+                ),
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        store
+            .insert_message(
+                &row(&account.id, &direct.id, "m3", "incoming", None, Some(25)),
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        store
+            .insert_message(
+                &row(
+                    &account.id,
+                    &direct.id,
+                    "m4",
+                    "incoming",
+                    Some("guid-4"),
+                    Some(40),
+                ),
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        store
+            .insert_message(
+                &row(
+                    &account.id,
+                    &direct.id,
+                    "m5",
+                    "outgoing",
+                    Some("guid-5"),
+                    Some(50),
+                ),
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        let params = |block: bool| ConversationsReportSpamParams {
+            account_id: account.id.clone(),
+            conversation_id: direct.id.clone(),
+            block,
+        };
+        let prepared = service
+            .prepare_conversations_report_spam(&params(false))
+            .unwrap();
+        assert_eq!(prepared.mrr_upstream["type"], serde_json::json!("spam"));
+        // The cap of 3, newest first; outgoing and guid-less rows stay out.
+        assert_eq!(
+            prepared.report_upstream.as_ref().unwrap()["serverGuids"],
+            serde_json::json!(["guid-4", "guid-2", "guid-1"])
+        );
+        // The report-and-block choice rides the official BLOCK_AND_SPAM
+        // word on the same ladder.
+        let prepared = service
+            .prepare_conversations_report_spam(&params(true))
+            .unwrap();
+        assert_eq!(
+            prepared.mrr_upstream["type"],
+            serde_json::json!("blockAndSpam")
+        );
+        // The captured token rides the report body exactly as §4.48 reads
+        // it.
+        store
+            .store_conversation_report_token(&account.id, &direct.id, "dG9rZW4tYWJj")
+            .unwrap();
+        let prepared = service
+            .prepare_conversations_report_spam(&params(false))
+            .unwrap();
+        assert_eq!(
+            prepared.report_upstream.as_ref().unwrap()["token"],
+            serde_json::json!("dG9rZW4tYWJj")
+        );
+    }
+
+    /// §4.243: an empty ladder keeps the MRR face (the official sync runs
+    /// regardless) and skips the report call — never a fabricated guid.
+    #[test]
+    fn conversations_report_spam_empty_ladder_keeps_the_mrr_face() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let aci = "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10";
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", aci, "Peer")
+            .unwrap();
+        let prepared = service
+            .prepare_conversations_report_spam(&ConversationsReportSpamParams {
+                account_id: account.id.clone(),
+                conversation_id: direct.id.clone(),
+                block: false,
+            })
+            .unwrap();
+        assert_eq!(prepared.mrr_upstream["type"], serde_json::json!("spam"));
+        assert!(prepared.report_upstream.is_none());
+    }
+
+    /// §4.243: the local landing mirrors the official applyMessageRequestResponse
+    /// LOCAL arm — rows behind didResponseChange/didBlockChange/didSpamChange,
+    /// the authoritative factor stamp, the blocked-family mask stamp, and an
+    /// idempotent replay (no duplicate rows on a second landing).
+    #[test]
+    fn land_local_report_response_walks_the_official_word_gates() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let aci = "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10";
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", aci, "Peer")
+            .unwrap();
+        let store = service.store_ref();
+        let word_events = |response_type: u8| -> Vec<HostSideEvent> {
+            land_local_report_response(store, &account.id, &direct.id, response_type).unwrap()
+        };
+        let row_words = |events: &[HostSideEvent]| -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    HostSideEvent::MessageUpserted(record) => record
+                        .rich
+                        .as_ref()
+                        .and_then(|rich| rich.message_request_response_event.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The plain report: the SPAM word alone — one SPAM row, no BLOCK
+        // row, accepted=false, the raw member stamped, not blocked.
+        let events = word_events(MRR_RESPONSE_TYPE_SPAM);
+        assert_eq!(row_words(&events), vec!["SPAM".to_string()]);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HostSideEvent::ConversationChanged(_)))
+        );
+        assert_eq!(
+            store
+                .conversation_accept_response_member(&account.id, &direct.id)
+                .unwrap(),
+            Some(MRR_RESPONSE_TYPE_SPAM)
+        );
+        assert!(
+            !store
+                .conversation_summary(&account.id, &direct.id)
+                .unwrap()
+                .unwrap()
+                .blocked
+        );
+        // The replay folds (didResponseChange = false): stamps only, no
+        // rows, no changed push needed beyond the summary re-push — the
+        // official gate keeps the timeline clean.
+        let events = word_events(MRR_RESPONSE_TYPE_SPAM);
+        assert!(row_words(&events).is_empty());
+        // The report-and-block word: BLOCK row (didBlockChange) + no second
+        // SPAM row (didSpamChange = false — the prior already carries the
+        // spam face), the mask stamp set.
+        let events = word_events(MRR_RESPONSE_TYPE_BLOCK_AND_SPAM);
+        assert_eq!(row_words(&events), vec!["BLOCK".to_string()]);
+        assert_eq!(
+            store
+                .conversation_accept_response_member(&account.id, &direct.id)
+                .unwrap(),
+            Some(MRR_RESPONSE_TYPE_BLOCK_AND_SPAM)
+        );
+        assert!(
+            store
+                .conversation_summary(&account.id, &direct.id)
+                .unwrap()
+                .unwrap()
+                .blocked
+        );
+        // A group conversation answers nothing locally — the store grammar
+        // keeps the request family direct-only (the §4.56 stamp posture).
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "g-master-key", "Group")
+            .unwrap();
+        let events =
+            land_local_report_response(store, &account.id, &group.id, MRR_RESPONSE_TYPE_SPAM)
+                .unwrap();
+        assert!(row_words(&events).is_empty());
     }
 
     /// §4.186 (the reportSpam data plane): every envelope carrying

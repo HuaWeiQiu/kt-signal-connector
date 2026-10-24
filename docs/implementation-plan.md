@@ -82,6 +82,33 @@
   the avatar member of the group change word list); the refreshed or
   honestly-cleared projection rides `conversation.changed`. No wire
   removal anywhere: pre-1.258 hosts read every face byte-identically.)
+- Contract revision: 1.259 (2026-10-24; §4.243 the conversation-level
+  report face — batch Z12, ledger §29.90: `conversations.reportSpam`
+  {accountId, conversationId, block} = the official reportSpam /
+  blockAndReportSpam thunks
+  (state/ducks/conversations.preload.ts:3862-3922 / :3924-3990) in the
+  official order — the MRR sync word (SPAM / BLOCK_AND_SPAM, the pinned
+  native `sendMessageRequestResponse` face) first, the LOCAL landing on
+  the upstream answer (the §4.239/§1.258 action-arm shape: rows behind
+  the official didResponseChange/didSpamChange/didBlockChange gates, the
+  authoritative factor stamp, the §4.131 blocked-family mask stamp,
+  row-then-summary changed push), then the §4.48 engine report face
+  over the official guid ladder
+  (getMessageServerGuidsForSpam, sql/Server.node.ts:9012-9027 — up to 3
+  most recent distinct non-outgoing serverGuids, newest first, the
+  conversation's captured reporting token riding exactly as §4.48 reads
+  it). Group conversations answer INVALID_REQUEST before anything
+  travels — the official group report resolves the added-by sender's
+  direct conversation first (getDirectConversationForReportSpam) and
+  this chain holds no added-by data plane (§4.39/§4.241 captured
+  rosters carry id/uuid/name only): the honest refusal beats a
+  mis-addressed report (回访: addedBy 捕获落地后开群腿). An empty
+  ladder keeps the MRR face and answers reported:0 — the official empty
+  job face, never a fabricated guid. Unknown outcomes answer
+  SEND_OUTCOME_UNKNOWN and are never retried; landing legs are
+  warn-only (§4.239 discipline). Advertised through the existing
+  `report-spam` tag, widened in place (the 1.82/1.88 precedent).
+  Pre-1.259 hosts see no face.)
 - Contract revision: 1.254 (2026-10-24; §4.38 the archive-import media
   face close-out — batch U, ledger §29.64: the engine's v2 export already
   projects `width`/`height` on every attachment line
@@ -19439,3 +19466,32 @@ pre-1.256 宿主逐字节同形。
 pre-1.257 宿主逐字节同形。
 **测试**：verbatim 三臂（true/false/无戳）+ 反演面不动钉形 + 群行缺席 +
 wire 缺席键钉形。
+
+## §4.243 会话级举报 conversations.reportSpam（契约 1.259 · 批 Z12 · 台账 §29.90）
+
+官方锚：reportSpam / blockAndReportSpam 两 thunk
+（state/ducks/conversations.preload.ts:3862-3922 / :3924-3990）——
+(1) syncMessageRequestResponse(SPAM|BLOCK_AND_SPAM)（先本地落行后上行 sync，
+models/conversations.preload.ts:2559-2680 LOCAL 臂门序）；(2) addReportSpamJob
+= getMessageServerGuidsForSpam（sql/Server.node.ts:9012-9027：DISTINCT、
+type IS NOT 'outgoing'、serverGuid 非空、received_at DESC/sent_at DESC、
+LIMIT 3「The server's maximum is 3」:8988）逐 guid 走 reportMessage 服务面
+（jobs/reportSpamJobQueue.preload.ts:64-89 {senderAci, serverGuid, token}）。
+
+我方承载：MRR 同步词走引擎 pinned native `sendMessageRequestResponse`
+（§4.56 同面，词表 spam/blockAndSpam 已在引擎 § 全六值词表）；本机落地 =
+§4.239/§1.258 动作臂同形（行门 didResponseChange/didSpamChange/
+didBlockChange + 因子盖章 + §4.131 掩码位 + 行先后总览 changed 推送）；
+举报面复用 §4.48 引擎 reportSpam（serverGuids = 阶梯 + 会话 reportingToken
+逐 §4.48 读法）。群会话先拒（INVALID_REQUEST）——官方群举报先解析
+addedBy 直聊（getDirectConversationForReportSpam），本链名册捕获无 addedBy
+数据面（§4.39/§4.241），诚实拒绝优于误址举报（回访：addedBy 落地后开群腿）。
+阶梯空 = 保 MRR 面、跳过举报调用、reported:0（官方空任务脸，绝不造 guid）。
+unknown = SEND_OUTCOME_UNKNOWN 永不重试；落地腿 warn-only（§4.239 纪律）。
+
+**wire**：新方法 conversations.reportSpam {accountId, conversationId, block}
+→ {status:'reported', reported}；capability `report-spam` 原标签扩面
+（1.82/1.88 先例）。pre-1.259 宿主无此面。
+**测试**：阶梯钉形（≤3/最新序/DISTINCT/非出站/guid 空跳过举报面）+ 直聊闸
+（群行 INVALID_REQUEST）+ block 词分流（spam/blockAndSpam）+ 落地门三臂
+（Spam 行/BLOCK 行/因子盖章）+ token 携带。

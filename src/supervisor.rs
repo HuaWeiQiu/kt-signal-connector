@@ -28,25 +28,25 @@ use crate::service::{
     ChatFoldersListParams, ChatFoldersSetRecordsParams, CommonGroupsDetails, ConnectorService,
     ContactsSyncOutcome, ConversationState, ConversationsGetAvatarParams,
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
-    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, ConversationsSetStateParams,
-    DeviceList, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES,
-    GroupDetails, GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword,
-    GroupInviteLinkPreview, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
-    GroupsCancelJoinRequestParams, GroupsCreateParams, GroupsCreateResult,
-    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
-    GroupsMigrateResult, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
-    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyIntent,
-    IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary,
-    MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS,
-    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary,
-    MessageRequestOutcome, MessageRequestParams, MessagesDeleteForMeMessagesParams,
-    MessagesDeleteForMeParams, MessagesReportSpamParams, MessagesSendContactParams,
-    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
-    MessagesSendStickerParams, MessagesSendStoryParams, NotificationProfileSyncs,
-    NotificationProfilesListParams, NotificationProfilesSetRecordsParams, PeerTarget,
-    PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
+    ConversationsReportSpamParams, ConversationsReportSpamResult, ConversationsSetBlockedParams,
+    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
+    ConversationsSetPinnedParams, ConversationsSetStateParams, DeviceList,
+    GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails,
+    GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword, GroupInviteLinkPreview,
+    GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams,
+    GroupsCreateParams, GroupsCreateResult, GroupsInviteLinkPasswordParams,
+    GroupsJoinViaLinkParams, GroupsMigrateParams, GroupsMigrateResult, GroupsParseInviteLinkParams,
+    GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
+    GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams,
+    IdentitiesVerifyIntent, IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome,
+    ImportGroupsSummary, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
+    MAX_STORY_RECIPIENTS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
+    MergeContactsSummary, MessageRequestOutcome, MessageRequestParams,
+    MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams, MessagesReportSpamParams,
+    MessagesSendContactParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
+    MessagesSendPollVoteParams, MessagesSendStickerParams, MessagesSendStoryParams,
+    NotificationProfileSyncs, NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
+    PeerTarget, PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
     PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
     SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
     StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
@@ -5427,6 +5427,110 @@ impl RuntimeSupervisor {
             ))),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// `conversations.reportSpam` (contract revision 1.259, §4.243,
+    /// capability report-spam): the conversation-level report — the official
+    /// `reportSpam` / `blockAndReportSpam` thunks
+    /// (state/ducks/conversations.preload.ts:3862-3922 / :3924-3990), in
+    /// the official order: (1) the MRR sync face — the pinned native
+    /// `sendMessageRequestResponse` upstream carrying the SPAM /
+    /// BLOCK_AND_SPAM word (the official `syncMessageRequestResponse`
+    /// argument); (2) the LOCAL landing on the upstream answer — the same
+    /// §4.239/§1.258 action-arm shape (rows behind the official
+    /// didResponseChange / didSpamChange / didBlockChange gates, the
+    /// authoritative factor stamp, the blocked-family mask stamp, the
+    /// row-then-summary push); (3) the report itself — the engine
+    /// `reportSpam` call over the §4.243 guid ladder
+    /// (`addReportSpamJob`'s server face), honestly skipped when the ladder
+    /// found nothing reportable. Unknown outcomes answer SEND_OUTCOME_UNKNOWN
+    /// and are never retried (the reaction class). Landing legs are
+    /// warn-only best-effort: the upstream answer is the primary face
+    /// (§4.239 discipline).
+    pub async fn report_conversation_spam(
+        &self,
+        params: ConversationsReportSpamParams,
+    ) -> Result<ConversationsReportSpamResult, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_conversations_report_spam(&params)?
+        };
+        if let Err(EngineError::UnknownOutcome) = engine
+            .call(
+                "sendMessageRequestResponse",
+                prepared.mrr_upstream,
+                CallClass::Mutating,
+            )
+            .await
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            )));
+        }
+        let response_type = if params.block {
+            crate::service::MRR_RESPONSE_TYPE_BLOCK_AND_SPAM
+        } else {
+            crate::service::MRR_RESPONSE_TYPE_SPAM
+        };
+        {
+            let store = Arc::clone(&self.store);
+            let account_id = params.account_id.clone();
+            let conversation_id = params.conversation_id.clone();
+            match blocking_service(move || {
+                crate::service::land_local_report_response(
+                    &store,
+                    &account_id,
+                    &conversation_id,
+                    response_type,
+                )
+            })
+            .await
+            {
+                Ok(events) => {
+                    // Row-then-summary order (§4.226): rows ride ahead of
+                    // the changed push so one pass renders both faces.
+                    for event in events {
+                        let _ = self.host_events.send(event);
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    kind = "message_request_report_landing",
+                    class = error.class(),
+                    "report landed no local face; the upstream answer stands"
+                ),
+            }
+        }
+        // The report itself (official addReportSpamJob): skipped when the
+        // ladder found no reportable rows — the honest empty-job face.
+        let reported = match prepared.report_upstream {
+            Some(upstream) => {
+                match engine
+                    .call("reportSpam", upstream, CallClass::Mutating)
+                    .await
+                {
+                    Ok(result) => result
+                        .get("reported")
+                        .and_then(Value::as_u64)
+                        .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+                    Err(EngineError::UnknownOutcome) => {
+                        return Err(ServiceError::Api(ApiError::new(
+                            "SEND_OUTCOME_UNKNOWN",
+                            "mutating request has an unknown outcome",
+                            false,
+                        )));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            None => 0,
+        };
+        Ok(ConversationsReportSpamResult {
+            status: "reported",
+            reported,
+        })
     }
 
     /// stickerPacks.getSyncs (contract revision 1.37, §4.34): account

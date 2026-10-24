@@ -9526,6 +9526,39 @@ impl Store {
             .collect()
     }
 
+    /// 契约 1.259（§4.243 · 批 Z12）：会话级举报的 serverGuid 阶梯——官方
+    /// `getMessageServerGuidsForSpam`（sql/Server.node.ts:9012-9027）逐语义：
+    /// DISTINCT、`type IS NOT 'outgoing'`（KT direction 列同位）、`server_guid
+    /// IS NOT NULL`、`ORDER BY received_at DESC, sent_at DESC`、LIMIT 3（官方
+    /// 「The server's maximum is 3」:8988）。本机铸造的系统行（MRR/identity
+    /// 族）无 server_guid，天然不入候选。空数组 = 会话无可举报行（官方
+    /// 队列脸：调用方诚实跳过 upstream 面，绝不发明 guid）。
+    pub fn server_guids_for_spam(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT server_guid FROM messages
+                 WHERE conversation_id=?1 AND account_id=?2
+                   AND direction IS NOT 'outgoing'
+                   AND server_guid IS NOT NULL
+                 ORDER BY received_at DESC, sent_at DESC
+                 LIMIT 3",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![conversation_id, account_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
     /// The account's cached contact addresses (kind='contact' peer keys) for
     /// the mention-number resolution (contract 1.34). The caller matches
     /// digit suffixes in Rust — the same resolution rule the engine applies —

@@ -100,6 +100,7 @@
             "messages.sendViewOnceOpen",
             "messages.markViewOnceOpened",
             "messages.reportSpam",
+            "conversations.reportSpam",
             "messages.attachments.open",
             "messages.attachments.readChunk",
             "messages.attachments.closeHandle",
@@ -989,6 +990,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesReportSpamParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.reportSpam" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsReportSpamParams" }
             }
           }
         },
@@ -2465,6 +2477,25 @@
             "description": "A conversation message row id; unresolvable ids fail individually into failures."
           },
           "description": "The rows to report; each must belong to this conversation."
+        }
+      }
+    },
+    "conversationsReportSpamParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "block"],
+      "description": "Report a conversation as spam (contract revision 1.259, §4.243, capability report-spam): the official conversation-level report thunks verbatim — reportSpam / blockAndReportSpam (state/ducks/conversations.preload.ts:3862-3922 / :3924-3990). One call performs the official ordered chain: (1) the multi-device MessageRequestResponse sync word — SPAM for block:false, BLOCK_AND_SPAM for block:true (the official syncMessageRequestResponse argument); (2) the local landing — the official applyMessageRequestResponse LOCAL arm gates (SPAM/BLOCK timeline rows behind didResponseChange/didSpamChange/didBlockChange, the authoritative acceptResponseType factor stamp, the blocked-family mask stamp, row-then-summary conversation.changed); (3) the report face over the official guid ladder (getMessageServerGuidsForSpam, sql/Server.node.ts:9012-9027 — up to 3 most recent distinct non-outgoing rows with a server GUID, newest first) reusing the §4.48 engine reportSpam face with the conversation's captured reporting token. block:true carries the block semantics inside the BLOCK_AND_SPAM word — the official thunk never sends a second block write. Group conversations answer INVALID_REQUEST before anything travels (the official group report resolves the added-by sender's direct conversation first; this chain holds no added-by data plane — the honest refusal beats a mis-addressed report). An empty ladder keeps the MRR face and answers reported:0 (the official empty job face, never a fabricated GUID). Unknown upstream outcomes answer SEND_OUTCOME_UNKNOWN and are never retried. The result is {status:'reported', reported} — reported is the engine's report count (0 when skipped).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The direct conversation to report; groups answer INVALID_REQUEST."
+        },
+        "block": {
+          "type": "boolean",
+          "description": "true = the official blockAndReportSpam thunk (BLOCK_AND_SPAM word); false = the plain reportSpam thunk (SPAM word)."
         }
       }
     },
