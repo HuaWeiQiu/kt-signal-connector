@@ -17,6 +17,42 @@
   document for the official anchor and the event mapping.
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.255 (2026-10-24; §4.240 the group removal-stage
+  face — batch W, ledger §29.67: the official
+  `ConversationAttributes.removalStage` state machine
+  (ts/model-types.d.ts:396-398) gets its data plane — the group row's
+  `group_extra_json` marker now captures the engine face's
+  `isMember: false` residual (the left/kicked family the batch-B
+  left-by-terminated approximation stood in for; the §4.167 Gone stamp
+  carries the word beside the legacy terminated face), and the summary
+  projects the official `"justNotification"` word from it at read time.
+  The `"messageRequest"` escalation leg is an upstream event this chain
+  has no source for and stays honestly unreachable. Absent-key additive:
+  pre-1.255 hosts read byte-identical rows; the terminated flag keeps its
+  own independent face — the official machines never folded.)
+- Contract revision: 1.256 (2026-10-24; §4.241 the shared-group titles
+  face — batch W, ledger §29.67: the official `sharedGroupNames`
+  reverse lookup (ts/util/sharedGroupNames.dom.ts:26-59) answers from
+  the member→group index one contacts-cache scan builds over the §4.39
+  captured rosters (the engine group table this chain holds — zero
+  upstream traffic). Conversation summaries (direct non-self rows) and
+  contacts rows carry the titles; candidate keys are the row's identity
+  set (§4.144 service id, §4.229 e164 in both spellings, the contact
+  row's peer key); order follows the group rows' sync recency; the array
+  caps at 32; an unmatched row answers the computed empty array. Absent
+  on group/self rows and a failed scan. Wire additive, pre-1.256 hosts
+  read byte-identical rows; the batch-B accept gate's free-confirm path
+  reads the truth once the desktop passes the key through.)
+- Contract revision: 1.257 (2026-10-24; §4.242 the hidden bit face —
+  batch W, ledger §29.67: the conversation summary carries the verbatim
+  `mrr_factors_json.hidden` stamp (the engine `JsonContact.isHidden`
+  face, stamped by the throttled listContacts enrich — the
+  storage-consumption landing the official `ContactRecord.hidden` word
+  mirrors, ts/services/storageRecordOps.preload.ts:399/:1662). Present
+  only when the stamp carries it; the read never re-derives the bit
+  through the `inSystemContacts` inversion, which stays verbatim beside
+  it for pre-1.257 consumers. Wire additive, byte-identical rows behind
+  the stamp.)
 - Contract revision: 1.254 (2026-10-24; §4.38 the archive-import media
   face close-out — batch U, ledger §29.64: the engine's v2 export already
   projects `width`/`height` on every attachment line
@@ -19165,3 +19201,77 @@ block→BLOCK / 同刻重放幂等 / 未解析会话 None / 行方向状态键�
 态门 / BLOCK_AND_SPAM 双臂齐铸 / SPAM 先态 spam 不重铸 / DELETE 无
 行）；桌面消费键（chrome icon 四臂 + 文案四臂）在桌面批 G 分支
 spec 已钉，本批 wire 键与其同名对表。
+
+## §4.240 群行 removalStage 独立状态机（契约 1.255 · 批 W · 台账 §29.67）
+
+官方锚：`ts/model-types.d.ts:396-398`——`removalStage?: 'justNotification' |
+'messageRequest'` 是会话属性上的独立移除状态机（removeContact →
+justNotification；来信升级 messageRequest；去信/restore 清除；
+storageRecordOps.preload.ts:399/:1662 以 `hidden` 位经 storage 同步持久/回放）。
+消费面语义：任一 stage 在场 = unaccepted（isConversationAccepted.preload.ts:29-31）；
+`justNotification` 保持 composer 与普通列表预览（CompositionArea.dom.tsx:1011、
+ConversationListItem.dom.tsx:145），`messageRequest` 才替换为请求区。
+
+我方数据面：群行 `group_extra_json` 捕获引擎面 `isMember: false` 残留
+（引擎 project_group_list_entry 计算值——被移出群的本地残留投影即 false，
+即官方 left/kicked 族；§4.167 resync Gone 戳 `{"isTerminated":true,"isMember":false}`
+同批 additive）。读侧投影：捕获词 → `removalStage: "justNotification"`
+（列表页 + conversation.changed 单行摘要同源）。
+
+诚实边界：`"messageRequest"` 升级腿是上游事件驱动（stage 内来信），
+本链无事件源，词表保留、今日不可达；`terminated` 保持独立
+`isTerminated` 面——官方两台状态机从不互相折叠，批 B 的 left≈terminated
+近似在读侧退役（isTerminated 键本身 additive 保留，旧行为零变化）。
+
+**wire**：摘要行 additive absent-key `removalStage`（词表闭集两词、
+今日仅 justNotification 投影）；pre-1.255 宿主逐字节同形。
+**测试**：捕获三臂（false 捕获/true 缺席/缺席键缺席）+ 读侧三臂
+（成员词→justNotification / Gone 双词戳双面独立 / 健康·直聊·pre批行缺席）
++ wire 缺席键钉形。
+
+## §4.241 member→群归属索引与摘要 sharedGroupNames（契约 1.256 · 批 W · 台账 §29.67）
+
+官方锚：`ts/util/sharedGroupNames.dom.ts:26-59`——
+`getSharedGroupNames` = 直聊行 serviceId → 全量 composable 会话中
+`type === 'group' && memberships.some(m => m.aci === serviceId)` 的群名数组
+（timestamp 降序）；消费面：accept 免确认短路（MessageRequestActions
+direct ∧ `sharedGroupNames.length > 1`）与 ContactModal 共同群行。
+
+我方数据面：引擎群表 = §4.39 捕获名册（contacts 缓存群行 extra JSON），
+member→群归属索引 = 一次 `kind='group'` 扫描（ORDER BY synced_at DESC, id；
+条目词形 = 捕获输出 `id`+可选 `uuid`；上限 32 标题）——零上游流量。
+投影：摘要直聊非 self 行 + contacts contact 行 additive
+`sharedGroupNames`；候选键 = §4.144 serviceId → §4.229 e164（+` 与裸号
+双拼）→（联系人行）peer_key，首键序保留、按群去重。空数组 = 计算零
+（官方 EMPTY_ARRAY 形），群行/self 行/扫描失败 = 缺席键。
+
+诚实边界：官方按会话活跃时刻排序，我方按同步新鲜度（同收敛方向，
+记档呈现差）；名册捕获有界（§4.39 hostile-roster 纪律），超界群不在索引。
+消费面（批 B accept 确认门）在桌面把摘要键传入
+`signalMessageRequestAcceptNeedsConfirm` 即点亮免确认路径（本批桌面
+随行接线，纯传参）。
+
+**wire**：摘要 + 联系人行 additive absent-key `sharedGroupNames`；
+pre-1.256 宿主逐字节同形。
+**测试**：uuid 键/号码双拼/排序/空数组/群行 self 行缺席/contacts 面/32 帽
++ wire 缺席键钉形。
+
+## §4.242 会话行独立 hidden 位（契约 1.257 · 批 W · 台账 §29.67）
+
+官方锚：storage 服务 ContactRecord 的 `hidden` 是自有 bool 字段
+（storageRecordOps.preload.ts:399 写侧 = removalStage 持久化、:1662 消费侧
+= removeContact/restoreContact 回放）；上游引擎面 = signal-cli
+`JsonContact.isHidden`。
+
+我方数据面：`mrr_factors_json.hidden` 戳（throttled listContacts enrich
+在既有往返上落——即「storage 消费时落」的本链承载）早已存储；本批补的
+是读侧独立词面：摘要 additive `hidden` = 戳内位逐字投影，绝不经
+`inSystemContacts` 反演再推（反演面原样保留供 pre-1.257 消费者）。
+批 B 的 hidden≈「非通讯录 profile 行」读侧反推近似就此退役通道打开；
+引擎侧 presage 无独立 hidden 列的语义近似（批 B 诚实缺口⑤）仍待引擎批
+（backup-l45 基线只读，不在本批）。
+
+**wire**：摘要行 additive absent-key `hidden`（直聊行、戳携带时）；
+pre-1.257 宿主逐字节同形。
+**测试**：verbatim 三臂（true/false/无戳）+ 反演面不动钉形 + 群行缺席 +
+wire 缺席键钉形。

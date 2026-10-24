@@ -9100,7 +9100,14 @@ impl RuntimeSupervisor {
                     kind: "group",
                     peer_key: group.as_str(),
                     title: title.as_str(),
-                    extra: Some(r#"{"isTerminated":true}"#),
+                    // Contract 1.255 (§4.240): the Gone stamp now also
+                    // carries the member word — the §4.167 definitive
+                    // negative folds to left semantics officially
+                    // (groups.preload.ts:3772-3777), so the row reads as
+                    // removed at the notification stage while the legacy
+                    // isTerminated face stays byte-identical for pre-1.255
+                    // consumers (the additive capture discipline).
+                    extra: Some(r#"{"isTerminated":true,"isMember":false}"#),
                 }];
                 store
                     .upsert_passive_contacts(&account, &entries, crate::link::now_ms())
@@ -9686,6 +9693,18 @@ fn group_extra_json(members: &[Value], group: &Value) -> String {
     if group.get("isTerminated").and_then(Value::as_bool) == Some(true) {
         extra.insert("isTerminated".to_string(), json!(true));
     }
+    // Contract 1.255 (§4.240): the engine face's member word — captured only
+    // when explicitly false, the left/kicked residual the engine's own
+    // isMember computation answers for a group this account no longer
+    // belongs to. true and absent collapse to no key: the healthy default
+    // stays the absent marker, the informative-keys discipline (the
+    // isTerminated capture beside it runs the same shape). The read side
+    // projects the official removalStage vocabulary from it (store
+    // extra_removal_stage); the two markers stay independent words — the
+    // official removal-stage and terminated machines never folded.
+    if group.get("isMember").and_then(Value::as_bool) == Some(false) {
+        extra.insert("isMember".to_string(), json!(false));
+    }
     // Contract 1.180 (§4.180): the official link-access word the upstream
     // JsonGroup carries (`addFromInviteLink` — the official
     // buildAccessControlAddFromInviteLinkChange vocabulary the desktop's
@@ -9775,7 +9794,7 @@ fn group_extra_json(members: &[Value], group: &Value) -> String {
 
 /// One upstream roster address with the connector-wide first-wins ladder:
 /// `number` before `uuid`, trimmed, non-empty, bounded to the roster id cap.
-fn member_address_id(object: &serde_json::Map<String, Value>) -> Option<String> {
+pub(crate) fn member_address_id(object: &serde_json::Map<String, Value>) -> Option<String> {
     ["number", "uuid"]
         .iter()
         .find_map(|key| object.get(*key).and_then(Value::as_str))
@@ -13001,6 +13020,44 @@ mod tests {
     /// kt-signal-engine shape marks none, address-less entries drop
     /// individually, and the roster cap holds while memberCount keeps the
     /// upstream length.
+    /// Contract 1.255 (§4.240): the engine face's member word is captured
+    /// only when explicitly false — the left/kicked residual the read side
+    /// projects onto the official removalStage vocabulary; true and absent
+    /// collapse to the absent marker (the healthy default never writes a
+    /// key), and the terminated capture beside it stays independent.
+    #[test]
+    fn group_extra_json_captures_the_member_word_when_false() {
+        use super::group_extra_json;
+        let members = serde_json::json!([
+            {"number": "+15555550101", "role": "DEFAULT"}
+        ]);
+        let removed = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &serde_json::json!({"id": "aWQ=", "isMember": false}),
+        ))
+        .unwrap();
+        assert_eq!(removed["isMember"], serde_json::json!(false));
+        let member = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &serde_json::json!({"id": "aWQ=", "isMember": true}),
+        ))
+        .unwrap();
+        assert!(member.get("isMember").is_none());
+        let absent = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &serde_json::json!({"id": "aWQ="}),
+        ))
+        .unwrap();
+        assert!(absent.get("isMember").is_none());
+        // The Gone stamp's shape — the legacy terminated face rides beside
+        // the member word, one marker, two independent words.
+        let gone =
+            serde_json::from_str::<serde_json::Value>(r#"{"isTerminated":true,"isMember":false}"#)
+                .unwrap();
+        assert_eq!(gone["isTerminated"], serde_json::json!(true));
+        assert_eq!(gone["isMember"], serde_json::json!(false));
+    }
+
     #[test]
     fn group_extra_json_captures_the_bounded_roster() {
         use super::group_extra_json;

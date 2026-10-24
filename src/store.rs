@@ -871,6 +871,57 @@ pub struct ConversationSummary {
     /// hosts read byte-identical summaries.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_terminated: bool,
+    /// Contract 1.255 (§4.240): the group row's removal stage — the official
+    /// `ConversationAttributes.removalStage` state machine word
+    /// (`ts/model-types.d.ts:396-398`, the independent removal lifecycle the
+    /// batch-B `left`-by-terminated approximation stood in for). Projected at
+    /// read time from the same `group_extra_json` marker the §4.54 flag
+    /// reads: the captured engine `isMember: false` residual (the
+    /// left/kicked family — the engine's own isMember computation answers
+    /// false for a group we no longer belong to) maps to
+    /// `"justNotification"`, the official notification-level stage whose
+    /// consumers keep the composer (CompositionArea.dom.tsx:1011) and the
+    /// plain list preview (ConversationListItem.dom.tsx:145). The
+    /// `"messageRequest"` escalation leg is event-driven upstream (an
+    /// incoming message in the stage, conversations.preload.ts:1597-1601)
+    /// and stays honestly unreachable in this chain — the word set is the
+    /// official two, only the notification stage projects today. Present
+    /// only when the capture carries the word (a healthy member row, a
+    /// pre-batch row, every direct row answer absent — pre-1.255 hosts read
+    /// byte-identical rows). The terminated flag stays on its own
+    /// `isTerminated` face: the official machines are independent
+    /// (`terminated` is the group-dead word, not a removal stage), and the
+    /// batch-B conflation retires on the read side only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removal_stage: Option<String>,
+    /// Contract 1.256 (§4.241): the direct row's shared-group titles — the
+    /// official `sharedGroupNames` reverse lookup
+    /// (`ts/util/sharedGroupNames.dom.ts:26-59`: every group whose roster
+    /// contains the contact's identity, titles only) answered from the
+    /// member→group index one contacts-cache scan builds (the §4.39
+    /// captured rosters are the engine group table this chain holds).
+    /// Candidate keys are the row's own identity set (peer key, the §4.144
+    /// resolved service id, the §4.229-resolved e164); order follows the
+    /// group rows' sync recency (the official timestamp-desc collapse) and
+    /// the array is capped at 32 titles. Direct non-self rows only; empty
+    /// projects as an empty array (a computed zero, the official EMPTY_ARRAY
+    /// shape), group/self rows and a failed scan answer absent. Wire
+    /// additive: pre-1.256 hosts read byte-identical rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_group_names: Option<Vec<String>>,
+    /// Contract 1.257 (§4.242): the direct row's hidden bit — the verbatim
+    /// stored `mrr_factors_json.hidden` stamp (the engine's
+    /// `JsonContact.isHidden` face, stamped by the throttled listContacts
+    /// enrich — the storage-consumption landing the official
+    /// `ContactRecord.hidden` word mirrors,
+    /// ts/services/storageRecordOps.preload.ts:399/:1662). Present only when
+    /// the stamp carries it (a pre-1.221 stamp, the probed-absent `{}`
+    /// marker, or any group row answer absent); the read never re-derives
+    /// the bit through the `inSystemContacts` inversion — that inverted
+    /// projection stays verbatim beside it for pre-1.257 consumers, and the
+    /// desktop retires its inversion derivation when it consumes this key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
     /// Contract 1.65 (§4.58): the conversation's message-request accepted
     /// state, derived at read time with the official
     /// `isConversationAccepted` factor weights over the material this chain
@@ -1123,6 +1174,201 @@ fn extra_username(extra: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The roster cap, shared with the capture side (§4.39) — one constant, no
+/// hand-written second bound.
+use crate::service::MAX_GROUP_MEMBERS;
+
+/// Contract 1.255 (§4.240): the group row's removal stage, read out of the
+/// §4.50 appendix `group_extra_json` marker at projection time. The
+/// official vocabulary is the `removalStage` state machine's two words
+/// (`ts/model-types.d.ts:397`); this chain's reachable word is
+/// `"justNotification"` — the captured `isMember: false` residual (the
+/// engine's own left/kicked family answer) is exactly the removed state,
+/// while the `"messageRequest"` escalation leg is an upstream event this
+/// chain has no source for and stays honestly unreachable. `true`, absent,
+/// and every malformed marker answer None — the absent wire key, the
+/// pre-1.255 behavior verbatim. The terminated flag keeps its own
+/// independent marker (the official machines never folded into each other).
+fn extra_removal_stage(extra: Option<&str>) -> Option<&'static str> {
+    let member = extra
+        .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
+        .and_then(|extra| extra.get("isMember").and_then(Value::as_bool));
+    match member {
+        Some(false) => Some("justNotification"),
+        _ => None,
+    }
+}
+
+/// Contract 1.255 (§4.240): the per-group lifecycle faces one contacts-cache
+/// scan answers — the §4.54 terminated set and the removal-stage word map,
+/// both read from the same `group_extra_json` marker at projection time.
+/// The scan is the whole group-kind contacts cache of the account (one row
+/// per group, the §6.5 sync scale), read over the caller's already-held
+/// connection guard (the store mutex is never re-entrant).
+fn group_lifecycle_faces(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<
+    (
+        std::collections::HashSet<String>,
+        std::collections::HashMap<String, &'static str>,
+    ),
+    StoreError,
+> {
+    let mut stmt = conn
+        .prepare("SELECT id, extra FROM contacts WHERE account_id=?1 AND kind='group'")
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let rows = stmt
+        .query_map(params![account_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let mut terminated = std::collections::HashSet::new();
+    let mut removal_stages = std::collections::HashMap::new();
+    for row in rows {
+        let (id, extra) = row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if extra_is_terminated(extra.as_deref()) {
+            terminated.insert(id.clone());
+        }
+        if let Some(stage) = extra_removal_stage(extra.as_deref()) {
+            removal_stages.insert(id, stage);
+        }
+    }
+    Ok((terminated, removal_stages))
+}
+
+/// Contract 1.256 (§4.241): the per-key title cap — the official projection
+/// renders the first three names plus a remaining count, and the accept
+/// gate reads only `length > 1`; 32 keeps every honest consumer shape
+/// whole while the wire stays bounded (the roster-discipline cap family).
+const MAX_SHARED_GROUP_NAMES: usize = 32;
+
+/// Contract 1.256 (§4.241): the member→group-titles index one contacts-cache
+/// scan builds — the engine group table this chain holds is the §4.39
+/// captured roster on each `kind='group'` row, so the official
+/// `sharedGroupNames` reverse lookup
+/// (`ts/util/sharedGroupNames.dom.ts:26-59`: every group whose memberships
+/// contain the contact's service id, titles only) answers from the cache
+/// with zero upstream traffic. Keys are the roster entry's `id` and
+/// optional `uuid` spellings; values collect in the scan's
+/// `synced_at DESC, id` order (the official timestamp-desc projection
+/// collapsed onto the sync recency this chain holds) and stop at
+/// [`MAX_SHARED_GROUP_NAMES`]. A hostile or malformed roster drops that
+/// row (never fails the scan — the §4.39 hostile-roster discipline).
+fn shared_group_index(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<std::collections::HashMap<String, Vec<(String, String)>>, StoreError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, extra FROM contacts
+              WHERE account_id=?1 AND kind='group'
+              ORDER BY synced_at DESC, id ASC",
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let rows = stmt
+        .query_map(params![account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let mut index: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (group_id, title, extra) = row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some(roster) = extra
+            .as_deref()
+            .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
+            .and_then(|extra| extra.get("members").cloned())
+            .and_then(|members| members.as_array().cloned())
+        else {
+            continue;
+        };
+        for member in roster.iter().take(MAX_GROUP_MEMBERS) {
+            let Some(object) = member.as_object() else {
+                continue;
+            };
+            // The stored marker's own entry vocabulary (the §4.39 capture
+            // OUTPUT: `id` — the capture-side ladder result — plus the
+            // optional `uuid` when the upstream supplied one), never the
+            // raw engine face words.
+            let mut keys: Vec<String> = Vec::with_capacity(2);
+            if let Some(id) = object
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                keys.push(id.to_string());
+            }
+            if let Some(uuid) = object
+                .get("uuid")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                keys.push(uuid.to_string());
+            }
+            for key in keys {
+                let titles = index.entry(key).or_default();
+                if titles.len() < MAX_SHARED_GROUP_NAMES
+                    && titles.iter().all(|(id, _)| *id != group_id)
+                {
+                    titles.push((group_id.clone(), title.clone()));
+                }
+            }
+        }
+    }
+    Ok(index)
+}
+
+/// Contract 1.256 (§4.241): the direct row's roster-lookup keys in identity
+/// order — the resolved service id first (the official membership key is the
+/// ACI, sharedGroupNames.dom.ts:41-45), then the number in both §4.229
+/// spellings (the roster's captured `id` is the capture-side label, which
+/// either spelling may hold). No invented key: every entry derives from the
+/// row's own identity set.
+fn summary_identity_keys(service_id: Option<&str>, e164: Option<&str>) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::with_capacity(3);
+    if let Some(service_id) = service_id {
+        keys.push(service_id.to_string());
+    }
+    if let Some(e164) = e164 {
+        keys.push(e164.to_string());
+        if let Some(bare) = e164.strip_prefix('+') {
+            keys.push(bare.to_string());
+        }
+    }
+    keys
+}
+
+/// Contract 1.256 (§4.241): the direct row's answer — the candidate keys in
+/// identity order (peer key, then the resolved service id, then e164),
+/// titles deduped by group across the keys, first key's order preserved
+/// (the same first-wins discipline the address ladder runs). A row no key
+/// matches answers an empty array — a computed zero, the official
+/// EMPTY_ARRAY shape, never absence.
+fn shared_group_names_for(
+    index: &std::collections::HashMap<String, Vec<(String, String)>>,
+    keys: &[String],
+) -> Option<Vec<String>> {
+    let mut titles: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for key in keys {
+        if let Some(group_titles) = index.get(key.as_str()) {
+            for (group_id, title) in group_titles {
+                if seen.insert(group_id.clone()) && titles.len() < MAX_SHARED_GROUP_NAMES {
+                    titles.push(title.clone());
+                }
+            }
+        }
+    }
+    Some(titles)
+}
+
 /// The §4.171 outbound-quote projection only names an author for an outgoing
 /// quoted row whose send outcome has reached an addressable rung of the §4.6
 /// resolve ladder (`service.rs` resolve_recipient): sent/delivered/read mean
@@ -1273,6 +1519,10 @@ struct MrrProjection {
     accepted: bool,
     profile_sharing: Option<bool>,
     in_system_contacts: Option<bool>,
+    /// Contract 1.257 (§4.242): the verbatim hidden stamp face — never
+    /// derived, never inverted; the inversion stays on
+    /// `in_system_contacts` alone for the pre-1.257 consumers.
+    hidden: Option<bool>,
 }
 
 fn derive_mrr_projection(
@@ -1301,12 +1551,14 @@ fn derive_mrr_projection(
             accepted,
             profile_sharing,
             in_system_contacts: factors.hidden.map(|hidden| !hidden),
+            hidden: factors.hidden,
         }
     } else {
         MrrProjection {
             accepted,
             profile_sharing: None,
             in_system_contacts: None,
+            hidden: None,
         }
     }
 }
@@ -1758,33 +2010,6 @@ fn conversation_draft_timestamp(
         .optional()
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
     Ok(stamp.map(|value| value.max(0) as u64))
-}
-
-/// Contract 1.60 (§4.54): the ids of the contacts-cache group rows whose last
-/// sync captured the terminated flag. Read at projection time over the
-/// caller's already-held connection guard (the store mutex is never
-/// re-entrant); the scanned set is the whole group-kind contacts cache of the
-/// account — one row per group, the scale the §6.5 sync already maintains.
-fn group_terminated_ids(
-    conn: &Connection,
-    account_id: &str,
-) -> Result<std::collections::HashSet<String>, StoreError> {
-    let mut stmt = conn
-        .prepare("SELECT id, extra FROM contacts WHERE account_id=?1 AND kind='group'")
-        .map_err(|error| StoreError::Unavailable(Some(error)))?;
-    let rows = stmt
-        .query_map(params![account_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })
-        .map_err(|error| StoreError::Unavailable(Some(error)))?;
-    let mut terminated = std::collections::HashSet::new();
-    for row in rows {
-        let (id, extra) = row.map_err(|error| StoreError::Unavailable(Some(error)))?;
-        if extra_is_terminated(extra.as_deref()) {
-            terminated.insert(id);
-        }
-    }
-    Ok(terminated)
 }
 
 /// One aggregated reaction pill projected onto a message row (contract
@@ -2300,6 +2525,14 @@ pub struct ContactSummary {
     #[serde(rename = "hasAvatar")]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub has_avatar: bool,
+    /// 契约 1.256（§4.241，批 W）：直聊联系人群归属词面——官方
+    /// `sharedGroupNames`（sharedGroupNames.dom.ts:26-59：名册含该联系人
+    /// 身份的群名数组）。与摘要行同一份索引读（一次扫描），候选键同
+    /// §4.144/§4.229 身份梯；contact 行携带、group/self 行缺席；空数组 =
+    /// 计算零（官方 EMPTY_ARRAY 形），缺席 = 群行/扫描失败。wire additive，
+    /// pre-1.256 宿主逐字节同形。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_group_names: Option<Vec<String>>,
 }
 
 /// One recorded reaction (contract 1.15): the actor's emoji state on a target
@@ -4347,6 +4580,12 @@ impl Store {
                         // cache after the row maps (page lookup / single-row
                         // query below).
                         is_terminated: false,
+                        // Contract 1.255/1.256/1.257 (§4.240/241/242): the
+                        // lifecycle/shared-group/hidden faces, filled in the
+                        // post-map loop (below), the same read-time family.
+                        removal_stage: None,
+                        shared_group_names: None,
+                        hidden: None,
                         // Contract 1.65 (§4.58): derived after the row maps
                         // (page lookup below), the same post-map loop.
                         message_request_accepted: false,
@@ -4403,6 +4642,9 @@ impl Store {
             item.message_request_accepted = mrr.accepted;
             item.profile_sharing = mrr.profile_sharing;
             item.in_system_contacts = mrr.in_system_contacts;
+            // Contract 1.257 (§4.242): the verbatim hidden stamp — the
+            // inversion stays on in_system_contacts alone.
+            item.hidden = mrr.hidden;
             // Contract 1.71 (§4.63): the whole-history outbound bit, the same
             // post-map loop, the same guard.
             item.has_user_initiated_outbound =
@@ -4430,10 +4672,20 @@ impl Store {
         // `stable_hash_id([account, 'group', peer])` id, so the summary is
         // stamped through its own id; direct conversations and groups without
         // a cache row stay false.
-        let terminated = group_terminated_ids(&conn, account_id)?;
+        // Contract 1.60 (§4.54) + 1.255 (§4.240): the group lifecycle
+        // faces ride one scan — the terminated set and the removal-stage
+        // map read the same §4.50 appendix marker.
+        let (terminated, removal_stages) = group_lifecycle_faces(&conn, account_id)?;
+        // Contract 1.256 (§4.241): the member→group-titles index, one scan
+        // per page over the same cache (the §6.5 scale the sync maintains).
+        let shared_index = shared_group_index(&conn, account_id)?;
         for item in &mut items {
             if item.kind == "group" {
                 item.is_terminated = terminated.contains(&item.id);
+                item.removal_stage = removal_stages.get(&item.id).copied().map(str::to_string);
+            } else if item.kind == "direct" && !item.is_self {
+                let keys = summary_identity_keys(item.service_id.as_deref(), item.e164.as_deref());
+                item.shared_group_names = shared_group_names_for(&shared_index, &keys);
             }
         }
         Ok(Page { items, next_cursor })
@@ -10249,6 +10501,12 @@ impl Store {
                         // cache after the row maps (page lookup / single-row
                         // query below).
                         is_terminated: false,
+                        // Contract 1.255/1.256/1.257 (§4.240/241/242): the
+                        // lifecycle/shared-group/hidden faces, filled in the
+                        // post-map match (below), the same read-time family.
+                        removal_stage: None,
+                        shared_group_names: None,
+                        hidden: None,
                         // Contract 1.65 (§4.58): derived after the row maps
                         // (single-row match below), the same post-map loop.
                         message_request_accepted: false,
@@ -10304,7 +10562,7 @@ impl Store {
                 // conversation row and the contacts row share the same stable
                 // id; a group without a cache row stays false.
                 if summary.kind == "group" {
-                    summary.is_terminated = conn
+                    let extra = conn
                         .query_row(
                             "SELECT c.extra FROM contacts c
                              WHERE c.id = ?1 AND c.account_id = ?2 AND c.kind = 'group'",
@@ -10313,9 +10571,19 @@ impl Store {
                         )
                         .optional()
                         .map_err(|error| StoreError::Unavailable(Some(error)))?
-                        .flatten()
-                        .map(|extra| extra_is_terminated(Some(&extra)))
+                        .flatten();
+                    summary.is_terminated = extra
+                        .as_deref()
+                        .map(|extra| extra_is_terminated(Some(extra)))
                         .unwrap_or(false);
+                    // Contract 1.255 (§4.240): the same captured marker's
+                    // member word, projected on the official removalStage
+                    // vocabulary — the event-driven summary and a reloaded
+                    // page cannot disagree (the 1.60 discipline).
+                    summary.removal_stage = extra
+                        .as_deref()
+                        .and_then(|extra| extra_removal_stage(Some(extra)))
+                        .map(str::to_string);
                 }
                 // Contract 1.65 (§4.58): the same read-time accepted
                 // derivation the list applies — the summary that rides
@@ -10331,6 +10599,20 @@ impl Store {
                 summary.message_request_accepted = mrr.accepted;
                 summary.profile_sharing = mrr.profile_sharing;
                 summary.in_system_contacts = mrr.in_system_contacts;
+                // Contract 1.257 (§4.242): the verbatim hidden stamp — the
+                // inversion stays on in_system_contacts alone.
+                summary.hidden = mrr.hidden;
+                // Contract 1.256 (§4.241): the same reverse lookup the list
+                // face runs — one scan over the group cache, direct non-self
+                // rows carry the titles.
+                if summary.kind == "direct" && !summary.is_self {
+                    let shared_index = shared_group_index(&conn, account_id)?;
+                    let keys = summary_identity_keys(
+                        summary.service_id.as_deref(),
+                        summary.e164.as_deref(),
+                    );
+                    summary.shared_group_names = shared_group_names_for(&shared_index, &keys);
+                }
                 // Contract 1.71 (§4.63): the whole-history outbound bit —
                 // the summary that rides conversation.changed carries it so
                 // an event-driven window and a full reload cannot disagree.
@@ -10899,6 +11181,9 @@ impl Store {
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))?
             .unwrap_or_default();
+        // 契约 1.256（§4.241）：member→群归属索引一次扫描建页——与摘要行
+        // 同一份反查读（sharedGroupNames.dom.ts:26-59），缓存面零上游流量。
+        let shared_index = shared_group_index(&conn, account_id)?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, kind, peer_key, title, extra
@@ -10955,19 +11240,32 @@ impl Store {
                             peer_key.as_str(),
                         ]),
                     );
+                    let is_self = contact_is_self(
+                        kind,
+                        &peer_key,
+                        signal_account.as_deref(),
+                        account_aci.as_deref(),
+                    );
+                    // 契约 1.256（§4.241）：contact 行的群归属词——候选键同
+                    // 摘要行身份梯；group/self 行缺席（官方 never-self）。
+                    let shared_group_names = if kind == "contact" && !is_self {
+                        let mut keys = summary_identity_keys(service_id.as_deref(), None);
+                        if !keys.iter().any(|key| key == &peer_key) {
+                            keys.push(peer_key.clone());
+                        }
+                        shared_group_names_for(&shared_index, &keys)
+                    } else {
+                        None
+                    };
                     Ok(ContactSummary {
                         id: row.get(0)?,
                         is_terminated: kind == "group" && extra_is_terminated(extra.as_deref()),
                         kind,
-                        is_self: contact_is_self(
-                            kind,
-                            &peer_key,
-                            signal_account.as_deref(),
-                            account_aci.as_deref(),
-                        ),
+                        is_self,
                         peer_key,
                         title: row.get(3)?,
                         service_id,
+                        shared_group_names,
                         // Contract 1.176 (§4.176): the username marker the
                         // sync captured, verbatim-trimmed at capture and
                         // re-checked whole-value here (a clipped username
@@ -16243,6 +16541,374 @@ mod tests {
                 .unwrap()
                 .is_terminated
         );
+    }
+
+    /// Contract 1.255 (§4.240): the group row's removalStage rides the same
+    /// §4.50 appendix marker the terminated flag reads — the captured
+    /// `isMember: false` residual projects the official
+    /// `"justNotification"` word on the list face, the single-summary
+    /// (conversation.changed) face, and the wire; a healthy member row, a
+    /// pre-batch row, and every direct row answer the absent key
+    /// (pre-1.255 hosts read byte-identical rows). The terminated flag stays
+    /// its own independent face on the Gone stamp's two-word marker.
+    #[test]
+    fn removal_stage_projects_the_captured_member_word() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let left = store
+            .ensure_conversation(&account.id, "group", "bGVmdA==", "Left Group")
+            .unwrap();
+        let alive = store
+            .ensure_conversation(&account.id, "group", "YWxpdmU=", "Alive Group")
+            .unwrap();
+        let gone = store
+            .ensure_conversation(&account.id, "group", "Z29uZQ==", "Gone Group")
+            .unwrap();
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Alice")
+            .unwrap();
+
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "bGVmdA==",
+                "Left Group",
+                Some(r#"{"memberCount":3,"isMember":false}"#),
+                20,
+            )
+            .unwrap();
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "YWxpdmU=",
+                "Alive Group",
+                Some(r#"{"memberCount":4,"isMember":true}"#),
+                20,
+            )
+            .unwrap();
+        // The §4.167 Gone stamp's exact two-word shape: the legacy
+        // terminated face rides beside the member word.
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z29uZQ==",
+                "Gone Group",
+                Some(r#"{"isTerminated":true,"isMember":false}"#),
+                20,
+            )
+            .unwrap();
+        store
+            .upsert_contact(&account.id, "contact", "+15555550101", "Alice", None, 20)
+            .unwrap();
+
+        // List face: the member word maps to the official notification
+        // stage; the terminated flag stays independent on the same row.
+        let listed = store.list_conversations(&account.id, 10, None).unwrap();
+        let left_row = listed.items.iter().find(|row| row.id == left.id).unwrap();
+        let alive_row = listed.items.iter().find(|row| row.id == alive.id).unwrap();
+        let gone_row = listed.items.iter().find(|row| row.id == gone.id).unwrap();
+        let direct_row = listed.items.iter().find(|row| row.id == direct.id).unwrap();
+        assert_eq!(left_row.removal_stage.as_deref(), Some("justNotification"));
+        assert!(!left_row.is_terminated);
+        assert_eq!(alive_row.removal_stage, None);
+        assert_eq!(gone_row.removal_stage.as_deref(), Some("justNotification"));
+        assert!(gone_row.is_terminated);
+        assert_eq!(direct_row.removal_stage, None);
+
+        // Single-summary face (the conversation.changed payload): the same
+        // projection, so an event-driven window and a reload cannot disagree.
+        assert_eq!(
+            store
+                .conversation_summary(&account.id, &left.id)
+                .unwrap()
+                .unwrap()
+                .removal_stage
+                .as_deref(),
+            Some("justNotification")
+        );
+        assert_eq!(
+            store
+                .conversation_summary(&account.id, &gone.id)
+                .unwrap()
+                .unwrap()
+                .removal_stage
+                .as_deref(),
+            Some("justNotification")
+        );
+        assert_eq!(
+            store
+                .conversation_summary(&account.id, &alive.id)
+                .unwrap()
+                .unwrap()
+                .removal_stage,
+            None
+        );
+
+        // Wire shape: the stage serializes only when present — pre-1.255
+        // hosts read byte-identical rows.
+        let wire = serde_json::to_value(&*listed.items).unwrap();
+        for row in wire.as_array().unwrap() {
+            let stage = row.get("removalStage");
+            let expected = matches!(row["id"], ref id if *id == left.id || *id == gone.id);
+            assert_eq!(stage.is_some(), expected, "row {}", row["id"]);
+            if expected {
+                assert_eq!(stage, Some(&serde_json::json!("justNotification")));
+            }
+        }
+    }
+
+    /// Contract 1.256 (§4.241): the shared-group titles answer the official
+    /// reverse lookup from the captured rosters — a UUID-keyed direct row
+    /// matches through its service id, a phone-keyed row through its e164
+    /// (both §4.229 spellings), titles order by the group rows' sync
+    /// recency, the array caps at 32, group/self rows and contact group
+    /// rows answer absent, and an unmatched direct row answers the computed
+    /// empty array (the official EMPTY_ARRAY shape, never absence).
+    #[test]
+    fn shared_group_names_reverse_lookup_answers_the_engine_group_table() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let aci = "11111111-1111-4111-8111-111111111111";
+        let number = "+15555550102";
+
+        // Conversations: A uuid-keyed (in two groups), B phone-keyed (in
+        // one), the account's own row (self — never projects).
+        let conv_a = store
+            .ensure_conversation(&account.id, "direct", aci, "A")
+            .unwrap();
+        let conv_b = store
+            .ensure_conversation(&account.id, "direct", number, "B")
+            .unwrap();
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "Self")
+            .unwrap();
+
+        // Group cache rows: recency-controlled sync stamps — the newer
+        // group must answer first.
+        let entries = [
+            SyncedContact {
+                kind: "group",
+                peer_key: "oldLQ==",
+                title: "Old Group",
+                extra: Some(
+                    r#"{"memberCount":2,"members":[{"id":"22222222-2222-4222-8222-222222222222"},{"id":"11111111-1111-4111-8111-111111111111"}]}"#,
+                ),
+            },
+            SyncedContact {
+                kind: "group",
+                peer_key: "bmV3",
+                title: "New Group",
+                extra: Some(
+                    r#"{"memberCount":2,"members":[{"id":"11111111-1111-4111-8111-111111111111"},{"id":"+15555550102"}]}"#,
+                ),
+            },
+            SyncedContact {
+                kind: "contact",
+                peer_key: aci,
+                title: "A",
+                extra: None,
+            },
+            SyncedContact {
+                kind: "contact",
+                peer_key: number,
+                title: "B",
+                extra: None,
+            },
+        ];
+        store
+            .upsert_passive_contacts(&account.id, &entries, 200)
+            .unwrap();
+        // Re-stamp the old group with an earlier synced_at: the passive
+        // upsert is latest-wins, so stamp it first at 100 and the 200 batch
+        // above keeps it stale — order comes out new-first.
+        let stale = [SyncedContact {
+            kind: "group",
+            peer_key: "oldLQ==",
+            title: "Old Group",
+            extra: Some(
+                r#"{"memberCount":2,"members":[{"id":"22222222-2222-4222-8222-222222222222"},{"id":"11111111-1111-4111-8111-111111111111"}]}"#,
+            ),
+        }];
+        store
+            .upsert_passive_contacts(&account.id, &stale, 100)
+            .unwrap();
+
+        // List face: A answers [New Group, Old Group] (recency order), B
+        // answers [New Group] through the e164 spelling, the self row never
+        // projects, group rows never project.
+        let listed = store.list_conversations(&account.id, 20, None).unwrap();
+        let row_a = listed.items.iter().find(|row| row.id == conv_a.id).unwrap();
+        let row_b = listed.items.iter().find(|row| row.id == conv_b.id).unwrap();
+        assert_eq!(
+            row_a.shared_group_names,
+            Some(vec!["New Group".to_string(), "Old Group".to_string()])
+        );
+        assert_eq!(
+            row_b.shared_group_names,
+            Some(vec!["New Group".to_string()])
+        );
+        assert!(
+            listed
+                .items
+                .iter()
+                .filter(|row| row.kind == "group")
+                .all(|row| row.shared_group_names.is_none())
+        );
+        assert!(
+            listed
+                .items
+                .iter()
+                .filter(|row| row.is_self)
+                .all(|row| row.shared_group_names.is_none())
+        );
+
+        // Single-summary face: the same answer the list carries.
+        assert_eq!(
+            store
+                .conversation_summary(&account.id, &conv_a.id)
+                .unwrap()
+                .unwrap()
+                .shared_group_names,
+            Some(vec!["New Group".to_string(), "Old Group".to_string()])
+        );
+
+        // Contacts face: the contact rows carry the same titles, the group
+        // rows stay absent.
+        let contacts = store.list_contacts(&account.id, None, 20, None).unwrap();
+        let contact_a = contacts
+            .items
+            .iter()
+            .find(|row| row.kind == "contact" && row.peer_key == aci)
+            .unwrap();
+        assert_eq!(
+            contact_a.shared_group_names,
+            Some(vec!["New Group".to_string(), "Old Group".to_string()])
+        );
+        assert!(
+            contacts
+                .items
+                .iter()
+                .filter(|row| row.kind == "group")
+                .all(|row| row.shared_group_names.is_none())
+        );
+
+        // An unmatched direct row answers the computed empty array.
+        let stranger = store
+            .ensure_conversation(&account.id, "direct", "+15555550109", "Stranger")
+            .unwrap();
+        let row = store
+            .conversation_summary(&account.id, &stranger.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.shared_group_names, Some(Vec::new()));
+
+        // Wire shape: group rows and the self row carry no key.
+        let wire = serde_json::to_value(&*listed.items).unwrap();
+        for row in wire.as_array().unwrap() {
+            if row["type"] == "group" {
+                assert!(row.get("sharedGroupNames").is_none(), "row {}", row["id"]);
+            }
+        }
+
+        // The cap: 33 groups containing A project exactly 32 titles.
+        for index in 0..33 {
+            let peer = format!("Y2Fw{}=", index);
+            let extra = format!(r#"{{"memberCount":1,"members":[{{"id":"{aci}"}}]}}"#);
+            store
+                .upsert_contact(&account.id, "group", &peer, "Cap", Some(&extra), 20)
+                .unwrap();
+        }
+        let capped = store
+            .conversation_summary(&account.id, &conv_a.id)
+            .unwrap()
+            .unwrap()
+            .shared_group_names
+            .unwrap();
+        assert_eq!(capped.len(), 32);
+    }
+
+    /// Contract 1.257 (§4.242): the hidden bit rides the factor stamp
+    /// verbatim — present exactly when the stamp carries it, never derived
+    /// through the inSystemContacts inversion (which stays verbatim beside
+    /// it for the pre-1.257 consumers); group rows and unstamped rows stay
+    /// absent.
+    #[test]
+    fn hidden_bit_rides_verbatim_beside_the_inversion() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550103", "C")
+            .unwrap();
+        let group = store
+            .ensure_conversation(&account.id, "group", "Z3Jw", "Group")
+            .unwrap();
+
+        // No stamp yet: both faces absent (unknown, never invented).
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.hidden, None);
+        assert_eq!(summary.in_system_contacts, None);
+
+        // hidden=true: the bit rides verbatim; the inversion stays on its
+        // own face (inSystemContacts=false).
+        store
+            .set_conversation_mrr_factors_for_peer(
+                &account.id,
+                "+15555550103",
+                r#"{"hidden":true,"profileSharing":false,"blocked":false}"#,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.hidden, Some(true));
+        assert_eq!(summary.in_system_contacts, Some(false));
+
+        // hidden=false: verbatim false; the inversion answers true.
+        store
+            .set_conversation_mrr_factors_for_peer(
+                &account.id,
+                "+15555550103",
+                r#"{"hidden":false,"profileSharing":false,"blocked":false}"#,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.hidden, Some(false));
+        assert_eq!(summary.in_system_contacts, Some(true));
+
+        // Group rows: no factor stamp face, always absent.
+        let summary = store
+            .conversation_summary(&account.id, &group.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.hidden, None);
+        assert_eq!(summary.in_system_contacts, None);
+
+        // Wire shape: hidden serializes only when the stamp carries it.
+        let listed = store.list_conversations(&account.id, 10, None).unwrap();
+        let wire = serde_json::to_value(&*listed.items).unwrap();
+        for row in wire.as_array().unwrap() {
+            let expected = row["id"] == direct.id;
+            assert_eq!(row.get("hidden").is_some(), expected, "row {}", row["id"]);
+        }
     }
 
     fn test_store_key() -> StoreKey {
