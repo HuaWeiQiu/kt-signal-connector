@@ -82,6 +82,21 @@
   the avatar member of the group change word list); the refreshed or
   honestly-cleared projection rides `conversation.changed`. No wire
   removal anywhere: pre-1.258 hosts read every face byte-identically.)
+- Contract revision: 1.259 (2026-10-24; batch Z1 — S14 direct-identity
+  merge surface, §4.243, ledger §29.78. New: `Store::merge_peer_identity`
+  folds the number-keyed direct shell `(direct, number±spelling)` into the
+  canonical ACI-keyed row `(direct, aci)` at the two identity-bridge write
+  seams (§4.37 ingest, §4.144 contacts sync) — the official
+  combineConversations projection (message move with identity-tuple dedupe,
+  pick-when-undefined pins/drafts/avatar, more-restrictive expire timer,
+  watermark-recomputed unread conservation, MAX muted/pinned, no title
+  copy), the official three-arm notification gate minting the §4.235 A5
+  conversation-merge system row live (unread-silent, `threadMerge` family
+  key), and the `conversation_identity_merges` rollback ledger (the
+  §4.170 memo-ledger twin, disjoint PK). New transient host frame
+  `conversation.merged {accountId, fromConversationId, to}`; summaries and
+  stored rows byte-identical behind the fold; self-number shells stay the
+  memo family's (§4.170 untouched).)
 - Contract revision: 1.254 (2026-10-24; §4.38 the archive-import media
   face close-out — batch U, ledger §29.64: the engine's v2 export already
   projects `width`/`height` on every attachment line
@@ -19345,3 +19360,55 @@ pre-1.256 宿主逐字节同形。
 pre-1.257 宿主逐字节同形。
 **测试**：verbatim 三臂（true/false/无戳）+ 反演面不动钉形 + 群行缺席 +
 wire 缺席键钉形。
+
+---
+
+## §4.243 直聊身份合并面（同人双键行折叠 + A5 合并提示行 live 触发 · 契约 1.259 · 批 Z1 · S14 · 台账 §29.78）
+
+**结构差（§29.77 S14）**：同一人的直聊双行并存——contacts 材料按号码键
+（§6.5/§4.122 同步 number 优先），sealed-sender 收路按 ACI 键建行（§4.37
+信封普遍无 legacy source，梯落 sourceUuid 臂）；§4.229 只把 JOIN 归一，
+两行仍并行（发号建行 / 存量行再加一条）。官方对同一形状的动作是
+**combineConversations**（合并请求排队语义：`combineConversations` 即
+`#_combineConversationsQueue.add(...)` 的逐个合并请求消费）。
+
+**官方对位（Signal-Desktop v8.31.0-alpha.1，只读零抄码）**：
+
+| 官方 | 锚 | 我方（1.259） |
+|---|---|---|
+| 同人判定 | `maybeMergeContacts` aci/e164/pni matches（ConversationController.preload.ts:730-1091）；`checkForConflicts` 三 map 扫描（:1093-1278） | `peer_identities` 桥（§4.37/§4.144 写下）绑定落点即时探测：`(direct, 号码±拼法)` × `(direct, aci)` 双行判定（每绑定点一探，非全表扫） |
+| 合并动作 | `#doCombineConversations`（:1288-1515） | `Store::merge_peer_identity`（单事务折叠，号码行 → ACI 行） |
+| 消息迁移 | `migrateConversationMessages`（:1467-1473） | signal-identity 元组去重搬移（§4.170 memo fold 同款 SQL；id 恒不变，side-ref 不失效），余行随壳删除 |
+| dataToCopy 缺位才搬 | pick 列表（:1360-1392） | pins/drafts/头像字节仅缺位搬移；mrr 因子 / 三色面 COALESCE 缺位补 |
+| 消息定时消失取更紧 | :1349-1356（小者胜，缺则取对侧） | MIN 臂同构（NULL→对侧；双有→MIN） |
+| 置顶归并 | obsolete.isPinned → current.pin() iff !current.isPinned（:1394-1400） | `pinned = MAX`（等价面）；muted 同 MAX（§4.170 连续性，官方 pick 列表无 muted 键记档） |
+| active_at 取大 | :1315-1324 | `last_message_at` MAX + preview CASE（§4.170 同款） |
+| 读态保持存活行 | pick 列表无读态键 | 未读/提及按存活行水位重算（本仓不变式「incoming ∧ sent_at > 水位」），徽标守恒不折损 |
+| 标题不搬运 | pick 列表无 title 键 | 同构：canonical 标题不动（§4.229 读面 + contacts 行自愈命名材料） |
+| 屏蔽态继承 | :1333-1347 | 记档：KT 会话行无 blocked 位（§4.131 因子戳在 mrr 戳内，随 COALESCE 缺位补语义行走） |
+| 协议侧清理（sessions/identity/GV1 成员换键） | :1419-1443 | 记档 N/A：KT 无本地 session/identity per-conversation 态、无 GV1 |
+| 选中重定向 | obsolete 选中 → showConversation(current)（:1475-1482） | `conversation.merged` 帧消费臂 selection redirect（桌面半） |
+| 合并提示行闸 | titleIsUseful ∧ private ∧ 双侧有消息（:1499-1512） | 同三臂：`title_is_useful`（掩码/占位孪生判）∧ 双 direct ∧ 双侧行数 > 0；缺一静默折叠不落行 |
+| 提示行铸造 | `addConversationMerge`（conversations.preload.ts:3478-3505，type conversation-merge、readStatus Read 不抬未读） | live 系统行（direction/status system，idempotent 键携 `threadMerge` 族词，与 §4.235 档案面同族同键形），`insert` 零未读 bump |
+| 提示行词面 | selector `getPropsForConversationMerge`（message.preload.ts:2026-2045） | §4.235 两键：`obsoleteConversationTitle` = 壳行标题（有用的场合）、`obsoleteConversationNumber` = 壳行号码 `+E164` 归一 |
+| storage 删除调度 | obsolete storageID → pending delete（:1453-1465） | `conversation_identity_merges` 台账行（壳快照 + dropped ids，PK(account, obsolete_peer_key)，operator 回滚面；§4.170 memo 台账孪生，两族互不覆盖） |
+
+**触发缝（两处，绑定写点即发现时刻）**：① 收路 §4.37
+`upsert_peer_identity` 后（:10447 区）——绑定新落时壳行若在则折叠，刚落
+行随折叠换键（id 不变），upserted 帧携 canonical 行 id；② 同步 §4.144
+`apply_sync_contacts`——先写面（骨架/标题梯走完）后逐绑定折叠，被折叠壳
+行的 changed 事件过滤，`conversation.merged` 携 fresh canonical 摘要。
+幂等：折叠后壳行不在，重复绑定写零折叠零事件；号码=自己 `signal_account`
+归 §4.170 memo 族，本面绝不触碰。两种号码拼法（§4.144 ± 形）都探壳，
+单次单折，余拼法随下次同步绑定重写收敛。
+
+**wire**：新瞬态帧 `conversation.merged {accountId, fromConversationId,
+to: summary}`（host lane；丢帧靠下次列表读自愈——壳行不再应答）。摘要/
+行面零改动：A5 词面 = §4.235 既有两键，档案行逐字节同形。pre-1.259
+宿主：帧不识别即降级 connector-event（形状闸纪律），存量面零变化。
+
+**测试**：折叠行数守恒（2 行→1 行）+ 消息归属/去重（同元组重叠单份存活）
++ 未读守恒（水印对齐和守恒；水位下已读行不虚涨）+ pins/drafts 缺位才搬 +
+定时消失 MIN 臂 + A5 闸三臂（双侧有消息 × 有用标题 × 直聊；掩码壳静默）+
+自我号码排除（memo 族不碰）+ 幂等重放零事件 + 收路缝（落行换键 +
+notice/merged 帧序）+ 同步缝（死行 changed 过滤）。

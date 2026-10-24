@@ -407,6 +407,18 @@ CREATE TABLE IF NOT EXISTS memo_migrations (
   migrated_at INTEGER NOT NULL,
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
+-- 契约 1.259（§4.243 · 批 Z1 · S14）：直聊身份合并台账——号码键行折叠进
+-- ACI 键行时的 shell 快照（§4.170 memo_migrations 的同人对端孪生面；
+-- PK(account, obsolete_peer_key) 与 memo 面的 PK(account) 各管一族互不覆盖）。
+CREATE TABLE IF NOT EXISTS conversation_identity_merges (
+  account_id TEXT NOT NULL,
+  obsolete_peer_key TEXT NOT NULL,
+  canonical_aci TEXT NOT NULL,
+  rollback_json TEXT NOT NULL,
+  merged_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, obsolete_peer_key),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS peer_identities (
   account_id TEXT NOT NULL,
   aci TEXT NOT NULL,
@@ -2673,7 +2685,7 @@ pub struct AccountDeleteReceipt {
 /// Rows one account deletion counts and removes. Every table carries
 /// `account_id`; `message_receipts` is counted through its message row
 /// because it is message-scoped rather than account-scoped.
-const ACCOUNT_DELETE_TABLES: [&str; 12] = [
+const ACCOUNT_DELETE_TABLES: [&str; 13] = [
     "messages",
     "conversations",
     "contacts",
@@ -2683,10 +2695,23 @@ const ACCOUNT_DELETE_TABLES: [&str; 12] = [
     "conversation_drafts",
     "memo_migrations",
     "peer_identities",
+    "conversation_identity_merges",
     "history_imports",
     "history_import_stage_recipients",
     "history_import_stage_chats",
 ];
+
+/// One completed direct-identity fold (contract 1.259, §4.243): the
+/// number-keyed shell row is gone, its material lives under the canonical
+/// ACI-keyed row. `canonical_summary` is the fresh post-fold read (the
+/// conversation_summary posture the memo fold answers); the optional notice
+/// is the live A5 conversation-merge system row minted into the canonical
+/// conversation when the official notification gate fired.
+pub struct PeerIdentityMergeOutcome {
+    pub canonical_summary: ConversationSummary,
+    pub obsolete_conversation_id: String,
+    pub merge_notice: Option<MessageRecord>,
+}
 
 /// Contract 1.197 (§4.197, ADR 0007): a fixed-size pool of read-only
 /// SQLCipher connections over the same store file.
@@ -3544,6 +3569,518 @@ impl Store {
         // mutex and would self-deadlock — release the lock first.
         drop(conn);
         self.conversation_summary(account_id, &canonical_id)
+    }
+
+    /// Contract 1.259 (§4.243, batch Z1 · S14): fold the number-keyed direct
+    /// shell `(direct, number)` into the canonical ACI-keyed row
+    /// `(direct, aci)` the moment the identity bridge holds that binding —
+    /// the peer-side twin of [`Self::normalize_memo_identity`] and our
+    /// projection of the official combineConversations action
+    /// (Signal-Desktop ConversationController.preload.ts:1288-1515, read-only
+    /// anchor). One person, two rows (§4.229: the contacts material keys on
+    /// the number, the sealed-sender receive chain §4.37 keys on the ACI)
+    /// collapse into the ACI row; the number row dies; an operator-rollback
+    /// snapshot rides the `conversation_identity_merges` ledger.
+    ///
+    /// Every guard miss answers `None` and writes nothing — idempotent on
+    /// replay, because a folded account has no shell row left:
+    /// * degenerate binding (`aci == number`, the redirect face);
+    /// * the number is the account's own `signal_account` — that shell
+    ///   belongs to the memo family (§4.170), never folded here;
+    /// * canonical row absent (number-only peer), or obsolete row absent
+    ///   (aci-only peer) — one row, nothing to fold. Both number spellings
+    ///   (`+`-prefixed and bare, §4.144) are probed for the shell; one fold
+    ///   per call, the remaining spelling converges on the next binding
+    ///   rewrite (every contacts sync rewrites the bridge row).
+    ///
+    /// Merge arms (official anchor → arm):
+    /// * messages move deduplicated by the signal-identity tuple, leftovers
+    ///   deleted (official `migrateConversationMessages`,
+    ///   ConversationController.preload.ts:1467-1473); ids never change so
+    ///   id-keyed side references stay valid;
+    /// * reactions move under their own unique tuple;
+    /// * pins and drafts move only when the canonical row lacks them (the
+    ///   official `dataToCopy` pick-when-undefined list :1360-1392; the pin
+    ///   face :1394-1400 `obsolete.isPinned → current.pin()` is the same
+    ///   MAX);
+    /// * the avatar bytes move only into an avatar-less canonical row (local
+    ///   bytes, zero upstream traffic; the official combine drops the
+    ///   obsolete face and the next read refetches — KT keeps the visible
+    ///   face without a round trip);
+    /// * unread/mentions recompute from the surviving row's read watermark
+    ///   over the moved union — the store's own unread invariant ("a row is
+    ///   unread iff it is incoming with `sent_at > watermark`"), which
+    ///   conserves the badge across the fold (the official merge keeps the
+    ///   surviving row's read state, :1360-1392 carries no read-state key);
+    /// * the expire timer keeps the more restrictive arm (official
+    ///   :1349-1356: the smaller non-null timer, the canonical row's own
+    ///   when it lacks one);
+    /// * mrr factors and the three conversation-color faces fill absent
+    ///   canonical faces only (the pick-when-undefined posture);
+    /// * the title is NOT copied (the pick list carries no title; naming
+    ///   material self-heals through the §4.229 read face and the surviving
+    ///   contacts row);
+    /// * last-message time/preview max-fold (official `active_at = max`,
+    ///   :1315-1324);
+    /// * muted/pinned max-fold (§4.170 continuity; pinned is exactly the
+    ///   official :1394-1400 face);
+    /// * the official notification gate (:1499-1512) — private type (both
+    ///   rows are direct), both rows had messages, and the obsolete title is
+    ///   useful — must all hold before the A5 conversation-merge notice is
+    ///   minted into the canonical conversation (official
+    ///   `addConversationMerge`, conversations.preload.ts:3478-3505: a
+    ///   read-status-Read system row, unread-silent; the wire face is the
+    ///   §4.235 two-key projection with the live title in the title key).
+    pub fn merge_peer_identity(
+        &self,
+        account_id: &str,
+        aci: &str,
+        number_peer_key: &str,
+    ) -> Result<Option<PeerIdentityMergeOutcome>, StoreError> {
+        let map_err = |error: rusqlite::Error| StoreError::Unavailable(Some(error));
+        if aci == number_peer_key {
+            return Ok(None);
+        }
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+
+        // The memo family owns the account's own number shell (§4.170); the
+        // peer fold never touches it.
+        let signal_account: String = tx
+            .query_row(
+                "SELECT signal_account FROM accounts WHERE id=?1",
+                params![account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .ok_or(StoreError::AccountNotFound)?;
+        if number_peer_key == signal_account {
+            return Ok(None);
+        }
+
+        // The shell: the number row under either spelling (§4.144 two forms),
+        // exact form first (the common case).
+        let mut shell: Option<(String, String)> = None; // (id, peer_key)
+        let mut candidates = vec![number_peer_key.to_string()];
+        if let Some(alternate) = alternate_phone_spelling(number_peer_key) {
+            candidates.push(alternate);
+        }
+        for key in &candidates {
+            let row = tx
+                .query_row(
+                    "SELECT id FROM conversations
+                     WHERE account_id=?1 AND kind='direct' AND peer_key=?2",
+                    params![account_id, key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_err)?;
+            if let Some(id) = row {
+                shell = Some((id, key.clone()));
+                break;
+            }
+        }
+        let Some((shell_id, shell_key)) = shell else {
+            return Ok(None);
+        };
+        let canonical_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM conversations
+                 WHERE account_id=?1 AND kind='direct' AND peer_key=?2",
+                params![account_id, aci],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some(canonical_id) = canonical_id else {
+            return Ok(None);
+        };
+        if shell_id == canonical_id {
+            return Ok(None);
+        }
+
+        // The official notification gate reads both sides' message counts
+        // before the move (:1358 `currentHadMessages`, :1448
+        // `obsoleteHadMessages`), plus the shell's title and state for the
+        // ledger snapshot and the notice face.
+        let count_messages = |conversation_id: &str| -> Result<i64, StoreError> {
+            tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![conversation_id],
+                |row| row.get(0),
+            )
+            .map_err(map_err)
+        };
+        let shell_had_messages = count_messages(&shell_id)? > 0;
+        let canonical_had_messages = count_messages(&canonical_id)? > 0;
+        let (shell_title, shell_unread, shell_mentions, shell_muted, shell_pinned): (
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = tx
+            .query_row(
+                "SELECT title, unread_count, unread_mentions, muted, pinned
+                 FROM conversations WHERE id=?1",
+                params![shell_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .map_err(map_err)?;
+        let shell_expire: Option<i64> = tx
+            .query_row(
+                "SELECT expire_timer_seconds FROM conversations WHERE id=?1",
+                params![shell_id],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        let shell_mrr: Option<String> = tx
+            .query_row(
+                "SELECT mrr_factors_json FROM conversations WHERE id=?1",
+                params![shell_id],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        let (shell_color, shell_custom_color, shell_custom_color_id): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = tx
+            .query_row(
+                "SELECT conversation_color, custom_color, custom_color_id
+                 FROM conversations WHERE id=?1",
+                params![shell_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(map_err)?;
+        let (shell_last_at, shell_last_preview): (Option<i64>, Option<String>) = tx
+            .query_row(
+                "SELECT last_message_at, last_message_preview FROM conversations
+                 WHERE id=?1",
+                params![shell_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(map_err)?;
+
+        // Messages move deduplicated by the signal-identity tuple (the table
+        // carries no unique constraint — the NOT EXISTS guard is the dedupe);
+        // what would duplicate stays shell-side and is deleted, the canonical
+        // copy winning. Message ids never change, so id-keyed side references
+        // stay valid; a deleted duplicate takes its edit history along (the
+        // edits FK cascades). (§4.170 fold posture; official
+        // migrateConversationMessages.)
+        tx.execute(
+            "UPDATE messages SET conversation_id=?2
+             WHERE conversation_id=?1
+               AND NOT EXISTS (SELECT 1 FROM messages other
+                 WHERE other.conversation_id=?2
+                   AND other.account_id=messages.account_id
+                   AND other.direction=messages.direction
+                   AND other.sent_at=messages.sent_at
+                   AND other.sender_id=messages.sender_id)",
+            params![shell_id, canonical_id],
+        )
+        .map_err(map_err)?;
+        let dropped_message_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM messages WHERE conversation_id=?1")
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(params![shell_id], |row| row.get::<_, String>(0))
+                .map_err(map_err)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(map_err)?
+        };
+        tx.execute(
+            "DELETE FROM messages WHERE conversation_id=?1",
+            params![shell_id],
+        )
+        .map_err(map_err)?;
+
+        // Reactions move under the same guard on their own unique tuple —
+        // the table's conversation FK has no cascade, so clearing the
+        // shell-side leftovers is what keeps the shell row deletable.
+        tx.execute(
+            "UPDATE message_events SET conversation_id=?2
+             WHERE conversation_id=?1
+               AND NOT EXISTS (SELECT 1 FROM message_events other
+                 WHERE other.conversation_id=?2
+                   AND other.account_id=message_events.account_id
+                   AND other.kind=message_events.kind
+                   AND other.target_timestamp=message_events.target_timestamp
+                   AND other.actor_id=message_events.actor_id)",
+            params![shell_id, canonical_id],
+        )
+        .map_err(map_err)?;
+        let dropped_event_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM message_events WHERE conversation_id=?1")
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(params![shell_id], |row| row.get::<_, String>(0))
+                .map_err(map_err)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(map_err)?
+        };
+        tx.execute(
+            "DELETE FROM message_events WHERE conversation_id=?1",
+            params![shell_id],
+        )
+        .map_err(map_err)?;
+
+        // Pins, drafts and the avatar face move when the canonical row lacks
+        // them (the official pick-when-undefined posture); the shell's
+        // leftovers cascade away with the shell.
+        for table in [
+            "conversation_pins",
+            "conversation_drafts",
+            "conversation_avatars",
+        ] {
+            tx.execute(
+                &format!(
+                    "UPDATE {table} SET conversation_id=?2
+                     WHERE conversation_id=?1
+                       AND NOT EXISTS (SELECT 1 FROM {table} other
+                         WHERE other.account_id={table}.account_id
+                           AND other.conversation_id=?2)"
+                ),
+                params![shell_id, canonical_id],
+            )
+            .map_err(map_err)?;
+        }
+
+        // State merge, shell → canonical. Every SET reads the pre-update row
+        // (the §4.170 discipline); the unread counters recompute from the
+        // surviving row's read watermark over the moved union — the store's
+        // unread invariant — so the badge is conserved, never maxed away;
+        // the expire timer keeps the more restrictive non-null arm (official
+        // :1349-1356); the pick faces fill absent canonical faces only.
+        tx.execute(
+            "UPDATE conversations SET
+               muted = MAX(muted, ?2),
+               pinned = MAX(pinned, ?3),
+               expire_timer_seconds = CASE
+                 WHEN expire_timer_seconds IS NULL THEN ?4
+                 WHEN ?4 IS NULL THEN expire_timer_seconds
+                 ELSE MIN(expire_timer_seconds, ?4) END,
+               mrr_factors_json = COALESCE(mrr_factors_json, ?5),
+               conversation_color = COALESCE(conversation_color, ?6),
+               custom_color = COALESCE(custom_color, ?7),
+               custom_color_id = COALESCE(custom_color_id, ?8),
+               last_message_at = CASE
+                 WHEN last_message_at IS NULL THEN ?9
+                 WHEN ?9 IS NULL THEN last_message_at
+                 ELSE MAX(last_message_at, ?9) END,
+               last_message_preview = CASE
+                 WHEN ?9 IS NULL THEN last_message_preview
+                 WHEN last_message_at IS NULL THEN ?10
+                 WHEN ?9 > last_message_at THEN ?10
+                 ELSE last_message_preview END,
+               unread_count = (
+                 SELECT COUNT(*) FROM messages m
+                  WHERE m.conversation_id=conversations.id
+                    AND m.account_id=conversations.account_id
+                    AND m.direction='incoming'
+                    AND m.sent_at > COALESCE(conversations.read_watermark_ms, 0)),
+               unread_mentions = (
+                 SELECT COUNT(*) FROM messages m
+                  WHERE m.conversation_id=conversations.id
+                    AND m.account_id=conversations.account_id
+                    AND m.direction='incoming'
+                    AND m.mentions_self=1
+                    AND m.sent_at > COALESCE(conversations.read_watermark_ms, 0))
+             WHERE id=?11",
+            params![
+                shell_id,
+                shell_muted,
+                shell_pinned,
+                shell_expire,
+                shell_mrr,
+                shell_color,
+                shell_custom_color,
+                shell_custom_color_id,
+                shell_last_at,
+                shell_last_preview,
+                canonical_id,
+            ],
+        )
+        .map_err(map_err)?;
+
+        // The official notification gate (:1499-1512): both sides had
+        // messages and the shell title is useful (unmasked display material)
+        // before a notice is minted — a masked-shell or one-sided fold is
+        // silent, exactly the official posture.
+        let merge_notice =
+            if shell_had_messages && canonical_had_messages && title_is_useful(&shell_title) {
+                let sent_at = crate::link::now_ms();
+                let sender_id = canonical_id.clone();
+                let message_id = stable_hash_id(&[
+                    "signal-message-v2",
+                    account_id,
+                    &canonical_id,
+                    "threadMerge",
+                    &sent_at.to_string(),
+                ]);
+                // The wire word is the `+`-prefixed E.164 form (§4.235's wire
+                // word shape): a bare-digit shell key gains the prefix, a
+                // `+`-prefixed one rides verbatim, a non-phone key stays
+                // verbatim (never invented).
+                let wire_number = if !shell_key.starts_with('+')
+                    && !shell_key.is_empty()
+                    && shell_key.chars().all(|c| c.is_ascii_digit())
+                {
+                    format!("+{shell_key}")
+                } else {
+                    shell_key.clone()
+                };
+                let text = format!("已合并与 {wire_number} 的会话记录");
+                Some(MessageRecord {
+                    is_erased: false,
+                    delete_failed: false,
+                    required_protocol_version: None,
+                    author_aci: None,
+                    id: message_id,
+                    account_id: account_id.to_string(),
+                    conversation_id: canonical_id.clone(),
+                    direction: "system",
+                    sender_id,
+                    sender_name: None,
+                    mentions_self: false,
+                    sent_at,
+                    received_at: Some(crate::link::now_ms()),
+                    text: Some(text.clone()),
+                    text_bytes: Some(text.len().min(u32::MAX as usize) as u32),
+                    text_truncated: false,
+                    text_retrievable: true,
+                    status: "system",
+                    client_request_id: None,
+                    quote_message_id: None,
+                    quote_snapshot: None,
+                    quote: None,
+                    attachments: Vec::new(),
+                    rich: Some(crate::engine::NormalizedRich {
+                        conversation_merge: Some(crate::engine::NormalizedConversationMerge {
+                            obsolete_conversation_title: Some(shell_title.clone()),
+                            obsolete_conversation_number: Some(wire_number),
+                        }),
+                        ..Default::default()
+                    }),
+                    edited_at: None,
+                    reactions: Vec::new(),
+                    edits: Vec::new(),
+                    delivered_at: None,
+                    read_at: None,
+                    viewed_at: None,
+                    send_outcomes: None,
+                    admin_deleted: false,
+                    sticker: None,
+                    // 提示行不参与清扫（§4.41 同款纪律）：期限列恒 NULL。
+                    expire_seconds: None,
+                    expire_start_at: None,
+                    server_guid: None,
+                    server_timestamp: None,
+                    is_story: false,
+                    story_message: None,
+                })
+            } else {
+                None
+            };
+        if let Some(record) = merge_notice.as_ref() {
+            // insert_message keeps every derived face consistent (preview,
+            // last-message columns); the unread bump stays off — the official
+            // notice is born read (conversations.preload.ts:3496
+            // readStatus: Read).
+            let record = record.clone();
+            tx.execute(
+                "INSERT INTO messages(id, account_id, conversation_id, direction,
+                   sender_id, sent_at, received_at, stored_at, body, body_bytes,
+                   body_truncated, status, rich_json)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12)
+                 ON CONFLICT(id) DO NOTHING",
+                params![
+                    record.id,
+                    record.account_id,
+                    record.conversation_id,
+                    record.direction,
+                    record.sender_id,
+                    record.sent_at as i64,
+                    record.received_at.map(|value| value as i64),
+                    crate::link::now_ms() as i64,
+                    record.text,
+                    record.text_bytes.map(|value| value as i64),
+                    record.status,
+                    record
+                        .rich
+                        .as_ref()
+                        .and_then(|rich| serde_json::to_string(rich).ok()),
+                ],
+            )
+            .map_err(map_err)?;
+        }
+
+        // The shell snapshot rides the ledger before the row goes away (the
+        // operator rollback affordance the memo fold established).
+        let obsolete_conversation_id = shell_id.clone();
+        let shell_snapshot = json!({
+            "id": shell_id,
+            "peerKey": shell_key,
+            "canonicalAci": aci,
+            "title": shell_title,
+            "unreadCount": shell_unread,
+            "unreadMentions": shell_mentions,
+            "muted": shell_muted,
+            "pinned": shell_pinned,
+            "expireTimerSeconds": shell_expire,
+            "mrrFactorsJson": shell_mrr,
+            "lastMessageAt": shell_last_at,
+            "lastMessagePreview": shell_last_preview,
+            "droppedMessageIds": dropped_message_ids,
+            "droppedEventIds": dropped_event_ids,
+            "noticeMinted": merge_notice.is_some(),
+        });
+        tx.execute(
+            "INSERT INTO conversation_identity_merges(account_id, obsolete_peer_key,
+               canonical_aci, rollback_json, merged_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(account_id, obsolete_peer_key) DO UPDATE SET
+               canonical_aci=excluded.canonical_aci,
+               rollback_json=excluded.rollback_json,
+               merged_at=excluded.merged_at",
+            params![
+                account_id,
+                number_peer_key,
+                aci,
+                shell_snapshot.to_string(),
+                crate::link::now_ms() as i64,
+            ],
+        )
+        .map_err(map_err)?;
+
+        tx.execute("DELETE FROM conversations WHERE id=?1", params![shell_id])
+            .map_err(map_err)?;
+        tx.commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // The guard is a Drop type and would otherwise live to the end of
+        // the function: the summary read below re-locks the same connection
+        // mutex and would self-deadlock — release the lock first.
+        drop(conn);
+        let canonical_summary = self
+            .conversation_summary(account_id, &canonical_id)?
+            .ok_or(StoreError::AccountNotFound)?;
+        Ok(Some(PeerIdentityMergeOutcome {
+            canonical_summary,
+            obsolete_conversation_id,
+            merge_notice,
+        }))
     }
 
     pub fn prepare_account_delete(
@@ -12485,6 +13022,16 @@ fn contacts_material_at(
         .then(|| trimmed.to_owned());
     Some((system_name, extra_username(row.1.as_deref())))
 }
+/// The useful-title judgment the identity-merge notice gate needs (contract
+/// 1.259, §4.243 — the official `titleIsUseful` boolean): the same masked /
+/// placeholder twins [`title_should_upgrade`] applies — a masked peer id or a
+/// bare placeholder word is not display material, and the official gate
+/// refuses the merge notice when the obsolete side has no useful title.
+fn title_is_useful(title: &str) -> bool {
+    let trimmed = title.trim();
+    !trimmed.is_empty() && !trimmed.contains("***") && trimmed != "group" && trimmed != "contact"
+}
+
 /// Prefer real display names over masked peer ids / placeholders.
 fn title_should_upgrade(current: &str, candidate: &str) -> bool {
     let cand = candidate.trim();
@@ -15838,6 +16385,550 @@ mod tests {
             (first_stamp, first_rollback),
             (second_stamp, second_rollback),
             "the ledger is untouched by a no-op run"
+        );
+    }
+
+    /// Contract 1.259 (§4.243, batch Z1 · S14): the peer-side fold — the
+    /// number-keyed shell collapses into the ACI-keyed row with the row
+    /// count 2 → 1, the message union deduplicated with ids stable, unread
+    /// conserved (not maxed), pins/drafts moved, and the A5 notice minted
+    /// into the canonical conversation when the official three-arm gate
+    /// holds (both sides had messages, the shell title useful). The notice
+    /// itself never raises the badge (the official readStatus: Read).
+    #[test]
+    fn peer_identity_merge_folds_the_number_shell_into_the_aci_row() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let aci = canonical_aci("18E2E00B2AC755ECA25DD5646A80C042").unwrap();
+        let shell = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer Name")
+            .unwrap();
+        let canonical = store
+            .ensure_conversation(&account.id, "direct", &aci, "8fc***e2")
+            .unwrap();
+        assert_ne!(shell.id, canonical.id, "two keys, two rows before the fold");
+
+        seed_memo_message(
+            &store,
+            &account.id,
+            &shell.id,
+            "m-shell-1",
+            "incoming",
+            "shell-sender",
+            1_000,
+        );
+        seed_memo_message(
+            &store,
+            &account.id,
+            &shell.id,
+            "m-shell-2",
+            "incoming",
+            "shell-sender",
+            2_000,
+        );
+        seed_memo_message(
+            &store,
+            &account.id,
+            &canonical.id,
+            "m-canonical-1",
+            "outgoing",
+            "self",
+            3_000,
+        );
+        store
+            .append_conversation_pin(
+                &account.id,
+                &shell.id,
+                "shell-sender",
+                1_000,
+                1_700_000_000_000,
+                None,
+            )
+            .unwrap();
+        store
+            .save_conversation_draft(&account.id, &shell.id, 6_000)
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET unread_count=2, unread_mentions=1,
+                        last_message_at=2000, last_message_preview='shell newest'
+                  WHERE id=?1",
+                params![shell.id],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET unread_count=1 WHERE id=?1",
+                params![canonical.id],
+            )
+            .unwrap();
+        store
+            .upsert_peer_identity(&account.id, &aci, "+15555550101")
+            .unwrap();
+
+        let outcome = store
+            .merge_peer_identity(&account.id, &aci, "+15555550101")
+            .unwrap()
+            .expect("both rows present: the fold answers");
+
+        // The shell row is gone; one row remains under the ACI key.
+        assert_eq!(outcome.canonical_summary.id, canonical.id);
+        assert_eq!(outcome.obsolete_conversation_id, shell.id);
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", "+15555550101")
+                .unwrap()
+                .is_none(),
+        );
+        let folded = store
+            .conversation_summary(&account.id, &canonical.id)
+            .unwrap()
+            .unwrap();
+        // Unread conservation: the union's incoming rows (the watermark is
+        // NULL here = everything incoming counts) — the shell's two incoming
+        // rows conserve; the canonical lone row is outgoing and never counts.
+        assert_eq!(folded.unread_count, 2, "the badge conserves, never maxes");
+        // The A5 notice: minted, unread-silent, carrying the two-key face.
+        let notice = outcome
+            .merge_notice
+            .expect("the gate holds: both had messages and the shell title is useful");
+        assert_eq!(notice.direction, "system");
+        assert_eq!(notice.status, "system");
+        assert_eq!(notice.conversation_id, canonical.id);
+        let rich = notice.rich.expect("the A5 face rides rich");
+        let merge = rich.conversation_merge.expect("the conversationMerge face");
+        assert_eq!(
+            merge.obsolete_conversation_title.as_deref(),
+            Some("Peer Name")
+        );
+        assert_eq!(
+            merge.obsolete_conversation_number.as_deref(),
+            Some("+15555550101")
+        );
+        let stored: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE id=?1 AND conversation_id=?2",
+                params![notice.id, canonical.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1, "the notice is persisted under the canonical row");
+        assert_eq!(
+            folded.unread_count, 2,
+            "the notice never raises the badge (readStatus: Read)"
+        );
+        // Pins and drafts moved with the fold.
+        let moved: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_pins WHERE conversation_id=?1",
+                params![canonical.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved, 1);
+        let draft: Option<i64> = store
+            .conn()
+            .query_row(
+                "SELECT draft_timestamp FROM conversation_drafts WHERE conversation_id=?1",
+                params![canonical.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(draft, Some(6_000));
+        // Messages: all three, none left shell-side.
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![canonical.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 4, "three seeded rows plus the minted notice");
+        // The peer ledger records the fold.
+        let rollback: String = store
+            .conn()
+            .query_row(
+                "SELECT rollback_json FROM conversation_identity_merges
+                 WHERE account_id=?1 AND obsolete_peer_key='+15555550101'",
+                params![account.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let snapshot: Value = serde_json::from_str(&rollback).unwrap();
+        assert_eq!(snapshot["id"], shell.id.as_str());
+        assert_eq!(snapshot["noticeMinted"], json!(true));
+    }
+
+    /// Contract 1.259 (§4.243): the unread counters recompute from the
+    /// surviving row's read watermark over the moved union — the store's own
+    /// invariant — so rows the shell already read (its watermark above them)
+    /// never inflate the surviving badge, and the mention badge recomputes
+    /// on the same clock.
+    #[test]
+    fn peer_identity_merge_recomputes_unread_from_the_surviving_watermark() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let aci = canonical_aci("18E2E00B2AC755ECA25DD5646A80C042").unwrap();
+        let shell = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let canonical = store
+            .ensure_conversation(&account.id, "direct", &aci, "Peer")
+            .unwrap();
+        // Shell rows: one read under its watermark (sent_at below), one
+        // unread above it; the canonical row's watermark sits above its own
+        // incoming row (read there).
+        seed_memo_message(
+            &store,
+            &account.id,
+            &shell.id,
+            "m-shell-read",
+            "incoming",
+            "peer",
+            1_000,
+        );
+        seed_memo_message(
+            &store,
+            &account.id,
+            &shell.id,
+            "m-shell-unread",
+            "incoming",
+            "peer",
+            5_000,
+        );
+        seed_memo_message(
+            &store,
+            &account.id,
+            &canonical.id,
+            "m-canonical-read",
+            "incoming",
+            "peer",
+            2_000,
+        );
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET read_watermark_ms=1000, unread_count=1,
+                        unread_mentions=1 WHERE id=?1",
+                params![shell.id],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET read_watermark_ms=2000 WHERE id=?1",
+                params![canonical.id],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET mentions_self=1 WHERE id='m-shell-unread'",
+                [],
+            )
+            .unwrap();
+        store
+            .upsert_peer_identity(&account.id, &aci, "+15555550101")
+            .unwrap();
+
+        let outcome = store
+            .merge_peer_identity(&account.id, &aci, "+15555550101")
+            .unwrap()
+            .expect("the fold answers");
+        let folded = outcome.canonical_summary;
+        // Conserved by the watermark union: the shell's read row stays read
+        // (its watermark carried the read), the unread row and the already-
+        // unread canonical window count — never the raw column sum 1+0, and
+        // never the MAX 1.
+        assert_eq!(folded.unread_count, 1);
+        assert_eq!(folded.unread_mentions, 1, "the mention badge recomputes");
+    }
+
+    /// Contract 1.259 (§4.243): the guard arms — one-sided rows, the self
+    /// number, the degenerate binding, and a masked shell title (the fold
+    /// runs, the notice stays silent — the official titleIsUseful gate); and
+    /// the replay after a fold is a no-op that answers None.
+    #[test]
+    fn peer_identity_merge_guard_arms_stay_silent_or_noop() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let aci = canonical_aci("18E2E00B2AC755ECA25DD5646A80C042").unwrap();
+
+        // Number-only peer: no canonical row, nothing folds.
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550103", "Lone")
+            .unwrap();
+        assert!(
+            store
+                .merge_peer_identity(&account.id, &aci, "+15555550103")
+                .unwrap()
+                .is_none(),
+        );
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", "+15555550103")
+                .unwrap()
+                .is_some(),
+            "the one-sided row survives a no-op probe"
+        );
+
+        // ACI-only peer: no shell, nothing folds.
+        store
+            .ensure_conversation(&account.id, "direct", &aci, "Aci Only")
+            .unwrap();
+        assert!(
+            store
+                .merge_peer_identity(&account.id, &aci, "+15555550104")
+                .unwrap()
+                .is_none(),
+        );
+
+        // Degenerate binding: the redirect face answers None.
+        assert!(
+            store
+                .merge_peer_identity(&account.id, &aci, &aci)
+                .unwrap()
+                .is_none(),
+        );
+
+        // The account's own number belongs to the memo family — the peer
+        // fold never touches it (§4.170 owns the shell). The ensure door
+        // itself redirects the own number onto the ACI key while the ACI is
+        // set (the §4.170 redirect), so the honest assertions here are: the
+        // peer probe answers None on the own number, and the canonical row
+        // is untouched.
+        store.set_account_aci(&account.id, Some(&aci)).unwrap();
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "Self")
+            .unwrap();
+        assert!(
+            store
+                .merge_peer_identity(&account.id, &aci, "+15555550100")
+                .unwrap()
+                .is_none(),
+        );
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", &aci)
+                .unwrap()
+                .is_some(),
+            "the canonical row survives the own-number no-op probe"
+        );
+        store.set_account_aci(&account.id, None).unwrap();
+
+        // Masked shell title: the fold runs, the notice stays silent.
+        let masked = store
+            .ensure_conversation(&account.id, "direct", "+15555550105", "+86***05")
+            .unwrap();
+        let peer_aci = canonical_aci("29D3E11C3BD866FDB36EE8271B90D153").unwrap();
+        store
+            .ensure_conversation(&account.id, "direct", &peer_aci, "Masked Peer")
+            .unwrap();
+        seed_memo_message(
+            &store,
+            &account.id,
+            &masked.id,
+            "m-masked",
+            "incoming",
+            "peer",
+            1_000,
+        );
+        store
+            .upsert_peer_identity(&account.id, &peer_aci, "+15555550105")
+            .unwrap();
+        let outcome = store
+            .merge_peer_identity(&account.id, &peer_aci, "+15555550105")
+            .unwrap()
+            .expect("the fold answers");
+        assert!(
+            outcome.merge_notice.is_none(),
+            "a masked shell title never mints the notice (titleIsUseful gate)"
+        );
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", "+15555550105")
+                .unwrap()
+                .is_none(),
+            "the fold itself still ran"
+        );
+
+        // Replay: the shell is gone, the probe answers None.
+        assert!(
+            store
+                .merge_peer_identity(&account.id, &peer_aci, "+15555550105")
+                .unwrap()
+                .is_none(),
+        );
+    }
+
+    /// Contract 1.259 (§4.243): the expire timer keeps the more restrictive
+    /// arm (official :1349-1356 — the smaller non-null timer wins; a
+    /// timer-less canonical row adopts the shell's; the shell's absence
+    /// keeps the canonical's).
+    #[test]
+    fn peer_identity_merge_carries_the_more_restrictive_expire_timer() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let build_pair = |store: &Store,
+                          number: &str,
+                          aci_word: &str,
+                          shell_timer: Option<i64>,
+                          canonical_timer: Option<i64>,
+                          seed_word: &str| {
+            let aci = canonical_aci(aci_word).unwrap();
+            let shell = store
+                .ensure_conversation(&account.id, "direct", number, "Peer")
+                .unwrap();
+            let canonical = store
+                .ensure_conversation(&account.id, "direct", &aci, "Peer")
+                .unwrap();
+            for (id, timer) in [(&shell.id, shell_timer), (&canonical.id, canonical_timer)] {
+                store
+                    .conn()
+                    .execute(
+                        "UPDATE conversations SET expire_timer_seconds=?2 WHERE id=?1",
+                        params![id, timer],
+                    )
+                    .unwrap();
+            }
+            seed_memo_message(
+                store,
+                &account.id,
+                &shell.id,
+                &format!("m-{seed_word}"),
+                "outgoing",
+                "self",
+                1_000,
+            );
+            seed_memo_message(
+                store,
+                &account.id,
+                &canonical.id,
+                &format!("m2-{seed_word}"),
+                "outgoing",
+                "self",
+                2_000,
+            );
+            store
+                .upsert_peer_identity(&account.id, &aci, number)
+                .unwrap();
+            let outcome = store
+                .merge_peer_identity(&account.id, &aci, number)
+                .unwrap()
+                .expect("the fold answers");
+            outcome.canonical_summary.expire_timer_seconds
+        };
+
+        // Shell 300s vs canonical 86400s: the more restrictive 300 wins.
+        let merged = build_pair(
+            &store,
+            "+15555550111",
+            "39E0E22D4CE9770EC1A2B3D4E5F60718",
+            Some(300),
+            Some(86_400),
+            "t1",
+        );
+        assert_eq!(merged, Some(300));
+        // Canonical without a timer adopts the shell's.
+        let merged = build_pair(
+            &store,
+            "+15555550112",
+            "4A1F33E5DF088A1F4C2B901E6C31E264",
+            Some(600),
+            None,
+            "t2",
+        );
+        assert_eq!(merged, Some(600));
+        // Shell without a timer keeps the canonical's.
+        let merged = build_pair(
+            &store,
+            "+15555550113",
+            "5B2044F6E0199B2A5D3CA12F7D42F375",
+            None,
+            Some(1_200),
+            "t3",
+        );
+        assert_eq!(merged, Some(1_200));
+    }
+
+    /// Contract 1.259 (§4.243): both number spellings (§4.144 — `+`-prefixed
+    /// against bare digits) are probed for the shell, exact form first; a
+    /// bare-keyed shell folds under a `+`-prefixed binding, and the wire
+    /// number in the notice normalizes to the `+` word form.
+    #[test]
+    fn peer_identity_merge_probes_both_number_spellings() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let aci = canonical_aci("6C3157A813ABAD3B6E4DB23F8E53F486").unwrap();
+        // The shell keyed in bare digits (the history-import/sync spelling).
+        let shell = store
+            .ensure_conversation(&account.id, "direct", "15555550116", "Bare Peer")
+            .unwrap();
+        let canonical = store
+            .ensure_conversation(&account.id, "direct", &aci, "Canonical Peer")
+            .unwrap();
+        seed_memo_message(
+            &store,
+            &account.id,
+            &shell.id,
+            "m-bare",
+            "incoming",
+            "peer",
+            1_000,
+        );
+        seed_memo_message(
+            &store,
+            &account.id,
+            &canonical.id,
+            "m-canon",
+            "outgoing",
+            "self",
+            1_000,
+        );
+        store
+            .upsert_peer_identity(&account.id, &aci, "+15555550116")
+            .unwrap();
+
+        let outcome = store
+            .merge_peer_identity(&account.id, &aci, "+15555550116")
+            .unwrap()
+            .expect("the alternate-spelling shell folds");
+        assert_eq!(outcome.canonical_summary.id, canonical.id);
+        let notice = outcome
+            .merge_notice
+            .expect("both sides had messages and a useful title");
+        let merge = notice.rich.unwrap().conversation_merge.unwrap();
+        assert_eq!(
+            merge.obsolete_conversation_number.as_deref(),
+            Some("+15555550116"),
+            "the wire number normalizes to the + word form"
+        );
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", "15555550116")
+                .unwrap()
+                .is_none(),
         );
     }
 
