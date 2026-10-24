@@ -37,6 +37,17 @@
   captured flag. The nested position is also the official client's own
   read position: GroupLinkManagement.dom.tsx:46-53 derives
   hasGroupLink/approval from conversation.accessControl.addFromInviteLink.)
+
+- Contract revision: 1.252 (2026-10-24; §4.238 the group access-control write
+  arms + member-label data face: groups.update folds permissionAddMember /
+  permissionEditDetails / permissionMemberLabel onto the engine updateGroup
+  words membersPermission / attributesPermission / memberLabelPermission
+  (the engine composes the official modifyMemberLabels clear actions on the
+  MEMBER-to-ADMINISTRATOR switch), and the engine listGroups roster now
+  projects the §4.60 member label / labelEmoji pair. Additive on both
+  wires; the whole-call refusal set shrinks to the description / admin /
+  ban families and the member-label pair — never a partial application.)
+  （合流重编 §29.56：批 N 原自报 §4.237 与批 M 撞号——按先例 §29.38.4 保 M §4.237，N 整族顺延 §4.238；wire 零变化仅 doc 重编）
 - Contract revision: 1.216 (2026-10-21; §4.216 the message-granular read
   watermark: `messages.markRead` / `messages.syncRead` gain the optional
   `messageId` read-position target. Present = the conversation's
@@ -18990,3 +19001,62 @@ UNKNOWN/MEMBER/坏值塌缩；坏 accessControl 形状不致败；两词同场�
 随批翻正——批 H 时代「嵌套 addFromInviteLink 永不入 linkAccess」钉住的
 正是本节修的 P0 恒缺席，三臂对象仍只收三门词（addFromInviteLink 不混
 入三臂对象，§4.180 边界不变），其嵌套词改按本节回退入 linkAccess。
+
+## §4.238 群 access-control 写臂接通 + 成员标签数据面（契约 1.252 · 台账 §29.45；合流重编 §29.56：原自报 §4.237 与批 M 撞号顺延，wire 零变化）
+
+**背景（批 N）**：批 H（§4.231）落了三臂读面与 `permissionMemberLabel`
+写意图，但引擎 updateGroup 没有 access-control 写臂——`permissionAddMember` /
+`permissionEditDetails` / `permissionMemberLabel` 三臂全部落入整调
+`CAPABILITY_UNAVAILABLE`（桌面诚实失败）；同时引擎 `listGroups` 的
+`members[]` 只有 number/role，成员级 label/labelEmoji（§4.60 捕获面早就
+在读）在引擎模式恒空——成员标签 chip/有标签节/清除警告判定三处恒空。
+
+**官方锚（upstream 只读零抄码）**：官方修改权限走 group update 消息族——
+`conversations.preload.ts:4871-4926 updateAccessControl{Attributes,Members,
+MemberLabel}` → `groups.preload.ts:906-977 buildAccessControl{Attributes,
+Members,MemberLabel}Change`：attributes = `modifyAttributesAccess`、members =
+`modifyMemberAccess`、memberLabel = `modifyMemberLabelAccess`（version =
+revision+1）；memberLabel 切到 ADMINISTRATOR 且 previous ≠ ADMINISTRATOR
+时，同一 change 附加 `modifyMemberLabels` 清除动作——逐非管理员且有标签
+成员一条 `{userId: encryptServiceId(aci), labelString: null, labelEmoji:
+null}`（:944-972）。成员标签材料 = 群态解密成员的 labelString/labelEmoji
+（`GroupMemberLabels.std.ts` SERVER_STRING_BYTE_LIMIT 512 /
+SERVER_EMOJI_BYTE_LIMIT 64）。
+
+**引擎（kt-signal-engine 同批，本批提交）**：
+
+- `updateGroup` 新增三写意图键（词表 = 链接访问臂同族 ANY/MEMBER/
+  ADMINISTRATOR/UNSATISFIABLE，UNKNOWN 不作写意图词；键在场但 null/未知
+  词/非字符串整拒）：`attributesPermission` / `membersPermission` /
+  `memberLabelPermission`，分别合成 `modify_attributes_access` /
+  `modify_member_access` / `modify_member_label_access` 动作（同 version
+  多 action 单 change 单 PATCH，§5 合成裁定顺延）。
+- `memberLabelPermission = ADMINISTRATOR` 的标签清除半引擎按官方同式合成：
+  previous（群态 accessControl.memberLabel，缺席 = MEMBER）非 ADMINISTRATOR
+  时逐非管理员有标签成员追加 `modify_member_labels` 清零动作（userId = ACI
+  经群密参加密，labelString/labelEmoji 空 = 清除——vendored decrypt 侧空
+  字节 = unset）。previous 从群态取真值，不信任调用方；群态 Unavailable 时
+  该臂诚实拒绝（removeMembers 臂同纪律——缺席退化合成会静默漏清）。
+- `listGroups` 条目 `members[]` additive 投影 `label` / `labelEmoji`
+  （§4.60 捕获同名同语义；材料 = vendored decrypt_member 解密明文，本批前
+  已在 presage 存储字段，投影层此前丢弃）；无标签成员两键缺席 = 旧 wire
+  逐字节不变（absent-when-none）。
+
+**connector（本批）**：`groups.update` 三 permission 臂从整调拒绝改折叠——
+`setPermissionAddMember` → `membersPermission`、`setPermissionEditDetails` →
+`attributesPermission`、`setPermissionMemberLabel` → `memberLabelPermission`；
+host 词 `every-member` = MEMBER、`only-admins` = ADMINISTRATOR（值在参数层
+已闸）。仍在拒绝集的键（groupDescription/admin/ban 族/memberLabel 对）
+不变——整调拒绝语义（绝不部分应用）不变。§4.60 成员标签捕获/读投影零改动：
+引擎 listGroups 条目自带该两键后自然流入 `group_extra_json`。
+
+**桌面（同批）**：权限区四 select 写穿此前已被 CAPABILITY_UNAVAILABLE 整调
+拒绝（失败序号回落真值）；本批起三 permission 臂真正落群更新（
+`permissionSendMessages` → announcementsOnly 在 1.188 已通）。标签清除警告
+（GVP:43-55/130-187）保持桌面本地判定（`nonAdminsHaveLabels` 现在有数据面
+支撑），确认后提交的清除由引擎在 change 内按官方同式合成。
+
+**测试**：引擎（listGroups 标签投影钉形 / 清除集合 wire 形状含解密回环 /
+三臂动作合成 + 触发判定四臂）；connector（三臂折叠 payload / 混合携带
+unsupported 键仍整调拒绝 / 坏词仍 INVALID_REQUEST）；桌面（写穿 spec 随批
+更新拒绝→成功面）。

@@ -3989,14 +3989,17 @@ impl ConnectorService {
     /// empty set would commit a no-delta group change broadcast. The
     /// conversation id must resolve to a kind='group' row (direct answers
     /// INVALID_REQUEST before any upstream call). The engine carries the
-    /// title/member/avatar/link-access subset plus the 1.180 resetLink fold
-    /// and the 1.188 send-messages fold; a change set naming anything
-    /// outside it (description, admin/ban families, the remaining
-    /// permission pair, the member label pair) answers
-    /// CAPABILITY_UNAVAILABLE naming the keys (retryable=false) after the
-    /// local validation completed — the
-    /// honest whole-call refusal, never a partial application. Zero local
-    /// writes: group state converges through the receive projection.
+    /// title/member/avatar/link-access subset plus the 1.180 resetLink fold,
+    /// the 1.188 send-messages fold, and the 1.252 access-control folds
+    /// (§4.238 — add-member / edit-details / member-label permissions onto
+    /// the engine words membersPermission / attributesPermission /
+    /// memberLabelPermission, the engine composing the official
+    /// modifyMemberLabels clears from its own group state); a change set
+    /// naming anything outside it (description, admin/ban families, the
+    /// member label pair) answers CAPABILITY_UNAVAILABLE naming the keys
+    /// (retryable=false) after the local validation completed — the honest
+    /// whole-call refusal, never a partial application. Zero local writes:
+    /// group state converges through the receive projection.
     pub fn prepare_groups_update(
         &self,
         params: &GroupsUpdateParams,
@@ -4258,6 +4261,32 @@ impl ConnectorService {
                         json!(value.as_str() == Some("only-admins")),
                     );
                 }
+                // Contract 1.252 (§4.238): the three permission arms ride the
+                // engine's access-control write family — every-member = MEMBER,
+                // only-admins = ADMINISTRATOR (the official AccessRequired enum
+                // words the engine handler parses; the value was validated at
+                // the params layer). The engine composes the official
+                // modifyMemberLabels clear actions on the member-label
+                // MEMBER-to-ADMINISTRATOR switch from its own group state, so
+                // the caller's single-parameter intent stays single-parameter.
+                "setPermissionAddMember" => {
+                    payload.insert(
+                        "membersPermission".to_owned(),
+                        json!(engine_access_control_word(&value)),
+                    );
+                }
+                "setPermissionEditDetails" => {
+                    payload.insert(
+                        "attributesPermission".to_owned(),
+                        json!(engine_access_control_word(&value)),
+                    );
+                }
+                "setPermissionMemberLabel" => {
+                    payload.insert(
+                        "memberLabelPermission".to_owned(),
+                        json!(engine_access_control_word(&value)),
+                    );
+                }
                 // The refusal names the caller's schema vocabulary, not the
                 // internal upstream keys the change vec carries.
                 _ => {
@@ -4267,9 +4296,6 @@ impl ConnectorService {
                         "removeAdmins" => "demoteAdmins",
                         "bans" => "banMembers",
                         "unbans" => "unbanMembers",
-                        "setPermissionAddMember" => "permissionAddMember",
-                        "setPermissionEditDetails" => "permissionEditDetails",
-                        "setPermissionMemberLabel" => "permissionMemberLabel",
                         other => other,
                     };
                     unsupported.push(host);
@@ -14255,6 +14281,18 @@ fn project_group_roster(
             })
         })
         .collect())
+}
+
+/// The host permission word pair onto the engine's AccessRequired vocabulary
+/// (contract 1.252, §4.238): every-member = MEMBER, only-admins =
+/// ADMINISTRATOR — the official enum words the engine handler parses. The
+/// params ladder already rejected every other value, so the default arm is
+/// the MEMBER reading and never a silent acceptance of foreign input.
+fn engine_access_control_word(value: &Value) -> &'static str {
+    match value.as_str() {
+        Some("only-admins") => "ADMINISTRATOR",
+        _ => "MEMBER",
+    }
 }
 
 /// The read-side twin of the capture budget (contract 1.67, §4.60): trimmed,
@@ -42218,30 +42256,30 @@ mod tests {
             .unwrap();
         assert_eq!(mixed["title"], json!("Renamed"));
         assert_eq!(mixed["announcementsOnly"], json!(true));
-        // The remaining permission arms keep the whole-call refusal, naming
-        // the host vocabulary.
-        let error = service
+        // Contract 1.252 (§4.238): the access-control arms fold onto the
+        // engine words (every-member = MEMBER, only-admins = ADMINISTRATOR)
+        // — the whole-call refusal they used to answer is gone.
+        let folded = service
             .prepare_groups_update(&GroupsUpdateParams {
                 permission_add_member: Some("only-admins".into()),
-                ..params(None)
-            })
-            .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE"
-                    && !api.retryable
-                    && api.message.contains("permissionAddMember")));
-        // The contract 1.221 member-label access arm rides the same
-        // whole-call refusal under its own host vocabulary.
-        let error = service
-            .prepare_groups_update(&GroupsUpdateParams {
+                permission_edit_details: Some("every-member".into()),
                 permission_member_label: Some("only-admins".into()),
                 ..params(None)
             })
-            .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE"
-                    && !api.retryable
-                    && api.message.contains("permissionMemberLabel")));
+            .unwrap();
+        assert_eq!(folded["membersPermission"], json!("ADMINISTRATOR"));
+        assert_eq!(folded["attributesPermission"], json!("MEMBER"));
+        assert_eq!(folded["memberLabelPermission"], json!("ADMINISTRATOR"));
+        // The folds compose with the other carried keys in one atomic
+        // engine change set (the single-Actions broadcast discipline).
+        let mixed_access = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                permission_member_label: Some("every-member".into()),
+                ..params(Some("only-admins".into()))
+            })
+            .unwrap();
+        assert_eq!(mixed_access["memberLabelPermission"], json!("MEMBER"));
+        assert_eq!(mixed_access["announcementsOnly"], json!(true));
         // The description write key keeps its refusal too — the engine's
         // updateGroup carries no description arm (the §4.188 recorded gap;
         // the local validation ladder still runs ahead of the seam).
@@ -42255,6 +42293,21 @@ mod tests {
                 if api.code == "CAPABILITY_UNAVAILABLE"
                     && !api.retryable
                     && api.message.contains("groupDescription")));
+        // Mixing a folded access arm with an unsupported key still refuses
+        // the whole call naming the unsupported host key — never a partial
+        // application (the engine commits the set as one change broadcast).
+        let error = service
+            .prepare_groups_update(&GroupsUpdateParams {
+                group_description: Some("no engine arm yet".into()),
+                permission_member_label: Some("only-admins".into()),
+                ..params(None)
+            })
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE"
+                    && !api.retryable
+                    && api.message.contains("groupDescription")
+                    && !api.message.contains("permissionMemberLabel")));
         // An invalid send-messages word keeps its INVALID_REQUEST (the
         // params ladder outranks the fold).
         let error = service

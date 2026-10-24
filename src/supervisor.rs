@@ -9488,7 +9488,9 @@ fn fold_invite_candidates(
 /// `GroupsV2Operations` server-side caps; the write face budgets them at
 /// `SERVER_EMOJI_BYTE_LIMIT` / `SERVER_STRING_BYTE_LIMIT`) drops the key
 /// instead of truncating — a clipped label would render a lie. Engines
-/// without a label face simply never set either key. Entries without any
+/// without a label face simply never set either key; the kt engine projects
+/// the same pair natively since contract 1.252 (§4.238), so both runtime
+/// faces feed this capture identically. Entries without any
 /// address and entries past [`MAX_GROUP_MEMBERS`]
 /// drop — a hostile roster can never fail the sync. `isTerminated: true` is
 /// recorded when the upstream `JsonGroup` carries it (the §4.50 verified read
