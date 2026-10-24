@@ -481,6 +481,15 @@ pub const METHODS: &[MethodRow] = &[
     // sees one method and one outcome.
     ("conversations.acceptRequest", Lane::Send, true, "send"),
     ("conversations.declineRequest", Lane::Send, true, "send"),
+    // Conversation-level report (contract revision 1.266, §4.250): the
+    // official reportSpam / blockAndReportSpam thunks — the MRR sync word
+    // plus the §4.48 report face over the guid ladder, one host method.
+    // Mutating, send-lane upstream traffic — the reaction class verbatim,
+    // same-account mutex and delete barrier included; advertised through
+    // the existing `report-spam` tag, widened in place (the 1.82/1.88
+    // precedent). Direct conversations only (the official group report
+    // resolves the added-by sender first — no data plane, honest refusal).
+    ("conversations.reportSpam", Lane::Send, true, "send"),
     // Safety-number read (contract revision 1.68, §4.61): the pinned
     // upstream's native `listIdentities` JSON-RPC read (0.14.8
     // jsonrpc.rs:121-126; ListIdentitiesCommand.java:23 — a
@@ -1119,6 +1128,7 @@ mod tests {
             "accounts.setUsername",
             "conversations.acceptRequest",
             "conversations.declineRequest",
+            "conversations.reportSpam",
             "identities.verify",
             "messages.sendStory",
             "stories.setDisabled",
@@ -1197,6 +1207,7 @@ mod tests {
             "accounts.setUsername",
             "conversations.acceptRequest",
             "conversations.declineRequest",
+            "conversations.reportSpam",
             "identities.verify",
             "messages.sendStory",
             "stories.setDisabled",

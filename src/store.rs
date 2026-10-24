@@ -4744,6 +4744,34 @@ impl Store {
     /// response or blocked state and the write faces can never clobber the
     /// trio (an engine answer that does carry `isBlocked` still wins, the
     /// cloud truth at enrich time).
+    /// 契约 1.268（§4.252 · 批 Z12 · S16）：会话行戳内 hidden 位的读取——
+    /// 回写引擎存储的变化检测读面（prev 与 item 位异同判定）。戳缺席/坏形
+    /// = None（未知，绝不折成 false——三态保真与批 B 口径同源）。
+    pub fn conversation_hidden_bit(
+        &self,
+        account_id: &str,
+        peer_key: &str,
+    ) -> Result<Option<bool>, StoreError> {
+        let conn = self.lock_conn()?;
+        let current = conn
+            .query_row(
+                "SELECT mrr_factors_json FROM conversations
+                 WHERE account_id=?1 AND kind='direct' AND peer_key=?2",
+                params![account_id, peer_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .flatten();
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        let hidden = serde_json::from_str::<Value>(&current)
+            .ok()
+            .and_then(|value| value.get("hidden").and_then(Value::as_bool));
+        Ok(hidden)
+    }
+
     pub fn set_conversation_mrr_factors_for_peer(
         &self,
         account_id: &str,
@@ -5267,7 +5295,7 @@ impl Store {
                         last_message_status: None,
                         last_message_author_name: None,
                         last_message_reactions: Vec::new(),
-                        // Contract 1.261 (§4.244): filled in the post-map
+                        // Contract 1.265 (§4.249): filled in the post-map
                         // pass from the same newest-row meta read, both the
                         // page loop and the single-row summary.
                         last_message_received_at_ms: None,
@@ -5366,7 +5394,7 @@ impl Store {
             item.last_message_status = meta.status;
             item.last_message_author_name = meta.author_name;
             item.last_message_reactions = meta.reactions;
-            // Contract 1.261 (§4.244): the newest row's arrival stamp rides
+            // Contract 1.265 (§4.249): the newest row's arrival stamp rides
             // the same meta read — the page face and the event face answer
             // from one source.
             item.last_message_received_at_ms = meta.received_at_ms;
@@ -10278,6 +10306,39 @@ impl Store {
             .collect()
     }
 
+    /// 契约 1.266（§4.250 · 批 Z12）：会话级举报的 serverGuid 阶梯——官方
+    /// `getMessageServerGuidsForSpam`（sql/Server.node.ts:9012-9027）逐语义：
+    /// DISTINCT、`type IS NOT 'outgoing'`（KT direction 列同位）、`server_guid
+    /// IS NOT NULL`、`ORDER BY received_at DESC, sent_at DESC`、LIMIT 3（官方
+    /// 「The server's maximum is 3」:8988）。本机铸造的系统行（MRR/identity
+    /// 族）无 server_guid，天然不入候选。空数组 = 会话无可举报行（官方
+    /// 队列脸：调用方诚实跳过 upstream 面，绝不发明 guid）。
+    pub fn server_guids_for_spam(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT server_guid FROM messages
+                 WHERE conversation_id=?1 AND account_id=?2
+                   AND direction IS NOT 'outgoing'
+                   AND server_guid IS NOT NULL
+                 ORDER BY received_at DESC, sent_at DESC
+                 LIMIT 3",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![conversation_id, account_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
     /// The account's cached contact addresses (kind='contact' peer keys) for
     /// the mention-number resolution (contract 1.34). The caller matches
     /// digit suffixes in Rust — the same resolution rule the engine applies —
@@ -11214,7 +11275,7 @@ impl Store {
                         last_message_status: None,
                         last_message_author_name: None,
                         last_message_reactions: Vec::new(),
-                        // Contract 1.261 (§4.244): filled in the post-map
+                        // Contract 1.265 (§4.249): filled in the post-map
                         // pass from the same newest-row meta read, both the
                         // page loop and the single-row summary.
                         last_message_received_at_ms: None,
@@ -11312,7 +11373,7 @@ impl Store {
                 summary.last_message_status = meta.status;
                 summary.last_message_author_name = meta.author_name;
                 summary.last_message_reactions = meta.reactions;
-                // Contract 1.261 (§4.244): the same newest-row meta read the
+                // Contract 1.265 (§4.249): the same newest-row meta read the
                 // page loop applies — a reloaded list and the
                 // conversation.changed event cannot disagree.
                 summary.last_message_received_at_ms = meta.received_at_ms;
@@ -14330,7 +14391,7 @@ struct ConversationLastMessageMeta {
     status: Option<&'static str>,
     author_name: Option<String>,
     reactions: Vec<String>,
-    /// Contract 1.261 (§4.244): the newest row's device-arrival stamp
+    /// Contract 1.265 (§4.249): the newest row's device-arrival stamp
     /// (`received_at`), the face behind `last_message_received_at_ms`.
     received_at_ms: Option<u64>,
 }
@@ -14420,7 +14481,7 @@ fn conversation_last_message_meta(
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
-                    // Contract 1.261 (§4.244): the same newest row's arrival
+                    // Contract 1.265 (§4.249): the same newest row's arrival
                     // stamp; NULL rides through as None (key stays absent).
                     row
                         .get::<_, Option<i64>>(6)?
@@ -17683,6 +17744,61 @@ mod tests {
     /// trio re-stamp when the incoming trio does not name `blocked`, an
     /// engine answer that does name it wins, and a group row is nobody's
     /// trio stamp (the §4.45 pull stays the group authority).
+    /// 契约 1.268（§4.252 · 批 Z12 · S16）：戳内 hidden 位读取三态——
+    /// true/false 显式、戳缺席/无 hidden 键 = None（未知不折 false）。
+    #[test]
+    fn conversation_hidden_bit_reads_the_stamp_tri_state() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        // 无戳 = None（未知）。
+        assert_eq!(
+            store
+                .conversation_hidden_bit(&account.id, "+15555550101")
+                .unwrap(),
+            None
+        );
+        // 显式 hidden 位逐字读出。
+        store
+            .set_conversation_mrr_factors_for_peer(
+                &account.id,
+                "+15555550101",
+                r#"{"hidden":true,"profileSharing":false}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .conversation_hidden_bit(&account.id, "+15555550101")
+                .unwrap(),
+            Some(true)
+        );
+        store
+            .set_conversation_mrr_factors_for_peer(
+                &account.id,
+                "+15555550101",
+                r#"{"hidden":false}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .conversation_hidden_bit(&account.id, "+15555550101")
+                .unwrap(),
+            Some(false)
+        );
+        // 未知群行/号码不存在的行 = None（绝不冒充 false）。
+        assert_eq!(
+            store
+                .conversation_hidden_bit(&account.id, "+15555559999")
+                .unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn blocked_stamp_survives_the_enrich_and_yields_to_engine_truth() {
         let temp = TempDir::new().unwrap();
@@ -18089,7 +18205,7 @@ mod tests {
 
         // Official activity face: the newest row stamps both moments — the
         // activity moment (last_message_at, official `timestamp`) and the
-        // device-arrival moment (contract 1.261, official
+        // device-arrival moment (contract 1.265, official
         // `lastMessageReceivedAtMs`). Incoming rows carry both.
         store
             .insert_message(

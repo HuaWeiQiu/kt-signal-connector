@@ -17,6 +17,7 @@ use crate::engine::{
     receive_channel,
 };
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
+use crate::link::now_ms;
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
@@ -28,25 +29,25 @@ use crate::service::{
     ChatFoldersListParams, ChatFoldersSetRecordsParams, CommonGroupsDetails, ConnectorService,
     ContactsSyncOutcome, ConversationState, ConversationsGetAvatarParams,
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
-    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, ConversationsSetStateParams,
-    DeviceList, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES,
-    GroupDetails, GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword,
-    GroupInviteLinkPreview, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
-    GroupsCancelJoinRequestParams, GroupsCreateParams, GroupsCreateResult,
-    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
-    GroupsMigrateResult, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
-    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyIntent,
-    IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary,
-    MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS,
-    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary,
-    MessageRequestOutcome, MessageRequestParams, MessagesDeleteForMeMessagesParams,
-    MessagesDeleteForMeParams, MessagesReportSpamParams, MessagesSendContactParams,
-    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
-    MessagesSendStickerParams, MessagesSendStoryParams, NotificationProfileSyncs,
-    NotificationProfilesListParams, NotificationProfilesSetRecordsParams, PeerTarget,
-    PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
+    ConversationsReportSpamParams, ConversationsReportSpamResult, ConversationsSetBlockedParams,
+    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
+    ConversationsSetPinnedParams, ConversationsSetStateParams, DeviceList,
+    GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails,
+    GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword, GroupInviteLinkPreview,
+    GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams,
+    GroupsCreateParams, GroupsCreateResult, GroupsInviteLinkPasswordParams,
+    GroupsJoinViaLinkParams, GroupsMigrateParams, GroupsMigrateResult, GroupsParseInviteLinkParams,
+    GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
+    GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams,
+    IdentitiesVerifyIntent, IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome,
+    ImportGroupsSummary, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
+    MAX_STORY_RECIPIENTS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
+    MergeContactsSummary, MessageRequestOutcome, MessageRequestParams,
+    MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams, MessagesReportSpamParams,
+    MessagesSendContactParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
+    MessagesSendPollVoteParams, MessagesSendStickerParams, MessagesSendStoryParams,
+    NotificationProfileSyncs, NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
+    PeerTarget, PhoneLookupEntry, PhoneLookupParams, PhoneLookupResult, PinnedConversations,
     PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
     SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
     StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
@@ -4063,9 +4064,10 @@ impl RuntimeSupervisor {
         let items = result.as_array().cloned().unwrap_or_default();
         // The row updates are store-only; they run batched on the blocking
         // pool without the service lock.
-        tokio::task::spawn_blocking({
+        let write_backs = tokio::task::spawn_blocking({
             let store = Arc::clone(&self.store);
             let account_id = account_id.to_string();
+            let items = items.clone();
             move || {
                 for (peer_key, _title) in peers {
                     if let Some(name) = find_contact_display_name(&items, &peer_key) {
@@ -4096,6 +4098,13 @@ impl RuntimeSupervisor {
                         &factors,
                     );
                 }
+                // 契约 1.268（§4.252 · 批 Z12 · S16）：回写目标的变化检测
+                // rides the same blocking pass（store 读共用线程池）。
+                hidden_write_back_targets(&items, &|uuid| {
+                    store
+                        .conversation_hidden_bit(&account_id, uuid)
+                        .unwrap_or(None)
+                })
             }
         })
         .await
@@ -4157,6 +4166,27 @@ impl RuntimeSupervisor {
         })
         .await
         .map_err(|_| StoreError::Unavailable(None))?;
+        // 引擎存储回写（两仓契约的 connector 半）：有界/轮（纯面帽 16），
+        // best-effort warn-only——丢失的回写让引擎读臂暂退批 W 反演近似，
+        // 下一次 hidden 变化自然再火，绝不阻断 enrich。uuid = 引擎
+        // allRecipients 条目的 ServiceId 串；号码键行无 uuid 永不收集。
+        for (peer_aci, hidden) in &write_backs {
+            let upstream = json!({
+                "account": number,
+                "peerAci": peer_aci,
+                "hidden": hidden,
+            });
+            if let Err(error) = engine
+                .call("setConversationHidden", upstream, CallClass::ReadOnly)
+                .await
+            {
+                tracing::warn!(
+                    kind = "conversation_hidden_write_back",
+                    class = error.class(),
+                    "engine hidden write-back skipped; the read arms keep the batch-W approximation",
+                );
+            }
+        }
         Ok(())
     }
 
@@ -5494,6 +5524,110 @@ impl RuntimeSupervisor {
             ))),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// `conversations.reportSpam` (contract revision 1.266, §4.250,
+    /// capability report-spam): the conversation-level report — the official
+    /// `reportSpam` / `blockAndReportSpam` thunks
+    /// (state/ducks/conversations.preload.ts:3862-3922 / :3924-3990), in
+    /// the official order: (1) the MRR sync face — the pinned native
+    /// `sendMessageRequestResponse` upstream carrying the SPAM /
+    /// BLOCK_AND_SPAM word (the official `syncMessageRequestResponse`
+    /// argument); (2) the LOCAL landing on the upstream answer — the same
+    /// §4.239/§1.258 action-arm shape (rows behind the official
+    /// didResponseChange / didSpamChange / didBlockChange gates, the
+    /// authoritative factor stamp, the blocked-family mask stamp, the
+    /// row-then-summary push); (3) the report itself — the engine
+    /// `reportSpam` call over the §4.250 guid ladder
+    /// (`addReportSpamJob`'s server face), honestly skipped when the ladder
+    /// found nothing reportable. Unknown outcomes answer SEND_OUTCOME_UNKNOWN
+    /// and are never retried (the reaction class). Landing legs are
+    /// warn-only best-effort: the upstream answer is the primary face
+    /// (§4.239 discipline).
+    pub async fn report_conversation_spam(
+        &self,
+        params: ConversationsReportSpamParams,
+    ) -> Result<ConversationsReportSpamResult, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_conversations_report_spam(&params)?
+        };
+        if let Err(EngineError::UnknownOutcome) = engine
+            .call(
+                "sendMessageRequestResponse",
+                prepared.mrr_upstream,
+                CallClass::Mutating,
+            )
+            .await
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            )));
+        }
+        let response_type = if params.block {
+            crate::service::MRR_RESPONSE_TYPE_BLOCK_AND_SPAM
+        } else {
+            crate::service::MRR_RESPONSE_TYPE_SPAM
+        };
+        {
+            let store = Arc::clone(&self.store);
+            let account_id = params.account_id.clone();
+            let conversation_id = params.conversation_id.clone();
+            match blocking_service(move || {
+                crate::service::land_local_report_response(
+                    &store,
+                    &account_id,
+                    &conversation_id,
+                    response_type,
+                )
+            })
+            .await
+            {
+                Ok(events) => {
+                    // Row-then-summary order (§4.226): rows ride ahead of
+                    // the changed push so one pass renders both faces.
+                    for event in events {
+                        let _ = self.host_events.send(event);
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    kind = "message_request_report_landing",
+                    class = error.class(),
+                    "report landed no local face; the upstream answer stands"
+                ),
+            }
+        }
+        // The report itself (official addReportSpamJob): skipped when the
+        // ladder found no reportable rows — the honest empty-job face.
+        let reported = match prepared.report_upstream {
+            Some(upstream) => {
+                match engine
+                    .call("reportSpam", upstream, CallClass::Mutating)
+                    .await
+                {
+                    Ok(result) => result
+                        .get("reported")
+                        .and_then(Value::as_u64)
+                        .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+                    Err(EngineError::UnknownOutcome) => {
+                        return Err(ServiceError::Api(ApiError::new(
+                            "SEND_OUTCOME_UNKNOWN",
+                            "mutating request has an unknown outcome",
+                            false,
+                        )));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            None => 0,
+        };
+        Ok(ConversationsReportSpamResult {
+            status: "reported",
+            reported,
+        })
     }
 
     /// stickerPacks.getSyncs (contract revision 1.37, §4.34): account
@@ -11221,6 +11355,29 @@ async fn engine_event_watch_loop(
                 };
                 emit_forwarded(&host_events, forwarded);
             }
+            Ok(EngineEvent::SessionReset {
+                account,
+                peer_aci,
+                word,
+                sent_at,
+            }) => {
+                // 契约 1.267 §4.251（批 Z12 · S15）：引擎 session-reset 投影的
+                // 消费臂——官方两类 session-reset 时间线系统行落地面（词臂
+                // endSession/chatSessionRefresh → 桌面 wire 键 1.181）。
+                // sentAt 缺席臂（引擎 chatSessionRefresh 发送侧时刻未知时整
+                // 键缺席，eba82d3 契约注）→ 行钟标本机时钟（identityChanged
+                // 模板），事件绝不丢。
+                let forwarded = {
+                    let guard = service.lock().await;
+                    guard.forward_session_reset(
+                        &account,
+                        &peer_aci,
+                        &word,
+                        sent_at.unwrap_or_else(now_ms),
+                    )
+                };
+                emit_forwarded(&host_events, forwarded);
+            }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
@@ -11499,6 +11656,38 @@ fn find_contact_display_name(items: &[Value], peer_key: &str) -> Option<String> 
 /// NULL and the sweep answers the probed-absent marker): the connector
 /// never persists an unknown word as trust material.
 const IDENTITY_TRUST_WORDS: &[&str] = &["UNTRUSTED", "TRUSTED_UNVERIFIED", "TRUSTED_VERIFIED"];
+/// 契约 1.268（§4.252 · 批 Z12 · S16）：回写引擎存储的变化检测纯面——
+/// item 显式携带 isHidden 位 ∧ 既有戳位不同（prev != item 位；None=戳
+/// 缺席/未知，按变化收集——初写与翻转同路）→ 收集 (uuid, hidden)（引擎
+/// setConversationHidden 只收 ACI，
+/// uuid 非 ACI 形的条目诚实跳过）。有界 CAP/轮，余量留给下一节流窗口。
+/// isHidden 缺席的条目（引擎读面未携带）绝不产生目标（未知不冒充变化）。
+pub(crate) fn hidden_write_back_targets(
+    items: &[Value],
+    prev_of: &dyn Fn(&str) -> Option<bool>,
+) -> Vec<(String, bool)> {
+    const HIDDEN_WRITE_BACK_CAP: usize = 16;
+    let mut targets = Vec::new();
+    for item in items {
+        if targets.len() >= HIDDEN_WRITE_BACK_CAP {
+            break;
+        }
+        let hidden = item.get("isHidden").and_then(Value::as_bool);
+        let Some(hidden) = hidden else {
+            continue;
+        };
+        let Some(uuid) = item.get("uuid").and_then(Value::as_str) else {
+            continue;
+        };
+        // prev = 既有戳位（None = 戳缺席/未知——按变化收集，初写与翻转同路；
+        // store 读失败同形收敛，warn 由调用面承担）。
+        let prev = prev_of(uuid);
+        if prev != Some(hidden) {
+            targets.push((uuid.to_string(), hidden));
+        }
+    }
+    targets
+}
 
 fn contact_item_peer_key(item: &Value) -> Option<&str> {
     ["number", "uuid", "numberUuid"].iter().find_map(|key| {
@@ -11838,6 +12027,7 @@ fn story_from_engine(result: &Value) -> Result<StorySendResult, ServiceError> {
 
 #[cfg(test)]
 mod tests {
+    use super::hidden_write_back_targets;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
@@ -12880,6 +13070,55 @@ mod tests {
             Some("abcd1234-0000-0000-0000-000000000000")
         );
         assert_eq!(contact_item_peer_key(&json!({"name": "x"})), None);
+    }
+
+    /// 契约 1.268（§4.252 · 批 Z12 · S16）：回写目标纯面四臂——显式位 ∧
+    /// 变化（初写 None→true/false 与翻转 true→false 都收）；显式位 ∧ 同值
+    /// 不收；isHidden 缺席不收（未知绝不冒充变化）；uuid 缺席不收（引擎面
+    /// 只收 ACI）；帽 16/轮（余量留下一节流窗口）。
+    #[test]
+    fn hidden_write_back_targets_collect_changed_bits_only() {
+        let item = |uuid: &str, is_hidden: Option<bool>| {
+            let mut object = serde_json::json!({ "uuid": uuid });
+            if let Some(hidden) = is_hidden {
+                object["isHidden"] = serde_json::json!(hidden);
+            }
+            object
+        };
+        let prevs: std::collections::HashMap<&str, Option<bool>> = [
+            ("new-hidden", None),
+            ("same-false", Some(false)),
+            ("flip-true", Some(false)),
+            ("flip-false", Some(true)),
+            ("same-true", Some(true)),
+        ]
+        .into_iter()
+        .collect();
+        let prev_of = |uuid: &str| prevs.get(uuid).copied().flatten();
+        let items = vec![
+            item("new-hidden", Some(true)),
+            item("same-false", Some(false)),
+            item("flip-true", Some(true)),
+            item("flip-false", Some(false)),
+            item("same-true", Some(true)),
+            item("unknown-arm", None),
+            serde_json::json!({ "isHidden": true }),
+        ];
+        let targets = hidden_write_back_targets(&items, &prev_of);
+        assert_eq!(
+            targets,
+            vec![
+                ("new-hidden".to_string(), true),
+                ("flip-true".to_string(), true),
+                ("flip-false".to_string(), false),
+            ]
+        );
+        // 帽 16/轮：17 个变化目标只收前 16。
+        let flood: Vec<serde_json::Value> = (0..17)
+            .map(|index| item(&format!("u{index}"), Some(true)))
+            .collect();
+        let targets = hidden_write_back_targets(&flood, &|_| None);
+        assert_eq!(targets.len(), 16);
     }
 
     #[tokio::test]

@@ -517,6 +517,16 @@ pub enum EngineEvent {
         source_uuid: String,
         timestamp: Option<u64>,
     },
+    /// 批 Z12（契约 1.267 §4.251 · S15）：引擎 `engine.sessionReset` 通知
+    /// ——官方两类 session-reset 事件的收流投影（endSession = 对端
+    /// END_SESSION 信封；chatSessionRefresh = 我方解密失败时刻，官方自动
+    /// reset + refreshed 行语义）。账号域瞬态车道转发；落行面在 service。
+    SessionReset {
+        account: String,
+        peer_aci: String,
+        word: String,
+        sent_at: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -851,6 +861,19 @@ pub struct NormalizedRich {
     /// The trust decision stays with the user (the §4.223 posture).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_identity_change: bool,
+    /// 批 Z12（契约 1.267 §4.251 · S15）：会话重置系统行标记——官方
+    /// ResetSessionNotification（Message.dom isResetSession 位）的行级键。
+    /// 仅由 engine.sessionReset 通知的落行面铸造（endSession 词臂）；两键
+    /// 互斥（一行一词臂）。仅真值出现；键缺席 = 非该族行，pre-1.267 宿主
+    /// 读行零变化。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_reset_session: bool,
+    /// 批 Z12（契约 1.267 §4.251 · S15）：会话已刷新系统行标记——官方
+    /// ChatSessionRefreshedNotification（桌面 wire isChatSessionRefreshed，
+    /// 契约 1.181 已在）的行级键。仅由 engine.sessionReset 通知的落行面
+    /// 铸造（chatSessionRefresh 词臂）。仅真值出现。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_chat_session_refreshed: bool,
     /// 消息请求响应时间线系统行（契约 1.253 §4.239）：官方
     /// `MessageRequestResponseEvent` 词表成员（types/
     /// MessageRequestResponseEvent.std.ts:6-11 verbatim：ACCEPT / BLOCK /
@@ -3806,6 +3829,50 @@ async fn handle_upstream_line(
                         account: account.to_string(),
                         manifest_ok,
                         profiles_ok,
+                    });
+                }
+                _ => {
+                    let _ = events.send(EngineEvent::ProtocolWarning {
+                        kind: "unknownNotification",
+                    });
+                }
+            }
+        } else if method == "engine.sessionReset" {
+            // Contract 1.267 §4.251 (batch Z12, S15): the engine's two-word
+            // session-reset projection, forwarded through the same
+            // account-domain lane. The parse pins the closed word list
+            // (endSession | chatSessionRefresh) and the attribution faces;
+            // a missing or wrong-typed face is a protocol error answered by
+            // the unknown-notification warning, never a guessed forward.
+            let params = object.get("params");
+            let account = params
+                .and_then(|params| params.get("account"))
+                .and_then(Value::as_str)
+                .filter(|account| !account.is_empty());
+            let peer_aci = params
+                .and_then(|params| params.get("peerAci"))
+                .and_then(Value::as_str)
+                .filter(|peer| !peer.is_empty());
+            let word = params
+                .and_then(|params| params.get("word"))
+                .and_then(Value::as_str)
+                .filter(|word| *word == "endSession" || *word == "chatSessionRefresh");
+            // sentAt = additive absent discipline (engine commit eba82d3
+            // contract note): the endSession arm always carries it; the
+            // chatSessionRefresh arm omits the whole key when the send-side
+            // client timestamp is unknown — absence is a valid face, the
+            // row clock degrades to the local one (the identityChanged
+            // template), never a dropped event.
+            let sent_at = params
+                .and_then(|params| params.get("sentAt"))
+                .and_then(Value::as_u64);
+            match (account, peer_aci, word) {
+                (Some(account), Some(peer_aci), Some(word)) => {
+                    let _ = events.send(EngineEvent::SessionReset {
+                        account: account.to_string(),
+                        peer_aci: peer_aci.to_string(),
+                        word: word.to_string(),
+                        sent_at,
                     });
                 }
                 _ => {
@@ -13208,6 +13275,128 @@ mod tests {
             ));
         }
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn session_reset_notification_pins_the_word_grammar() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+        let line = |value: serde_json::Value| serde_json::to_string(&value).unwrap();
+
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "engine.sessionReset",
+                "params": {
+                    "account": "+15555550100",
+                    "peerAci": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                    "word": "endSession",
+                    "sentAt": 1700000000000u64,
+                },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        let EngineEvent::SessionReset {
+            account,
+            peer_aci,
+            word,
+            sent_at,
+        } = event_rx.recv().await.unwrap()
+        else {
+            panic!("expected the SessionReset event");
+        };
+        assert_eq!(account, "+15555550100");
+        assert_eq!(peer_aci, "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10");
+        assert_eq!(word, "endSession");
+        assert_eq!(sent_at, Some(1_700_000_000_000));
+
+        // The refreshed word arm rides the same grammar.
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "engine.sessionReset",
+                "params": {
+                    "account": "+15555550100",
+                    "peerAci": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                    "word": "chatSessionRefresh",
+                    "sentAt": 1700000000001u64,
+                },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        let EngineEvent::SessionReset { word, .. } = event_rx.recv().await.unwrap() else {
+            panic!("expected the SessionReset event");
+        };
+        assert_eq!(word, "chatSessionRefresh");
+
+        // The refreshed word arm's additive absent face (eba82d3 contract
+        // note): sentAt omitted whole-key when the send-side timestamp is
+        // unknown — the event rides, the row clock degrades to the local one.
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "engine.sessionReset",
+                "params": {
+                    "account": "+15555550100",
+                    "peerAci": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                    "word": "chatSessionRefresh",
+                },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        let EngineEvent::SessionReset { word, sent_at, .. } = event_rx.recv().await.unwrap() else {
+            panic!("expected the SessionReset event");
+        };
+        assert_eq!(word, "chatSessionRefresh");
+        assert!(
+            sent_at.is_none(),
+            "absent sentAt rides as None, never a guessed clock"
+        );
+
+        // Bad shapes（词表越界/必要四面缺失 → unknownNotification，绝不猜发；
+        // extra 键 additive 安全不入清单——strict 词表在发射端，
+        // initialSyncComplete 臂同款消费姿态。）:
+        for bad in [
+            json!({
+                "jsonrpc": "2.0",
+                "method": "engine.sessionReset",
+                "params": {
+                    "account": "+15555550100",
+                    "peerAci": "aci",
+                    "word": "resetEverything",
+                    "sentAt": 1u64,
+                },
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "engine.sessionReset",
+            }),
+        ] {
+            handle_upstream_line(&line(bad), &mut pending, &events, &ingress, &mut degraded)
+                .await
+                .unwrap();
+            let EngineEvent::ProtocolWarning { kind } = event_rx.recv().await.unwrap() else {
+                panic!("expected the unknown-notification warning");
+            };
+            assert_eq!(kind, "unknownNotification");
+        }
     }
 
     /// Contract 1.134 (§4.117): the account-domain notifications follow the

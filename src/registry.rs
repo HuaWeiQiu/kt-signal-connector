@@ -590,7 +590,8 @@ impl ProxyGroupRuntime {
             | EngineEvent::StoragePull { .. }
             | EngineEvent::InitialSyncComplete { .. }
             | EngineEvent::ReceiveDecryptionError { .. }
-            | EngineEvent::ReceiveIdentityChanged { .. } => {
+            | EngineEvent::ReceiveIdentityChanged { .. }
+            | EngineEvent::SessionReset { .. } => {
                 // Contract 1.21: handled by the supervisor's engine-event
                 // watcher, which owns the service handle. Contract 1.134
                 // §4.117: the account-domain transient notifications ride
@@ -630,7 +631,8 @@ impl ProxyGroupRuntime {
             | EngineEvent::StoragePull { .. }
             | EngineEvent::InitialSyncComplete { .. }
             | EngineEvent::ReceiveDecryptionError { .. }
-            | EngineEvent::ReceiveIdentityChanged { .. } => {
+            | EngineEvent::ReceiveIdentityChanged { .. }
+            | EngineEvent::SessionReset { .. } => {
                 // The dynamic supervisor's own watchers own the account-level
                 // notifications (contract 1.134); the registry forwards the
                 // global lanes only.
@@ -2844,6 +2846,17 @@ impl ProxyGroupRuntime {
     ) -> Result<crate::service::ReportSpamResult, ServiceError> {
         let slot = self.slot_for_account(&params.account_id).await?;
         slot.supervisor.report_spam(params).await
+    }
+
+    /// conversations.reportSpam (contract revision 1.266, §4.250, capability
+    /// report-spam): the conversation-level report routes through the
+    /// account's owning supervisor like every other mutating face.
+    pub async fn report_conversation_spam(
+        &self,
+        params: crate::service::ConversationsReportSpamParams,
+    ) -> Result<crate::service::ConversationsReportSpamResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.report_conversation_spam(params).await
     }
 
     pub async fn set_local_alias(

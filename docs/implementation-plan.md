@@ -173,6 +173,58 @@
   memo family's (§4.170 untouched).)
 - Contract revision: 1.263 (2026-10-24; §4.247 the incoming-call kind face — batch Z3, ledger §29.80: the official video-call protocol half gets its wire word — the legacy offer frame's proto `Offer.type` the engine already projects as the words `audio`|`video` (offer_type_json, mod.rs offer arm, test :19483-19489) rides the `call.incoming` event additively as `callKind`. The official desktop learns `isVideoCall` from RingRTC's offer parse; on the modern opaque face that bit lives inside the RingRTC-serialized bytes and is unreachable connector-side, so the key stays absent and the desktop's truth-adoption path is the sidecar `call.state` `hasVideo` face (the RingRTC Call.isVideoCall the sidecar already projects) — the wire word covers the legacy face, the truth path covers the modern one, and the banner never invents a kind. Absent-key additive: pre-1.263 hosts read the event byte-identically.)
 - Contract revision: 1.264 (2026-10-24; §4.248 the group-call era receive face — batch Z3, ledger §29.80: the official `handleGroupCallUpdateMessage` posture (background.preload.ts:3534-3563) gets its receive half — the engine's live `DataMessage.groupCallUpdate {eraId}` projection (field 19, mod.rs Q4 arm) routed as a control face (no renderable row, zero persistence — the official consumes the message as `peekNotConnectedGroupCall({conversationId})` and nothing else) and forwarded as the transient `call.groupCallUpdate` event {accountId, conversationId, eraId}. Group context only (the official gate `message.groupV2 && type===GROUP`): an era-less, oversized (the §4.108 send gate's own 256-char cap), or groupless update drops the face — the official warn-and-ignore leg — and the envelope keeps its pre-existing fall-through, so the 1:1 leg stays byte-identical. The send side already rode `calls.sendGroupCallUpdate` (§4.108); this closes the loop: join arm sends the era update, receivers peek and light the header Join face from the peek truth. Transient like `call.incoming`: a missed delivery stays missed, the next era update re-triggers (the official peek-refresh posture).)
+- Contract revision: 1.268 (2026-10-24; §4.252 the hidden write-back
+  face — batch Z12, ledger §29.77 S16: the two-repo contract's connector
+  half — at the throttled listContacts enrich (the §4.58 stamp
+  moment), items whose `isHidden` bit is explicit and differs from the
+  row's stored stamp bit collect as bounded (16/cycle) best-effort
+  `setConversationHidden` {account, peerAci, hidden} engine writes
+  (ACI-keyed rows only — number-keyed items have no uuid and never
+  collect; the engine's own storage keeps the §4.252 kv truth the
+  engine's read arms project). Warn-only: a lost write degrades the
+  engine read arms to the batch-W inversion approximation until the next
+  hidden change and never blocks the enrich. No wire row changes:
+  pre-1.268 hosts byte-identical.)
+
+  timeline face — batch Z12, ledger §29.77 S15: the engine's
+  `engine.sessionReset` {account, peerAci, word: endSession |
+  chatSessionRefresh, sentAt} notification (the official two-word
+  session-reset receive projection — the peer END_SESSION envelope and the
+  own-decrypt-failure moment) lands a persisted direct-conversation system
+  row per word arm (`isResetSession` / `isChatSessionRefreshed`, the
+  desktop's 1.181 wire keys — the batch-C recorded light-up condition).
+  The direct ladder resolves the peer (the §4.58 batch-X ladder); an
+  unresolvable ACI lands nothing (no conversation invented for an
+  unattributed peer); the idempotency key folds engine replays
+  (account+conversation+sessionReset+word+sentAt). Wire additive,
+  pre-1.267 hosts read byte-identical rows.)
+
+  report face — batch Z12, ledger §29.90: `conversations.reportSpam`
+  {accountId, conversationId, block} = the official reportSpam /
+  blockAndReportSpam thunks
+  (state/ducks/conversations.preload.ts:3862-3922 / :3924-3990) in the
+  official order — the MRR sync word (SPAM / BLOCK_AND_SPAM, the pinned
+  native `sendMessageRequestResponse` face) first, the LOCAL landing on
+  the upstream answer (the §4.239/§1.258 action-arm shape: rows behind
+  the official didResponseChange/didSpamChange/didBlockChange gates, the
+  authoritative factor stamp, the §4.131 blocked-family mask stamp,
+  row-then-summary changed push), then the §4.48 engine report face
+  over the official guid ladder
+  (getMessageServerGuidsForSpam, sql/Server.node.ts:9012-9027 — up to 3
+  most recent distinct non-outgoing serverGuids, newest first, the
+  conversation's captured reporting token riding exactly as §4.48 reads
+  it). Group conversations answer INVALID_REQUEST before anything
+  travels — the official group report resolves the added-by sender's
+  direct conversation first (getDirectConversationForReportSpam) and
+  this chain holds no added-by data plane (§4.39/§4.241 captured
+  rosters carry id/uuid/name only): the honest refusal beats a
+  mis-addressed report (回访: addedBy 捕获落地后开群腿). An empty
+  ladder keeps the MRR face and answers reported:0 — the official empty
+  job face, never a fabricated guid. Unknown outcomes answer
+  SEND_OUTCOME_UNKNOWN and are never retried; landing legs are
+  warn-only (§4.239 discipline). Advertised through the existing
+  `report-spam` tag, widened in place (the 1.82/1.88 precedent).
+  Pre-1.266 hosts see no face.)
 - Contract revision: 1.254 (2026-10-24; §4.38 the archive-import media
   face close-out — batch U, ledger §29.64: the engine's v2 export already
   projects `width`/`height` on every attachment line
@@ -19792,3 +19844,68 @@ incrementMessageCounter.preload.ts:53-63，max(db,localStorage) 初始化
 **测试**：`received_at_ms_rides_the_newest_row_face_additively`——
 incoming 行双时刻/outgoing 行同面/无戳末行键缺席/空会话缺席/单行与列表
 同源/wire 缺席键钉形。
+## §4.250 会话级举报 conversations.reportSpam（契约 1.266 · 批 Z12 · 台账 §29.90）
+
+官方锚：reportSpam / blockAndReportSpam 两 thunk
+（state/ducks/conversations.preload.ts:3862-3922 / :3924-3990）——
+(1) syncMessageRequestResponse(SPAM|BLOCK_AND_SPAM)（先本地落行后上行 sync，
+models/conversations.preload.ts:2559-2680 LOCAL 臂门序）；(2) addReportSpamJob
+= getMessageServerGuidsForSpam（sql/Server.node.ts:9012-9027：DISTINCT、
+type IS NOT 'outgoing'、serverGuid 非空、received_at DESC/sent_at DESC、
+LIMIT 3「The server's maximum is 3」:8988）逐 guid 走 reportMessage 服务面
+（jobs/reportSpamJobQueue.preload.ts:64-89 {senderAci, serverGuid, token}）。
+
+我方承载：MRR 同步词走引擎 pinned native `sendMessageRequestResponse`
+（§4.56 同面，词表 spam/blockAndSpam 已在引擎 § 全六值词表）；本机落地 =
+§4.239/§1.258 动作臂同形（行门 didResponseChange/didSpamChange/
+didBlockChange + 因子盖章 + §4.131 掩码位 + 行先后总览 changed 推送）；
+举报面复用 §4.48 引擎 reportSpam（serverGuids = 阶梯 + 会话 reportingToken
+逐 §4.48 读法）。群会话先拒（INVALID_REQUEST）——官方群举报先解析
+addedBy 直聊（getDirectConversationForReportSpam），本链名册捕获无 addedBy
+数据面（§4.39/§4.241），诚实拒绝优于误址举报（回访：addedBy 落地后开群腿）。
+阶梯空 = 保 MRR 面、跳过举报调用、reported:0（官方空任务脸，绝不造 guid）。
+unknown = SEND_OUTCOME_UNKNOWN 永不重试；落地腿 warn-only（§4.239 纪律）。
+
+**wire**：新方法 conversations.reportSpam {accountId, conversationId, block}
+→ {status:'reported', reported}；capability `report-spam` 原标签扩面
+（1.82/1.88 先例）。pre-1.259 宿主无此面。
+**测试**：阶梯钉形（≤3/最新序/DISTINCT/非出站/guid 空跳过举报面）+ 直聊闸
+（群行 INVALID_REQUEST）+ block 词分流（spam/blockAndSpam）+ 落地门三臂
+（Spam 行/BLOCK 行/因子盖章）+ token 携带。
+
+## §4.251 会话重置时间线行（契约 1.267 · 批 Z12 · S15 · 台账 §29.77）
+
+官方锚：解密失败→自动 session reset + ChatSessionRefreshed 行；对端
+END_SESSION→ResetSession 行（批 C §29.30 审计结论，upstream 只读取证）。
+引擎半（4184c7d）：收流识别 END_SESSION 信封/解密失败时刻 → additive 通知
+`engine.sessionReset` {account, peerAci, word: endSession |
+chatSessionRefresh, sentAt}（引擎侧 strict-parse 词表测试钉形）。
+
+connector 消费半：EngineEvent::SessionReset 变体 + 方法名 parse 臂（词表
+闭集二值、四面 strict、坏形 → unknownNotification 警告绝不猜发）+
+forward_session_reset 落行面——直聊阶梯（batch-X §4.58 ladder）解析 peer，
+rich 词臂 endSession→isResetSession / chatSessionRefresh→isChatSessionRefreshed
+（桌面 wire 键契约 1.181 已在，行到手系统行即亮——批 C 记档 1 的点亮条件）；
+幂等键 account+conversation+sessionReset+word+sentAt 重放折叠；解析不到
+直聊落零行（绝不为未归属 ACI 造会话）。落行 warn-only（行只是持久回声）。
+
+**wire**：system 行 rich additive `isResetSession`/`isChatSessionRefreshed`
+（互斥单词臂；仅真值出现）；pre-1.261 宿主读行零变化。
+**测试**：parse 词表钉形（双词臂 + 三坏形 → unknownNotification）+ 落行
+双词臂/互斥/幂等重放/未知 ACI 零行。
+
+## §4.252 hidden 回写引擎存储（契约 1.268 · 批 Z12 · S16 · 台账 §29.77）
+
+两仓契约（§29.77 S16 修复形态「connector 落位时写引擎存储」）：引擎半 =
+per-account store.db kv per-peer 版本化键 + `setConversationHidden`
+{account, peerAci, hidden} 恰三键 strict-parse（引擎侧分支，conversation_hidden
+模块 + listContacts 两读臂）。connector 半 = 节流 enrich（§4.58 盖章时刻）
+的回写臂：item 显式 isHidden 位 ∧ 行既有戳位不同（None=未知也收——初写与
+翻转同路）→ 纯面收集（帽 16/轮，uuid=引擎 ServiceId 串；号码键行无 uuid
+永不收集）→ 引擎写 best-effort warn-only（丢失回写让引擎读臂暂退批 W 反演
+近似，下一次 hidden 变化再火，绝不阻断 enrich）。三态纪律：戳缺席/无键 =
+None（未知绝不折 false，store 读面单测钉形）。
+
+**wire**：零行变化（引擎 RPC additive，pre-1.268 宿主逐字节同形）。
+**测试**：纯面四臂（初写/翻转/同值不收/缺席与 uuid 缺席不收 + 帽 16）+
+store 三态读面 + 回写臂接线源码锁（enrich 内联）。
