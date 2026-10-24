@@ -768,6 +768,19 @@ pub struct ConversationSummary {
     pub last_message_reactions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_at: Option<u64>,
+    /// Contract 1.261 (§4.244): the official `lastMessageReceivedAtMs` sort
+    /// face — the newest row's device-arrival stamp (the `received_at`
+    /// column), a distinct dimension from [`Self::last_message_at`]
+    /// (official `timestamp`, the activity moment). The official list
+    /// comparator keys on `lastMessageReceivedAtMs || timestamp`
+    /// (ts/state/selectors/conversations.dom.ts:349/:352) and both faces are
+    /// optional attributes (ts/model-types.d.ts:408-409). Absent when the
+    /// newest row carries no `received_at` stamp (never synthesized) or the
+    /// conversation has no rows — absent-key additive, pre-1.261 hosts read
+    /// byte-identical rows and fall back to the activity moment exactly as
+    /// the official comparator does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_message_received_at_ms: Option<u64>,
     pub unread_count: u32,
     /// Contract 1.29: how many unread incoming rows @mention the linked
     /// account. Moves in lockstep with `unread_count` — incremented by the
@@ -4541,6 +4554,10 @@ impl Store {
                         last_message_status: None,
                         last_message_author_name: None,
                         last_message_reactions: Vec::new(),
+                        // Contract 1.261 (§4.244): filled in the post-map
+                        // pass from the same newest-row meta read, both the
+                        // page loop and the single-row summary.
+                        last_message_received_at_ms: None,
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
                         unread_mentions: row.get::<_, i64>(7)? as u32,
@@ -4632,6 +4649,10 @@ impl Store {
             item.last_message_status = meta.status;
             item.last_message_author_name = meta.author_name;
             item.last_message_reactions = meta.reactions;
+            // Contract 1.261 (§4.244): the newest row's arrival stamp rides
+            // the same meta read — the page face and the event face answer
+            // from one source.
+            item.last_message_received_at_ms = meta.received_at_ms;
             item.pinned_messages = pinned_messages_for_conversation(&conn, account_id, &item.id)?;
             item.pinned_message = item.pinned_messages.last().cloned();
             // Contract 1.65 (§4.58): the same read-time accepted derivation
@@ -10462,6 +10483,10 @@ impl Store {
                         last_message_status: None,
                         last_message_author_name: None,
                         last_message_reactions: Vec::new(),
+                        // Contract 1.261 (§4.244): filled in the post-map
+                        // pass from the same newest-row meta read, both the
+                        // page loop and the single-row summary.
+                        last_message_received_at_ms: None,
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
                         unread_mentions: row.get::<_, i64>(7)? as u32,
@@ -10552,6 +10577,10 @@ impl Store {
                 summary.last_message_status = meta.status;
                 summary.last_message_author_name = meta.author_name;
                 summary.last_message_reactions = meta.reactions;
+                // Contract 1.261 (§4.244): the same newest-row meta read the
+                // page loop applies — a reloaded list and the
+                // conversation.changed event cannot disagree.
+                summary.last_message_received_at_ms = meta.received_at_ms;
                 summary.pinned_messages =
                     pinned_messages_for_conversation(&conn, account_id, conversation_id)?;
                 summary.pinned_message = summary.pinned_messages.last().cloned();
@@ -13527,6 +13556,9 @@ struct ConversationLastMessageMeta {
     status: Option<&'static str>,
     author_name: Option<String>,
     reactions: Vec<String>,
+    /// Contract 1.261 (§4.244): the newest row's device-arrival stamp
+    /// (`received_at`), the face behind `last_message_received_at_ms`.
+    received_at_ms: Option<u64>,
 }
 
 /// Project one conversation's pinned queue onto the summary wire shape
@@ -13601,7 +13633,7 @@ fn conversation_last_message_meta(
 ) -> Result<ConversationLastMessageMeta, StoreError> {
     let latest = conn
         .query_row(
-            "SELECT direction, body, attachments_json, sender_name, status, sent_at FROM messages
+            "SELECT direction, body, attachments_json, sender_name, status, sent_at, received_at FROM messages
              WHERE account_id=?1 AND conversation_id=?2
              ORDER BY sent_at DESC, id DESC
              LIMIT 1",
@@ -13614,18 +13646,26 @@ fn conversation_last_message_meta(
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    // Contract 1.261 (§4.244): the same newest row's arrival
+                    // stamp; NULL rides through as None (key stays absent).
+                    row
+                        .get::<_, Option<i64>>(6)?
+                        .map(|value| value.max(0) as u64),
                 ))
             },
         )
         .optional()
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
-    let Some((direction, body, attachments_json, sender_name, status, sent_at)) = latest else {
+    let Some((direction, body, attachments_json, sender_name, status, sent_at, received_at_ms)) =
+        latest
+    else {
         return Ok(ConversationLastMessageMeta {
             kind: None,
             direction: None,
             status: None,
             author_name: None,
             reactions: Vec::new(),
+            received_at_ms: None,
         });
     };
     let has_caption = body.is_some_and(|text| !text.trim().is_empty());
@@ -13703,6 +13743,7 @@ fn conversation_last_message_meta(
         status: wire_status,
         author_name,
         reactions,
+        received_at_ms,
     })
 }
 
@@ -16670,6 +16711,150 @@ mod tests {
     /// recency, the array caps at 32, group/self rows and contact group
     /// rows answer absent, and an unmatched direct row answers the computed
     /// empty array (the official EMPTY_ARRAY shape, never absence).
+    #[test]
+    fn received_at_ms_rides_the_newest_row_face_additively() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Peer")
+            .unwrap();
+        let row = |id: &str,
+                   direction: &'static str,
+                   sent_at: u64,
+                   received_at: Option<u64>|
+         -> MessageRecord {
+            MessageRecord {
+                is_erased: false,
+                delete_failed: false,
+                required_protocol_version: None,
+                author_aci: None,
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction,
+                sender_id: "peer".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at,
+                text: None,
+                text_bytes: None,
+                text_truncated: false,
+                text_retrievable: false,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                send_outcomes: None,
+                admin_deleted: false,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                server_guid: None,
+                server_timestamp: None,
+                is_story: false,
+                story_message: None,
+            }
+        };
+
+        // Official activity face: the newest row stamps both moments — the
+        // activity moment (last_message_at, official `timestamp`) and the
+        // device-arrival moment (contract 1.261, official
+        // `lastMessageReceivedAtMs`). Incoming rows carry both.
+        store
+            .insert_message(
+                &row("m-in", "incoming", 4_000, Some(5_000)),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let listed = store.list_conversations(&account.id, 20, None).unwrap();
+        let ending = listed
+            .items
+            .iter()
+            .find(|row| row.id == conversation.id)
+            .unwrap();
+        assert_eq!(ending.last_message_received_at_ms, Some(5_000));
+        // The single-row summary — the conversation.changed event face —
+        // answers from the same newest-row meta read: a reloaded page and
+        // the event-driven window cannot disagree.
+        let single = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(single.last_message_received_at_ms, Some(5_000));
+        // Wire shape: the key rides only when the store holds the stamp.
+        let wire = serde_json::to_value(&single).unwrap();
+        assert_eq!(wire["lastMessageReceivedAtMs"], serde_json::json!(5_000));
+
+        // Outgoing activity stamps the same face (the official
+        // getLastMessageData consumes the activity row regardless of
+        // direction; our send lane stamps received_at on the outgoing row).
+        store
+            .insert_message(
+                &row("m-out", "outgoing", 6_500, Some(7_000)),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let single = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(single.last_message_received_at_ms, Some(7_000));
+
+        // A newer ending without a receive stamp (legacy/import face) moves
+        // the ending: the key goes absent — absence is honest, never zero,
+        // and the official comparator falls back to the activity moment
+        // (conversations.dom.ts:349 `|| timestamp`).
+        store
+            .insert_message(&row("m-new", "incoming", 9_000, None), None, None, false)
+            .unwrap();
+        let listed = store.list_conversations(&account.id, 20, None).unwrap();
+        let ending = listed
+            .items
+            .iter()
+            .find(|row| row.id == conversation.id)
+            .unwrap();
+        assert_eq!(ending.last_message_received_at_ms, None);
+        let single = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(single.last_message_received_at_ms, None);
+        let wire = serde_json::to_value(&single).unwrap();
+        assert!(wire.get("lastMessageReceivedAtMs").is_none());
+
+        // A conversation whose ending is a rowless row never projects the
+        // key either — the empty-conversation arm of the same face.
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550103", "Empty")
+            .unwrap();
+        let listed = store.list_conversations(&account.id, 20, None).unwrap();
+        let empty_row = listed
+            .items
+            .iter()
+            .find(|row| row.title == "Empty")
+            .unwrap();
+        assert_eq!(empty_row.last_message_received_at_ms, None);
+        let wire = serde_json::to_value(empty_row).unwrap();
+        assert!(wire.get("lastMessageReceivedAtMs").is_none());
+    }
+
     #[test]
     fn shared_group_names_reverse_lookup_answers_the_engine_group_table() {
         let temp = TempDir::new().unwrap();

@@ -82,6 +82,23 @@
   the avatar member of the group change word list); the refreshed or
   honestly-cleared projection rides `conversation.changed`. No wire
   removal anywhere: pre-1.258 hosts read every face byte-identically.)
+- Contract revision: 1.261 (2026-10-24; §4.244 the received-at summary
+  face — batch AA, ledger §29.88 dispatched / §29.94 delivered: the
+  official list sort keys on `lastMessageReceivedAtMs || timestamp`
+  (ts/state/selectors/conversations.dom.ts:349/:352) — the newest row's
+  device-arrival moment is a distinct dimension from the activity moment
+  (`timestamp`, our `lastMessageAt`, contract 1.27). The summary now
+  projects the newest row's `received_at` stamp as additive
+  `lastMessageReceivedAtMs` (the official optional attribute,
+  ts/model-types.d.ts:409; the stamp the store has held since the
+  received-at column landed). Absent when the newest ending carries no
+  stamp (legacy/import rows), when the conversation has no rows, or on
+  pre-1.261 connectors — the official comparator falls back to the
+  activity moment, which is exactly the pre-1.261 wire shape, so
+  pre-1.261 hosts read byte-identical rows. The A1-D1 counter
+  tie-break (`lastMessageReceivedAt`, conversations.dom.ts:361-370) is
+  a global arrival counter, not a moment — this store holds no counter
+  data plane and honestly keeps that face unprojected.)
 - Contract revision: 1.254 (2026-10-24; §4.38 the archive-import media
   face close-out — batch U, ledger §29.64: the engine's v2 export already
   projects `width`/`height` on every attachment line
@@ -19439,3 +19456,39 @@ pre-1.256 宿主逐字节同形。
 pre-1.257 宿主逐字节同形。
 **测试**：verbatim 三臂（true/false/无戳）+ 反演面不动钉形 + 群行缺席 +
 wire 缺席键钉形。
+
+## §4.244 摘要 received-at 排序面（lastMessageReceivedAtMs · 契约 1.261 · 批 AA · 台账 §29.88 派出）
+
+官方锚：会话列表排序主键两段
+（ts/state/selectors/conversations.dom.ts:344-361）——
+`shouldShowDraft ? draftTimestamp : (lastMessageReceivedAtMs || timestamp)`，
+到站时刻缺席回落活动时刻；两属性均为官方 ConversationType 可选位
+（ts/model-types.d.ts:408-409）；供数面 = `getLastMessageData`
+（ts/models/conversations.preload.ts:4686-4697）——活动行（任意方向）的
+`received_at_ms` 落 `lastMessageReceivedAtMs`、`sent_at` 落 `timestamp`。
+投影面 = `ts/util/getConversation.preload.ts:211-212` 原样透出。
+
+我方数据面：`messages.received_at` 列（本仓建表既有的到站戳，live
+receive/send/import 各腿落 `now_ms()`）早已在库，缺的只是读侧投影——
+摘要 additive `lastMessageReceivedAtMs` = **末条行**（`sent_at DESC,
+id DESC`，与 `last_message_*` 家族同一行序）的 `received_at` 逐字投影，
+列表页与 `conversation.changed` 单行同源（`conversation_last_message_meta`
+同一读取）。`lastMessageAt`（契约 1.27 活动时刻）与 `lastMessageAt` 的
+官方 `timestamp` 口径不变，pre-1.261 宿主逐字节同形。
+
+**缺席语义（absent-key 纪律）**：末条行无 `received_at`（legacy/导入行）、
+空会话、pre-1.261 连接器 → 键缺席，绝不合成零值/never 0——官方比较器
+本就以 `|| timestamp` 回落活动时刻，键缺席即回落 pre-1.261 形状。
+
+**A1-D1 计数器位记档**：官方 `lastMessageReceivedAt`
+（conversations.dom.ts:361-370，注释「looks like a timestamp, but is
+actually a counter」）= 全局到达计数器（
+incrementMessageCounter.preload.ts:53-63，max(db,localStorage) 初始化
+逐条 +1）——本仓无计数器数据面，诚实不投影；同刻行 tie-break 沿桌面
+标题序（A1-D1 原记档维持，数据面到位批另立）。
+
+**wire**：摘要行 additive absent-key `lastMessageReceivedAtMs`
+（epoch ms）；pre-1.261 宿主逐字节同形。
+**测试**：`received_at_ms_rides_the_newest_row_face_additively`——
+incoming 行双时刻/outgoing 行同面/无戳末行键缺席/空会话缺席/单行与列表
+同源/wire 缺席键钉形。
