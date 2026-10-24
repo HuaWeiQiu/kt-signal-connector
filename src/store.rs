@@ -971,6 +971,16 @@ pub struct ConversationSummary {
     #[serde(rename = "avatarUrl")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
+    /// 契约 1.217（§29.2 · L2 接线批补齐）：缓存头像在场位——官方 Avatar
+    /// prop hasAvatar 词形（Avatar.dom.tsx Props.hasAvatar：远端存在头像的
+    /// 下载/查看臂素材）。connector 侧诚实来源 = 缓存行在场（与 avatarUrl
+    /// 同一份缓存读派生，位真必伴字节）；字节缺席时位缺席 = 远端在场态未知
+    /// （connector 无上游头像在场读面，永不发明——§29.2 剩余⑤留后续批）。
+    /// bool 缺席键纪律（skip_serializing_if = Not::not，is_erased 同式），
+    /// 旧行为逐字节不变。
+    #[serde(rename = "hasAvatar")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub has_avatar: bool,
 }
 
 /// One conversation's pinned state (contract 1.33): the local row the pin
@@ -2284,6 +2294,12 @@ pub struct ContactSummary {
     #[serde(rename = "avatarUrl")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
+    /// 契约 1.217（§29.2 · L2 接线批补齐）：hasAvatar 位同词形同纪律——
+    /// 与 avatarUrl 同一份缓存读派生（位真必伴字节），缺席 = 未知，
+    /// bool 缺席键（Not::not，is_erased 同式）。
+    #[serde(rename = "hasAvatar")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub has_avatar: bool,
 }
 
 /// One recorded reaction (contract 1.15): the actor's emoji state on a target
@@ -4326,6 +4342,10 @@ impl Store {
                             account_id,
                             &row.get::<_, String>(0)?,
                         ),
+                        // 契约 1.217（§29.2 · L2）：filled in the post-map
+                        // loop (below) from the same cached read — the
+                        // §4.130 post-map read-time family.
+                        has_avatar: false,
                     })
                 },
             )
@@ -4357,6 +4377,9 @@ impl Store {
             // Contract 1.138 (§4.130): the stored draft stamp, the same
             // post-map loop, the same guard.
             item.draft_timestamp = conversation_draft_timestamp(&conn, account_id, &item.id)?;
+            // 契约 1.217（§29.2 · L2）：缓存头像在场位——从同一份已投影缓存读
+            // 派生（零次额外查询），位真必伴字节；读时家族纪律。
+            item.has_avatar = item.avatar_url.is_some();
         }
         let next_cursor = if items.len() as u32 > limit {
             items.truncate(limit as usize);
@@ -10221,6 +10244,9 @@ impl Store {
                             account_id,
                             &row.get::<_, String>(0)?,
                         ),
+                        // 契约 1.217（§29.2 · L2）：filled in the post-map
+                        // match (below) from the same cached read.
+                        has_avatar: false,
                     })
                 },
             )
@@ -10285,6 +10311,9 @@ impl Store {
                 // 契约 1.217（§29.2）：缓存头像 data URI——随 conversation.changed
                 // 的事件面与整页读共用同一读时家族（事件窗与重载窗不撕裂）。
                 summary.avatar_url = conversation_avatar_cached(&conn, account_id, conversation_id);
+                // 契约 1.217（§29.2 · L2）：在场位从同一份已投影缓存读派生
+                // （零次额外查询），事件窗与重载窗同词。
+                summary.has_avatar = summary.avatar_url.is_some();
                 Ok(Some(summary))
             }
             None => Ok(None),
@@ -10878,6 +10907,21 @@ impl Store {
                     let service_id =
                         conversation_identifiers_lossy(&conn, account_id, kind, &peer_key)
                             .service_id;
+                    // 契约 1.217（§29.2 · L2）：一次缓存读同出 url+位（缺席键）。
+                    // 缓存按会话寻址：contacts 行的 kind 词表（'contact'）与会话行
+                    // （'direct'）不同词，两行的 stable id 因此不同源（group 两边
+                    // 同词同 id）——直聊行投影前把 kind 归回会话词表再派生 id
+                    // （与 ensure_conversation 同一派生式）；群行原词即同 id。
+                    // 一个查不到缓存的派生只是诚实缺席（§4.42 容错纪律）。
+                    let cached_avatar = conversation_avatar_cached(
+                        &conn,
+                        account_id,
+                        &stable_hash_id(&[
+                            account_id,
+                            if kind == "contact" { "direct" } else { kind },
+                            peer_key.as_str(),
+                        ]),
+                    );
                     Ok(ContactSummary {
                         id: row.get(0)?,
                         is_terminated: kind == "group" && extra_is_terminated(extra.as_deref()),
@@ -10903,20 +10947,9 @@ impl Store {
                             None
                         },
                         // 契约 1.217（§29.2）：与摘要行同一份缓存，compose/联系人行
-                        // 免二次查找。缓存按会话寻址：contacts 行的 kind 词表（'contact'）
-                        // 与会话行（'direct'）不同词，两行的 stable id 因此不同源
-                        // （group 两边同词同 id）——直聊行投影前把 kind 归回会话词表再派生
-                        // id（与 ensure_conversation 同一派生式）；群行原词即同 id。
-                        // 一个查不到缓存的派生只是诚实缺席（§4.42 容错纪律）。
-                        avatar_url: conversation_avatar_cached(
-                            &conn,
-                            account_id,
-                            &stable_hash_id(&[
-                                account_id,
-                                if kind == "contact" { "direct" } else { kind },
-                                row.get::<_, String>(2)?.as_str(),
-                            ]),
-                        ),
+                        // 免二次查找（url+位同源于闭包前的同一次缓存读）。
+                        avatar_url: cached_avatar.clone(),
+                        has_avatar: cached_avatar.is_some(),
                     })
                 },
             )

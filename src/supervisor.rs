@@ -6005,7 +6005,17 @@ impl RuntimeSupervisor {
     /// avatar-fetch): resolution under the service lock, then the read-only
     /// engine call — a download touches no account state. The result
     /// projects through the avatar face's bound and byte-count cross-check
-    /// (`avatar_from_engine`); nothing is persisted and nothing is logged.
+    /// (`avatar_from_engine`). Contract 1.217 (§29.2 · L2 接线批，剩余项①
+    /// 落库闸): the success arm commits the bytes into the
+    /// `conversation_avatars` cache through the service commit gate
+    /// (best-effort — a failed cache write never pollutes the
+    /// already-successful Read lane, the answer still ships, and the absent
+    /// cache stays the honest uncached face); the engine's honest
+    /// `AVATAR_UNAVAILABLE` arm (peer/group never set an avatar, or the
+    /// server folded a 403/404) idempotently clears a stale cache row so a
+    /// removed avatar stops projecting. Transient `AVATAR_FETCH_FAILED` and
+    /// capacity `AVATAR_TOO_LARGE` touch neither arm — cached bytes stay
+    /// valid. Bytes are never logged (§4.47 discipline).
     pub async fn get_avatar(
         &self,
         params: ConversationsGetAvatarParams,
@@ -6015,10 +6025,46 @@ impl RuntimeSupervisor {
             let service = self.service.lock().await;
             service.prepare_conversations_get_avatar(&params.account_id, &params.conversation_id)?
         };
-        let result = engine
+        let result = match engine
             .call("getAvatar", upstream, CallClass::ReadOnly)
-            .await?;
-        avatar_from_engine(&result)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                // §29.2① 失效半：上游诚实「无头像」（engine avatar.rs 折叠
+                // 语义，含服务器 403/404）→ 幂等清缓存防陈旧（best-effort，
+                // 清失败不遮蔽上游答案面，下次拉取自愈）；瞬态 FETCH_FAILED /
+                // TOO_LARGE / 协议与生命周期族不触缓存，原样上抛。
+                if matches!(
+                    &error,
+                    EngineError::UpstreamCode {
+                        code: "AVATAR_UNAVAILABLE",
+                        ..
+                    }
+                ) {
+                    let service = self.service.lock().await;
+                    let _ = service
+                        .clear_conversation_avatar(&params.account_id, &params.conversation_id);
+                }
+                return Err(error.into());
+            }
+        };
+        let download = avatar_from_engine(&result)?;
+        // §29.2① 落库半：result-face 门禁已在 avatar_from_engine 过闸，这里
+        // 经 service 提交闸（二次门禁重放 + wire 顺序 ladder + upsert
+        // latest-wins）把字节送进缓存——下次 list/summary/conversation.changed
+        // 投影即携 avatarUrl。缓存写失败不污染已成功的 Read lane（字节照答），
+        // 缺席缓存保持诚实的「未缓存」面；字节从不入日志（§4.47）。
+        {
+            let service = self.service.lock().await;
+            let _ = service.commit_conversation_avatar(
+                &params.account_id,
+                &params.conversation_id,
+                &download.data_uri,
+                download.byte_size,
+            );
+        }
+        Ok(download)
     }
 
     /// accounts.setUsername (contract revision 1.59, §4.55; the kt-engine

@@ -6332,6 +6332,35 @@ impl ConnectorService {
             .conversation_avatar(account_id, &conversation.id)?)
     }
 
+    /// 契约 1.217（§29.2 · L2 接线批，剩余项①失效半）：缓存失效闸——上游
+    /// getAvatar 以 `AVATAR_UNAVAILABLE` 回答（对端/群未设头像或服务器
+    /// 403/404，engine avatar.rs 折叠语义）时，supervisor 失效臂调用本面把
+    /// 陈旧缓存行清掉（缺席即无操作，幂等）。目标 ladder 与提交闸同序
+    /// （id 形状闸 → 账号 → 会话行），行 id 与读时投影同源，清后下次
+    /// list/summary 投影诚实缺席。瞬态 `AVATAR_FETCH_FAILED` / 容量面
+    /// `AVATAR_TOO_LARGE` 不走本面——缓存字节仍然有效，绝不制造缺席。
+    pub fn clear_conversation_avatar(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        self.store
+            .clear_conversation_avatar(account_id, &conversation.id)?;
+        Ok(())
+    }
+
     /// conversations.setBlocked (contract revision 1.48, §4.47): bounds,
     /// kind enum, and resolution — the §4.33 pin-write ladder verbatim. No
     /// local row is written: the cloud record is the whole state and the
@@ -29653,11 +29682,13 @@ mod tests {
         }
     }
 
-    /// 契约 1.217（§29.2，头像字节面）：缓存提交闸与投影面——门禁四态
-    /// （byteSize 失配 / 无 base64 标 / 坏载荷 → 协议错误；未知会话 →
+    /// 契约 1.217（§29.2，头像字节面 · L2 接线批）：缓存提交闸与投影面——
+    /// 门禁四态（byteSize 失配 / 无 base64 标 / 坏载荷 → 协议错误；未知会话 →
     /// CONVERSATION_NOT_FOUND 先于任何落库）+ 好路径落库后，摘要行、
-    /// contacts 行、conversations.list、单行读四处投影同一份 avatarUrl；
-    /// 覆盖提交 latest-wins。
+    /// contacts 行、conversations.list、单行读四处投影同一份 avatarUrl +
+    /// hasAvatar 位（位真必伴字节；缺席态两键逐字节不出现——缺席键纪律）；
+    /// 覆盖提交 latest-wins；失效闸（supervisor AVATAR_UNAVAILABLE 臂的
+    /// service 面）：幂等清行 + 投影回落缺席 + 未知会话先于任何写。
     #[test]
     fn avatar_commit_gate_feeds_the_summary_projection() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -29671,13 +29702,22 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
 
-        // Nothing committed yet: the honest absent-cache face.
+        // Nothing committed yet: the honest absent-cache face — both wire
+        // keys byte-for-byte absent (缺席键纪律), the bit never invented.
         assert!(
             service
                 .cached_conversation_avatar(&account.id, &conversation.id)
                 .unwrap()
                 .is_none()
         );
+        let absent = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert!(!absent.has_avatar);
+        let absent_wire = serde_json::to_value(&absent).unwrap();
+        assert!(absent_wire.get("avatarUrl").is_none());
+        assert!(absent_wire.get("hasAvatar").is_none());
 
         // Good path: "QUJD" decodes to "ABC" (3 bytes).
         let uri = "data:image/png;base64,QUJD";
@@ -29690,6 +29730,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.avatar_url.as_deref(), Some(uri));
+        // The bit rides the same cached read: true exactly with bytes, and
+        // both wire keys serialize (camelCase, additive on the cached row).
+        assert!(summary.has_avatar);
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire.get("avatarUrl"), Some(&json!(uri)));
+        assert_eq!(wire.get("hasAvatar"), Some(&json!(true)));
 
         // The contacts-cache row shares the stable id — same cache answer.
         store
@@ -29702,6 +29748,7 @@ mod tests {
             .find(|row| row.peer_key == "+15555550101")
             .unwrap();
         assert_eq!(row.avatar_url.as_deref(), Some(uri));
+        assert!(row.has_avatar);
 
         // conversations.list carries it too.
         let page = store.list_conversations(&account.id, 10, None).unwrap();
@@ -29711,6 +29758,7 @@ mod tests {
             .find(|row| row.id == conversation.id)
             .unwrap();
         assert_eq!(listed.avatar_url.as_deref(), Some(uri));
+        assert!(listed.has_avatar);
 
         // Latest-wins overwrite.
         let next = "data:image/jpeg;base64,REVG"; // "DEF", 3 bytes
@@ -29783,6 +29831,57 @@ mod tests {
         assert_eq!(
             service
                 .commit_conversation_avatar(&account.id, "no-such-row", uri, 3)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "CONVERSATION_NOT_FOUND"
+        );
+
+        // §29.2① 失效闸（supervisor AVATAR_UNAVAILABLE 臂的 service 面）：
+        // 清行后四处投影回落诚实缺席（url None + 位 false + 两键缺席），
+        // 再清一次幂等无操作；未知会话先于任何写 NOT_FOUND。
+        service
+            .clear_conversation_avatar(&account.id, &conversation.id)
+            .unwrap();
+        assert!(
+            service
+                .cached_conversation_avatar(&account.id, &conversation.id)
+                .unwrap()
+                .is_none()
+        );
+        let cleared = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.avatar_url, None);
+        assert!(!cleared.has_avatar);
+        let cleared_wire = serde_json::to_value(&cleared).unwrap();
+        assert!(cleared_wire.get("avatarUrl").is_none());
+        assert!(cleared_wire.get("hasAvatar").is_none());
+        let cleared_contacts = store.list_contacts(&account.id, None, 50, None).unwrap();
+        let cleared_row = cleared_contacts
+            .items
+            .iter()
+            .find(|row| row.peer_key == "+15555550101")
+            .unwrap();
+        assert_eq!(cleared_row.avatar_url, None);
+        assert!(!cleared_row.has_avatar);
+        let cleared_page = store.list_conversations(&account.id, 10, None).unwrap();
+        let cleared_listed = cleared_page
+            .items
+            .iter()
+            .find(|row| row.id == conversation.id)
+            .unwrap();
+        assert_eq!(cleared_listed.avatar_url, None);
+        assert!(!cleared_listed.has_avatar);
+        // Idempotent: clearing an already-absent row is a no-op.
+        service
+            .clear_conversation_avatar(&account.id, &conversation.id)
+            .unwrap();
+        // Unknown conversation: NOT_FOUND before any touch.
+        assert_eq!(
+            service
+                .clear_conversation_avatar(&account.id, "no-such-row")
                 .unwrap_err()
                 .into_api()
                 .code,
