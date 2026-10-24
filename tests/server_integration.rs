@@ -19,7 +19,21 @@ use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 use tokio_util::codec::{Framed, LinesCodec};
 
+#[path = "common/harness_scene.rs"]
+mod harness_scene;
+use harness_scene::dump_connector_crash_scene;
+
 const API_VERSION: &str = "1.0";
+
+/// Upper bound for one harness request round trip (write + response wait).
+/// The investigation found the harness blocked forever inside deadline-less
+/// `client.next().await` calls (no pending timer — an unbounded await), so any
+/// transient upstream anomaly became an indefinite hang that the gate's
+/// runner kill fixed into an orphan. Every harness read face now carries this
+/// deadline and converts the hang into an evidence-dumping failure.
+const HARNESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound for the handshake faces (challenge read + proof response read).
+const HARNESS_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Phase 3 contract: every spawned connector gets its store key as bootstrap
 /// payload line 2. One fixed test key keeps respawns against the same state
@@ -87,6 +101,55 @@ async fn binary_serves_authenticated_runtime_lifecycle() {
 }
 
 #[tokio::test]
+async fn a_second_host_connection_is_answered_busy_without_queueing() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret = [7_u8; 32];
+
+    let mut connector = spawn_connector_from_stdin(temp.path(), &endpoint, &secret).await;
+    wait_for_path(&endpoint).await;
+
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut owner = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut owner, &secret).await;
+
+    // ADR 0006: the second connection is accepted and answered, not left in
+    // the kernel backlog behind the live session.
+    let second_stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut second = Framed::new(second_stream, LinesCodec::new());
+    let line = timeout(Duration::from_secs(5), second.next())
+        .await
+        .expect("the busy answer must not wait for the live session to end")
+        .expect("the second connection must receive one frame")
+        .expect("the busy frame must be a valid line");
+    let busy: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(busy["apiVersion"], API_VERSION);
+    assert_eq!(busy["event"], "runtime.busy");
+    assert_eq!(busy["data"]["code"], "HOST_BUSY");
+    assert_eq!(busy["data"]["retryable"], true);
+    assert!(
+        busy["data"].get("sessionId").is_none(),
+        "the busy answer carries no session identity"
+    );
+    // The same connection is closed after the one frame.
+    assert!(
+        timeout(Duration::from_secs(5), second.next())
+            .await
+            .expect("the busy connection must close")
+            .is_none(),
+        "the busy connection ends after its single answer"
+    );
+
+    // The live session is untouched by the rejected second connection.
+    let status = request(&mut owner, "status-after-busy", "runtime.status", json!({})).await;
+    assert_eq!(status["result"]["state"], "stopped");
+
+    drop(owner);
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
 async fn phase2_link_receive_send_and_idempotent_text() {
     let temp = TempDir::new().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -105,7 +168,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
 
     let started = request(&mut client, "start-1", "runtime.start", json!({})).await;
     assert_eq!(started["result"]["state"], "running");
-    let mut engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
 
     let slow_link = request(
         &mut client,
@@ -163,7 +226,10 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     .await
     .expect("link.cancel must not wait for phone approval");
 
-    wait_for_process_exit(engine_pid).await;
+    // B3: cancellation abandons the finish wait locally; it must not stop or
+    // restart the shared engine (the pre-B3 restart disconnected every other
+    // account in the group). The same pid must survive and the engine stay
+    // running.
     let after_cancel = request(
         &mut client,
         "status-after-link-cancel",
@@ -172,7 +238,11 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     )
     .await;
     assert_eq!(after_cancel["result"]["state"], "running");
-    engine_pid = after_cancel["result"]["pid"].as_u64().unwrap() as u32;
+    assert_eq!(
+        after_cancel["result"]["pid"].as_u64().unwrap() as u32,
+        engine_pid,
+        "link.cancel must not restart the group engine"
+    );
 
     let link = request(
         &mut client,
@@ -223,11 +293,12 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     assert_eq!(accounts["result"].as_array().unwrap().len(), 1);
 
     // Fixture finishLink emits one receive notification (+15555550101) after
-    // the JSON-RPC result. Contract revision 1.14: the inline contacts.sync
-    // materializes skeletons for Alice, Bob, and the fixture group; contract
-    // 1.43 (§4.42) adds the linked account's own Note to Self skeleton, so
-    // the listing has 4 rows — the messaged conversation first (history
-    // ordering), then the empty skeletons.
+    // the JSON-RPC result. Contract 1.201 (§6.5 amendment): the inline
+    // contacts.sync no longer materializes skeletons for **other people** —
+    // only structurally-owned chats do (the fixture group, and the linked
+    // account's own Note to Self row per 1.43/§4.42). Alice and Bob are bare
+    // contacts until a message flows, so the listing is the messaged
+    // conversation first, then the group and the self row.
     sleep(Duration::from_millis(50)).await;
     let conversations = request(
         &mut client,
@@ -237,7 +308,11 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     )
     .await;
     let items = conversations["result"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 3, "messaged + group + self: {items:?}");
+    assert!(
+        items.iter().all(|row| row["title"] != "Bob"),
+        "Bob is a bare contact and must not appear as a chat: {items:?}"
+    );
     // The messaged conversation first; its title follows the sync cache's
     // profile-name preference ("Alice Example" over the envelope peer name).
     assert_eq!(items[0]["title"], "Alice Example");
@@ -256,7 +331,8 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     )
     .await;
     assert_eq!(messages["result"]["items"].as_array().unwrap().len(), 1);
-    assert_eq!(messages["result"]["items"][0]["text"], "private text");
+    // 契约 1.212（审计 P4）：正文 wire 键已对齐官方 body（原 text）。
+    assert_eq!(messages["result"]["items"][0]["body"], "private text");
     assert_eq!(messages["result"]["items"][0]["direction"], "incoming");
 
     let sent = request(
@@ -272,7 +348,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     )
     .await;
     assert_eq!(sent["result"]["status"], "sent");
-    assert_eq!(sent["result"]["text"], "hello from kt");
+    assert_eq!(sent["result"]["body"], "hello from kt");
     assert_eq!(sent["result"]["clientRequestId"], "client-req-1");
     let message_id = sent["result"]["id"].as_str().unwrap().to_string();
 
@@ -344,14 +420,25 @@ async fn phase2_link_receive_send_and_idempotent_text() {
 
     let mut response_order = Vec::new();
     while response_order.len() < 3 {
-        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
-        if let Some(request_id) = response.get("requestId").and_then(Value::as_str) {
-            if matches!(
+        let response: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => panic!(
+                "the send/response ordering drain stalled over \
+                 {HARNESS_REQUEST_TIMEOUT:?} with {response_order:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
+        if let Some(request_id) = response.get("requestId").and_then(Value::as_str)
+            && matches!(
                 request_id,
                 "send-slow" | "send-after-slow" | "msg-concurrent"
-            ) {
-                response_order.push(request_id.to_string());
-            }
+            )
+        {
+            response_order.push(request_id.to_string());
         }
     }
     assert_eq!(
@@ -375,7 +462,18 @@ async fn phase2_link_receive_send_and_idempotent_text() {
         .await;
     }
     loop {
-        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let response: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => panic!(
+                "the capacity drain never saw capacity-32 within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if response.get("requestId").and_then(Value::as_str) == Some("capacity-32") {
             assert_eq!(response["error"]["code"], "INTERNAL_ERROR");
             assert_eq!(
@@ -416,7 +514,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|message| message["text"] == "[slow-host-test]")
+        .filter(|message| message["body"] == "[slow-host-test]")
         .map(|message| message["status"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert!(slow_statuses.contains(&"sent"));
@@ -506,6 +604,165 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     )
     .await;
     assert!(after_delete["result"].as_array().unwrap().is_empty());
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
+async fn link_cancel_keeps_the_group_engine_and_other_accounts() {
+    // B3: cancel one account's link on a shared engine/group. The engine must
+    // keep the same pid, the already-linked account must keep working, and
+    // the cancelled account must be linkable again afterwards.
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [13_u8; 32];
+    fs::write(&secret_file, bootstrap_payload(&secret)).unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_MULTI_ACCOUNT", "1")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "b3-start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    // Account B is linked first and keeps its engine connection throughout.
+    let b_link = request(
+        &mut client,
+        "b3-link-b",
+        "link.start",
+        json!({ "deviceName": "KT-B3-B" }),
+    )
+    .await;
+    let b_finished = request(
+        &mut client,
+        "b3-finish-b",
+        "link.finish",
+        json!({ "linkSessionId": b_link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let b_id = b_finished["result"]["id"]
+        .as_str()
+        .expect("account B links")
+        .to_string();
+    let b_synced = request(
+        &mut client,
+        "b3-sync-b-before",
+        "contacts.sync",
+        json!({ "accountId": b_id }),
+    )
+    .await;
+    assert_eq!(b_synced["result"]["contactCount"], 3);
+
+    // Account A's link stays in the phone-approval wait, then the user
+    // cancels it.
+    let a_link = request(
+        &mut client,
+        "b3-link-a",
+        "link.start",
+        json!({ "deviceName": "[slow-link-test]" }),
+    )
+    .await;
+    let a_session = a_link["result"]["linkSessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    send_request_frame(
+        &mut client,
+        "b3-finish-a",
+        "link.finish",
+        json!({ "linkSessionId": a_session }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "b3-cancel-a",
+        "link.cancel",
+        json!({ "linkSessionId": a_session }),
+    )
+    .await;
+    let mut finish_cancelled = false;
+    let mut cancel_answered = false;
+    timeout(Duration::from_secs(3), async {
+        while !finish_cancelled || !cancel_answered {
+            let response: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            match response.get("requestId").and_then(Value::as_str) {
+                Some("b3-finish-a") => {
+                    assert_eq!(response["error"]["code"], "LINK_CANCELLED");
+                    finish_cancelled = true;
+                }
+                Some("b3-cancel-a") => {
+                    assert!(response.get("result").is_some());
+                    cancel_answered = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("link.cancel must answer without waiting for phone approval");
+
+    // The shared engine must not have been stopped or restarted.
+    let status = request(&mut client, "b3-status", "runtime.status", json!({})).await;
+    assert_eq!(status["result"]["state"], "running");
+    assert_eq!(
+        status["result"]["pid"].as_u64().unwrap() as u32,
+        engine_pid,
+        "cancelling one link must not restart the group engine"
+    );
+
+    // B is still bound and its engine lane still answers.
+    let accounts = request(&mut client, "b3-accounts", "accounts.list", json!({})).await;
+    let ids: Vec<&str> = accounts["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|account| account["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![b_id.as_str()]);
+    let b_synced_after = request(
+        &mut client,
+        "b3-sync-b-after",
+        "contacts.sync",
+        json!({ "accountId": b_id }),
+    )
+    .await;
+    assert_eq!(b_synced_after["result"]["contactCount"], 3);
+
+    // The cancelled account can start over and link successfully.
+    let a_relink = request(
+        &mut client,
+        "b3-relink-a",
+        "link.start",
+        json!({ "deviceName": "KT-B3-A" }),
+    )
+    .await;
+    let a_finished = request(
+        &mut client,
+        "b3-finish-relink-a",
+        "link.finish",
+        json!({ "linkSessionId": a_relink["result"]["linkSessionId"] }),
+    )
+    .await;
+    assert!(
+        a_finished["result"]["id"].as_str().is_some(),
+        "the cancelled account must be linkable again: {a_finished}"
+    );
+    let accounts = request(&mut client, "b3-accounts-2", "accounts.list", json!({})).await;
+    assert_eq!(accounts["result"].as_array().unwrap().len(), 2);
 
     drop(client);
     assert_clean_exit(&mut connector).await;
@@ -778,6 +1035,10 @@ async fn note_to_self_skeleton_marks_the_wire_and_send_reaches_the_upstream() {
     )
     .await;
     let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    // Contract 1.170 (§4.170): the self chat's canonical key is this ACI —
+    // the skeleton below materializes under it, and the self send dispatches
+    // to it (the same Signal identity the number names).
+    let self_aci = finished["result"]["aci"].as_str().unwrap();
 
     // The cached-counts answer proves the sync transaction (rows + marker)
     // committed, so the skeletons below are deterministic.
@@ -832,7 +1093,11 @@ async fn note_to_self_skeleton_marks_the_wire_and_send_reaches_the_upstream() {
     assert_eq!(sent["result"]["status"], "sent");
     assert_eq!(sent["result"]["conversationId"], conversation_id);
 
-    // The upstream dispatch carries the self recipient verbatim.
+    // The upstream dispatch carries the self recipient. Contract 1.170
+    // (§4.170): the canonical ACI-keyed row is what the send path reads, so
+    // the dispatch targets the ACI — the same Signal identity the number
+    // names (the engine's resolve_recipient parses a UUID service id on its
+    // first ladder arm, verified read-only in §4.170).
     let send_log = fs::read_to_string(
         temp.path()
             .join("signal-data")
@@ -845,7 +1110,7 @@ async fn note_to_self_skeleton_marks_the_wire_and_send_reaches_the_upstream() {
         .find(|entry: &Value| entry["message"] == "note to myself")
         .expect("the self send must reach the upstream engine");
     assert_eq!(dispatch["account"], "+15555550100");
-    assert_eq!(dispatch["recipient"], json!(["+15555550100"]));
+    assert_eq!(dispatch["recipient"], json!([self_aci]));
 
     // The row landed on the self conversation and the marker stays.
     let relisted = request(
@@ -977,6 +1242,124 @@ async fn contacts_list_marks_the_own_entry_is_self_same_source_with_conversation
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract 1.142 (§4.138): the engine's own-ACI answer rides the link.finish
+/// result and the accounts.list rows. The fixture derives a stable uuid5 per
+/// number, so the expected value is pinned; the connector carries it verbatim
+/// (canonical dashed lowercase) on both faces and never substitutes the
+/// opaque local row id.
+#[tokio::test]
+async fn link_finish_and_accounts_list_carry_the_answered_aci() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [23_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Aci" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap();
+    let aci = finished["result"]["aci"].as_str().unwrap();
+    assert_eq!(aci, "5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b");
+    assert_ne!(
+        aci, account_id,
+        "the row id is not an ACI and must never stand in for one"
+    );
+
+    let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
+    let rows = accounts["result"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], account_id);
+    assert_eq!(rows[0]["aci"], aci);
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.142 (§4.138): an engine face without the aci key reads as
+/// honest absence on both faces — the connector serializes no invented
+/// identity (the key is skipped, never a guess from the opaque row id).
+/// KT_FAKE_OMIT_ACCOUNT_ACI=1 is the fixture's engine-without-the-answer
+/// build, the face the pinned engine actually rides today.
+#[tokio::test]
+async fn an_engine_without_the_aci_face_reads_as_absence_on_both_faces() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [29_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_OMIT_ACCOUNT_ACI", "1")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-NoAci" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    assert_eq!(finished["result"]["state"], "ready");
+    assert!(
+        finished["result"].get("aci").is_none(),
+        "an absent engine face must not invent a key: {finished:?}"
+    );
+
+    let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
+    let rows = accounts["result"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].get("aci").is_none(),
+        "an absent engine face must not invent a key: {rows:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Phase 0 happy-path smoke gap (docs/optimization-plan.md): the existing
 /// phase2 test proves receive persistence through `messages.list`, but nothing
 /// asserted the normalized host event stream, and `messages.getText` had no
@@ -1061,7 +1444,7 @@ async fn receive_delivers_host_events_and_get_text_returns_the_full_body() {
     let message = &upserted["data"];
     assert_eq!(message["accountId"], account_id);
     assert_eq!(message["direction"], "incoming");
-    assert_eq!(message["text"], "private text");
+    assert_eq!(message["body"], "private text");
     assert_eq!(message["status"], "delivered");
     // attachments was removed from MessageRecord in optimization-plan Phase 2
     // (the engine runs signal-cli with --ignore-attachments); the field must
@@ -1991,58 +2374,7 @@ async fn conversation_summary_and_reactions_carry_author_metadata() {
 }
 
 #[tokio::test]
-async fn socks_proxy_env_is_forwarded_to_the_jvm() {
-    let temp = TempDir::new().unwrap();
-    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let endpoint = temp.path().join("connector.sock");
-    let secret_file = temp.path().join("bootstrap.secret");
-    let secret = [13_u8; 32];
-    write_secret_file(&secret_file, &secret);
-
-    // The fixture exits 91 immediately unless JAVA_OPTS carries exactly the
-    // heap budget plus the SOCKS proxy flags.
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
-    command
-        .arg("serve")
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .arg("--bootstrap-secret-file")
-        .arg(&secret_file)
-        .arg("--signal-cli")
-        .arg(fixture())
-        .arg("--signal-data-dir")
-        .arg(temp.path().join("signal-data"))
-        .arg("--state-dir")
-        .arg(temp.path().join("state"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .env("KT_SIGNAL_SOCKS_PROXY", "127.0.0.1:11080")
-        .env(
-            "KT_FAKE_EXPECT_JAVA_OPTS",
-            "-Xms16m -Xmx384m -DsocksProxyHost=127.0.0.1 -DsocksProxyPort=11080",
-        );
-    let mut connector = command.spawn().unwrap();
-    wait_for_path(&endpoint).await;
-    let stream = UnixStream::connect(&endpoint).await.unwrap();
-    let mut client = Framed::new(stream, LinesCodec::new());
-    authenticate(&mut client, &secret).await;
-
-    let started = request(&mut client, "start", "runtime.start", json!({})).await;
-    assert_eq!(started["result"]["state"], "running");
-    // A proxy-flag mismatch kills the fixture at JVM launch; a live answer
-    // after a settle delay proves the exact JAVA_OPTS reached the child.
-    sleep(Duration::from_millis(200)).await;
-    let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
-    assert!(accounts.get("result").is_some());
-
-    drop(client);
-    assert_clean_exit(&mut connector).await;
-}
-
-#[tokio::test]
-async fn native_mode_serves_without_a_jvm_environment() {
+async fn serve_ignores_java_home_and_never_leaks_java_env() {
     let temp = TempDir::new().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let endpoint = temp.path().join("connector.sock");
@@ -2050,12 +2382,14 @@ async fn native_mode_serves_without_a_jvm_environment() {
     let secret = [14_u8; 32];
     write_secret_file(&secret_file, &secret);
 
-    // Native mode via the environment variable (the form Desktop uses), with
-    // a JAVA_HOME that JVM mode would reject: it must be ignored entirely.
-    // A SOCKS proxy stays configured to prove native+proxy starts; the proxy
-    // reaches a real native binary as `-D` argv properties (the fixture
-    // ignores argv; the argv shape is unit-tested in engine.rs). The fixture
-    // exits 94 immediately if JAVA_OPTS or JAVA_HOME leak into its env.
+    // The launcher-compat `--java-home` flag (Desktop still passes it) points
+    // at a path serve no longer validates: serve must accept and
+    // ignore it. A SOCKS proxy stays configured to prove serve starts with
+    // one: the value is validated at launch, nothing proxy-shaped is placed
+    // on the child command line, and the engine child inherits the same
+    // `KT_SIGNAL_SOCKS_PROXY` environment (engine.rs pins the parse shape).
+    // The fixture exits 94 immediately if JAVA_OPTS or JAVA_HOME leak into
+    // its env.
     let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
     command
         .arg("serve")
@@ -2063,7 +2397,7 @@ async fn native_mode_serves_without_a_jvm_environment() {
         .arg(&endpoint)
         .arg("--bootstrap-secret-file")
         .arg(&secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--java-home")
         .arg(temp.path().join("no-such-jre"))
@@ -2075,7 +2409,6 @@ async fn native_mode_serves_without_a_jvm_environment() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .env("KT_SIGNAL_CLI_NATIVE", "1")
         .env("KT_SIGNAL_SOCKS_PROXY", "127.0.0.1:11080")
         .env("KT_FAKE_EXPECT_NO_JAVA", "1");
     let mut connector = command.spawn().unwrap();
@@ -2087,12 +2420,636 @@ async fn native_mode_serves_without_a_jvm_environment() {
     let started = request(&mut client, "start", "runtime.start", json!({})).await;
     assert_eq!(started["result"]["state"], "running");
     // A JAVA_* leak kills the fixture at spawn; a live answer after a settle
-    // delay proves the native spawn path serves requests without a JVM env.
+    // delay proves the serve path answers requests without a JVM env.
     sleep(Duration::from_millis(200)).await;
     let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
     assert!(accounts.get("result").is_some());
 
     drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+/// conversations.setExpireTimer end to end (2026-10-06 group-timer batch;
+/// engine main @ 216a4c7): the group form no longer answers the recorded
+/// INVALID_REQUEST gate — it dispatches `updateGroup {account, groupId,
+/// expiration}` verbatim (SEND_LOG), the groupUpdated projection the engine
+/// emits after the change injects through the fixture and converges the
+/// mirror, and `conversation.changed` carries the new timer. The
+/// launcher-compat `--java-home` points at a path serve does not
+/// validate: serve ignores it, and the fixture's no-Java guard would exit 94 if
+/// either JAVA_* variable leaked into the child env.
+#[tokio::test]
+async fn kt_engine_mode_serves_group_expire_timer_and_group_updated() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [15_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--bootstrap-secret-file")
+        .arg(&secret_file)
+        .arg("--engine-bin")
+        .arg(fixture())
+        .arg("--java-home")
+        .arg(temp.path().join("no-such-jre"))
+        .arg("--signal-data-dir")
+        .arg(temp.path().join("signal-data"))
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1");
+    let mut connector = command.spawn().unwrap();
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupTimer" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The fixture links with one known group conversation in place; find it
+    // and set its timer: the call must not answer the former INVALID_REQUEST
+    // gate but the ordinary success.
+    let listed = request(
+        &mut client,
+        "list-for-group",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with a group conversation");
+    let group_timer = request(
+        &mut client,
+        "group-timer",
+        "conversations.setExpireTimer",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "expireSeconds": 3600
+        }),
+    )
+    .await;
+    assert_eq!(group_timer["result"]["expireTimerSeconds"], 3600);
+
+    // The success mirror rides conversation.changed first — drain it so the
+    // groupUpdated assertion below can only pass through its own path.
+    let mut saw_send_mirror = false;
+    for _ in 0..16 {
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "conversation.changed send mirror never arrived within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
+        if frame["event"] == "conversation.changed"
+            && frame["data"]["id"] == group_conversation.as_str()
+            && frame["data"]["expireTimerSeconds"] == 3600
+        {
+            saw_send_mirror = true;
+            break;
+        }
+    }
+    assert!(
+        saw_send_mirror,
+        "the send-path mirror must ride conversation.changed"
+    );
+
+    // The exact upstream contract landed on the engine wire.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log the dispatch");
+    let group_timer_call: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|params| params.get("groupId").is_some() && params.get("expiration").is_some())
+        .expect("the group timer must reach updateGroup");
+    assert_eq!(group_timer_call["account"], "+15555550100");
+    assert_eq!(group_timer_call["groupId"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(group_timer_call["expiration"], 3600);
+
+    // Inject the engine's groupUpdated projection (the real engine emits it
+    // after the change lands — here a member changed the timer to 86400)
+    // through the extra-receives marker, delivered by the sendTyping flush
+    // (a typing indicator changes no conversation state — the clean post-link
+    // flush trigger): the mirror converges through the receive path alone.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([{
+            "timestamp": 1727000000000_u64,
+            "groupUpdated": {
+                "groupId": "ZmFrZS1ncm91cC0x",
+                "revision": 2,
+                "expireTimerSeconds": 86400
+            }
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let _ = request(
+        &mut client,
+        "typing-flush",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation
+        }),
+    )
+    .await;
+    let mut saw_timer_change = false;
+    for _ in 0..16 {
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "group conversation.changed timer mirror (86400) never arrived \
+                 within {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
+        if frame["event"] == "conversation.changed"
+            && frame["data"]["id"] == group_conversation.as_str()
+            && frame["data"]["expireTimerSeconds"] == 86400
+        {
+            saw_timer_change = true;
+            break;
+        }
+    }
+    assert!(
+        saw_timer_change,
+        "the groupUpdated projection must converge the mirror through conversation.changed"
+    );
+
+    // conversations.list agrees with the receive-path mirror.
+    let listed = request(
+        &mut client,
+        "list-after-update",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let row = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == group_conversation.as_str())
+        .expect("the conversation is listed")
+        .clone();
+    assert_eq!(row["expireTimerSeconds"], 86400);
+
+    // The off form (0) routes the same updateGroup write — the engine face
+    // validates 0 = off verbatim.
+    let off_timer = request(
+        &mut client,
+        "group-timer-off",
+        "conversations.setExpireTimer",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "expireSeconds": 0
+        }),
+    )
+    .await;
+    assert_eq!(off_timer["result"]["expireTimerSeconds"], 0);
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log the dispatch");
+    let off_call: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|params| params.get("expiration") == Some(&json!(0)))
+        .expect("the off timer must reach updateGroup");
+    assert_eq!(off_call["groupId"], "ZmFrZS1ncm91cC0x");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.134 (§4.117): the engine-notification forwarding batch end to
+/// end. Pass-through lane: the fixture's raw-notification marker injects the
+/// three standalone account-domain notifications and their host frames ride
+/// with the resolved accountId (receive.emptied / receive.clockSkew /
+/// conversation.stateChanged); the envelope-key faces (groupTerminated /
+/// contactProfileUpdated) ride the extra-receives channel like the
+/// groupUpdated projection. F red line: a conversations array past the
+/// engine's own batch cap forwards verbatim — no connector trim, unnamed
+/// sibling keys ride. Attribution/error lane: a notification naming an
+/// unbound account forwards nothing (the warn-only drop), and a malformed
+/// face surfaces as runtime.protocolWarning instead of a guessed frame.
+/// Local gate n/a (the events carry no request) and crash n/a (the engine
+/// staying alive is the assertion) — the §4.114 four-lane set's other two
+/// lanes do not apply to notifications.
+#[tokio::test]
+async fn engine_notifications_forward_through_the_transient_lane() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [21_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--bootstrap-secret-file")
+        .arg(&secret_file)
+        .arg("--engine-bin")
+        .arg(fixture())
+        .arg("--java-home")
+        .arg(temp.path().join("no-such-jre"))
+        .arg("--signal-data-dir")
+        .arg(temp.path().join("signal-data"))
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1");
+    let mut connector = command.spawn().unwrap();
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-EngineNotifications" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Drain the link-time burst (the fixture's default receive and any
+    // mirrors) before injecting, so the assertions below only see this
+    // batch's frames. Opportunistic drain: dry reads cost a short window,
+    // never the full harness timeout.
+    for _ in 0..8 {
+        let read = timeout(Duration::from_secs(2), client.next()).await;
+        if read.is_err() || matches!(read, Ok(None)) {
+            break;
+        }
+    }
+
+    // Pass-through lane, standalone methods: one marker batch with the
+    // three notifications.
+    async fn next_frame(client: &mut Framed<UnixStream, LinesCodec>) -> Value {
+        match timeout(HARNESS_REQUEST_TIMEOUT, client.next()).await {
+            Ok(Some(Ok(line))) => serde_json::from_str::<Value>(&line).unwrap(),
+            other => panic!(
+                "the host frame stream ended early: {other:?}\n{}",
+                dump_connector_crash_scene()
+            ),
+        }
+    }
+    // The quiet read: an Option window for drains and absence proofs — a
+    // dry stream is a value, not a failure.
+    async fn next_frame_quiet(client: &mut Framed<UnixStream, LinesCodec>) -> Option<Value> {
+        match timeout(Duration::from_secs(2), client.next()).await {
+            Ok(Some(Ok(line))) => serde_json::from_str::<Value>(&line).ok(),
+            _ => None,
+        }
+    }
+    let conversations = json!([
+        {
+            "conversationId": "11111111-1111-1111-1111-111111111111",
+            "kind": "contact",
+            "mutedUntilTimestamp": 1727000000000_u64,
+            "archived": true,
+            "markedUnread": false,
+            "unnamedSibling": { "rides": true },
+        },
+        {
+            "conversationId": "ZmFrZS1ncm91cC0x",
+            "kind": "group",
+            "mutedUntilTimestamp": 0,
+            "archived": false,
+            "markedUnread": true,
+        },
+    ]);
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-notifications.json"),
+        json!({ "notifications": [
+            { "jsonrpc": "2.0", "method": "receive.emptied", "params": { "account": "+15555550100" } },
+            { "jsonrpc": "2.0", "method": "receive.clockskew", "params": {
+                "account": "+15555550100", "skewMs": -86_400_001_i64, "serverTimestamp": 1727000000000_u64 } },
+            { "jsonrpc": "2.0", "method": "receive.conversationState", "params": {
+                "account": "+15555550100", "conversations": conversations, "overflow": false } },
+            { "jsonrpc": "2.0", "method": "engine.storagePull", "params": {
+                "account": "+15555550100", "trigger": "login", "contactsOk": true, "groupsOk": false } },
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut saw_emptied = None;
+    let mut saw_skew = None;
+    let mut saw_state = None;
+    let mut saw_pull = None;
+    for _ in 0..24 {
+        let frame = next_frame(&mut client).await;
+        match frame["event"].as_str() {
+            Some("receive.emptied") => saw_emptied = Some(frame),
+            Some("receive.clockSkew") => saw_skew = Some(frame),
+            Some("conversation.stateChanged") => saw_state = Some(frame),
+            Some("engine.storagePull") => saw_pull = Some(frame),
+            _ => {}
+        }
+        if saw_emptied.is_some() && saw_skew.is_some() && saw_state.is_some() && saw_pull.is_some()
+        {
+            break;
+        }
+    }
+    let emptied = saw_emptied.expect("receive.emptied must ride the lane");
+    assert_eq!(emptied["data"]["accountId"], account_id);
+    let skew = saw_skew.expect("receive.clockSkew must ride the lane");
+    assert_eq!(skew["data"]["accountId"], account_id);
+    assert_eq!(skew["data"]["skewMs"], -86_400_001, "signed skew verbatim");
+    assert_eq!(skew["data"]["serverTimestamp"], 1727000000000_u64);
+    let state = saw_state.expect("conversation.stateChanged must ride the lane");
+    assert_eq!(state["data"]["accountId"], account_id);
+    assert_eq!(
+        state["data"]["conversations"], conversations,
+        "the batch rides verbatim, sibling keys included"
+    );
+    assert_eq!(state["data"]["overflow"], false);
+    // Contract 1.141 (§4.137): the storage-pull outcome rides the same lane
+    // with the resolved account and the verbatim trigger.
+    let pull = saw_pull.expect("engine.storagePull must ride the lane");
+    assert_eq!(pull["data"]["accountId"], account_id);
+    assert_eq!(pull["data"]["trigger"], "login");
+    assert_eq!(pull["data"]["contactsOk"], true);
+    assert_eq!(pull["data"]["groupsOk"], false);
+
+    // F red line: a batch past the engine's own 256-entry cap forwards
+    // verbatim — the connector never trims, and the overflow tail marker
+    // rides beside the array.
+    let oversized: Vec<Value> = (0..257)
+        .map(|index| {
+            json!({
+                "conversationId": format!("id-{index}"),
+                "kind": "contact",
+                "mutedUntilTimestamp": index,
+                "archived": false,
+                "markedUnread": true,
+            })
+        })
+        .collect();
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-notifications.json"),
+        json!({ "notifications": [
+            { "jsonrpc": "2.0", "method": "receive.conversationState", "params": {
+                "account": "+15555550100", "conversations": oversized, "overflow": true } },
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut saw_oversized = None;
+    for _ in 0..24 {
+        let frame = next_frame(&mut client).await;
+        if frame["event"] == "conversation.stateChanged" {
+            saw_oversized = Some(frame);
+            break;
+        }
+    }
+    let state = saw_oversized.expect("the oversized batch must ride");
+    let carried = state["data"]["conversations"].as_array().unwrap();
+    assert_eq!(
+        carried.len(),
+        257,
+        "the connector never trims the engine batch: {} entries",
+        carried.len()
+    );
+    assert_eq!(carried[0]["conversationId"], "id-0");
+    assert_eq!(carried[256]["conversationId"], "id-256");
+    assert_eq!(state["data"]["overflow"], true, "the tail marker rides");
+
+    // Envelope-key faces: the termination and profile-refresh projections
+    // ride the receive lane (the extra-receives marker + the typing flush,
+    // the groupUpdated test's channel). The two forwarded frames race the
+    // flush request's own reply — the marker flushes during the upstream
+    // listContacts call, before the answer — so the interleaved event frames
+    // are collected beside the reply instead of eaten by a reply-only read.
+    async fn request_collecting(
+        client: &mut Framed<UnixStream, LinesCodec>,
+        request_id: &str,
+        method: &str,
+        params: Value,
+        interleaved: &mut Vec<Value>,
+    ) -> Value {
+        send_request_frame(client, request_id, method, params).await;
+        loop {
+            let frame = next_frame(client).await;
+            if frame.get("requestId").and_then(Value::as_str) == Some(request_id) {
+                return frame;
+            }
+            interleaved.push(frame);
+        }
+    }
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "timestamp": 1727000001000_u64,
+                "groupTerminated": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "terminator": "33333333-3333-3333-3333-333333333333",
+                    "timestamp": 1727000001000_u64,
+                },
+            },
+            {
+                "timestamp": 1727000002000_u64,
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "contactProfileUpdated": { "aci": "22222222-2222-2222-2222-222222222222" },
+            },
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let mut interleaved = Vec::new();
+    let listed = request_collecting(
+        &mut client,
+        "list-for-flush",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+        &mut interleaved,
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with a group conversation");
+    let _ = request_collecting(
+        &mut client,
+        "typing-flush",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation
+        }),
+        &mut interleaved,
+    )
+    .await;
+    fn note_lane_frame(
+        frame: Value,
+        saw_terminated: &mut Option<Value>,
+        saw_profile: &mut Option<Value>,
+    ) {
+        match frame["event"].as_str() {
+            Some("group.terminated") if saw_terminated.is_none() => {
+                *saw_terminated = Some(frame);
+            }
+            Some("contact.profileUpdated") if saw_profile.is_none() => {
+                *saw_profile = Some(frame);
+            }
+            _ => {}
+        }
+    }
+    let mut saw_terminated = None;
+    let mut saw_profile = None;
+    for frame in interleaved {
+        note_lane_frame(frame, &mut saw_terminated, &mut saw_profile);
+    }
+    for _ in 0..24 {
+        if saw_terminated.is_some() && saw_profile.is_some() {
+            break;
+        }
+        let frame = next_frame(&mut client).await;
+        note_lane_frame(frame, &mut saw_terminated, &mut saw_profile);
+    }
+    let terminated = saw_terminated.expect("group.terminated must ride the lane");
+    assert_eq!(terminated["data"]["accountId"], account_id);
+    assert_eq!(terminated["data"]["groupId"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(
+        terminated["data"]["terminator"],
+        "33333333-3333-3333-3333-333333333333"
+    );
+    assert_eq!(terminated["data"]["timestamp"], 1727000001000_u64);
+    let profile = saw_profile.expect("contact.profileUpdated must ride the lane");
+    assert_eq!(profile["data"]["accountId"], account_id);
+    assert_eq!(
+        profile["data"]["aci"],
+        "22222222-2222-2222-2222-222222222222"
+    );
+    assert_eq!(profile["data"]["timestamp"], 1727000002000_u64);
+
+    // Attribution/error lane: an unbound account forwards nothing, and a
+    // malformed face (a non-array conversations) surfaces as
+    // runtime.protocolWarning — never a guessed frame.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-notifications.json"),
+        json!({ "notifications": [
+            { "jsonrpc": "2.0", "method": "receive.emptied", "params": { "account": "+15555550999" } },
+            { "jsonrpc": "2.0", "method": "receive.conversationState", "params": {
+                "account": "+15555550100", "conversations": 42, "overflow": false } },
+            { "jsonrpc": "2.0", "method": "engine.storagePull", "params": {
+                "account": "+15555550100", "trigger": "login", "contactsOk": true } },
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut saw_warning = false;
+    let mut unattributed_forward = None;
+    // The quiet window: long enough for the batch to deliver (or drop),
+    // bounded so absence stays provable without the full harness timeout.
+    for _ in 0..12 {
+        let Some(frame) = next_frame_quiet(&mut client).await else {
+            continue;
+        };
+        match frame["event"].as_str() {
+            Some("runtime.protocolWarning") => saw_warning = true,
+            Some("receive.emptied")
+            | Some("conversation.stateChanged")
+            | Some("engine.storagePull") => {
+                unattributed_forward = Some(frame);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_warning,
+        "the malformed face must surface as a protocol warning"
+    );
+    assert!(
+        unattributed_forward.is_none(),
+        "an unbound account must never forward: {unattributed_forward:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
     assert_clean_exit(&mut connector).await;
 }
 
@@ -2132,6 +3089,253 @@ async fn link_finish_reports_a_non_retryable_unknown_outcome_when_the_engine_die
     // retryable timeout: re-running it could claim a second device slot.
     assert_eq!(finished["error"]["code"], "LINK_OUTCOME_UNKNOWN");
     assert_eq!(finished["error"]["retryable"], false);
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
+async fn delete_refuses_same_number_relink_until_cleanup_settles() {
+    // B4 (§9.10 item 7): a relink of the number whose local-data delete has
+    // not settled must be refused honestly; once the delete completes the
+    // same number links again.
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [14_u8; 32];
+    fs::write(&secret_file, bootstrap_payload(&secret)).unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+
+    let mut connector =
+        spawn_connector_with(temp.path(), &endpoint, &secret_file, Some("hold"), &[]);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "b4-start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    let link = request(
+        &mut client,
+        "b4-link",
+        "link.start",
+        json!({ "deviceName": "KT-B4" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "b4-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // An in-flight transfer download for this account: the delete must cancel
+    // it through the only account-task cancel face the pinned engine has.
+    fs::write(signal_data.join(".fixture-transfer-running"), "").unwrap();
+    fs::write(signal_data.join(".fixture-transfer-bytes"), "0").unwrap();
+
+    send_request_frame(
+        &mut client,
+        "b4-delete",
+        "accounts.deleteLocalData",
+        json!({ "accountId": account_id, "operationId": "b4-delete-op" }),
+    )
+    .await;
+    wait_for_marker(&signal_data.join(".fixture-delete-running")).await;
+    let cancel_log =
+        fs::read_to_string(signal_data.join(".fixture-import-cancel-log")).unwrap_or_default();
+    assert_eq!(
+        cancel_log.lines().collect::<Vec<_>>(),
+        vec!["+15555550100"],
+        "the delete cancels the account's own import task before dispatch"
+    );
+    assert!(
+        !signal_data.join(".fixture-transfer-running").exists(),
+        "the in-flight transfer task was cancelled"
+    );
+
+    // While the delete is held open, the same number's relink is refused with
+    // the honest in-progress code and is retryable.
+    let relink = request(
+        &mut client,
+        "b4-relink-while-deleting",
+        "link.start",
+        json!({ "deviceName": "KT-B4-Relink" }),
+    )
+    .await;
+    let refused = request(
+        &mut client,
+        "b4-finish-while-deleting",
+        "link.finish",
+        json!({ "linkSessionId": relink["result"]["linkSessionId"] }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "ACCOUNT_DELETE_IN_PROGRESS");
+    assert_eq!(refused["error"]["retryable"], false);
+
+    // Release the delete and wait for the store cleanup to land.
+    fs::write(signal_data.join(".fixture-delete-release"), "").unwrap();
+    let delete_response = await_response(&mut client, "b4-delete").await;
+    assert!(
+        delete_response.get("result").is_some(),
+        "the delete must complete: {delete_response}"
+    );
+    wait_until_accounts_empty(&mut client, "b4-delete-settling").await;
+
+    // Same number links again after the cleanup.
+    let relink = request(
+        &mut client,
+        "b4-relink-after",
+        "link.start",
+        json!({ "deviceName": "KT-B4-Relink" }),
+    )
+    .await;
+    let relinked = request(
+        &mut client,
+        "b4-finish-after",
+        "link.finish",
+        json!({ "linkSessionId": relink["result"]["linkSessionId"] }),
+    )
+    .await;
+    assert!(
+        relinked["result"]["id"].as_str().is_some(),
+        "the same number must link after the delete settled: {relinked}"
+    );
+    let accounts = request(&mut client, "b4-accounts-after", "accounts.list", json!({})).await;
+    assert_eq!(accounts["result"].as_array().unwrap().len(), 1);
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
+async fn delete_cancels_only_its_own_accounts_tasks() {
+    // B4 (§9.10 item 6): deleting A cancels A's import task without touching
+    // B's engine connection, and the cancel face is idempotent when there is
+    // nothing in flight.
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [15_u8; 32];
+    fs::write(&secret_file, bootstrap_payload(&secret)).unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        Some("hold"),
+        &[("KT_FAKE_MULTI_ACCOUNT", "1")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "b4b-start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    let mut account_ids = Vec::new();
+    for (index, name) in ["KT-B4B-A", "KT-B4B-B"].iter().enumerate() {
+        let link = request(
+            &mut client,
+            &format!("b4b-link-{index}"),
+            "link.start",
+            json!({ "deviceName": name }),
+        )
+        .await;
+        let finished = request(
+            &mut client,
+            &format!("b4b-finish-{index}"),
+            "link.finish",
+            json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+        )
+        .await;
+        account_ids.push(finished["result"]["id"].as_str().unwrap().to_string());
+    }
+    let numbers: Vec<String> = fs::read_to_string(signal_data.join(".fixture-linked-numbers"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(numbers.len(), 2);
+    let (a_number, b_number) = (numbers[0].clone(), numbers[1].clone());
+    assert_ne!(a_number, b_number);
+
+    fs::write(signal_data.join(".fixture-transfer-running"), "").unwrap();
+    fs::write(signal_data.join(".fixture-transfer-bytes"), "0").unwrap();
+    send_request_frame(
+        &mut client,
+        "b4b-delete-a",
+        "accounts.deleteLocalData",
+        json!({ "accountId": account_ids[0], "operationId": "b4b-delete-op" }),
+    )
+    .await;
+    wait_for_marker(&signal_data.join(".fixture-delete-running")).await;
+
+    // A's task was cancelled; B's was not touched.
+    let cancel_log = fs::read_to_string(signal_data.join(".fixture-import-cancel-log")).unwrap();
+    assert_eq!(
+        cancel_log.lines().collect::<Vec<_>>(),
+        vec![a_number.as_str()],
+        "the delete cancels only its own account's task"
+    );
+
+    // B keeps working while A's delete is still held open.
+    let accounts = request(&mut client, "b4b-accounts", "accounts.list", json!({})).await;
+    assert!(
+        accounts["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|account| account["id"].as_str() == Some(account_ids[1].as_str())),
+        "B stays bound during A's delete"
+    );
+    let b_synced = request(
+        &mut client,
+        "b4b-sync-b",
+        "contacts.sync",
+        json!({ "accountId": account_ids[1] }),
+    )
+    .await;
+    assert_eq!(b_synced["result"]["contactCount"], 3);
+
+    // Cancelling an account with nothing in flight is an idempotent no-op.
+    for round in 0..2 {
+        let cancelled = request(
+            &mut client,
+            &format!("b4b-cancel-b-{round}"),
+            "history.importCancel",
+            json!({ "accountId": account_ids[1] }),
+        )
+        .await;
+        assert_eq!(cancelled["result"]["cancelled"], false);
+    }
+
+    fs::write(signal_data.join(".fixture-delete-release"), "").unwrap();
+    let delete_response = await_response(&mut client, "b4b-delete-a").await;
+    assert!(
+        delete_response.get("result").is_some(),
+        "A's delete must complete: {delete_response}"
+    );
+    wait_until_only_account(&mut client, &account_ids[1], "b4b-delete-settling").await;
+    let b_synced_after = request(
+        &mut client,
+        "b4b-sync-b-after",
+        "contacts.sync",
+        json!({ "accountId": account_ids[1] }),
+    )
+    .await;
+    assert_eq!(b_synced_after["result"]["contactCount"], 3);
 
     drop(client);
     assert_clean_exit(&mut connector).await;
@@ -2201,6 +3405,23 @@ async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
     )
     .await;
     assert!(reconciled.get("result").is_some());
+    let deleted = &reconciled["result"]["deleted"];
+    assert_eq!(deleted["accountId"], account_id);
+    assert!(
+        deleted["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:")),
+        "the delete answer carries the content-free receipt: {reconciled:?}"
+    );
+    assert!(deleted["rowsDeleted"].as_u64().is_some());
+    assert!(
+        deleted["tableCounts"].is_object(),
+        "counts ride the receipt: {reconciled:?}"
+    );
+    assert!(
+        reconciled["result"].get("signalAccount").is_none(),
+        "the receipt never echoes the linked number"
+    );
     let idempotent = request(
         &mut client,
         "delete-completed",
@@ -2214,6 +3435,10 @@ async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
     assert!(
         idempotent.get("result").is_some(),
         "idempotent delete response: {idempotent:?}"
+    );
+    assert_eq!(
+        idempotent["result"]["deleted"]["digest"], deleted["digest"],
+        "the replay returns the recorded receipt unchanged"
     );
     let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
     assert!(accounts["result"].as_array().unwrap().is_empty());
@@ -2312,7 +3537,18 @@ async fn account_delete_drains_in_flight_send_and_rejects_new_sends() {
     let mut delete = None;
     let mut during = None;
     while slow.is_none() || delete.is_none() || during.is_none() {
-        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let response: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => panic!(
+                "the delete-race drain stalled over {HARNESS_REQUEST_TIMEOUT:?} \
+                 with order {order:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         match response.get("requestId").and_then(Value::as_str) {
             Some("race-send-slow") => {
                 order.push("race-send-slow");
@@ -2572,6 +3808,265 @@ async fn incoming_mentions_project_author_aci_on_the_wire_row() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// §4.118 end-to-end: the fake engine's live poll envelopes ride the
+/// receive stream verbatim — the bodyless `dataMessage.poll` create lands a
+/// message row whose wire `poll` face is byte-identical to the §4.38
+/// history chain's (no `terminated`, no `votes`, no `voteCount` yet), the
+/// later `pollVote` folds the voter into that same row on
+/// `message.upserted`, and the `pollTerminate` flips `terminated` in place
+/// — and, since §4.189, lands the standalone notice row beside the poll
+/// (the flattened `pollTerminate` rich face on a `system` row keyed to the
+/// terminate envelope's own stamp). The vote rides in the same emission as
+/// its create (the §4.91 buffer converges whatever order the stream picks).
+#[tokio::test]
+async fn live_poll_create_vote_terminate_land_the_history_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [43_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-LivePoll" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Stage one: the create alone. The marker is written only AFTER
+    // link.finish (the established convention — injection is single-shot
+    // and pre-registration envelopes drop fail-closed).
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "sourceName": "Alice",
+                "timestamp": 600,
+                "dataMessage": {
+                    "groupInfo": { "groupId": "Z3JvdXAta2V5" },
+                    "poll": {
+                        "question": "Lunch?",
+                        "options": ["Ramen", "Sushi"],
+                        "allowMultiple": true,
+                    },
+                },
+            },
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Poll the history reads until the create row is visible (each poll
+    // drains interleaved events).
+    let mut conversation_id = String::new();
+    let mut create_row: Option<Value> = None;
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let conversations = request(
+            &mut client,
+            &format!("conv-{attempt}"),
+            "conversations.list",
+            json!({ "accountId": account_id, "limit": 50 }),
+        )
+        .await;
+        let group = conversations["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["type"] == "group")
+            .cloned();
+        let Some(group) = group else { continue };
+        conversation_id = group["id"].as_str().unwrap().to_string();
+        let listed = request(
+            &mut client,
+            &format!("list-{attempt}"),
+            "messages.list",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "limit": 50,
+            }),
+        )
+        .await;
+        let items = listed["result"]["items"].as_array().unwrap();
+        if let Some(row) = items.iter().find(|row| row.get("poll").is_some()) {
+            create_row = Some(row.clone());
+            break;
+        }
+    }
+    let create_row = create_row.expect("the poll create row landed");
+    assert_eq!(create_row["direction"], "incoming");
+    assert_eq!(create_row["sentAt"], 600);
+    assert!(
+        create_row.get("body").is_none() || create_row["body"].is_null(),
+        "poll creates carry no body"
+    );
+    // The wire face is the §4.38 history chain's exact keys: the defaults
+    // (terminated false, no votes) stay absent and `voteCount` never rides.
+    assert_eq!(
+        create_row["poll"],
+        json!({
+            "question": "Lunch?",
+            "options": ["Ramen", "Sushi"],
+            "allowMultiple": true,
+        })
+    );
+
+    // Stage two: the vote and the terminate ride one emission — whatever
+    // order the connector ingests them in, the folded row converges.
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "timestamp": 601,
+                "dataMessage": {
+                    "groupInfo": { "groupId": "Z3JvdXAta2V5" },
+                    "pollVote": {
+                        "targetAuthor": "+15555550101",
+                        "targetSentTimestamp": 600,
+                        "optionIndexes": [1],
+                        "voteCount": 1,
+                    },
+                },
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 602,
+                "dataMessage": {
+                    "groupInfo": { "groupId": "Z3JvdXAta2V5" },
+                    "pollTerminate": { "targetSentTimestamp": 600 },
+                },
+            },
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut folded_row: Option<Value> = None;
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("poll2-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let listed = request(
+            &mut client,
+            &format!("list2-{attempt}"),
+            "messages.list",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "limit": 50,
+            }),
+        )
+        .await;
+        let items = listed["result"]["items"].as_array().unwrap();
+        if let Some(row) = items.iter().find(|row| {
+            row.get("poll").is_some()
+                && row["poll"].get("terminated").and_then(Value::as_bool) == Some(true)
+        }) {
+            folded_row = Some(row.clone());
+            break;
+        }
+    }
+    let folded_row = folded_row.expect("the terminate folded onto the poll row");
+    assert_eq!(
+        folded_row["id"], create_row["id"],
+        "the controls folded into the create's own row"
+    );
+    assert_eq!(
+        folded_row["poll"],
+        json!({
+            "question": "Lunch?",
+            "options": ["Ramen", "Sushi"],
+            "allowMultiple": true,
+            "terminated": true,
+            "votes": [
+                { "voterId": "+15555550101", "optionIndexes": [1] },
+            ],
+        }),
+        "the converged face is the history chain's exact shape"
+    );
+    let final_items = {
+        let listed = request(
+            &mut client,
+            "list-final",
+            "messages.list",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "limit": 50,
+            }),
+        )
+        .await;
+        listed["result"]["items"].as_array().unwrap().clone()
+    };
+    // §4.189: the vote never mints a row, but the terminate's first flip
+    // lands the official standalone notice row beside the poll — the
+    // host wire sees exactly two rows, and the notice's rich face rides
+    // flattened camelCase like every rich key.
+    assert_eq!(
+        final_items.len(),
+        2,
+        "the poll row plus its terminate notice row"
+    );
+    let notice = final_items
+        .iter()
+        .find(|row| row.get("pollTerminate").is_some())
+        .expect("the notice row carries the flattened pollTerminate face");
+    assert_eq!(notice["direction"], "system");
+    assert_eq!(notice["status"], "system");
+    assert_eq!(notice["sentAt"], 602, "the terminate envelope's own stamp");
+    assert_eq!(
+        notice["pollTerminate"],
+        json!({
+            "pollQuestion": "Lunch?",
+            "pollSentAt": 600,
+        }),
+        "a peer terminate carries no selfTerminated key (skip-when-false)"
+    );
+    assert!(
+        notice.get("poll").is_none(),
+        "the notice row is not the poll bubble"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn groups_get_projects_the_synced_group_cache() {
     let temp = TempDir::new().unwrap();
@@ -2632,6 +4127,9 @@ async fn groups_get_projects_the_synced_group_cache() {
     assert_eq!(group["result"]["title"], "Fixture Group");
     assert_eq!(group["result"]["memberCount"], 2);
     assert!(group["result"]["syncedAt"].as_u64().unwrap() > 0);
+    // Contract 1.53 (§4.50 appendix): the plain terminated bool — false on
+    // the default fixture row (the stub carries the upstream flag).
+    assert_eq!(group["result"]["isTerminated"], false);
     // Contract 1.40 (§4.39): the roster the sync captured projects beside
     // memberCount — the number-based self marker on the linked account's own
     // entry, the contacts-cache name plus the upstream uuid and admin mark on
@@ -2706,6 +4204,551 @@ async fn groups_get_projects_the_synced_group_cache() {
     )
     .await;
     assert_eq!(unknown_account["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
+async fn groups_get_carries_the_sync_terminated_flag() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [38_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    // The stub answers the upstream JsonGroup.isTerminated true for the
+    // fixture group (the §4.50 verified listGroups read source), so the sync
+    // capture path runs end to end: listGroups → group_extra_json → the
+    // groups.get projection.
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_TERMINATED_GROUPS", "ZmFrZS1ncm91cC0x")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Terminated" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let _ = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+
+    let group = request(
+        &mut client,
+        "groups-get",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    assert_eq!(group["result"]["peerKey"], "ZmFrZS1ncm91cC0x");
+    // The terminated flag survives the whole ladder as the plain bool.
+    assert_eq!(group["result"]["isTerminated"], true);
+    // The roster still projects beside it — the flag adds one key, it does
+    // not replace the §4.39 face.
+    assert_eq!(group["result"]["memberCount"], 2);
+    assert_eq!(group["result"]["members"].as_array().unwrap().len(), 2);
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// groups.get carries the sync-captured member label projection (contract
+/// 1.67, §4.60): the stub answers the fixture label pair for the fixture
+/// group's members, so the full ladder — listGroups JsonGroupMember
+/// labelEmoji/label → group_extra_json capture (server budgets) → the
+/// groups.get roster projection — lands in the response as absent-when-none
+/// keys; the unlabeled default fixture row (groups_get_projects_the_synced_
+/// group_cache's exact-shape assertion) proves the absent face.
+#[tokio::test]
+async fn groups_get_carries_the_member_label_projection() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [56_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_LABELED_GROUPS", "ZmFrZS1ncm91cC0x")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-MemberLabels" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let _ = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+
+    let group = request(
+        &mut client,
+        "groups-get",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    let members = group["result"]["members"].as_array().unwrap();
+    // Self member: label string only — the fixture carries no labelEmoji for
+    // it, so the emoji key stays absent (the NON_NULL omission shape).
+    assert_eq!(
+        members[0],
+        json!({
+            "id": "+15555550100",
+            "name": "Test User",
+            "self": true,
+            "label": "Ops",
+        })
+    );
+    // Alice: the full pair, captured verbatim.
+    assert_eq!(
+        members[1],
+        json!({
+            "id": "+15555550101",
+            "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+            "name": "Alice Example",
+            "admin": true,
+            "labelEmoji": "🛠️",
+            "label": "Builders",
+        })
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.181 (§4.181) end to end: the sync capture keeps the upstream
+/// JsonGroup's `announcementsOnly` flag and the engine's GV2 role word (the
+/// stub's KT_FAKE_ROLE_GROUPS arm swaps the fixture roster onto the real
+/// engine member shape — ADMINISTRATOR for Alice, DEFAULT for self), the
+/// groups.get projection lands both (the banner gate's supply), and
+/// `groups.common` answers the official groups-in-common panel over the
+/// cached rosters for the direct Alice conversation — INVALID_REQUEST on a
+/// group target, the honest shape refusal.
+#[tokio::test]
+async fn groups_common_and_the_announcement_role_capture_end_to_end() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [57_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[
+            ("KT_FAKE_ANNOUNCEMENT_GROUPS", "ZmFrZS1ncm91cC0x"),
+            ("KT_FAKE_ROLE_GROUPS", "ZmFrZS1ncm91cC0x=+15555550101"),
+        ],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    // Stage one group message before linking: finishLink's receive burst
+    // delivers it after the default direct receive, so the group conversation
+    // exists for the INVALID_REQUEST arm below.
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550101",
+                "timestamp": 90,
+                "dataMessage": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "message": "group hello"
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-SupplyB" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let _ = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+
+    // The announcements-only flag and the role-word admin mark land together:
+    // Alice is the group's ADMINISTRATOR (roster admin via the GV2 role word,
+    // no legacy uuid key in this arm), self is a DEFAULT member — the
+    // CompositionArea.dom.tsx:1108 banner gate's exact supply.
+    let group = request(
+        &mut client,
+        "groups-get",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    assert_eq!(group["result"]["announcementsOnly"], true);
+    assert_eq!(
+        group["result"]["members"],
+        json!([
+            {"id": "+15555550100", "name": "Test User", "self": true},
+            {"id": "+15555550101", "name": "Alice Example", "admin": true},
+        ])
+    );
+
+    // The direct Alice conversation (the fixture's default receive) answers
+    // the panel over the captured rosters.
+    let conversations = request(
+        &mut client,
+        "conversations-list",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let direct = conversations["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "direct")
+        .unwrap();
+    let direct_id = direct["id"].as_str().unwrap().to_string();
+    let common = request(
+        &mut client,
+        "groups-common",
+        "groups.common",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_id
+        }),
+    )
+    .await;
+    assert_eq!(
+        common["result"]["groups"],
+        json!([{ "peerKey": "ZmFrZS1ncm91cC0x", "title": "Fixture Group" }])
+    );
+
+    // A group conversation target is the wrong face — INVALID_REQUEST, the
+    // honest shape refusal (a NOT_FOUND would be a lie: the conversation
+    // exists).
+    let group_conversation = conversations["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "group")
+        .map(|item| item["id"].as_str().unwrap().to_string())
+        .expect("the staged group receive created the group conversation");
+    let refused = request(
+        &mut client,
+        "groups-common-group",
+        "groups.common",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation
+        }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(refused["error"]["retryable"], false);
+
+    // A bogus conversation id answers the ladder's CONVERSATION_NOT_FOUND.
+    let missing = request(
+        &mut client,
+        "groups-common-missing",
+        "groups.common",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation"
+        }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "CONVERSATION_NOT_FOUND");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// groups.get carries the live requesting-members projection (contract
+/// 1.62, §4.53 appendix): the stub answers one requesting member for the
+/// fixture group, so the full ladder — single-group listGroups live read →
+/// address-ladder projection → read-time contacts-cache name — lands in the
+/// response beside the cached face; the sync's requesting-less cached row
+/// proves the key is the live read, not the capture; and a group with an
+/// empty requesting set answers without the key.
+#[tokio::test]
+async fn groups_get_carries_the_live_requesting_members() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [55_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    // One requesting member on the fixture group only; the former-member
+    // group stays requesting-less so the absent-key face is exercisable on
+    // the same engine answer.
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_REQUESTING_GROUPS", "ZmFrZS1ncm91cC0x=+15555550101")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupApproveRead" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    // Sync first so the cached row exists — the assertion below that the
+    // requesting key rides a requesting-less cache row is the whole point
+    // (the face is the live read, not the capture).
+    let _ = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+
+    let group = request(
+        &mut client,
+        "groups-get",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    assert_eq!(group["result"]["peerKey"], "ZmFrZS1ncm91cC0x");
+    // The cached face stays intact beside the live key.
+    assert_eq!(group["result"]["memberCount"], 2);
+    let requesting = group["result"]["requestingMembers"]
+        .as_array()
+        .expect("the live requesting set must ride the response");
+    assert_eq!(requesting.len(), 1, "{group}");
+    assert_eq!(requesting[0]["id"], "+15555550101");
+    assert_eq!(requesting[0]["name"], "Alice Example");
+    assert!(
+        requesting[0].get("self").is_none(),
+        "a requesting candidate is never a member row"
+    );
+    assert!(requesting[0].get("admin").is_none());
+
+    // A requesting-less group answers without the key (empty live set
+    // collapses to absent, never an empty array).
+    let empty = request(
+        &mut client,
+        "groups-get-empty",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "bm90LWEtbWVtYmVy"
+        }),
+    )
+    .await;
+    // The former-member group is not a cached row (the sync filters
+    // isMember=false) — it answers GROUP_NOT_FOUND, which is itself the
+    // §4.8 gate staying intact over the live read. The absent-key face on
+    // a cached row needs the same engine's fixture group after its set
+    // drains; the stub cannot drain mid-run, so the empty-set face is
+    // pinned by the unit test instead. Read the former-member group to
+    // prove the gate.
+    assert_eq!(empty["error"]["code"], "GROUP_NOT_FOUND", "{empty}");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// groups.get carries the live pending-invite projection (contract revision
+/// 1.64, §4.57): a real engine answer projects bounded {id, uuid?, name?}
+/// entries through the full listGroups → projection ladder, the cached face
+/// stays intact beside it, and a pending-less answer degrades without the
+/// key.
+#[tokio::test]
+async fn groups_get_carries_the_live_pending_members() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [56_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    // Two pending invitees on the fixture group (the §4.57 verified
+    // listGroups read source); the projection must carry both.
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[(
+            "KT_FAKE_PENDING_GROUPS",
+            "ZmFrZS1ncm91cC0x=+15555550101,+15555550102",
+        )],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupInvitesRead" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    // Sync first so the cached row exists — the assertion below that the
+    // pending key rides the cached row is the whole point (the face is the
+    // live read, not the capture).
+    let _ = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+
+    let group = request(
+        &mut client,
+        "groups-get",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    assert_eq!(group["result"]["peerKey"], "ZmFrZS1ncm91cC0x");
+    // The cached face stays intact beside the live key.
+    assert_eq!(group["result"]["memberCount"], 2);
+    let pending = group["result"]["pendingMembers"]
+        .as_array()
+        .expect("the live pending set must ride the response");
+    assert_eq!(pending.len(), 2, "{group}");
+    assert_eq!(pending[0]["id"], "+15555550101");
+    assert_eq!(pending[0]["name"], "Alice Example");
+    assert!(
+        pending[0].get("self").is_none(),
+        "a pending invitee is never a member row"
+    );
+    assert!(pending[0].get("admin").is_none());
+    assert_eq!(pending[1]["id"], "+15555550102");
+    assert!(
+        pending[0].get("addedByUserId").is_none() && pending[1].get("addedByUserId").is_none(),
+        "the upstream face carries no inviter metadata (the §4.57 projection difference)"
+    );
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
@@ -3218,7 +5261,7 @@ async fn pin_family_round_trips_pinned_state_and_admin_delete_tombstone() {
     let tombstone = upserted.unwrap()["data"].clone();
     assert_eq!(tombstone["adminDeleted"], json!(true));
     assert_eq!(tombstone["status"], json!("delivered"));
-    assert_eq!(tombstone["text"], json!("group pin target"));
+    assert_eq!(tombstone["body"], json!("group pin target"));
     assert_eq!(
         unpinned_change.unwrap()["data"]["id"],
         group_row["id"].clone()
@@ -3432,9 +5475,10 @@ fn receipt_log_lines(contents: &str) -> Vec<Value> {
 /// genuinely-ingested incoming dataMessage (the finishLink burst covers the
 /// default fixture receive, a staged direct message, and a staged group
 /// message — every receipt addresses the author as a single string, never the
-/// group id); `messages.markRead` without messageIds fans the whole direct
-/// conversation out as one ascending per-author read receipt;
-/// `messages.markViewed` with explicit ids narrows to those rows; and a group
+/// group id); `messages.markRead` without messageIds fans the §4.119-window
+/// selection out as one ascending per-author read receipt (the stale
+/// fixture-era row stays silent, the fresh staged row rides); `messages.markViewed`
+/// with explicit ids narrows to those rows unfiltered; and a group
 /// markRead is the silent `sent` no-op (local group rows carry no resolvable
 /// author, so zero upstream calls).
 #[tokio::test]
@@ -3456,7 +5500,15 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
     let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
 
     // Stage a group message and a second direct message behind the default
-    // link receive: three incoming dataMessages, three auto delivery receipts.
+    // link receive: three incoming dataMessages, three auto delivery
+    // receipts. The direct message carries a FRESH timestamp — §4.119 puts
+    // the absent receipt selection inside the seven-day window, so the
+    // fixture-era default receive (42) stays deliberately stale and the
+    // absent fan-out below proves the exclusion.
+    let fresh_direct: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let signal_data = temp.path().join("signal-data");
     fs::create_dir_all(&signal_data).unwrap();
     fs::write(
@@ -3474,7 +5526,7 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
             {
                 "source": "+15555550101",
                 "sourceName": "林菲菲",
-                "timestamp": 60,
+                "timestamp": fresh_direct,
                 "dataMessage": { "message": "second direct text" }
             }
         ])
@@ -3524,10 +5576,10 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
     let send_log_path = signal_data.join(".fixture-send-log.jsonl");
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(contents) = fs::read_to_string(&send_log_path) {
-                if receipt_log_lines(&contents).len() >= 3 {
-                    break;
-                }
+            if let Ok(contents) = fs::read_to_string(&send_log_path)
+                && receipt_log_lines(&contents).len() >= 3
+            {
+                break;
             }
             sleep(Duration::from_millis(20)).await;
         }
@@ -3547,7 +5599,7 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
                 .collect()
         })
         .collect();
-    assert_eq!(timestamps, [vec![42], vec![50], vec![60]]);
+    assert_eq!(timestamps, [vec![42], vec![50], vec![fresh_direct]]);
     for entry in &delivery_receipts {
         assert_eq!(entry["account"], "+15555550100");
         assert_eq!(entry["recipient"], "+15555550101");
@@ -3585,14 +5637,19 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
         .as_str()
         .unwrap()
         .to_string();
-    let id_60 = rows.iter().find(|row| row["sentAt"] == 60).unwrap()["id"]
+    let id_fresh = rows
+        .iter()
+        .find(|row| row["sentAt"] == fresh_direct)
+        .unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
 
-    // Absent messageIds: the whole conversation as one ascending read
-    // receipt — distinguishable from every delivery receipt by its [42, 60]
-    // shape, and its log line precedes the markRead answer.
+    // Absent messageIds: the §4.119 window at the wire face — only the fresh
+    // direct row fans out (one ascending per-author read receipt whose
+    // [fresh_direct] shape is distinguishable from every delivery receipt),
+    // while the stale fixture-era row (42) stays silent; the log line
+    // precedes the markRead answer.
     let marked = request(
         &mut client,
         "mark-read",
@@ -3603,11 +5660,12 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
     assert_eq!(marked["result"]["status"], "sent");
     let after_read = receipt_log_lines(&fs::read_to_string(&send_log_path).unwrap());
     assert_eq!(after_read.len(), 4);
-    assert_eq!(after_read[3]["timestamps"], json!([42, 60]));
+    assert_eq!(after_read[3]["timestamps"], json!([fresh_direct]));
     assert_eq!(after_read[3]["recipient"], "+15555550101");
 
     // Explicit messageIds: exactly the addressed rows, receipt order, same
-    // single-author fan-out.
+    // single-author fan-out — unfiltered by §4.119 (the desktop naming ids
+    // is itself the incremental act), so the stale row is still addressable.
     let viewed = request(
         &mut client,
         "mark-viewed",
@@ -3615,14 +5673,14 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
         json!({
             "accountId": account_id,
             "conversationId": direct_id,
-            "messageIds": [id_42, id_60]
+            "messageIds": [id_42, id_fresh]
         }),
     )
     .await;
     assert_eq!(viewed["result"]["status"], "sent");
     let after_viewed = receipt_log_lines(&fs::read_to_string(&send_log_path).unwrap());
     assert_eq!(after_viewed.len(), 5);
-    assert_eq!(after_viewed[4]["timestamps"], json!([42, 60]));
+    assert_eq!(after_viewed[4]["timestamps"], json!([42, fresh_direct]));
 
     // A group markRead resolves no author locally: the trivial `sent` no-op
     // with zero new upstream calls — no receipt ever carries the group id.
@@ -3733,14 +5791,40 @@ async fn receipt_upstream_failures_degrade_to_unknown_not_errors() {
         .unwrap()
         .to_string();
 
-    // The default selection includes the 425 row, so the read receipt kills
-    // the engine mid-call — and the request still answers, degraded to
-    // `unknown`, with no error object and no retry.
+    // The explicit selection names the 425 row — §4.119 keeps the absent
+    // form window-filtered (a stale row would silently no-op), so the
+    // mid-call crash path drives the explicit face — and the read receipt
+    // still kills the engine mid-call, the request still answers degraded
+    // to `unknown`, with no error object and no retry.
+    let messages = request(
+        &mut client,
+        "messages-1",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct,
+            "limit": 50
+        }),
+    )
+    .await;
+    let crash_target = messages["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["sentAt"] == 425)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let marked = request(
         &mut client,
         "mark-read",
         "messages.markRead",
-        json!({ "accountId": account_id, "conversationId": direct }),
+        json!({
+            "accountId": account_id,
+            "conversationId": direct,
+            "messageIds": [crash_target]
+        }),
     )
     .await;
     assert_eq!(marked["result"]["status"], "unknown");
@@ -3781,7 +5865,17 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
 
     // Handshake with an inline capability assertion (the shared helper only
     // checks the api version).
-    let challenge: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let challenge: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(challenge) => challenge,
+        Err(_) => panic!(
+            "authentication challenge never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
     let client_nonce = hex::encode([9_u8; 32]);
     let mut mac = Hmac::<Sha256>::new_from_slice(&secret).unwrap();
@@ -3806,7 +5900,17 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         )
         .await
         .unwrap();
-    let handshake: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let handshake: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(handshake) => handshake,
+        Err(_) => panic!(
+            "handshake response never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
     for advertised in [
         "messages.markRead",
@@ -3823,9 +5927,49 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "stickerPacks.getSyncs",
         "stickerPacks.setSync",
         "sticker-pack-sync",
+        "chatFolders.list",
+        "chatFolders.setRecords",
+        "chat-folders",
+        "notificationProfiles.list",
+        "notificationProfiles.setRecords",
+        "notification-profiles",
+        "storyDistributionLists.list",
+        "storyDistributionLists.setRecords",
+        "storage.mergeContacts",
+        "storage.importGroups",
+        "storage.getCallLinks",
+        "storage.setCallLink",
+        "storage-sync",
         "groups.update",
         "groups.quit",
         "group-management",
+        "accounts.setExpireTimer",
+        "accounts.setProfile",
+        "accounts.updateConfiguration",
+        "account-settings",
+        "conversations.getBlocked",
+        "blocked-conversations",
+        "backups.export",
+        "backups.exportStatus",
+        "backups.exportFile.open",
+        "backups.exportFile.readChunk",
+        "backups.exportFile.closeHandle",
+        "backup-export",
+        "conversations.getAvatar",
+        "avatar-fetch",
+        "conversations.setBlocked",
+        "blocked-write",
+        "messages.reportSpam",
+        "report-spam",
+        "calls.sendSignal",
+        "calls.getState",
+        "call-signaling",
+        "accounts.setUsername",
+        "accounts.getUsername",
+        "username.lookup",
+        "username",
+        "phone.lookup",
+        "phone-lookup",
     ] {
         assert!(
             capabilities
@@ -3834,6 +5978,18 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
             "capabilities must advertise {advertised}: {capabilities:?}"
         );
     }
+
+    // Contract revision 1.98: this harness spawns `serve` without
+    // `--media-ingest` (the launcher decision is the whole decision since
+    // 1.121, §4.102), so the attachment-download tag must stay absent — the
+    // honest unavailable advertisement, not a capability every call would
+    // fail.
+    assert!(
+        !capabilities
+            .iter()
+            .any(|value| value.as_str() == Some("attachment-download")),
+        "an unarmed runtime must not advertise attachment-download: {capabilities:?}"
+    );
 
     let started = request(&mut client, "start", "runtime.start", json!({})).await;
     assert_eq!(started["result"]["state"], "running");
@@ -3856,7 +6012,7 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
 
     // Refresh the contacts cache outside the link debounce so the digit
     // suffix resolution has +15555550101 to match against.
-    request(
+    let _ = request(
         &mut client,
         "sync-1",
         "contacts.sync",
@@ -4577,12 +6733,12 @@ async fn sticker_pack_browse_and_pin_sync_round_trip() {
 
 /// conversations.setExpireTimer end to end (contract 1.42, §4.41; group
 /// route re-cut by contract 1.45, §4.44): the direct call lands on the
-/// signal-cli face's `updateContact` with the int-seconds `expiration`, the
-/// success mirrors the timer into the conversation and rides
-/// `conversation.changed`, the result carries the resolved value; a group
-/// conversation routes the same mirror through `updateGroup {account,
-/// groupId, expiration}`; an unknown conversation answers
-/// CONVERSATION_NOT_FOUND.
+/// engine face's `setExpirationTimer` with the seconds-keyed
+/// `expirationInSeconds`, the success mirrors the timer into the
+/// conversation and rides `conversation.changed`, the result carries the
+/// resolved value; a group conversation routes the same mirror through
+/// `updateGroup {account, groupId, expiration}`; an unknown conversation
+/// answers CONVERSATION_NOT_FOUND.
 #[tokio::test]
 async fn conversations_set_expire_timer_round_trip_and_guards() {
     let temp = TempDir::new().unwrap();
@@ -4652,7 +6808,18 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
     // The refreshed summary arrived on conversation.changed with the timer.
     let mut saw_timer_change = false;
     for _ in 0..8 {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "conversation.changed timer mirror (86400) never arrived within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame["event"] == "conversation.changed"
             && frame["data"]["id"] == conversation_id
             && frame["data"]["expireTimerSeconds"] == 86400
@@ -4683,8 +6850,9 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
         .clone();
     assert_eq!(row["expireTimerSeconds"], 86400);
 
-    // The exact upstream contract landed on the wire: int-seconds
-    // `expiration` with the single-string resolved recipient.
+    // The exact upstream contract landed on the wire: the engine face's
+    // seconds-keyed `expirationInSeconds` with the single-string resolved
+    // recipient.
     let send_log = fs::read_to_string(
         temp.path()
             .join("signal-data")
@@ -4694,11 +6862,11 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
     let timer_call: Value = send_log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .find(|params| params.get("expiration").is_some())
-        .expect("the timer call must reach updateContact");
+        .find(|params| params.get("expirationInSeconds").is_some())
+        .expect("the timer call must reach setExpirationTimer");
     assert_eq!(timer_call["account"], "+15555550100");
     assert_eq!(timer_call["recipient"], "+15555550102");
-    assert_eq!(timer_call["expiration"], 86400);
+    assert_eq!(timer_call["expirationInSeconds"], 86400);
 
     // A group conversation routes the timer change through the same
     // group-management write it always traveled by upstream (contract 1.45,
@@ -4734,7 +6902,18 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
     assert_eq!(group_timer["result"]["expireTimerSeconds"], 3600);
     let mut saw_group_timer_change = false;
     for _ in 0..8 {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "group conversation.changed timer mirror (3600) never arrived \
+                 within {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame["event"] == "conversation.changed"
             && frame["data"]["id"] == group_conversation
             && frame["data"]["expireTimerSeconds"] == 3600
@@ -4807,15 +6986,19 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
 }
 
 /// groups.update / groups.quit end to end (contract 1.45, §4.44, capability
-/// group-management): the full change set lands on the upstream `updateGroup`
-/// keys verbatim (including the enabled-without-approval → "enabled" link
-/// mapping), the local refusal ladder answers before any upstream call, and
-/// the receive projection converges the group row — the bodyless UPDATE
-/// envelope lands as a system row carrying `isGroupUpdate` + the resulting
-/// title, and `conversation.changed` mirrors the new title. groups.quit
-/// dispatches `{account, groupId}`, a last-admin quit answers the upstream
-/// user error verbatim (UPSTREAM_ERROR), and the crash-with-in-flight-write
-/// path pins the SEND_OUTCOME_UNKNOWN answer and the no-retry discipline.
+/// group-management; the engine write face wired by contract 1.115, §4.96):
+/// the local refusal ladder answers before any upstream call, and the
+/// engine-carried change families ride the wired updateGroup/leaveGroup
+/// dispatch verbatim ({account, groupId} + title/member/link-access/avatar,
+/// the avatar tri-state included) while any change key outside the engine
+/// subset still answers the honest whole-call CAPABILITY_UNAVAILABLE —
+/// never a partial application, nothing dispatched. The structured
+/// GROUP_UPDATE_FAILED face carries data.status verbatim (403 non-admin,
+/// 409 revision race) with retryable=false, the leave deny face answers the
+/// deterministic UPSTREAM_ERROR (retryable=false), and the receive
+/// projection converges the group row independently of the send face: the
+/// bodyless UPDATE envelope lands as a system row carrying `isGroupUpdate` +
+/// the resulting title, and `conversation.changed` mirrors the new title.
 #[tokio::test]
 async fn groups_update_quit_round_trip_and_guards() {
     let temp = TempDir::new().unwrap();
@@ -4849,9 +7032,25 @@ async fn groups_update_quit_round_trip_and_guards() {
     .await;
     let account_id = finished["result"]["id"].as_str().unwrap().to_string();
 
-    // The link sync materialized the fixture group; a staged envelope also
-    // creates the quit-fail group so the UPSTREAM_ERROR drill has a real
-    // local row to address.
+    // Contract 1.65 (§4.58): the factor probe rides the first
+    // conversations.list — the link sync already resolved every title, so
+    // the probe is the enrich's only trigger, and the fixture's listContacts
+    // flush hook would deliver the staged envelopes on that round trip. Burn
+    // the probe here, before the staged envelopes are written: this list
+    // pays the one listContacts round trip (stamping the default-burst rows,
+    // the flush hook finding an empty marker), so the list below stays a
+    // store-only read and the choreography keeps controlling the burst via
+    // the typing flush as before.
+    let _ = request(
+        &mut client,
+        "probe-burn",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+
+    // The link sync materialized the fixture group; staged envelopes refresh
+    // it (the UPDATE projection below) and materialize a second group row.
     let extra_receives = temp
         .path()
         .join("signal-data")
@@ -4878,6 +7077,30 @@ async fn groups_update_quit_round_trip_and_guards() {
                 "dataMessage": {
                     "groupId": "ZmFhaWwtZ3JvdXAtMg==",
                     "message": "quit-fail group"
+                }
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 62,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-group-forbidden]",
+                        "type": "UPDATE",
+                        "groupName": "Forbidden Fixture",
+                        "revision": 2
+                    }
+                }
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 63,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-group-conflict]",
+                        "type": "UPDATE",
+                        "groupName": "Conflict Fixture",
+                        "revision": 3
+                    }
                 }
             }
         ])
@@ -4987,10 +7210,211 @@ async fn groups_update_quit_round_trip_and_guards() {
     .await;
     assert_eq!(unknown["error"]["code"], "CONVERSATION_NOT_FOUND");
 
-    // The full change set: every family lands on its upstream key verbatim,
-    // the connector-facing names are the caller's, the upstream names are
-    // the wire's.
-    let updated = request(
+    // Contract 1.89 avatar tri-state on the wired face (1.115): a malformed
+    // data URI answers the shape ladder (INVALID_REQUEST); a well-formed
+    // one — and an explicit null — ride the updateGroup dispatch verbatim
+    // and answer {status: "sent"}.
+    let bad_avatar = request(
+        &mut client,
+        "update-avatar-bad",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "avatar": "data:text/html;base64,YQ=="
+        }),
+    )
+    .await;
+    assert_eq!(bad_avatar["error"]["code"], "INVALID_REQUEST");
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let group_dispatches = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| {
+                // updateGroup/leaveGroup dispatches carry {account, groupId};
+                // the typing flush rows carry the same pair plus `stop`, and
+                // the text send lane carries neither pair.
+                params.get("account").is_some()
+                    && params.get("groupId").is_some()
+                    && params.get("stop").is_none()
+            })
+            .collect()
+    };
+    for (request_id, avatar) in [
+        ("update-avatar-replace", json!("data:image/png;base64,YQ==")),
+        ("update-avatar-remove", Value::Null),
+    ] {
+        let sent = request(
+            &mut client,
+            request_id,
+            "groups.update",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "avatar": avatar
+            }),
+        )
+        .await;
+        assert_eq!(sent["result"]["status"], "sent", "{request_id}: {sent}");
+    }
+    let avatar_calls: Vec<Value> = group_dispatches()
+        .into_iter()
+        .filter(|params| params.get("avatar").is_some())
+        .collect();
+    assert_eq!(avatar_calls.len(), 2, "{avatar_calls:?}");
+    assert_eq!(
+        avatar_calls[0]["account"], "+15555550100",
+        "{avatar_calls:?}"
+    );
+    assert_eq!(
+        avatar_calls[0]["groupId"], "ZmFrZS1ncm91cC0x",
+        "{avatar_calls:?}"
+    );
+    assert_eq!(avatar_calls[0]["avatar"], "data:image/png;base64,YQ==");
+    assert!(avatar_calls[0].get("title").is_none(), "{avatar_calls:?}");
+    assert_eq!(avatar_calls[1]["avatar"], Value::Null, "{avatar_calls:?}");
+
+    // The engine-carried change set (contract 1.115, §4.96) rides one
+    // updateGroup dispatch: groupName→title, the member arrays verbatim,
+    // and linkState mapped onto the engine's access word.
+    let renamed = request(
+        &mut client,
+        "update-wired",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "groupName": "Renamed Fixture",
+            "addMembers": ["+15555550102"],
+            "removeMembers": ["+15555550102"],
+            "linkState": "enabled-without-approval",
+            "operationId": "group-mgmt-op-1"
+        }),
+    )
+    .await;
+    assert_eq!(renamed["result"]["status"], "sent", "{renamed}");
+    let wired_calls: Vec<Value> = group_dispatches()
+        .into_iter()
+        .filter(|params| params.get("title").is_some())
+        .collect();
+    assert_eq!(wired_calls.len(), 1, "{wired_calls:?}");
+    assert_eq!(
+        wired_calls[0],
+        json!({
+            "account": "+15555550100",
+            "groupId": "ZmFrZS1ncm91cC0x",
+            "title": "Renamed Fixture",
+            "addMembers": ["+15555550102"],
+            "removeMembers": ["+15555550102"],
+            "addFromInviteLinkAccess": "ANY"
+        }),
+        "{wired_calls:?}"
+    );
+
+    // Contract 1.180 §4.180: resetLink folds onto the engine's
+    // inviteLinkPassword arm — a freshly minted 24-char standard-base64
+    // password (16 official bytes), never a resetLink key, and two calls
+    // never mint the same password (the official refreshGroupLink: the old
+    // link dies with the old password).
+    let reset_once = request(
+        &mut client,
+        "update-reset-1",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "resetLink": true,
+            "operationId": "group-mgmt-op-reset-1"
+        }),
+    )
+    .await;
+    assert_eq!(reset_once["result"]["status"], "sent", "{reset_once}");
+    let reset_dispatches: Vec<Value> = group_dispatches()
+        .into_iter()
+        .filter(|params| params.get("inviteLinkPassword").is_some())
+        .collect();
+    assert_eq!(reset_dispatches.len(), 1, "{reset_dispatches:?}");
+    let first_password = reset_dispatches[0]["inviteLinkPassword"].as_str().unwrap();
+    assert_eq!(first_password.len(), 24);
+    assert!(first_password.ends_with("=="));
+    assert!(reset_dispatches[0].get("resetLink").is_none());
+    assert_eq!(reset_dispatches[0]["groupId"], "ZmFrZS1ncm91cC0x");
+    let reset_twice = request(
+        &mut client,
+        "update-reset-2",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "resetLink": true,
+            "operationId": "group-mgmt-op-reset-2"
+        }),
+    )
+    .await;
+    assert_eq!(reset_twice["result"]["status"], "sent", "{reset_twice}");
+    let second_passwords: Vec<String> = group_dispatches()
+        .into_iter()
+        .filter_map(|params| {
+            params
+                .get("inviteLinkPassword")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(second_passwords.len(), 2);
+    assert_ne!(second_passwords[0], second_passwords[1]);
+
+    // Contract 1.188 (§4.188): the send-messages permission fold — the
+    // host word pair rides the engine's own `announcementsOnly` bool in
+    // one dispatch (only-admins → true, every-member → false, both real
+    // write intents; the host permission words never reach the wire).
+    for (request_id, word) in [
+        ("update-announce-on", "only-admins"),
+        ("update-announce-off", "every-member"),
+    ] {
+        let sent = request(
+            &mut client,
+            request_id,
+            "groups.update",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "permissionSendMessages": word,
+            }),
+        )
+        .await;
+        assert_eq!(sent["result"]["status"], "sent", "{request_id}: {sent}");
+    }
+    let announce_calls: Vec<Value> = group_dispatches()
+        .into_iter()
+        .filter(|params| params.get("announcementsOnly").is_some())
+        .collect();
+    assert_eq!(announce_calls.len(), 2, "{announce_calls:?}");
+    assert_eq!(announce_calls[0]["announcementsOnly"], json!(true));
+    assert_eq!(announce_calls[1]["announcementsOnly"], json!(false));
+    for call in &announce_calls {
+        assert!(
+            call.get("setPermissionSendMessages").is_none()
+                && call.get("permissionSendMessages").is_none(),
+            "the engine face carries only the folded bool: {call:?}"
+        );
+    }
+
+    // Any change key outside the engine subset (description, the admin and
+    // ban families, the remaining permission pair, the member label pair —
+    // resetLink left this family in 1.180 §4.180 and permissionSendMessages
+    // in 1.188 §4.188) still answers the honest whole-call
+    // refusal — naming the offending keys, retryable=false — and dispatches
+    // nothing: never a partial application of the change set. (The set below
+    // also carries resetLink and permissionSendMessages, which now fold —
+    // but the other offenders still refuse the whole call.)
+    let dispatches_before = group_dispatches().len();
+    let refused_update = request(
         &mut client,
         "update-all",
         "groups.update",
@@ -5012,42 +7436,29 @@ async fn groups_update_quit_round_trip_and_guards() {
             "permissionSendMessages": "only-admins",
             "memberLabel": "KT",
             "memberLabelEmoji": "🛠️",
-            "operationId": "group-mgmt-op-1"
+            "operationId": "group-mgmt-op-3"
         }),
     )
     .await;
-    assert_eq!(updated["result"]["status"], "sent");
-    let send_log_path = temp
-        .path()
-        .join("signal-data")
-        .join(".fixture-send-log.jsonl");
-    let update_call: Value = fs::read_to_string(&send_log_path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .find(|params| params.get("name") == Some(&json!("Renamed Fixture")))
-        .expect("the full change set must reach updateGroup");
-    assert_eq!(update_call["account"], "+15555550100");
-    assert_eq!(update_call["groupId"], "ZmFrZS1ncm91cC0x");
-    assert_eq!(update_call["description"], "KT ops group");
-    assert_eq!(update_call["members"], json!(["+15555550102"]));
-    assert_eq!(update_call["removeMembers"], json!(["+15555550102"]));
-    assert_eq!(update_call["admins"], json!(["+15555550101"]));
-    assert_eq!(update_call["removeAdmins"], json!(["+15555550101"]));
-    assert_eq!(update_call["bans"], json!(["+15555550102"]));
-    assert_eq!(update_call["unbans"], json!(["+15555550102"]));
-    assert_eq!(update_call["link"], "enabled");
-    assert_eq!(update_call["resetLink"], true);
-    assert_eq!(update_call["setPermissionAddMember"], "only-admins");
-    assert_eq!(update_call["setPermissionEditDetails"], "every-member");
-    assert_eq!(update_call["setPermissionSendMessages"], "only-admins");
-    assert_eq!(update_call["memberLabel"], "KT");
-    assert_eq!(update_call["memberLabelEmoji"], "🛠️");
+    assert_eq!(refused_update["error"]["code"], "CAPABILITY_UNAVAILABLE");
+    assert_eq!(refused_update["error"]["retryable"], false);
+    assert!(
+        refused_update["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("groupDescription"),
+        "{refused_update}"
+    );
+    assert_eq!(
+        group_dispatches().len(),
+        dispatches_before,
+        "a refused change set never reaches the engine"
+    );
 
     // Flush the staged envelopes through the typing hook (the receive burst
     // rides the request): the UPDATE envelope lands as a system row and the
     // conversation.changed summary already carries the mirrored title.
-    request(
+    let _ = request(
         &mut client,
         "flush-update",
         "presence.setTypingMessage",
@@ -5060,7 +7471,18 @@ async fn groups_update_quit_round_trip_and_guards() {
     .await;
     let mut saw_title_change = false;
     for _ in 0..16 {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "conversation.changed title mirror never arrived within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame["event"] == "conversation.changed"
             && frame["data"]["id"] == group_conversation
             && frame["data"]["title"] == "Renamed Fixture"
@@ -5091,13 +7513,12 @@ async fn groups_update_quit_round_trip_and_guards() {
         .find(|row| row["isGroupUpdate"] == true)
         .expect("the bodyless update must land a system row");
     assert_eq!(update_row["direction"], "system");
-    assert_eq!(update_row["text"], "群聊信息已更新");
+    assert_eq!(update_row["body"], "群聊信息已更新");
     assert_eq!(update_row["groupName"], "Renamed Fixture");
 
-    // groups.quit leaves the fixture group; the quit-fail group (its local
-    // row materialized by the staged timestamp-61 envelope) answers the
-    // upstream user error verbatim — the last-admin quit the connector
-    // forwards faithfully.
+    // The wired quit face (1.115): the resolved group row dispatches
+    // leaveGroup {account, groupId} — the engine's method name for the
+    // upstream quit write — and answers {status: "sent"}.
     let quit = request(
         &mut client,
         "quit-group",
@@ -5109,59 +7530,2003 @@ async fn groups_update_quit_round_trip_and_guards() {
         }),
     )
     .await;
-    assert_eq!(quit["result"]["status"], "sent");
-    let quit_call: Value = fs::read_to_string(&send_log_path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .find(|params| params.get("groupId").is_some() && params.get("name").is_none())
-        .expect("the quit must reach quitGroup");
-    assert_eq!(quit_call["account"], "+15555550100");
-    assert_eq!(quit_call["groupId"], "ZmFrZS1ncm91cC0x");
-    let listed = request(
+    assert_eq!(quit["result"]["status"], "sent", "{quit}");
+    let quit_calls: Vec<Value> = group_dispatches()
+        .into_iter()
+        .filter(|params| {
+            params.get("title").is_none()
+                && params.get("avatar").is_none()
+                && params.get("addMembers").is_none()
+                && params.get("removeMembers").is_none()
+                && params.get("addFromInviteLinkAccess").is_none()
+                // 1.180 §4.180: the reset-link dispatches carry
+                // inviteLinkPassword — not the quit face.
+                && params.get("inviteLinkPassword").is_none()
+                // 1.188 §4.188: the announcements-only dispatches carry
+                // announcementsOnly — not the quit face.
+                && params.get("announcementsOnly").is_none()
+        })
+        .collect();
+    assert_eq!(quit_calls.len(), 1, "{quit_calls:?}");
+    assert_eq!(quit_calls[0]["account"], "+15555550100", "{quit_calls:?}");
+    assert_eq!(
+        quit_calls[0]["groupId"], "ZmFrZS1ncm91cC0x",
+        "{quit_calls:?}"
+    );
+
+    // The structured server-rejection face (1.115, §4.96): the fixture's
+    // sentinel group rows answer GROUP_UPDATE_FAILED with the engine's
+    // data.status pass-through verbatim — 403 (non-admin) and 409 (revision
+    // race) — retryable=false both: a bare replay fails the same way, and a
+    // 409 unblocks only after re-reading the group state.
+    let relisted = request(
         &mut client,
-        "list-for-quit-fail",
+        "list-sentinel-groups",
         "conversations.list",
         json!({ "accountId": account_id, "limit": 50 }),
     )
     .await;
-    let fail_group_conversation = listed["result"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["type"] == "group" && row["id"] != group_conversation)
-        .map(|row| row["id"].as_str().unwrap().to_string())
-        .expect("the staged envelope must materialize the quit-fail group");
-    let quit_upstream_error = request(
+    let find_by = |title: &str, preview: &str| {
+        relisted["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row["type"] == "group"
+                    && row["title"] == title
+                    && row["lastMessagePreview"] == preview
+            })
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the staged sentinel row {title} must exist; items: {:?}",
+                    relisted["result"]["items"]
+                )
+            })
+    };
+    let forbidden_conversation = find_by("Forbidden Fixture", "群聊信息已更新");
+    let conflict_conversation = find_by("Conflict Fixture", "群聊信息已更新");
+    let quit_fail_conversation = find_by("group", "quit-fail group");
+    for (request_id, conversation, status) in [
+        ("update-forbidden", forbidden_conversation.as_str(), 403),
+        ("update-conflict", conflict_conversation.as_str(), 409),
+    ] {
+        let rejected = request(
+            &mut client,
+            request_id,
+            "groups.update",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation,
+                "groupName": "Still Forbidden"
+            }),
+        )
+        .await;
+        assert_eq!(
+            rejected["error"]["code"], "GROUP_UPDATE_FAILED",
+            "{request_id}: {rejected}"
+        );
+        assert_eq!(rejected["error"]["retryable"], false, "{request_id}");
+        assert_eq!(rejected["error"]["data"]["status"], status, "{request_id}");
+    }
+
+    // The leave deny face: a last-admin quit (the fixture's user-error
+    // sentinel) answers the deterministic UPSTREAM_ERROR — retryable=false,
+    // the 1.115 correction: a replay of the same quit fails the same way.
+    let quit_denied = request(
         &mut client,
-        "quit-fail-group",
+        "quit-denied",
         "groups.quit",
         json!({
             "accountId": account_id,
-            "conversationId": fail_group_conversation
+            "conversationId": quit_fail_conversation
         }),
     )
     .await;
-    assert_eq!(quit_upstream_error["error"]["code"], "UPSTREAM_ERROR");
-    assert_eq!(quit_upstream_error["error"]["retryable"], true);
+    assert_eq!(
+        quit_denied["error"]["code"], "UPSTREAM_ERROR",
+        "{quit_denied}"
+    );
+    assert_eq!(quit_denied["error"]["retryable"], false);
 
-    // Crash with the mutating update in flight (fixture magic group name,
-    // os._exit(25)): SEND_OUTCOME_UNKNOWN, never retried — exactly one such
-    // call in the recovered log.
-    let crash = request(
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// conversations.getState / conversations.setState end to end (contract
+/// 1.116, §4.97, capability conversation-state): the read answers the
+/// all-default projection, the partial writes answer the post-write
+/// projection and persist across reads, only the sent flags ride the wire
+/// (asserted byte-exact on the fixture dispatch log), and the honest engine
+/// faces pass through — CONVERSATION_NOT_RESOLVED for a reference outside
+/// the engine's storage taxonomy (a 12-byte fixture group id is not 32-byte
+/// master-key material; a phone number is not group material either),
+/// STORAGE_UNAVAILABLE for the outage sentinel — while the local refusal
+/// ladder (empty intent, wrong flag shapes, kind enum, unknown rows)
+/// answers before any upstream call.
+#[tokio::test]
+async fn conversation_state_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [47_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries the new faces before anything else runs.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in [
+        "conversations.getState",
+        "conversations.setState",
+        "conversation-state",
+    ] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
         &mut client,
-        "update-crash",
-        "groups.update",
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-ConversationState" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The §4.58 factor probe rides the first conversations.list (the batch-A
+    // choreography): burn it before the staged envelopes are written so the
+    // burst stays under the typing flush's control.
+    let _ = request(
+        &mut client,
+        "probe-burn",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+
+    // Stage the storage-outage sentinel group; the receive projection
+    // materializes its row with the sentinel groupId verbatim as peer
+    // reference.
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550101",
+                "timestamp": 64,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-state-unavailable]",
+                        "type": "UPDATE",
+                        "groupName": "State Sentinel",
+                        "revision": 4
+                    }
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let listed = request(
+        &mut client,
+        "list-groups",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group" && row["title"] == "Fixture Group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with the fixture group");
+    let direct_setup = request(
+        &mut client,
+        "direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "state round trip",
+            "clientRequestId": "state-rt-0"
+        }),
+    )
+    .await;
+    let direct_conversation = direct_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Flush the staged envelope through the typing hook and wait for the
+    // sentinel row's summary mirror.
+    let _ = request(
+        &mut client,
+        "flush-state",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "stop": true
+        }),
+    )
+    .await;
+    let mut sentinel_conversation = None;
+    for _ in 0..16 {
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "the sentinel group's conversation.changed never arrived within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
+        if frame["event"] == "conversation.changed" && frame["data"]["title"] == "State Sentinel" {
+            sentinel_conversation = Some(frame["data"]["id"].as_str().unwrap().to_string());
+            break;
+        }
+    }
+    let sentinel_conversation = sentinel_conversation
+        .expect("the staged sentinel group must materialize with its mirrored title");
+
+    // The all-default read: a conversation the cloud record holds at the
+    // unset bits reads {0, false, false}, all three keys present.
+    let initial = request(
+        &mut client,
+        "state-initial",
+        "conversations.getState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact"
+        }),
+    )
+    .await;
+    assert_eq!(
+        initial["result"],
+        json!({
+            "mutedUntilTimestamp": 0,
+            "archived": false,
+            "markedUnread": false
+        }),
+        "{initial}"
+    );
+
+    // The partial write: only the sent flag rides the wire, the answer is
+    // the post-write projection, and a read-back observes the write.
+    let archived = request(
+        &mut client,
+        "state-archive",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact",
+            "archived": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        archived["result"],
+        json!({
+            "mutedUntilTimestamp": 0,
+            "archived": true,
+            "markedUnread": false
+        }),
+        "{archived}"
+    );
+    let read_back = request(
+        &mut client,
+        "state-read-back",
+        "conversations.getState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact"
+        }),
+    )
+    .await;
+    assert_eq!(read_back["result"]["archived"], true, "{read_back}");
+
+    // The two-flag write composes over the untouched bit.
+    let muted = request(
+        &mut client,
+        "state-mute",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact",
+            "mutedUntilTimestamp": 7_200_000,
+            "markedUnread": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        muted["result"],
+        json!({
+            "mutedUntilTimestamp": 7_200_000,
+            "archived": true,
+            "markedUnread": true
+        }),
+        "{muted}"
+    );
+
+    // The exact upstream contract: the resolved peer reference, the kind,
+    // and only the flags each write carried.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log the dispatch");
+    let state_writes: Vec<Value> = send_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| {
+            params.get("kind").is_some()
+                && (params.get("archived").is_some() || params.get("mutedUntilTimestamp").is_some())
+        })
+        .collect();
+    assert_eq!(state_writes.len(), 2, "{state_writes:?}");
+    assert_eq!(
+        state_writes[0],
+        json!({
+            "account": "+15555550100",
+            "conversationId": "+15555550102",
+            "kind": "contact",
+            "archived": true
+        }),
+        "{state_writes:?}"
+    );
+    assert_eq!(
+        state_writes[1],
+        json!({
+            "account": "+15555550100",
+            "conversationId": "+15555550102",
+            "kind": "contact",
+            "mutedUntilTimestamp": 7_200_000,
+            "markedUnread": true
+        }),
+        "{state_writes:?}"
+    );
+
+    // The local refusal ladder, each before any upstream call: an empty
+    // intent (no write intent — there is no toggle-to-nothing form), a
+    // wrong-shaped flag, a flag value that is not a number, and the kind
+    // enum on both faces.
+    let empty = request(
+        &mut client,
+        "state-empty",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact"
+        }),
+    )
+    .await;
+    assert_eq!(empty["error"]["code"], "INVALID_REQUEST", "{empty}");
+    let wrong_shape = request(
+        &mut client,
+        "state-wrong-shape",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact",
+            "archived": "yes"
+        }),
+    )
+    .await;
+    assert_eq!(wrong_shape["error"]["code"], "INVALID_REQUEST");
+    let bad_mute = request(
+        &mut client,
+        "state-bad-mute",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact",
+            "mutedUntilTimestamp": "soon"
+        }),
+    )
+    .await;
+    assert_eq!(bad_mute["error"]["code"], "INVALID_REQUEST");
+    // The kind enum refuses on both faces — the get face with the bare
+    // addressing trio (its params carry no flags), the set face with a flag
+    // present so the empty-intent gate does not outrank the kind ladder.
+    let refused_get = request(
+        &mut client,
+        "state-kind-get",
+        "conversations.getState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "story"
+        }),
+    )
+    .await;
+    assert_eq!(refused_get["error"]["code"], "INVALID_REQUEST");
+    let refused_set = request(
+        &mut client,
+        "state-kind-set",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "story",
+            "archived": true
+        }),
+    )
+    .await;
+    assert_eq!(refused_set["error"]["code"], "INVALID_REQUEST");
+
+    // Unknown rows answer the local NOT_FOUND ladder.
+    let unknown_conversation = request(
+        &mut client,
+        "state-unknown-conversation",
+        "conversations.getState",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation",
+            "kind": "contact"
+        }),
+    )
+    .await;
+    assert_eq!(
+        unknown_conversation["error"]["code"], "CONVERSATION_NOT_FOUND",
+        "{unknown_conversation}"
+    );
+    let unknown_account = request(
+        &mut client,
+        "state-unknown-account",
+        "conversations.getState",
+        json!({
+            "accountId": "no-such-account",
+            "conversationId": direct_conversation,
+            "kind": "contact"
+        }),
+    )
+    .await;
+    assert_eq!(
+        unknown_account["error"]["code"], "ACCOUNT_NOT_FOUND",
+        "{unknown_account}"
+    );
+
+    // The engine's canonicalization refusal (1.116, §4.97): a reference
+    // outside the storage taxonomy — the fixture group's 12-byte id is not
+    // 32-byte master-key material, and a phone number is not group material
+    // either — answers CONVERSATION_NOT_RESOLVED, retryable=false.
+    for (request_id, conversation, kind) in [
+        ("state-group-shape", group_conversation.as_str(), "group"),
+        ("state-kind-mismatch", direct_conversation.as_str(), "group"),
+    ] {
+        let unresolved = request(
+            &mut client,
+            request_id,
+            "conversations.getState",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation,
+                "kind": kind
+            }),
+        )
+        .await;
+        assert_eq!(
+            unresolved["error"]["code"], "CONVERSATION_NOT_RESOLVED",
+            "{request_id}: {unresolved}"
+        );
+        assert_eq!(unresolved["error"]["retryable"], false, "{request_id}");
+    }
+
+    // The storage-outage sentinel: both faces answer STORAGE_UNAVAILABLE
+    // verbatim, retryable=true (the outage may clear).
+    for (request_id, method, extra) in [
+        ("state-outage-get", "conversations.getState", json!({})),
+        (
+            "state-outage-set",
+            "conversations.setState",
+            json!({ "archived": true }),
+        ),
+    ] {
+        let mut params = json!({
+            "accountId": account_id,
+            "conversationId": sentinel_conversation,
+            "kind": "group"
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            params
+                .as_object_mut()
+                .unwrap()
+                .insert(key.clone(), value.clone());
+        }
+        let outage = request(&mut client, request_id, method, params).await;
+        assert_eq!(
+            outage["error"]["code"], "STORAGE_UNAVAILABLE",
+            "{request_id}: {outage}"
+        );
+        assert_eq!(outage["error"]["retryable"], true, "{request_id}");
+    }
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.117 (§4.98): the group invite-link family round trip. The
+/// handshake advertises the six faces plus the `group-invite-links` tag;
+/// the password face answers 16-byte CSPRNG material; build → parse is a
+/// real proto round trip (the fixture mirrors the engine's group_link
+/// codec) across the three official URL forms plus the bare code; preview
+/// projects the full pre-join face; join answers both status verbs and
+/// records its dispatch (the record-before-parse discipline, pinned on the
+/// fixture log); cancel answers its verb; the two structured codes ride
+/// their data.status pass-through; the outage marker answers
+/// STORAGE_UNAVAILABLE; the local ladders (direct row, unknown rows,
+/// bounds) refuse before any engine call.
+#[tokio::test]
+async fn groups_invite_link_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [48_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in [
+        "groups.generateInviteLinkPassword",
+        "groups.buildInviteLink",
+        "groups.parseInviteLink",
+        "groups.previewViaLink",
+        "groups.joinViaLink",
+        "groups.cancelJoinRequest",
+        "group-invite-links",
+    ] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-InviteLinks" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The §4.58 factor probe rides the first conversations.list: burn it
+    // before the staged envelope is written.
+    let _ = request(
+        &mut client,
+        "probe-burn",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+
+    // Stage a 32-byte master-key group; its receive projection materializes
+    // the row with that peer reference — the link family's addressing
+    // material (the fixture group's 12-byte id is deliberately not link
+    // material, the §4.97 honesty mirror).
+    const LINK_GROUP_KEY: &str = "ERERERERERERERERERERERERERERERERERERERERERE=";
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550101",
+                "timestamp": 71,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": LINK_GROUP_KEY,
+                        "type": "UPDATE",
+                        "groupName": "Link Group",
+                        "revision": 2
+                    }
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let _ = request(
+        &mut client,
+        "list-groups",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let direct_setup = request(
+        &mut client,
+        "direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "link round trip",
+            "clientRequestId": "link-rt-0"
+        }),
+    )
+    .await;
+    let direct_conversation = direct_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = request(
+        &mut client,
+        "flush-link",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "stop": true
+        }),
+    )
+    .await;
+    let mut link_group_conversation = None;
+    for _ in 0..16 {
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "the staged link group's conversation.changed never arrived within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
+        if frame["event"] == "conversation.changed" && frame["data"]["title"] == "Link Group" {
+            link_group_conversation = Some(frame["data"]["id"].as_str().unwrap().to_string());
+            break;
+        }
+    }
+    let link_group_conversation = link_group_conversation
+        .expect("the staged 32-byte link group must materialize with its mirrored title");
+
+    // The password face: 16 CSPRNG bytes as standard base64 (24 chars),
+    // two calls never coincide. The empty-params shape is part of the
+    // contract.
+    let password_one = request(
+        &mut client,
+        "link-password-1",
+        "groups.generateInviteLinkPassword",
+        json!({}),
+    )
+    .await;
+    let password_material = password_one["result"]["password"].as_str().unwrap();
+    assert_eq!(password_material.len(), 24, "{password_one}");
+    let password_two = request(
+        &mut client,
+        "link-password-2",
+        "groups.generateInviteLinkPassword",
+        json!({}),
+    )
+    .await;
+    assert_ne!(
+        password_material,
+        password_two["result"]["password"].as_str().unwrap()
+    );
+
+    // Build (explicit password) → the official link shape; parse is a real
+    // round trip back to the same key + password bytes, across the three
+    // official URL forms and the bare invite code.
+    let built = request(
+        &mut client,
+        "link-build",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": link_group_conversation,
+            "password": "EREREREREREREREREREREQ=="
+        }),
+    )
+    .await;
+    let invite_link = built["result"]["inviteLink"].as_str().unwrap().to_string();
+    assert!(invite_link.starts_with("https://signal.group/#"), "{built}");
+    let code = invite_link.rsplit('#').next().unwrap().to_string();
+    assert!(!code.contains('+') && !code.contains('/') && !code.contains('='));
+    let parsed = request(
+        &mut client,
+        "link-parse",
+        "groups.parseInviteLink",
+        json!({ "inviteLink": invite_link }),
+    )
+    .await;
+    assert_eq!(
+        parsed["result"],
+        json!({
+            "groupId": LINK_GROUP_KEY,
+            "password": "EREREREREREREREREREREQ=="
+        }),
+        "{parsed}"
+    );
+    for (request_id, shape) in [
+        ("link-parse-sgnl", format!("sgnl://signal.group/#{code}")),
+        ("link-parse-join", format!("sgnl://joingroup#{code}")),
+        ("link-parse-bare", code.clone()),
+    ] {
+        let answer = request(
+            &mut client,
+            request_id,
+            "groups.parseInviteLink",
+            json!({ "inviteLink": shape }),
+        )
+        .await;
+        assert_eq!(
+            answer["result"]["groupId"], LINK_GROUP_KEY,
+            "{request_id}: {answer}"
+        );
+    }
+
+    // Preview: the full pre-join projection (both optional profile keys
+    // present), the same master key the parse decoded.
+    let preview = request(
+        &mut client,
+        "link-preview",
+        "groups.previewViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(
+        preview["result"],
+        json!({
+            "groupId": LINK_GROUP_KEY,
+            "memberCount": 12,
+            "revision": 7,
+            "addFromInviteLink": "ANY",
+            "approvalRequired": false,
+            "pendingAdminApproval": false,
+            "name": "Fixture Link Group",
+            "description": "previewed through the invite link"
+        }),
+        "{preview}"
+    );
+
+    // Join: the definite verb, and the dispatch record rides the fixture
+    // log verbatim (the record-before-parse discipline — a refused join
+    // would leave its record too).
+    let joined = request(
+        &mut client,
+        "link-join",
+        "groups.joinViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(joined["result"], json!({ "status": "joined" }), "{joined}");
+    // The approval gate turns the same call into a request.
+    let requested_build = request(
+        &mut client,
+        "link-build-requested",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": link_group_conversation,
+            "password": "9/f39/f39/f39/f39/f39w=="
+        }),
+    )
+    .await;
+    let requested_link = requested_build["result"]["inviteLink"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let requested = request(
+        &mut client,
+        "link-join-requested",
+        "groups.joinViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": requested_link
+        }),
+    )
+    .await;
+    assert_eq!(
+        requested["result"],
+        json!({ "status": "requested" }),
+        "{requested}"
+    );
+    // Cancel: the definite verb.
+    let cancelled = request(
+        &mut client,
+        "link-cancel",
+        "groups.cancelJoinRequest",
+        json!({
+            "accountId": account_id,
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(
+        cancelled["result"],
+        json!({ "status": "cancelled" }),
+        "{cancelled}"
+    );
+
+    // The structured refusal faces ride the data.status pass-through: the
+    // preview's own code and the join/cancel server-rejection channel (the
+    // forged link carries the sentinel password bytes the fixture answers
+    // on).
+    let forged_build = request(
+        &mut client,
+        "link-build-forged",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": link_group_conversation,
+            "password": "/v7+/v7+/v7+/v7+/v7+/g=="
+        }),
+    )
+    .await;
+    let forged_link = forged_build["result"]["inviteLink"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let preview_failed = request(
+        &mut client,
+        "link-preview-failed",
+        "groups.previewViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": forged_link
+        }),
+    )
+    .await;
+    assert_eq!(
+        preview_failed["error"]["code"], "GROUP_INVITE_LINK_PREVIEW_FAILED",
+        "{preview_failed}"
+    );
+    assert_eq!(preview_failed["error"]["data"], json!({ "status": 404 }));
+    assert_eq!(preview_failed["error"]["retryable"], false);
+    let join_failed = request(
+        &mut client,
+        "link-join-failed",
+        "groups.joinViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": forged_link
+        }),
+    )
+    .await;
+    assert_eq!(join_failed["error"]["code"], "GROUP_UPDATE_FAILED");
+    assert_eq!(join_failed["error"]["data"], json!({ "status": 403 }));
+    assert_eq!(join_failed["error"]["retryable"], false);
+    let cancel_failed = request(
+        &mut client,
+        "link-cancel-failed",
+        "groups.cancelJoinRequest",
+        json!({
+            "accountId": account_id,
+            "inviteLink": forged_link
+        }),
+    )
+    .await;
+    assert_eq!(cancel_failed["error"]["code"], "GROUP_UPDATE_FAILED");
+    assert_eq!(cancel_failed["error"]["data"], json!({ "status": 409 }));
+    assert_eq!(cancel_failed["error"]["retryable"], false);
+
+    // The build face's own code, both arms: the server-rejection sentinel
+    // password (data.status) and the password-absent read-the-server-state
+    // arm (the engine fake's link-not-set face, no data).
+    let build_forbidden = request(
+        &mut client,
+        "link-build-forbidden",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": link_group_conversation,
+            "password": "ra2tra2tra2tra2tra2trQ=="
+        }),
+    )
+    .await;
+    assert_eq!(
+        build_forbidden["error"]["code"], "GROUP_INVITE_LINK_UNAVAILABLE",
+        "{build_forbidden}"
+    );
+    assert_eq!(build_forbidden["error"]["data"], json!({ "status": 403 }));
+    assert_eq!(build_forbidden["error"]["retryable"], false);
+    let build_unset = request(
+        &mut client,
+        "link-build-unset",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": link_group_conversation
+        }),
+    )
+    .await;
+    assert_eq!(
+        build_unset["error"]["code"],
+        "GROUP_INVITE_LINK_UNAVAILABLE"
+    );
+    assert!(build_unset["error"].get("data").is_none(), "{build_unset}");
+    assert_eq!(build_unset["error"]["retryable"], false);
+
+    // The dispatch log pins the five writes' exact upstream payloads (the
+    // account + inviteLink verbatim; nothing else rides). This runs before
+    // the outage and malformed faces below so the log holds only the
+    // definite round trips.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log the join dispatches");
+    let link_writes: Vec<Value> = send_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| params.get("inviteLink").is_some())
+        .collect();
+    assert_eq!(link_writes.len(), 5, "{link_writes:?}");
+    for write in &link_writes {
+        assert_eq!(write["account"], "+15555550100", "{write}");
+    }
+    assert_eq!(link_writes[0]["inviteLink"], invite_link);
+    assert_eq!(link_writes[1]["inviteLink"], requested_link);
+    assert_eq!(link_writes[2]["inviteLink"], invite_link);
+    assert_eq!(link_writes[3]["inviteLink"], forged_link);
+    assert_eq!(link_writes[4]["inviteLink"], forged_link);
+
+    // The outage marker: the read and write faces answer STORAGE_UNAVAILABLE
+    // verbatim, retryable=true (the outage may clear).
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-invite-link-unavailable"),
+        b"outage",
+    )
+    .unwrap();
+    let outage_preview = request(
+        &mut client,
+        "link-outage-preview",
+        "groups.previewViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(
+        outage_preview["error"]["code"], "STORAGE_UNAVAILABLE",
+        "{outage_preview}"
+    );
+    assert_eq!(outage_preview["error"]["retryable"], true);
+    let outage_join = request(
+        &mut client,
+        "link-outage-join",
+        "groups.joinViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(outage_join["error"]["code"], "STORAGE_UNAVAILABLE");
+    assert_eq!(outage_join["error"]["retryable"], true);
+    fs::remove_file(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-invite-link-unavailable"),
+    )
+    .unwrap();
+
+    // The malformed-link face: the engine's -32603 parse gate folds into
+    // the deterministic UPSTREAM_ERROR (retryable=false).
+    let malformed = request(
+        &mut client,
+        "link-parse-malformed",
+        "groups.parseInviteLink",
+        json!({ "inviteLink": "https://signal.group/#@@@" }),
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], "UPSTREAM_ERROR", "{malformed}");
+    assert_eq!(malformed["error"]["retryable"], false);
+    let malformed_join = request(
+        &mut client,
+        "link-join-malformed",
+        "groups.joinViaLink",
+        json!({ "accountId": account_id, "inviteLink": "not-a-link" }),
+    )
+    .await;
+    assert_eq!(malformed_join["error"]["code"], "UPSTREAM_ERROR");
+    assert_eq!(malformed_join["error"]["retryable"], false);
+
+    // The local refusal ladder, each before any engine call: the direct row
+    // is not link material, unknown rows, and the link bounds.
+    let direct_build = request(
+        &mut client,
+        "link-build-direct",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "password": "EREREREREREREREREREREQ=="
+        }),
+    )
+    .await;
+    assert_eq!(direct_build["error"]["code"], "INVALID_REQUEST");
+    let unknown_conversation = request(
+        &mut client,
+        "link-build-unknown",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation"
+        }),
+    )
+    .await;
+    assert_eq!(
+        unknown_conversation["error"]["code"], "CONVERSATION_NOT_FOUND",
+        "{unknown_conversation}"
+    );
+    let unknown_account = request(
+        &mut client,
+        "link-preview-unknown-account",
+        "groups.previewViaLink",
+        json!({
+            "accountId": "no-such-account",
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(unknown_account["error"]["code"], "ACCOUNT_NOT_FOUND");
+    let empty_link = request(
+        &mut client,
+        "link-preview-empty",
+        "groups.previewViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": ""
+        }),
+    )
+    .await;
+    assert_eq!(empty_link["error"]["code"], "INVALID_REQUEST");
+    let oversized_link = request(
+        &mut client,
+        "link-preview-oversized",
+        "groups.parseInviteLink",
+        json!({ "inviteLink": "x".repeat(1025) }),
+    )
+    .await;
+    assert_eq!(oversized_link["error"]["code"], "INVALID_REQUEST");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+/// Contract revision 1.118 (§4.99): the delete-for-me upstream leg. The
+/// handshake advertises `messages.deleteForMe` plus the `delete-for-me`
+/// tag; the full-clear arm rides the engine `deleteForMeConversation` face
+/// with the entries verbatim, the local-only arm carries no entries, the
+/// grammar refuses (empty full-clear entries, oversized lists, entries on
+/// the local-only arm, a zero timestamp, legacyGroup), and the crash
+/// sentinel degrades to `unknown` with no error object and no retry (the
+/// receipt-class discipline).
+#[tokio::test]
+async fn messages_delete_for_me_rides_the_engine_sync_face() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [58_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["messages.deleteForMe", "delete-for-me"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-DeleteForMe" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // A direct conversation with one landed message: the delete-for-me
+    // conversation resolves through the local row.
+    let sent = request(
+        &mut client,
+        "dfm-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "text": "conversation to clear",
+            "clientRequestId": "dfm-send-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Full-clear arm: the entries ride verbatim, the conversation resolves
+    // to the peer reference the engine's toConversationIdentifier carries.
+    let cleared = request(
+        &mut client,
+        "dfm-clear",
+        "messages.deleteForMe",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "mostRecentMessages": [
+                { "author": "+15555550101", "timestamp": 99 },
+                { "author": "+15555550100", "timestamp": 100 }
+            ],
+            "mostRecentNonExpiringMessages": [
+                { "author": "+15555550101", "timestamp": 101 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(cleared["result"]["status"], "sent");
+    assert!(
+        cleared.get("error").is_none(),
+        "a confirmed sync must not carry an error: {cleared:?}"
+    );
+
+    // Local-only arm: no entries travel, the localOnly bit rides.
+    let local_only = request(
+        &mut client,
+        "dfm-local",
+        "messages.deleteForMe",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "localOnly": true
+        }),
+    )
+    .await;
+    assert_eq!(local_only["result"]["status"], "sent");
+
+    // The exact upstream dispatches were recorded by the fixture, in wire
+    // order, entries verbatim.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log deleteForMeConversation params");
+    let dispatches: Vec<Value> = send_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|params: &Value| {
+            params.get("mostRecentMessages").is_some() || params.get("localOnly").is_some()
+        })
+        .collect();
+    assert_eq!(
+        dispatches.len(),
+        2,
+        "both arms reach the upstream exactly once: {dispatches:?}"
+    );
+    assert_eq!(dispatches[0]["account"], "+15555550100");
+    assert_eq!(dispatches[0]["kind"], "contact");
+    assert_eq!(dispatches[0]["conversationId"], "+15555550101");
+    assert_eq!(
+        dispatches[0]["mostRecentMessages"],
+        json!([
+            { "author": "+15555550101", "timestamp": 99 },
+            { "author": "+15555550100", "timestamp": 100 }
+        ])
+    );
+    assert_eq!(
+        dispatches[0]["mostRecentNonExpiringMessages"],
+        json!([{ "author": "+15555550101", "timestamp": 101 }])
+    );
+    assert!(dispatches[0].get("localOnly").is_none());
+    assert_eq!(dispatches[1]["localOnly"], true);
+    assert!(dispatches[1].get("mostRecentMessages").is_none());
+    assert!(dispatches[1].get("mostRecentNonExpiringMessages").is_none());
+
+    // The grammar refuses before any upstream call.
+    let grammar_refusals: Vec<(&str, Value)> = vec![
+        (
+            "dfm-empty",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact",
+                "mostRecentMessages": []
+            }),
+        ),
+        (
+            "dfm-oversized",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact",
+                "mostRecentMessages": [
+                    { "author": "+15555550101", "timestamp": 1 },
+                    { "author": "+15555550101", "timestamp": 2 },
+                    { "author": "+15555550101", "timestamp": 3 },
+                    { "author": "+15555550101", "timestamp": 4 },
+                    { "author": "+15555550101", "timestamp": 5 },
+                    { "author": "+15555550101", "timestamp": 6 }
+                ]
+            }),
+        ),
+        (
+            "dfm-local-with-entries",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact",
+                "localOnly": true,
+                "mostRecentMessages": [{ "author": "+15555550101", "timestamp": 99 }]
+            }),
+        ),
+        (
+            "dfm-zero-timestamp",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact",
+                "mostRecentMessages": [{ "author": "+15555550101", "timestamp": 0 }]
+            }),
+        ),
+        (
+            "dfm-legacy-group",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "legacyGroup",
+                "mostRecentMessages": [{ "author": "+15555550101", "timestamp": 99 }]
+            }),
+        ),
+        (
+            "dfm-oversized-non-expiring",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact",
+                "mostRecentMessages": [{ "author": "+15555550101", "timestamp": 99 }],
+                "mostRecentNonExpiringMessages": [
+                    { "author": "+15555550101", "timestamp": 1 },
+                    { "author": "+15555550101", "timestamp": 2 },
+                    { "author": "+15555550101", "timestamp": 3 },
+                    { "author": "+15555550101", "timestamp": 4 },
+                    { "author": "+15555550101", "timestamp": 5 },
+                    { "author": "+15555550101", "timestamp": 6 }
+                ]
+            }),
+        ),
+    ];
+    for (id, params) in grammar_refusals {
+        let refused = request(&mut client, id, "messages.deleteForMe", params).await;
+        assert_eq!(
+            refused["error"]["code"], "INVALID_REQUEST",
+            "{id} must refuse before any upstream call: {refused:?}"
+        );
+    }
+    let refusals_logged = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+    .filter(|params: &Value| {
+        params.get("mostRecentMessages").is_some() || params.get("localOnly").is_some()
+    })
+    .count();
+    assert_eq!(
+        refusals_logged, 2,
+        "the refusals must not reach the upstream"
+    );
+
+    // The crash sentinel (timestamp 427) kills the engine mid-call: the
+    // sync message may or may not have reached the other devices — the
+    // request degrades to `unknown`, no error object, no retry.
+    let indeterminate = request(
+        &mut client,
+        "dfm-crash",
+        "messages.deleteForMe",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "mostRecentMessages": [
+                { "author": "+15555550101", "timestamp": 99 },
+                { "author": "+15555550101", "timestamp": 427 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(indeterminate["result"]["status"], "unknown");
+    assert!(
+        indeterminate.get("error").is_none(),
+        "a receipt failure must not fail the request: {indeterminate:?}"
+    );
+
+    wait_for_process_exit(engine_pid).await;
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.197 (§4.197): the message-level delete-for-me
+/// upstream leg. The handshake advertises `messages.deleteForMeMessages`
+/// plus the existing `delete-for-me` tag; the desktop addresses local row
+/// ids, the connector resolves the row's official `(author, sentTimestamp)`
+/// pair (outgoing → the account's own address), and exactly one engine
+/// `deleteForMeMessages` dispatch lands. Batch refusals — an unknown row
+/// and an over-cap list — answer before any engine call.
+#[tokio::test]
+async fn messages_delete_for_me_messages_resolves_rows_and_rides_the_engine() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [61_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["messages.deleteForMeMessages", "delete-for-me"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-DeleteForMeMessages" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // One landed outgoing row: its id is the desktop handle, its upstream
+    // stamp is what the sync frame must address.
+    let sent = request(
+        &mut client,
+        "dfm-msg-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "text": "delete this message for me",
+            "clientRequestId": "dfm-msg-send-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let message_id = sent["result"]["id"].as_str().unwrap().to_string();
+    let sent_at = sent["result"]["sentAt"].as_u64().unwrap();
+
+    let synced = request(
+        &mut client,
+        "dfm-msg-sync",
+        "messages.deleteForMeMessages",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [message_id]
+        }),
+    )
+    .await;
+    assert_eq!(synced["result"]["status"], "sent", "{synced:?}");
+    assert!(
+        synced.get("error").is_none(),
+        "a confirmed sync must not carry an error: {synced:?}"
+    );
+
+    // The exact upstream dispatch: local ids resolved to the official pair,
+    // the conversation reference and the row family on the wire.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log deleteForMeMessages params");
+    let dispatches: Vec<Value> = send_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|params: &Value| params.get("entries").is_some())
+        .collect();
+    assert_eq!(
+        dispatches.len(),
+        1,
+        "one engine dispatch for the whole batch: {dispatches:?}"
+    );
+    assert_eq!(dispatches[0]["account"], "+15555550100");
+    assert_eq!(dispatches[0]["kind"], "contact");
+    assert_eq!(dispatches[0]["conversationId"], "+15555550101");
+    assert_eq!(
+        dispatches[0]["entries"],
+        json!([{ "author": "+15555550100", "timestamp": sent_at }])
+    );
+
+    // The all-or-nothing refusals never reach the engine: an unknown row
+    // and a list past the 256 ceiling.
+    let unknown = request(
+        &mut client,
+        "dfm-msg-unknown",
+        "messages.deleteForMeMessages",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [message_id, "no-such-row"]
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "MESSAGE_NOT_FOUND", "{unknown:?}");
+    let over_cap: Vec<String> = (0..=256).map(|index| format!("row-{index}")).collect();
+    let over_cap = request(
+        &mut client,
+        "dfm-msg-over-cap",
+        "messages.deleteForMeMessages",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": over_cap
+        }),
+    )
+    .await;
+    assert_eq!(over_cap["error"]["code"], "INVALID_REQUEST", "{over_cap:?}");
+    let refusals_logged = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+    .filter(|params: &Value| params.get("entries").is_some())
+    .count();
+    assert_eq!(
+        refusals_logged, 1,
+        "the refused batches must not reach the upstream"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+/// through the fixture's `.fixture-extra-receives.json` carry `serverGuid`
+/// Contract 1.49 (§4.48): the reportSpam round trip. Envelopes staged
+/// through the fixture's `.fixture-extra-receives.json` carry `serverGuid`
+/// values; the report addresses the persisted rows, guid-less rows answer
+/// per-id failures (no invented code), group conversations refuse before
+/// any upstream call, unknown ids fail per-id, the structured
+/// REPORT_SPAM_FAILED maps through the host face, the crash sentinel pins
+/// SEND_OUTCOME_UNKNOWN with the no-retry discipline, and the handshake
+/// advertises the method plus the `report-spam` capability.
+#[tokio::test]
+async fn report_spam_round_trip_persists_server_guids_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [46_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries the new face before anything else runs.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["messages.reportSpam", "report-spam"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-ReportSpam" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Stage one guid-carrying envelope and one guid-less envelope for the
+    // fixture peer, then flush them through the typing hook.
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 70,
+                "serverGuid": "guid-live-1",
+                "dataMessage": { "message": "spam candidate one" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 71,
+                "dataMessage": { "message": "sent-row twin" }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let setup = request(
+        &mut client,
+        "direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "report guard",
+            "clientRequestId": "report-spam-0"
+        }),
+    )
+    .await;
+    let conversation_id = setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = request(
+        &mut client,
+        "flush-receives",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "stop": true
+        }),
+    )
+    .await;
+
+    // The flush response can outrun the receive processing; wait for both
+    // staged rows' upsert events before reading the list.
+    let upserted = timeout(Duration::from_secs(5), async {
+        let mut seen: Vec<Value> = Vec::new();
+        while seen.len() < 2 {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["direction"] == "incoming"
+            {
+                seen.push(frame["data"].clone());
+            }
+        }
+        seen
+    })
+    .await
+    .expect("both staged envelopes must land rows");
+    let guided_id = upserted
+        .iter()
+        .find(|row| row["sentAt"] == 70)
+        .expect("the guid-carrying envelope lands a row")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain_id = upserted
+        .iter()
+        .find(|row| row["sentAt"] == 71)
+        .expect("the guid-less envelope lands a row")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let listed = request(
+        &mut client,
+        "list-rows",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    let rows = listed["result"]["items"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row["direction"] == "incoming" && row["sentAt"] == 70),
+        "the guid-carrying row is listable"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["direction"] == "incoming" && row["sentAt"] == 71),
+        "the guid-less row is listable"
+    );
+
+    // Group addressing refuses before any upstream call. The link sync
+    // materialized the fixture group; its rows address the refusal.
+    let listed_groups = request(
+        &mut client,
+        "list-groups",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed_groups["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with the fixture group");
+    let group_report = request(
+        &mut client,
+        "group-report",
+        "messages.reportSpam",
         json!({
             "accountId": account_id,
             "conversationId": group_conversation,
-            "groupName": "[fixture-crash-group]"
+            "messageIds": ["any-id"]
         }),
     )
     .await;
-    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    assert_eq!(group_report["error"]["code"], "INVALID_REQUEST");
+
+    // The mixed report: the guided row reports, the guid-less twin and the
+    // unknown id answer per-id failures without a code.
+    let reported = request(
+        &mut client,
+        "report-mixed",
+        "messages.reportSpam",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [guided_id, plain_id, "msg-unknown"]
+        }),
+    )
+    .await;
+    assert_eq!(reported["result"]["reported"], 1);
+    let failures = reported["result"]["failures"].as_array().unwrap();
+    assert_eq!(
+        failures.len(),
+        2,
+        "the guid-less twin and the unknown id fail: {failures:?}"
+    );
+    for failure in failures {
+        assert_eq!(
+            failure["code"],
+            Value::Null,
+            "no invented status: {failure:?}"
+        );
+        assert!(
+            failure.get("code").is_none(),
+            "the code key stays absent on transport-class failures: {failure:?}"
+        );
+    }
+    let failed_ids: Vec<&str> = failures
+        .iter()
+        .map(|failure| failure["messageId"].as_str().unwrap())
+        .collect();
+    assert!(failed_ids.contains(&plain_id.as_str()));
+    assert!(failed_ids.contains(&"msg-unknown"));
+
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let report_call: Value = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|params| params.get("serverGuids").is_some())
+        .expect("the report must reach reportSpam");
+    assert_eq!(report_call["account"], "+15555550100");
+    // The fixture peer's ACI comes from the envelope's sourceUuid (the peer
+    // identity the ingest recorded), not the numeric peer key.
+    assert_eq!(
+        report_call["targetAci"],
+        "22222222-2222-2222-2222-222222222222"
+    );
+    assert_eq!(report_call["serverGuids"], json!(["guid-live-1"]));
+
+    // A partial failure rides the success result: the server rejected one
+    // guid with status 400, keyed back onto the caller's message id. The
+    // fixture's marker cursor is positional, so the appended envelope rides
+    // the same array (the first two entries were already emitted).
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 70,
+                "serverGuid": "guid-live-1",
+                "dataMessage": { "message": "spam candidate one" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 71,
+                "dataMessage": { "message": "sent-row twin" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 72,
+                "serverGuid": "guid-partial",
+                "dataMessage": { "message": "partial reject" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 73,
+                "serverGuid": "guid-reject-all",
+                "dataMessage": { "message": "batch reject" }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let _ = request(
+        &mut client,
+        "flush-partial",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "stop": true
+        }),
+    )
+    .await;
+    let staged_tail = timeout(Duration::from_secs(5), async {
+        let mut seen: Vec<Value> = Vec::new();
+        while seen.len() < 2 {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["direction"] == "incoming"
+            {
+                seen.push(frame["data"].clone());
+            }
+        }
+        seen
+    })
+    .await
+    .expect("both staged tail envelopes must land rows");
+    let partial_id = staged_tail
+        .iter()
+        .find(|row| row["sentAt"] == 72)
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the partial envelope lands a row");
+    let reject_all_id = staged_tail
+        .iter()
+        .find(|row| row["sentAt"] == 73)
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the reject-all envelope lands a row");
+    let partial = request(
+        &mut client,
+        "report-partial",
+        "messages.reportSpam",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [partial_id]
+        }),
+    )
+    .await;
+    assert_eq!(partial["result"]["reported"], 1);
+    assert_eq!(partial["result"]["failures"][0]["messageId"], partial_id);
+    assert_eq!(partial["result"]["failures"][0]["code"], 400);
+
+    // The structured refusal: the whole batch rejected maps onto the host
+    // code verbatim, retryable=false.
+    let refused = request(
+        &mut client,
+        "report-refused",
+        "messages.reportSpam",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [reject_all_id]
+        }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "REPORT_SPAM_FAILED");
+    assert_eq!(refused["error"]["retryable"], false);
+
+    // Crash with the mutating report in flight (fixture magic guid):
+    // SEND_OUTCOME_UNKNOWN, never retried — exactly one such call in the
+    // recovered log. The crash needs a row carrying the magic guid.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 70,
+                "serverGuid": "guid-live-1",
+                "dataMessage": { "message": "spam candidate one" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 71,
+                "dataMessage": { "message": "sent-row twin" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 72,
+                "serverGuid": "guid-partial",
+                "dataMessage": { "message": "partial reject" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 73,
+                "serverGuid": "guid-reject-all",
+                "dataMessage": { "message": "batch reject" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 74,
+                "serverGuid": "guid-crash",
+                "dataMessage": { "message": "crash carrier" }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let _ = request(
+        &mut client,
+        "flush-crash",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "stop": true
+        }),
+    )
+    .await;
+    let crash_id = timeout(Duration::from_secs(5), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["direction"] == "incoming"
+                && frame["data"]["sentAt"] == 74
+            {
+                return frame["data"]["id"].as_str().unwrap().to_string();
+            }
+        }
+    })
+    .await
+    .expect("the crash-carrier envelope lands a row");
+    let crash_setup = request(
+        &mut client,
+        "report-crash",
+        "messages.reportSpam",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [crash_id]
+        }),
+    )
+    .await;
+    assert_eq!(crash_setup["error"]["code"], "SEND_OUTCOME_UNKNOWN");
     wait_for_process_exit(engine_pid).await;
-    let restarted = request(&mut client, "restart-group", "runtime.start", json!({})).await;
+    let restarted = request(&mut client, "restart-report", "runtime.start", json!({})).await;
     assert_eq!(restarted["result"]["state"], "running");
     let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
     assert_ne!(recovered_pid, engine_pid);
@@ -5169,12 +9534,17 @@ async fn groups_update_quit_round_trip_and_guards() {
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|params| params.get("name") == Some(&json!("[fixture-crash-group]")))
+        .filter(|params| {
+            params
+                .get("serverGuids")
+                .and_then(Value::as_array)
+                .is_some_and(|guids| guids.contains(&json!("guid-crash")))
+        })
         .collect();
     assert_eq!(
         crash_calls.len(),
         1,
-        "an unknown group-update outcome is never retried: {crash_calls:?}"
+        "an unknown report outcome is never retried: {crash_calls:?}"
     );
 
     drop(client);
@@ -5323,6 +9693,2698 @@ async fn sticker_and_pin_methods_surface_engine_errors() {
             .count(),
         1,
         "an unknown pin outcome is never retried: {crash_calls:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revisions 1.46 + 1.120: the §4.45 account-settings write faces
+/// (accounts.updateConfiguration partial-write forwarding — the 1.120 §4.101
+/// linkPreviews bit included — accounts.setProfile
+/// text full-write + avatar tri-state + bounds, accounts.setExpireTimer u32
+/// engine face) and the conversations.getBlocked read face — success shapes,
+/// the deterministic fail-closed ladder, the structured STORAGE_* passthrough
+/// riding the profile face's sentinels, and the crash-with-in-flight-write
+/// unknown outcome on both mutating faces (no retry, exactly-once dispatch).
+/// The 1.120 read-mirror linkage: another linked device's configuration sync
+/// lands as the §4.87 settings.configurationSync event carrying the same
+/// linkPreviews key the write face takes.
+#[tokio::test]
+async fn account_settings_and_blocked_faces_round_trip() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [43_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let mut engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-AccountSettings" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let send_log = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    };
+
+    // Blocked read: the storage-order fixture constant, the pinned-face entry
+    // shape (conversationId + kind), contact and legacyGroup kinds.
+    let blocked = request(
+        &mut client,
+        "get-blocked",
+        "conversations.getBlocked",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let entries = blocked["result"]["blocked"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["conversationId"], "+15555550103");
+    assert_eq!(entries[0]["kind"], "contact");
+    // The 窗D B7 read-projection (contract revision 1.119, §4.100): the
+    // contact record's stamp rides verbatim, the GV1 entry never carries
+    // the key (the official shape).
+    assert_eq!(entries[0]["blockedAtTimestampMs"], 1700000000000_u64);
+    assert_eq!(entries[1]["kind"], "legacyGroup");
+    assert!(entries[1].get("blockedAtTimestampMs").is_none());
+    let missing_account = request(
+        &mut client,
+        "blocked-missing-account",
+        "conversations.getBlocked",
+        json!({}),
+    )
+    .await;
+    assert_eq!(missing_account["error"]["code"], "INVALID_REQUEST");
+
+    // Configuration partial write: only the provided keys reach upstream.
+    // Contract 1.120 (§4.101): the linkPreviews bit rides the same face.
+    let configured = request(
+        &mut client,
+        "config-partial",
+        "accounts.updateConfiguration",
+        json!({
+            "accountId": account_id,
+            "readReceipts": true,
+            "phoneNumberSharingMode": "nobody",
+            "linkPreviews": true
+        }),
+    )
+    .await;
+    assert_eq!(configured["result"]["status"], "saved");
+    let config_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("readReceipts").is_some())
+        .collect();
+    assert_eq!(config_calls.len(), 1, "{config_calls:?}");
+    assert_eq!(config_calls[0]["account"], "+15555550100");
+    assert_eq!(config_calls[0]["readReceipts"], true);
+    assert_eq!(config_calls[0]["phoneNumberSharingMode"], "nobody");
+    assert_eq!(config_calls[0]["linkPreviews"], true);
+    assert!(config_calls[0].get("typingIndicators").is_none());
+    assert!(config_calls[0].get("unlistedPhoneNumber").is_none());
+
+    // A lone linkPreviews write satisfies the at-least-one rule by itself and
+    // forwards only its own key (the partial-write contract, new member).
+    let link_only = request(
+        &mut client,
+        "config-link-only",
+        "accounts.updateConfiguration",
+        json!({
+            "accountId": account_id,
+            "linkPreviews": false
+        }),
+    )
+    .await;
+    assert_eq!(link_only["result"]["status"], "saved");
+    let link_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| {
+            params.get("linkPreviews").is_some() && params.get("readReceipts").is_none()
+        })
+        .collect();
+    assert_eq!(link_calls.len(), 1, "{link_calls:?}");
+    assert_eq!(link_calls[0]["account"], "+15555550100");
+    assert_eq!(link_calls[0]["linkPreviews"], false);
+    assert!(link_calls[0].get("readReceipts").is_none());
+
+    // Fail-closed ladder: zero writable keys, the retired CONTACTS_ONLY enum
+    // value, an unknown key, a non-boolean, a non-boolean linkPreviews.
+    for (request_id, params) in [
+        ("config-empty", json!({ "accountId": account_id })),
+        (
+            "config-retired-enum",
+            json!({
+                "accountId": account_id,
+                "phoneNumberSharingMode": "contactsOnly"
+            }),
+        ),
+        (
+            "config-unknown-key",
+            json!({
+                "accountId": account_id,
+                "readReceipts": true,
+                "bogus": 1
+            }),
+        ),
+        (
+            "config-non-bool",
+            json!({
+                "accountId": account_id,
+                "readReceipts": "yes"
+            }),
+        ),
+        (
+            "config-link-non-bool",
+            json!({
+                "accountId": account_id,
+                "linkPreviews": "yes"
+            }),
+        ),
+    ] {
+        let rejected = request(
+            &mut client,
+            request_id,
+            "accounts.updateConfiguration",
+            params,
+        )
+        .await;
+        assert_eq!(
+            rejected["error"]["code"], "INVALID_REQUEST",
+            "{request_id}: {rejected}"
+        );
+    }
+    let config_calls_after: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("readReceipts").is_some())
+        .collect();
+    assert_eq!(config_calls_after.len(), 1, "refusals never dial upstream");
+
+    // The 1.120 read-mirror linkage: another linked device's configuration
+    // sync lands as the §4.87 settings.configurationSync event with the
+    // linkPreviews key in place — the write face and the read projection
+    // speak the same key name.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [{
+            "source": "+15555550100",
+            "timestamp": 5000000123_u64,
+            "syncMessage": {
+                "configuration": {
+                    "readReceipts": true,
+                    "linkPreviews": false
+                }
+            }
+        }] })
+        .to_string(),
+    )
+    .unwrap();
+    // The marker-file trigger is asynchronous (the fixture watcher polls the
+    // file), so the wait side is a deadline loop for the event itself — the
+    // drain_until pattern without a response barrier.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mirrored = loop {
+        let frame: Value = match timeout(Duration::from_secs(2), async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "the configurationSync mirror must arrive within the deadline:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
+        if frame.get("event").and_then(Value::as_str) == Some("settings.configurationSync") {
+            break frame["data"].clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only unrelated frames arrived before the deadline: {frame}"
+        );
+    };
+    assert_eq!(mirrored["accountId"], account_id);
+    assert_eq!(mirrored["readReceipts"], true);
+    assert_eq!(mirrored["linkPreviews"], false);
+    assert!(mirrored.get("typingIndicators").is_none());
+    assert!(mirrored.get("unidentifiedDeliveryIndicators").is_none());
+
+    // Profile full-write: text keys forward verbatim, absent keys stay absent
+    // (the caller's clear instruction), the avatar replace forwards verbatim.
+    let profile = request(
+        &mut client,
+        "profile-set",
+        "accounts.setProfile",
+        json!({
+            "accountId": account_id,
+            "givenName": "李",
+            "about": "hello",
+            "avatar": "data:image/png;base64,YQ=="
+        }),
+    )
+    .await;
+    assert_eq!(profile["result"]["status"], "saved");
+    let profile_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("givenName").is_some())
+        .collect();
+    assert_eq!(profile_calls.len(), 1, "{profile_calls:?}");
+    assert_eq!(profile_calls[0]["account"], "+15555550100");
+    assert_eq!(profile_calls[0]["givenName"], "李");
+    assert_eq!(profile_calls[0]["about"], "hello");
+    assert_eq!(profile_calls[0]["avatar"], "data:image/png;base64,YQ==");
+    assert!(profile_calls[0].get("familyName").is_none());
+
+    // Clearing face: familyName "" clears upstream; avatar null removes.
+    let cleared = request(
+        &mut client,
+        "profile-clear",
+        "accounts.setProfile",
+        json!({
+            "accountId": account_id,
+            "givenName": "Li",
+            "familyName": "",
+            "avatar": null
+        }),
+    )
+    .await;
+    assert_eq!(cleared["result"]["status"], "saved");
+    let profile_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("givenName").is_some())
+        .collect();
+    assert_eq!(profile_calls.len(), 2);
+    assert_eq!(profile_calls[1]["familyName"], "");
+    assert!(
+        profile_calls[1].get("avatar").is_some_and(Value::is_null),
+        "explicit null forwards a present avatar:null key, not a dropped key"
+    );
+
+    // Keep face: a profile call without the avatar key forwards no avatar
+    // key — absence and explicit null are distinct wire states (1.90 pin;
+    // the 1.46 Option<Value> shape folded null into absence, so this line
+    // never had a real witness before).
+    let kept = request(
+        &mut client,
+        "profile-keep",
+        "accounts.setProfile",
+        json!({
+            "accountId": account_id,
+            "givenName": "Li"
+        }),
+    )
+    .await;
+    assert_eq!(kept["result"]["status"], "saved");
+    let profile_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("givenName").is_some())
+        .collect();
+    assert_eq!(profile_calls.len(), 3);
+    assert!(profile_calls[2].get("avatar").is_none());
+
+    // Profile fail-closed ladder: empty/over-bound text, non-image avatar,
+    // non-canonical payload, over-budget decode, non-string avatar.
+    let oversized_name = "A".repeat(129);
+    let oversized_about = "A".repeat(513);
+    let oversized_avatar = format!(
+        "data:image/png;base64,{}",
+        "QUJD".repeat(10 * 1024 * 1024 / 3 + 1)
+    );
+    for (request_id, params) in [
+        (
+            "profile-empty-name",
+            json!({ "accountId": account_id, "givenName": "" }),
+        ),
+        (
+            "profile-long-name",
+            json!({ "accountId": account_id, "givenName": oversized_name }),
+        ),
+        (
+            "profile-long-about",
+            json!({ "accountId": account_id, "givenName": "Li", "about": oversized_about }),
+        ),
+        (
+            "profile-non-image",
+            json!({
+                "accountId": account_id,
+                "givenName": "Li",
+                "avatar": "data:text/html;base64,YQ=="
+            }),
+        ),
+        (
+            "profile-non-canonical",
+            json!({
+                "accountId": account_id,
+                "givenName": "Li",
+                "avatar": "data:image/png;base64,YQ"
+            }),
+        ),
+        (
+            "profile-over-budget",
+            json!({ "accountId": account_id, "givenName": "Li", "avatar": oversized_avatar }),
+        ),
+        (
+            "profile-non-string-avatar",
+            json!({ "accountId": account_id, "givenName": "Li", "avatar": 7 }),
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, "accounts.setProfile", params).await;
+        assert_eq!(
+            rejected["error"]["code"], "INVALID_REQUEST",
+            "{request_id}: {rejected}"
+        );
+    }
+
+    // STORAGE_* passthrough: the profile face's about sentinels surface the
+    // engine's structured codes verbatim, retryable.
+    for (request_id, sentinel, expected) in [
+        (
+            "profile-storage-unavailable",
+            "[fixture-storage-unavailable]",
+            "STORAGE_UNAVAILABLE",
+        ),
+        (
+            "profile-storage-read-failed",
+            "[fixture-storage-read-failed]",
+            "STORAGE_READ_FAILED",
+        ),
+        (
+            "profile-storage-write-failed",
+            "[fixture-storage-write-failed]",
+            "STORAGE_WRITE_FAILED",
+        ),
+    ] {
+        let error = request(
+            &mut client,
+            request_id,
+            "accounts.setProfile",
+            json!({
+                "accountId": account_id,
+                "givenName": "Li",
+                "about": sentinel
+            }),
+        )
+        .await;
+        assert_eq!(error["error"]["code"], expected, "{request_id}: {error}");
+        assert_eq!(error["error"]["retryable"], true, "{request_id}: {error}");
+    }
+
+    // Universal timer: the engine-face key forwards; 0 is the legal off value.
+    for (request_id, seconds) in [("timer-set", 86400), ("timer-off", 0)] {
+        let timer = request(
+            &mut client,
+            request_id,
+            "accounts.setExpireTimer",
+            json!({ "accountId": account_id, "expireSeconds": seconds }),
+        )
+        .await;
+        assert_eq!(timer["result"]["status"], "saved", "{request_id}");
+    }
+    let timer_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("expirationInSeconds").is_some())
+        .collect();
+    assert_eq!(timer_calls.len(), 2, "{timer_calls:?}");
+    assert_eq!(timer_calls[0]["account"], "+15555550100");
+    assert_eq!(timer_calls[0]["expirationInSeconds"], 86400);
+    assert_eq!(timer_calls[1]["expirationInSeconds"], 0);
+
+    // Timer fail-closed ladder: negative, fractional, beyond the u32 face.
+    for (request_id, params) in [
+        (
+            "timer-negative",
+            json!({ "accountId": account_id, "expireSeconds": -1 }),
+        ),
+        (
+            "timer-fractional",
+            json!({ "accountId": account_id, "expireSeconds": 1.5 }),
+        ),
+        (
+            "timer-over-u32",
+            json!({ "accountId": account_id, "expireSeconds": 4294967296u64 }),
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, "accounts.setExpireTimer", params).await;
+        assert_eq!(
+            rejected["error"]["code"], "INVALID_REQUEST",
+            "{request_id}: {rejected}"
+        );
+    }
+
+    // Crash with the mutating profile write in flight (givenName sentinel,
+    // os._exit(31)): SEND_OUTCOME_UNKNOWN, never retried.
+    let crash = request(
+        &mut client,
+        "profile-crash",
+        "accounts.setProfile",
+        json!({
+            "accountId": account_id,
+            "givenName": "[fixture-crash-profile]"
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-profile", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let profile_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(profile_pid, engine_pid, "the engine actually restarted");
+    engine_pid = profile_pid;
+
+    // Same discipline on the timer face: the max legal u32 value is the
+    // crash magic (os._exit(31), a value the per-conversation int face
+    // cannot carry).
+    let timer_crash = request(
+        &mut client,
+        "timer-crash",
+        "accounts.setExpireTimer",
+        json!({ "accountId": account_id, "expireSeconds": 4294967295u32 }),
+    )
+    .await;
+    assert_eq!(timer_crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-timer", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+
+    // No-retry audit: exactly one crashing profile call and one crashing
+    // timer call across both restarts.
+    let log = send_log();
+    assert_eq!(
+        log.iter()
+            .filter(|params| params["givenName"] == "[fixture-crash-profile]")
+            .count(),
+        1,
+        "an unknown profile outcome is never retried"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|params| params["expirationInSeconds"] == 4294967295u64)
+            .count(),
+        1,
+        "an unknown timer outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.100 (§4.81 D5): the accounts.deviceCapabilities read
+/// face — the idempotent engine registration rides the resolved account, the
+/// host answer strips the engine's bare `account` identity (a bare identity
+/// never crosses the connector), the capability bits ride verbatim, and the
+/// ladder answers the deterministic failures.
+#[tokio::test]
+async fn device_capabilities_strips_the_bare_identity() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [43_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-DeviceCapabilities" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+
+    let capabilities = request(
+        &mut client,
+        "device-capabilities",
+        "accounts.deviceCapabilities",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let result = &capabilities["result"];
+    assert_eq!(result["registered"], true);
+    // The pinned upload bits ride verbatim — the connector invents no keys
+    // and strips none.
+    assert_eq!(result["capabilities"]["attachmentBackfill"], false);
+    assert_eq!(result["capabilities"]["spqr"], true);
+    assert_eq!(result["capabilities"]["usernameChangeSyncMessage"], true);
+    assert_eq!(result["capabilities"]["optionalPhoneNumber"], false);
+    // The engine's bare `account` identity never crosses the connector.
+    assert!(result.get("account").is_none(), "{result}");
+
+    // The upstream frame carried the resolved account number (the fixture's
+    // dispatch log, the getUsername read-face discipline) — exactly the
+    // single-key frame the prepare face projects.
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| **frame == json!({ "account": "+15555550100" }))
+            .count(),
+        1,
+        "expected exactly one resolved-account frame: {frames:?}"
+    );
+
+    // The deterministic ladder: unknown account, malformed params.
+    let missing = request(
+        &mut client,
+        "capabilities-missing-account",
+        "accounts.deviceCapabilities",
+        json!({ "accountId": "no-such-account" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+    let malformed = request(
+        &mut client,
+        "capabilities-malformed",
+        "accounts.deviceCapabilities",
+        json!({}),
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], "INVALID_REQUEST");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.122 (§4.103): the device-plane faces — accounts.getDevices
+/// (the resolved account rides upstream; the bounded projection drops the
+/// ghost string-deviceId entry, keeps the nameless primary and the
+/// absent-optional-keys linked device) and accounts.unlinkDevice (the write
+/// round-trip with the exact upstream frame, the DEVICES_FAILED data.status
+/// pass-through, the local deviceId=0 refusal, and the crash-in-flight
+/// unknown outcome that is never retried).
+#[tokio::test]
+async fn device_plane_faces_read_and_unlink() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [44_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-DevicePlane" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let frames = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    };
+
+    // The read face: two real entries project (the ghost string-deviceId
+    // entry drops), the nameless primary answers no `name` key (the honest
+    // no-name face), the linked device's absent optionals stay absent.
+    let devices = request(
+        &mut client,
+        "get-devices",
+        "accounts.getDevices",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let list = devices["result"]["devices"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{devices}");
+    assert_eq!(list[0]["deviceId"], 1);
+    assert!(
+        list[0].get("name").is_none(),
+        "an undecryptable/absent device name projects no key: {}",
+        list[0]
+    );
+    assert_eq!(list[0]["registrationId"], 111);
+    assert_eq!(list[0]["lastSeenMs"], 1728000000000u64);
+    assert_eq!(list[0]["createdAtCiphertext"], "Zml4dHVyZS1jcmVk");
+    assert_eq!(list[1]["deviceId"], 2);
+    assert_eq!(list[1]["name"], "KT-Desktop");
+    assert!(list[1].get("registrationId").is_none());
+    assert!(list[1].get("lastSeenMs").is_none());
+    // The upstream frame carried exactly the resolved account key.
+    assert_eq!(
+        frames()
+            .iter()
+            .filter(|frame| **frame == json!({ "account": "+15555550100" }))
+            .count(),
+        1,
+        "expected exactly one resolved-account read frame"
+    );
+
+    // The write round-trip: the definite success answers {status: unlinked}
+    // and the upstream frame carried the resolved account and the deviceId.
+    let unlink = request(
+        &mut client,
+        "unlink-2",
+        "accounts.unlinkDevice",
+        json!({ "accountId": account_id, "deviceId": 2 }),
+    )
+    .await;
+    assert_eq!(unlink["result"]["status"], "unlinked", "{unlink}");
+    assert!(
+        frames()
+            .iter()
+            .any(|frame| { *frame == json!({ "account": "+15555550100", "deviceId": 2 }) }),
+        "expected the unlink upstream frame: {:#?}",
+        frames()
+    );
+
+    // The server-rejection family rides the engine's data.status verbatim,
+    // deterministic (retryable=false).
+    let refused = request(
+        &mut client,
+        "unlink-refused",
+        "accounts.unlinkDevice",
+        json!({ "accountId": account_id, "deviceId": 4294967295u32 }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "DEVICES_FAILED", "{refused}");
+    assert_eq!(refused["error"]["retryable"], false);
+    assert_eq!(refused["error"]["data"]["status"], 409);
+
+    // The local ladder: deviceId 0 refuses INVALID_REQUEST before any
+    // upstream call (no frame), malformed params refuse at the shape gate.
+    let zero = request(
+        &mut client,
+        "unlink-zero",
+        "accounts.unlinkDevice",
+        json!({ "accountId": account_id, "deviceId": 0 }),
+    )
+    .await;
+    assert_eq!(zero["error"]["code"], "INVALID_REQUEST", "{zero}");
+    let malformed = request(
+        &mut client,
+        "unlink-malformed",
+        "accounts.unlinkDevice",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], "INVALID_REQUEST");
+    let missing = request(
+        &mut client,
+        "unlink-missing-account",
+        "accounts.unlinkDevice",
+        json!({ "accountId": "no-such-account", "deviceId": 2 }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // The red line: a crash with the mutating call in flight answers
+    // SEND_OUTCOME_UNKNOWN and is never retried — exactly one crashing frame
+    // across the restart.
+    let crash = request(
+        &mut client,
+        "unlink-crash",
+        "accounts.unlinkDevice",
+        json!({ "accountId": account_id, "deviceId": 4294967294u32 }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-unlink", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_eq!(
+        frames()
+            .iter()
+            .filter(|frame| frame["deviceId"] == 4294967294u64)
+            .count(),
+        1,
+        "an unknown unlink outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.123 (§4.104): the groups.migrate face — the GV1→GV2
+/// migration upstream leg. The round-trip carries the resolved account, the
+/// legacy base64 groupId, and the roster upstream, and answers the engine's
+/// {groupId, revision} verbatim; the local ladder refuses the malformed
+/// legacy id, the empty roster, and the over-bounds roster before any
+/// upstream call; the server-rejection family rides GROUP_MIGRATION_FAILED
+/// with data.status verbatim; the crash-in-flight outcome answers
+/// SEND_OUTCOME_UNKNOWN and is never retried.
+#[tokio::test]
+async fn group_migration_round_trips_and_gates_the_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [45_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupMigrate" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let legacy_id = "MTIzNDU2Nzg5MGFiY2RlZg==";
+
+    // The round-trip: the definite success projects {groupId, revision} and
+    // the upstream frame carries the change set (optional keys omitted stay
+    // absent upstream).
+    let migrated = request(
+        &mut client,
+        "migrate",
+        "groups.migrate",
+        json!({ "accountId": account_id, "groupId": legacy_id, "members": ["+15555550101"] }),
+    )
+    .await;
+    assert_eq!(
+        migrated["result"]["groupId"], "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=",
+        "{migrated}"
+    );
+    assert_eq!(migrated["result"]["revision"], 0);
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert!(
+        frames.iter().any(|frame| {
+            frame["account"] == "+15555550100"
+                && frame["groupId"] == legacy_id
+                && frame["members"] == json!(["+15555550101"])
+                && frame.get("title").is_none()
+        }),
+        "expected the migration upstream frame: {frames:?}"
+    );
+
+    // The optional change set rides when present.
+    let titled = request(
+        &mut client,
+        "migrate-titled",
+        "groups.migrate",
+        json!({
+            "accountId": account_id,
+            "groupId": legacy_id,
+            "title": "Migrated",
+            "expiration": 86400,
+            "members": ["+15555550101"]
+        }),
+    )
+    .await;
+    assert_eq!(titled["result"]["revision"], 0);
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert!(
+        frames
+            .iter()
+            .any(|frame| { frame["title"] == "Migrated" && frame["expiration"] == 86400 }),
+        "expected the titled migration frame: {frames:?}"
+    );
+
+    // The server-rejection family rides GROUP_MIGRATION_FAILED with the
+    // engine's data.status verbatim, deterministic.
+    let refused = request(
+        &mut client,
+        "migrate-refused",
+        "groups.migrate",
+        json!({
+            "accountId": account_id,
+            "groupId": "Zml4dHVyZS1taWdyYXRpb24tZmFpbA==",
+            "members": ["+15555550101"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"], "GROUP_MIGRATION_FAILED",
+        "{refused}"
+    );
+    assert_eq!(refused["error"]["retryable"], false);
+    assert_eq!(refused["error"]["data"]["status"], 409);
+
+    // The local ladder: the malformed legacy id, the empty roster, and the
+    // over-bounds roster refuse before any upstream call; unknown account.
+    let bad_id = request(
+        &mut client,
+        "migrate-bad-id",
+        "groups.migrate",
+        json!({ "accountId": account_id, "groupId": "not base64!!", "members": ["+15555550101"] }),
+    )
+    .await;
+    assert_eq!(bad_id["error"]["code"], "INVALID_REQUEST", "{bad_id}");
+    let empty_roster = request(
+        &mut client,
+        "migrate-empty-roster",
+        "groups.migrate",
+        json!({ "accountId": account_id, "groupId": legacy_id, "members": [] }),
+    )
+    .await;
+    assert_eq!(empty_roster["error"]["code"], "INVALID_REQUEST");
+    let over_roster = request(
+        &mut client,
+        "migrate-over-roster",
+        "groups.migrate",
+        json!({
+            "accountId": account_id,
+            "groupId": legacy_id,
+            "members": vec!["+15555550101"; 1002]
+        }),
+    )
+    .await;
+    assert_eq!(over_roster["error"]["code"], "INVALID_REQUEST");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["groupId"] == "not base64!!")
+            .count(),
+        0,
+        "a malformed id never reaches the engine"
+    );
+    let missing = request(
+        &mut client,
+        "migrate-missing-account",
+        "groups.migrate",
+        json!({ "accountId": "no-such-account", "groupId": legacy_id, "members": ["+15555550101"] }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // The red line: a crash with the mutating call in flight answers
+    // SEND_OUTCOME_UNKNOWN and is never retried — exactly one crashing frame
+    // across the restart.
+    let crash = request(
+        &mut client,
+        "migrate-crash",
+        "groups.migrate",
+        json!({
+            "accountId": account_id,
+            "groupId": legacy_id,
+            "title": "[fixture-crash-migrate]",
+            "members": ["+15555550101"]
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-migrate", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["title"] == "[fixture-crash-migrate]")
+            .count(),
+        1,
+        "an unknown migration outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.126 (§4.107): the groups.create face — the new-group
+/// upstream leg. The round-trip carries the resolved account and title (the
+/// optional change set rides when present, absent keys stay absent), and
+/// answers the engine's {groupId, revision} verbatim; the local ladder
+/// refuses the empty title, the over-bounds title, the explicit empty
+/// roster, and the over-bounds roster before any upstream call; the
+/// server-rejection family rides GROUP_CREATE_FAILED with data.status
+/// verbatim; the crash-in-flight outcome answers SEND_OUTCOME_UNKNOWN and
+/// is never retried.
+#[tokio::test]
+async fn group_create_round_trips_and_gates_the_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [45_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupCreate" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+
+    // The round-trip: the definite success projects {groupId, revision} and
+    // the upstream frame carries the title plus the optional roster (the
+    // engine derives the new group master key).
+    let created = request(
+        &mut client,
+        "create",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "kt group", "members": ["+15555550101"] }),
+    )
+    .await;
+    assert_eq!(
+        created["result"]["groupId"], "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=",
+        "{created}"
+    );
+    assert_eq!(created["result"]["revision"], 0);
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert!(
+        frames.iter().any(|frame| {
+            frame["account"] == "+15555550100"
+                && frame["title"] == "kt group"
+                && frame["members"] == json!(["+15555550101"])
+                && frame.get("expiration").is_none()
+                && frame.get("avatar").is_none()
+        }),
+        "expected the create upstream frame: {frames:?}"
+    );
+
+    // The bare create: no roster, no change set — the frame carries the
+    // title alone (the absent keys stay absent upstream).
+    let bare = request(
+        &mut client,
+        "create-bare",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "bare group" }),
+    )
+    .await;
+    assert_eq!(bare["result"]["revision"], 0);
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame["title"] == "bare group" && frame.get("members").is_none()),
+        "expected the bare create frame: {frames:?}"
+    );
+
+    // The server-rejection family rides GROUP_CREATE_FAILED with the
+    // engine's data.status verbatim, deterministic.
+    let refused = request(
+        &mut client,
+        "create-refused",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "[fixture-reject-create]" }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "GROUP_CREATE_FAILED", "{refused}");
+    assert_eq!(refused["error"]["retryable"], false);
+    assert_eq!(refused["error"]["data"]["status"], 400);
+
+    // The local ladder: the empty title, the over-bounds title, the
+    // explicit empty roster, and the over-bounds roster refuse before any
+    // upstream call; unknown account.
+    let empty_title = request(
+        &mut client,
+        "create-empty-title",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "" }),
+    )
+    .await;
+    assert_eq!(empty_title["error"]["code"], "INVALID_REQUEST");
+    let over_title = request(
+        &mut client,
+        "create-over-title",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "x".repeat(257) }),
+    )
+    .await;
+    assert_eq!(over_title["error"]["code"], "INVALID_REQUEST");
+    let empty_roster = request(
+        &mut client,
+        "create-empty-roster",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "kt group", "members": [] }),
+    )
+    .await;
+    assert_eq!(empty_roster["error"]["code"], "INVALID_REQUEST");
+    let over_roster = request(
+        &mut client,
+        "create-over-roster",
+        "groups.create",
+        json!({
+            "accountId": account_id,
+            "title": "kt group",
+            "members": vec!["+15555550101"; 1002]
+        }),
+    )
+    .await;
+    assert_eq!(over_roster["error"]["code"], "INVALID_REQUEST");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames.iter().filter(|frame| frame["title"] == "").count(),
+        0,
+        "an empty title never reaches the engine"
+    );
+    let missing = request(
+        &mut client,
+        "create-missing-account",
+        "groups.create",
+        json!({ "accountId": "no-such-account", "title": "kt group" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // The red line: a crash with the mutating call in flight answers
+    // SEND_OUTCOME_UNKNOWN and is never retried — exactly one crashing frame
+    // across the restart.
+    let crash = request(
+        &mut client,
+        "create-crash",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "[fixture-crash-create]" }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-create", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["title"] == "[fixture-crash-create]")
+            .count(),
+        1,
+        "an unknown create outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.124 (§4.105): the messages.sendContact face — the
+/// contact-card send. The direct leg resolves the row's peer reference into
+/// the engine's recipient addressing and the group leg the groupId
+/// addressing (the calls.sendSignal precedent); the {sentAt} ack echoes the
+/// engine's send timestamp; the card rides the local fail-closed ladder (the
+/// all-empty card, the out-of-vocabulary type word, the postal MOBILE, the
+/// over-bounds scalar, the over-entries array, and the malformed avatar data
+/// URI refuse before any upstream call); the empty-string organization
+/// drops from the upstream frame; the crash-in-flight outcome answers
+/// SEND_OUTCOME_UNKNOWN and is never retried.
+#[tokio::test]
+async fn contact_send_round_trips_both_legs_and_gates_the_card() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [46_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-ContactSend" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let avatar_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+
+    // The direct leg: a fresh peer send mints the row; the card routes the
+    // engine's recipient face and answers the {sentAt} ack. The avatar
+    // rides the data URI upstream and is digest-summarized in the dispatch
+    // log; the empty-string organization is the official falsy-absent and
+    // drops from the frame.
+    let seeded = request(
+        &mut client,
+        "seed-direct",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550103",
+            "peerTitle": "Contact Target",
+            "text": "seed the row",
+            "clientRequestId": "contact-seed-1"
+        }),
+    )
+    .await;
+    let direct_conversation = seeded["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let direct = request(
+        &mut client,
+        "contact-direct",
+        "messages.sendContact",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "contact": {
+                "name": { "givenName": "Ada", "familyName": "Lovelace" },
+                "number": [{ "value": "+15551230000", "type": "MOBILE", "label": "cell" }],
+                "email": [{ "value": "ada@example.test", "type": "WORK" }],
+                "address": [{ "type": "HOME", "city": "London" }],
+                "organization": "",
+                "avatar": avatar_uri
+            }
+        }),
+    )
+    .await;
+    assert_eq!(direct["result"]["sentAt"], 1727000000000_u64, "{direct}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["account"], "+15555550100");
+    assert_eq!(frame["recipient"], "+15555550103");
+    assert!(frame.get("groupId").is_none(), "{frame}");
+    assert_eq!(frame["contact"]["name"]["givenName"], "Ada");
+    assert_eq!(frame["contact"]["number"][0]["type"], "MOBILE");
+    assert_eq!(frame["contact"]["email"][0]["value"], "ada@example.test");
+    assert_eq!(frame["contact"]["address"][0]["city"], "London");
+    assert_eq!(
+        frame["contact"]["avatar"],
+        json!(format!("[avatar data uri: {} bytes]", avatar_uri.len()))
+    );
+    assert!(
+        frame["contact"].get("organization").is_none(),
+        "the empty-string organization is the official falsy-absent: {frame}"
+    );
+
+    // The group leg: the fixture links with one group conversation in
+    // place; the card routes the groupId addressing, the optional type
+    // stays absent upstream.
+    let listed = request(
+        &mut client,
+        "list-for-group",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with a group conversation");
+    let group = request(
+        &mut client,
+        "contact-group",
+        "messages.sendContact",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "contact": {
+                "name": { "givenName": "Grace" },
+                "number": [{ "value": "+15551230001" }]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(group["result"]["sentAt"], 1727000000000_u64, "{group}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["account"], "+15555550100");
+    assert_eq!(frame["groupId"], "ZmFrZS1ncm91cC0x");
+    assert!(frame.get("recipient").is_none(), "{frame}");
+    assert_eq!(frame["contact"]["name"]["givenName"], "Grace");
+    assert!(
+        frame["contact"]["number"][0].get("type").is_none(),
+        "the optional type stays absent upstream: {frame}"
+    );
+
+    // The local ladder refuses before any upstream call: the all-empty
+    // card (and its all-falsy twin), the out-of-vocabulary type word, the
+    // postal MOBILE, the over-bounds scalar, the over-entries array, and
+    // the malformed avatar data URI.
+    let frames_before = fs::read_to_string(&send_log_path).unwrap().lines().count();
+    let many: Vec<Value> = (0..65).map(|_| json!({ "value": "+1" })).collect();
+    let ladder: Vec<(&str, Value)> = vec![
+        ("empty-card", json!({})),
+        ("falsy-card", json!({ "organization": "" })),
+        (
+            "bad-type",
+            json!({ "number": [{ "value": "+1", "type": "CELL" }] }),
+        ),
+        (
+            "postal-mobile",
+            json!({ "address": [{ "type": "MOBILE", "city": "x" }] }),
+        ),
+        (
+            "long-value",
+            json!({ "number": [{ "value": "x".repeat(129) }] }),
+        ),
+        ("many-entries", json!({ "number": many })),
+        ("bad-avatar", json!({ "avatar": "not-a-data-uri" })),
+    ];
+    for (id, contact) in ladder {
+        let refused = request(
+            &mut client,
+            id,
+            "messages.sendContact",
+            json!({
+                "accountId": account_id,
+                "conversationId": direct_conversation,
+                "contact": contact
+            }),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"], "INVALID_REQUEST",
+            "{id}: {refused}"
+        );
+    }
+    let frames_after = fs::read_to_string(&send_log_path).unwrap().lines().count();
+    assert_eq!(
+        frames_before, frames_after,
+        "a refused card never reaches the engine"
+    );
+
+    // Unknown account.
+    let missing = request(
+        &mut client,
+        "contact-missing-account",
+        "messages.sendContact",
+        json!({
+            "accountId": "no-such-account",
+            "conversationId": direct_conversation,
+            "contact": { "name": { "givenName": "Ada" } }
+        }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // The red line: a crash with the mutating call in flight answers
+    // SEND_OUTCOME_UNKNOWN and is never retried — exactly one crashing
+    // frame across the restart.
+    let crash = request(
+        &mut client,
+        "contact-crash",
+        "messages.sendContact",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "contact": { "organization": "[fixture-crash-contact]" }
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    assert_eq!(crash["error"]["retryable"], false);
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-contact", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["contact"]["organization"] == "[fixture-crash-contact]")
+            .count(),
+        1,
+        "an unknown contact-send outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.125 (§4.106): the poll send faces — the three
+/// group-only routes (create/vote/terminate). The round-trips carry the
+/// resolved account and the group's peer key upstream and answer the
+/// remoteDelete status discipline ({"status":"sent"} definite, the explicit
+/// {"status":"unknown"} indeterminate); the local ladder (the content
+/// bounds, the selection domain, the zero target, and the direct
+/// conversation refusal) refuses before any upstream call; the
+/// crash-in-flight outcome answers {"status":"unknown"} and is never
+/// retried.
+#[tokio::test]
+async fn poll_send_faces_round_trip_and_gate_the_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [47_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-PollSend" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+
+    // The fixture links with one group conversation in place.
+    let listed = request(
+        &mut client,
+        "list-for-group",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with a group conversation");
+
+    // The create round-trip: the definite success answers {"status":"sent"}
+    // and the upstream frame carries the resolved account, the group peer
+    // key, and the content; allowMultiple rides when present, stays absent
+    // when not.
+    let created = request(
+        &mut client,
+        "poll-create",
+        "messages.sendPollCreate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "question": "Lunch?",
+            "options": ["Ramen", "Tacos"],
+            "allowMultiple": true
+        }),
+    )
+    .await;
+    assert_eq!(created["result"]["status"], "sent", "{created}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["account"], "+15555550100");
+    assert_eq!(frame["groupId"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(frame["question"], "Lunch?");
+    assert_eq!(frame["options"], json!(["Ramen", "Tacos"]));
+    assert_eq!(frame["allowMultiple"], true);
+    let created = request(
+        &mut client,
+        "poll-create-single",
+        "messages.sendPollCreate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "question": "Lunch?",
+            "options": ["Ramen", "Tacos"]
+        }),
+    )
+    .await;
+    assert_eq!(created["result"]["status"], "sent", "{created}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert!(
+        frame.get("allowMultiple").is_none(),
+        "the absent default stays absent upstream: {frame}"
+    );
+
+    // The vote round-trip: the anchor + selection ride verbatim; the empty
+    // selection is the legal clear-vote and answers the same sent.
+    let voted = request(
+        &mut client,
+        "poll-vote",
+        "messages.sendPollVote",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "targetAuthor": "+15555550101",
+            "targetTimestamp": 1727000000000_u64,
+            "optionIndexes": [0, 1],
+            "voteCount": 2
+        }),
+    )
+    .await;
+    assert_eq!(voted["result"]["status"], "sent", "{voted}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["targetAuthor"], "+15555550101");
+    assert_eq!(frame["targetTimestamp"], 1727000000000_u64);
+    assert_eq!(frame["optionIndexes"], json!([0, 1]));
+    assert_eq!(frame["voteCount"], 2);
+    let cleared = request(
+        &mut client,
+        "poll-vote-clear",
+        "messages.sendPollVote",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "targetAuthor": "+15555550101",
+            "targetTimestamp": 1727000000000_u64,
+            "optionIndexes": []
+        }),
+    )
+    .await;
+    assert_eq!(cleared["result"]["status"], "sent", "{cleared}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["optionIndexes"], json!([]));
+    assert!(frame.get("voteCount").is_none(), "{frame}");
+
+    // The terminate round-trip.
+    let terminated = request(
+        &mut client,
+        "poll-terminate",
+        "messages.sendPollTerminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "targetTimestamp": 1727000000000_u64
+        }),
+    )
+    .await;
+    assert_eq!(terminated["result"]["status"], "sent", "{terminated}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["targetTimestamp"], 1727000000000_u64);
+
+    // The local ladder refuses before any upstream call: the over-bounds
+    // question, the single option, the out-of-domain index, the zero
+    // target, and the direct-conversation refusal (polls are
+    // group-conversation faces exclusively).
+    let seeded = request(
+        &mut client,
+        "seed-direct",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550103",
+            "peerTitle": "Poll Refusal",
+            "text": "seed the row",
+            "clientRequestId": "poll-seed-1"
+        }),
+    )
+    .await;
+    let direct_conversation = seeded["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let frames_before = fs::read_to_string(&send_log_path).unwrap().lines().count();
+    let long_question = "x".repeat(201);
+    let ladder: Vec<(&str, &str, Value)> = vec![
+        (
+            "long-question",
+            "messages.sendPollCreate",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "question": long_question,
+                "options": ["A", "B"]
+            }),
+        ),
+        (
+            "one-option",
+            "messages.sendPollCreate",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "question": "Q",
+                "options": ["A"]
+            }),
+        ),
+        (
+            "bad-index",
+            "messages.sendPollVote",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "targetAuthor": "+15555550101",
+                "targetTimestamp": 1727000000000_u64,
+                "optionIndexes": [10]
+            }),
+        ),
+        (
+            "zero-target",
+            "messages.sendPollTerminate",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "targetTimestamp": 0
+            }),
+        ),
+        (
+            "direct-refusal",
+            "messages.sendPollCreate",
+            json!({
+                "accountId": account_id,
+                "conversationId": direct_conversation,
+                "question": "Q",
+                "options": ["A", "B"]
+            }),
+        ),
+    ];
+    for (id, method, params) in ladder {
+        let refused = request(&mut client, id, method, params).await;
+        assert_eq!(
+            refused["error"]["code"], "INVALID_REQUEST",
+            "{id}: {refused}"
+        );
+    }
+    let frames_after = fs::read_to_string(&send_log_path).unwrap().lines().count();
+    assert_eq!(
+        frames_before, frames_after,
+        "a refused poll never reaches the engine"
+    );
+
+    // Unknown account.
+    let missing = request(
+        &mut client,
+        "poll-missing-account",
+        "messages.sendPollCreate",
+        json!({
+            "accountId": "no-such-account",
+            "conversationId": group_conversation,
+            "question": "Q",
+            "options": ["A", "B"]
+        }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // The red line: a crash with the mutating call in flight answers the
+    // explicit {"status":"unknown"} and is never retried — exactly one
+    // crashing frame across the restart.
+    let crash = request(
+        &mut client,
+        "poll-crash",
+        "messages.sendPollCreate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "question": "[fixture-crash-poll]",
+            "options": ["A", "B"]
+        }),
+    )
+    .await;
+    assert_eq!(crash["result"]["status"], "unknown", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-poll", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["question"] == "[fixture-crash-poll]")
+            .count(),
+        1,
+        "an unknown poll-create outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.68: the §4.61 safety-number faces — identities.get
+/// (the pinned listIdentities read narrowed to the resolved peer reference,
+/// the honest empty-list no-identity face) and identities.verify (the pinned
+/// trust verifiedSafetyNumber write with the exact upstream params on the
+/// dispatch log, the digits-mismatch UserError folding to the plain upstream
+/// family, and the 1:1 fail-closed ladder).
+#[tokio::test]
+async fn safety_number_faces_round_trip_and_gate_the_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [44_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-SafetyNumber" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let send_log = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    };
+
+    // Address a fresh direct conversation (the established sendText ladder);
+    // the fixture identity's peer is the same number the contacts sync
+    // materialized.
+    let sent = request(
+        &mut client,
+        "send-peer",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550103",
+            "peerTitle": "Safety Peer",
+            "text": "open the safety number face",
+            "clientRequestId": "safety-peer-send"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Read: the pinned JsonIdentity record projects verbatim.
+    let identity = request(
+        &mut client,
+        "identity-get",
+        "identities.get",
+        json!({ "accountId": account_id, "conversationId": conversation_id }),
+    )
+    .await;
+    let row = &identity["result"]["identity"];
+    assert_eq!(row["number"], "+15555550103");
+    assert_eq!(row["uuid"], "99999999-9999-9999-9999-999999999999");
+    assert_eq!(row["trustLevel"], "TRUSTED_UNVERIFIED");
+    assert_eq!(
+        row["safetyNumber"],
+        "12345 67890 12345 67890 12345 67890 12345 67890 12345 67890 12345 67890"
+    );
+    assert_eq!(row["scannableSafetyNumber"], "AQIDBAUGBwgJCgsMDQ4PEA==");
+    assert_eq!(row["addedTimestamp"], 1727000000000_u64);
+
+    // Read dispatch shape: the connector narrowed the pinned read to the
+    // resolved peer reference (read faces are not dispatch-recorded, so the
+    // params shape is integration-proven on the verify write below and the
+    // projection above).
+
+    // Verify write: the echoed digits ride `recipient` + `verifiedSafetyNumber`.
+    let verified = request(
+        &mut client,
+        "identity-verify",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "safetyNumber": "12345 67890 12345 67890 12345 67890 12345 67890 12345 67890 12345 67890"
+        }),
+    )
+    .await;
+    assert_eq!(verified["result"]["status"], "verified");
+    let trust_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("verifiedSafetyNumber").is_some())
+        .collect();
+    assert_eq!(trust_calls.len(), 1, "{trust_calls:?}");
+    assert_eq!(trust_calls[0]["account"], "+15555550100");
+    assert_eq!(trust_calls[0]["recipient"], "+15555550103");
+    assert!(trust_calls[0].get("trustAllKnownKeys").is_none());
+
+    // Digits mismatch: the upstream's definite UserError folds into the
+    // plain upstream family (no per-failure ladder to honest-map), and the
+    // failed write is not retried.
+    let mismatch = request(
+        &mut client,
+        "identity-verify-mismatch",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "safetyNumber": "99999 99999"
+        }),
+    )
+    .await;
+    assert_eq!(mismatch["error"]["code"], "UPSTREAM_ERROR");
+    assert_eq!(
+        send_log()
+            .into_iter()
+            .filter(|params| params.get("verifiedSafetyNumber").is_some())
+            .count(),
+        2,
+        "a definite trust failure is never retried"
+    );
+
+    // The 1:1 gate: a group conversation fails closed before any upstream
+    // call, on both faces.
+    let group_sent = request(
+        &mut client,
+        "group-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "group",
+            "peerKey": "ZmFrZS1ncm91cC0x",
+            "peerTitle": "Safety Group",
+            "text": "group face",
+            "clientRequestId": "safety-group-send"
+        }),
+    )
+    .await;
+    let group_conversation_id = group_sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let group_read = request(
+        &mut client,
+        "identity-group-read",
+        "identities.get",
+        json!({ "accountId": account_id, "conversationId": group_conversation_id }),
+    )
+    .await;
+    assert_eq!(group_read["error"]["code"], "INVALID_REQUEST");
+    let group_verify = request(
+        &mut client,
+        "identity-group-verify",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "safetyNumber": "12345 67890"
+        }),
+    )
+    .await;
+    assert_eq!(group_verify["error"]["code"], "INVALID_REQUEST");
+
+    // Params-shape ladder: missing fields, an over-bound safety number, an
+    // unknown key.
+    for (request_id, method, params) in [
+        (
+            "identity-missing-conversation",
+            "identities.get",
+            json!({ "accountId": account_id }),
+        ),
+        (
+            "verify-missing-digits",
+            "identities.verify",
+            json!({ "accountId": account_id, "conversationId": conversation_id }),
+        ),
+        (
+            "verify-over-bound-digits",
+            "identities.verify",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "safetyNumber": "1".repeat(257)
+            }),
+        ),
+        (
+            "verify-unknown-key",
+            "identities.verify",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "safetyNumber": "12345 67890",
+                "trustAllKnownKeys": true
+            }),
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, method, params).await;
+        assert_eq!(
+            rejected["error"]["code"], "INVALID_REQUEST",
+            "{request_id}: {rejected:?}"
+        );
+    }
+
+    // Unknown conversation answers CONVERSATION_NOT_FOUND (resolution before
+    // any upstream call) on both faces.
+    let unknown_conversation = request(
+        &mut client,
+        "identity-unknown-conversation",
+        "identities.get",
+        json!({ "accountId": account_id, "conversationId": "no-such-conversation" }),
+    )
+    .await;
+    assert_eq!(
+        unknown_conversation["error"]["code"],
+        "CONVERSATION_NOT_FOUND"
+    );
+    let unknown_conversation = request(
+        &mut client,
+        "verify-unknown-conversation",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation",
+            "safetyNumber": "12345 67890"
+        }),
+    )
+    .await;
+    assert_eq!(
+        unknown_conversation["error"]["code"],
+        "CONVERSATION_NOT_FOUND"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.59: the §4.55 username faces — accounts.setUsername
+/// (the engine's two-hop usernameReserve→usernameConfirm write with the
+/// confirm write-back projection, the structured USERNAME_TAKEN sentinel,
+/// the crash-with-in-flight-write unknown outcome with no retry),
+/// accounts.getUsername (the engine reader opened with contract 1.74,
+/// §4.65), and username.lookup (the usernameLookup array projection
+/// entry-for-entry, including the unregistered face and the CDSI rate-limit
+/// sentinel).
+#[tokio::test]
+async fn username_faces_round_trip() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [45_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let mut engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Username" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let send_log = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    };
+
+    // setUsername round trip: the two-hop engine face — reserve carries the
+    // resolved account + candidate (no hash yet), confirm lands it with the
+    // reservation hash; the result projects the confirm write-back verbatim
+    // (username + the generated username link).
+    let set = request(
+        &mut client,
+        "username-set",
+        "accounts.setUsername",
+        json!({ "accountId": account_id, "username": "kt_test_agent.07" }),
+    )
+    .await;
+    assert_eq!(set["result"]["username"], "kt_test_agent.07");
+    assert_eq!(
+        set["result"]["usernameLink"],
+        "https://signal.me/username/fixture-link"
+    );
+    let set_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("username").is_some())
+        .collect();
+    assert_eq!(set_calls.len(), 2, "{set_calls:?}");
+    assert_eq!(set_calls[0]["account"], "+15555550100");
+    assert_eq!(set_calls[0]["username"], "kt_test_agent.07");
+    assert!(set_calls[0].get("usernameHash").is_none());
+    assert_eq!(set_calls[1]["account"], "+15555550100");
+    assert_eq!(set_calls[1]["username"], "kt_test_agent.07");
+    assert_eq!(
+        set_calls[1]["usernameHash"],
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    );
+
+    // The XOR ladder: both present and both absent answer INVALID_REQUEST
+    // before any upstream call.
+    let both = request(
+        &mut client,
+        "username-both",
+        "accounts.setUsername",
+        json!({
+            "accountId": account_id,
+            "username": "kt_test_agent.07",
+            "deleteUsername": true
+        }),
+    )
+    .await;
+    assert_eq!(both["error"]["code"], "INVALID_REQUEST");
+    let neither = request(
+        &mut client,
+        "username-neither",
+        "accounts.setUsername",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(neither["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(
+        send_log()
+            .iter()
+            .filter(
+                |params| params.get("username").is_some() || params.get("deleteUsername").is_some()
+            )
+            .count(),
+        2,
+        "XOR refusals never dial upstream"
+    );
+
+    // The taken-username sentinel rides the engine's structured code —
+    // USERNAME_TAKEN, retryable=false — after the reserve hop; the confirm
+    // never fires.
+    let taken = request(
+        &mut client,
+        "username-taken",
+        "accounts.setUsername",
+        json!({ "accountId": account_id, "username": "fixture_username_taken.01" }),
+    )
+    .await;
+    assert_eq!(taken["error"]["code"], "USERNAME_TAKEN");
+    assert_eq!(taken["error"]["retryable"], false);
+
+    // Local grammar: a malformed username answers INVALID_REQUEST without
+    // dialing upstream.
+    let malformed = request(
+        &mut client,
+        "username-malformed",
+        "accounts.setUsername",
+        json!({ "accountId": account_id, "username": "kt_test.00" }),
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(
+        send_log()
+            .iter()
+            .filter(|params| params.get("username").is_some())
+            .count(),
+        3,
+        "the grammar refusal stays local"
+    );
+
+    // getUsername: the engine reader projects the storage truth — after the
+    // set above both keys are present.
+    let get = request(
+        &mut client,
+        "username-get",
+        "accounts.getUsername",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(get["result"]["username"], "fixture_user.01");
+    assert_eq!(
+        get["result"]["usernameLink"],
+        "https://signal.me/username/fixture-link"
+    );
+    let missing = request(
+        &mut client,
+        "username-get-missing",
+        "accounts.getUsername",
+        json!({ "accountId": "acct-absent" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // username.lookup: the getUserStatus array projects entry-for-entry —
+    // first entry registered (number/username/uuid), the rest the
+    // unregistered face.
+    let lookup = request(
+        &mut client,
+        "username-lookup",
+        "username.lookup",
+        json!({
+            "accountId": account_id,
+            "usernames": ["kt_registered.01", "kt_unregistered.02"]
+        }),
+    )
+    .await;
+    let results = lookup["result"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["recipient"], "kt_registered.01");
+    assert_eq!(results[0]["isRegistered"], true);
+    assert!(results[0]["uuid"].is_string());
+    assert_eq!(results[1]["recipient"], "kt_unregistered.02");
+    assert_eq!(results[1]["isRegistered"], false);
+    assert!(results[1]["uuid"].is_null());
+
+    // The lookup batch cap: 21 entries refuse locally.
+    let oversized: Vec<&str> = std::iter::repeat_n("kt_lookup.entry", 21).collect();
+    let too_many = request(
+        &mut client,
+        "username-lookup-oversized",
+        "username.lookup",
+        json!({ "accountId": account_id, "usernames": oversized }),
+    )
+    .await;
+    assert_eq!(too_many["error"]["code"], "INVALID_REQUEST");
+
+    // The CDSI rate-limit sentinel degrades to UPSTREAM_ERROR.
+    let ratelimited = request(
+        &mut client,
+        "username-lookup-ratelimited",
+        "username.lookup",
+        json!({
+            "accountId": account_id,
+            "usernames": ["[fixture-username-ratelimited]"]
+        }),
+    )
+    .await;
+    assert_eq!(ratelimited["error"]["code"], "UPSTREAM_ERROR");
+
+    // Crash with the mutating username write in flight (os._exit(31)):
+    // SEND_OUTCOME_UNKNOWN, never retried.
+    let crash = request(
+        &mut client,
+        "username-crash",
+        "accounts.setUsername",
+        json!({ "accountId": account_id, "username": "fixture_crash_username.31" }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-username", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    engine_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_eq!(
+        send_log()
+            .iter()
+            .filter(|params| params["username"] == "fixture_crash_username.31")
+            .count(),
+        1,
+        "an unknown username outcome is never retried"
+    );
+
+    // The delete face: the bare usernameDelete {account} payload, an empty
+    // result body.
+    let single_account_frame =
+        |params: &&Value| params.get("account").is_some() && params.as_object().unwrap().len() == 1;
+    let singles_before = send_log().iter().filter(single_account_frame).count();
+    let delete = request(
+        &mut client,
+        "username-delete",
+        "accounts.setUsername",
+        json!({ "accountId": account_id, "deleteUsername": true }),
+    )
+    .await;
+    assert_eq!(delete["result"], json!({}));
+    let singles_after = send_log().iter().filter(single_account_frame).count();
+    assert_eq!(
+        singles_after,
+        singles_before + 1,
+        "the delete hop dispatches usernameDelete {{account}}"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.48: the §4.47 alignment faces — conversations.getAvatar
+/// (round trip with the fixture data URI, the honest UNAVAILABLE face, the
+/// FETCH_FAILED/TOO_LARGE structured codes, the fail-closed local ladder) and
+/// conversations.setBlocked (verbatim forwarding of the resolved reference +
+/// kind + boolean, the post-write blocked list read back, unblock
+/// symmetry, CONVERSATION_NOT_RESOLVED, and the crash-with-in-flight-write
+/// unknown outcome on the mutating face — no retry, exactly-once dispatch).
+#[tokio::test]
+async fn avatar_and_blocked_write_faces_round_trip() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [44_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Align3a" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // getAvatar round trip: the fixture PNG payload arrives as the sniffed
+    // data URI with the decoded byte count, projected 1:1 from the engine.
+    let sent = request(
+        &mut client,
+        "avatar-setup-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "avatar me",
+            "clientRequestId": "avatar-setup-0"
+        }),
+    )
+    .await;
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let avatar = request(
+        &mut client,
+        "get-avatar",
+        "conversations.getAvatar",
+        json!({ "accountId": account_id, "conversationId": conversation_id }),
+    )
+    .await;
+    let data_uri = avatar["result"]["dataUri"].as_str().unwrap();
+    assert!(data_uri.starts_with("data:image/png;base64,"), "{avatar}");
+    // The fixture payload's exact padded base64 (the connector ships the
+    // engine's URI verbatim) and the decoded byte count beside it.
+    assert_eq!(
+        data_uri,
+        "data:image/png;base64,iVBORw0KGgpmaXh0dXJlLWF2YXRhcg=="
+    );
+    assert_eq!(avatar["result"]["byteSize"], 22);
+
+    // The honest no-avatar face: retryable=false — the state is the answer.
+    // The sentinels travel as the conversation's upstream peer reference
+    // (the pin face's materialize-then-call discipline): each sentinel is
+    // first materialized as a real local conversation by a send to that
+    // peerKey, so the local ladder passes and the fixture sees the sentinel
+    // as the forwarded peer reference.
+    for (request_id, sentinel, expected_code, retryable) in [
+        (
+            "avatar-unavailable",
+            "[fixture-avatar-unavailable]",
+            "AVATAR_UNAVAILABLE",
+            false,
+        ),
+        (
+            "avatar-fetch-failed",
+            "[fixture-avatar-failed]",
+            "AVATAR_FETCH_FAILED",
+            true,
+        ),
+        (
+            "avatar-too-large",
+            "[fixture-avatar-large]",
+            "AVATAR_TOO_LARGE",
+            false,
+        ),
+    ] {
+        let setup = request(
+            &mut client,
+            &format!("{request_id}-setup"),
+            "messages.sendText",
+            json!({
+                "accountId": account_id,
+                "kind": "contact",
+                "peerKey": sentinel,
+                "text": sentinel,
+                "clientRequestId": format!("{request_id}-0")
+            }),
+        )
+        .await;
+        let sentinel_conversation = setup["result"]["conversationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let error = request(
+            &mut client,
+            request_id,
+            "conversations.getAvatar",
+            json!({ "accountId": account_id, "conversationId": sentinel_conversation }),
+        )
+        .await;
+        assert_eq!(
+            error["error"]["code"], expected_code,
+            "{request_id}: {error}"
+        );
+        assert_eq!(
+            error["error"]["retryable"], retryable,
+            "{request_id}: {error}"
+        );
+    }
+
+    // Local fail-closed ladder: empty/over-bound conversationId, unknown
+    // account and conversation — all before any upstream call.
+    let oversized = "A".repeat(257);
+    for (request_id, params, expected) in [
+        (
+            "avatar-empty",
+            json!({ "accountId": account_id, "conversationId": "" }),
+            "INVALID_REQUEST",
+        ),
+        (
+            "avatar-over-bound",
+            json!({ "accountId": account_id, "conversationId": oversized }),
+            "INVALID_REQUEST",
+        ),
+        (
+            "avatar-unknown-account",
+            json!({ "accountId": "no-such-account", "conversationId": "conv" }),
+            "ACCOUNT_NOT_FOUND",
+        ),
+        (
+            "avatar-unknown-conversation",
+            json!({ "accountId": account_id, "conversationId": "no-such-conversation" }),
+            "CONVERSATION_NOT_FOUND",
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, "conversations.getAvatar", params).await;
+        assert_eq!(
+            rejected["error"]["code"], expected,
+            "{request_id}: {rejected}"
+        );
+    }
+
+    // setBlocked verbatim forwarding: the resolved peer reference, kind, and
+    // boolean land on the wire; the answer is the post-write blocked list.
+    let blocked = request(
+        &mut client,
+        "set-blocked",
+        "conversations.setBlocked",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "blocked": true
+        }),
+    )
+    .await;
+    let entries = blocked["result"]["blocked"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["conversationId"] == "+15555550102" && entry["kind"] == "contact"),
+        "the blocked write must read back in the list: {entries:?}"
+    );
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let send_log = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    };
+    let blocked_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("blocked").is_some())
+        .collect();
+    assert_eq!(blocked_calls.len(), 1, "{blocked_calls:?}");
+    assert_eq!(blocked_calls[0]["account"], "+15555550100");
+    assert_eq!(blocked_calls[0]["conversationId"], "+15555550102");
+    assert_eq!(blocked_calls[0]["kind"], "contact");
+    assert_eq!(blocked_calls[0]["blocked"], true);
+
+    // Unblock: the false form of the same method, symmetric read-back.
+    let unblocked = request(
+        &mut client,
+        "set-unblocked",
+        "conversations.setBlocked",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "blocked": false
+        }),
+    )
+    .await;
+    let entries = unblocked["result"]["blocked"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["conversationId"] != "+15555550102"),
+        "the unblocked conversation must be gone: {entries:?}"
+    );
+
+    // Fail-closed ladder: illegal kind, missing boolean, unknown
+    // conversation, over-bound id.
+    for (request_id, params, expected) in [
+        (
+            "blocked-bad-kind",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "story",
+                "blocked": true
+            }),
+            "INVALID_REQUEST",
+        ),
+        (
+            "blocked-missing-bool",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact"
+            }),
+            "INVALID_REQUEST",
+        ),
+        (
+            "blocked-unknown-conversation",
+            json!({
+                "accountId": account_id,
+                "conversationId": "no-such-conversation",
+                "kind": "contact",
+                "blocked": true
+            }),
+            "CONVERSATION_NOT_FOUND",
+        ),
+        (
+            "blocked-over-bound",
+            json!({
+                "accountId": account_id,
+                "conversationId": oversized,
+                "kind": "contact",
+                "blocked": true
+            }),
+            "INVALID_REQUEST",
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, "conversations.setBlocked", params).await;
+        assert_eq!(
+            rejected["error"]["code"], expected,
+            "{request_id}: {rejected}"
+        );
+    }
+    assert_eq!(
+        send_log()
+            .into_iter()
+            .filter(|params| params.get("blocked").is_some())
+            .count(),
+        2,
+        "refusals never dial upstream"
+    );
+
+    // CONVERSATION_NOT_RESOLVED passes through verbatim (retryable=false)
+    // and STORAGE_UNAVAILABLE verbatim (retryable=true): the sentinels ride
+    // materialized conversations whose peer reference the fixture answers
+    // on, the pin face's discipline.
+    for (request_id, sentinel, expected_code, retryable) in [
+        (
+            "blocked-unresolved",
+            "[fixture-blocked-unresolved]",
+            "CONVERSATION_NOT_RESOLVED",
+            false,
+        ),
+        (
+            "blocked-storage",
+            "[fixture-blocked-unavailable]",
+            "STORAGE_UNAVAILABLE",
+            true,
+        ),
+    ] {
+        let setup = request(
+            &mut client,
+            &format!("{request_id}-setup"),
+            "messages.sendText",
+            json!({
+                "accountId": account_id,
+                "kind": "contact",
+                "peerKey": sentinel,
+                "text": sentinel,
+                "clientRequestId": format!("{request_id}-0")
+            }),
+        )
+        .await;
+        let sentinel_conversation = setup["result"]["conversationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let error = request(
+            &mut client,
+            request_id,
+            "conversations.setBlocked",
+            json!({
+                "accountId": account_id,
+                "conversationId": sentinel_conversation,
+                "kind": "contact",
+                "blocked": true
+            }),
+        )
+        .await;
+        assert_eq!(
+            error["error"]["code"], expected_code,
+            "{request_id}: {error}"
+        );
+        assert_eq!(
+            error["error"]["retryable"], retryable,
+            "{request_id}: {error}"
+        );
+    }
+
+    // Crash with the mutating blocked write in flight (fixture sentinel,
+    // os._exit(32)): SEND_OUTCOME_UNKNOWN, never retried. The crash sentinel
+    // is also materialized as a real conversation first so the local ladder
+    // passes and the engine call goes out.
+    let crash_setup = request(
+        &mut client,
+        "blocked-crash-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "[fixture-blocked-crash]",
+            "text": "[fixture-blocked-crash]",
+            "clientRequestId": "blocked-crash-0"
+        }),
+    )
+    .await;
+    let crash_conversation = crash_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let crash = request(
+        &mut client,
+        "blocked-crash",
+        "conversations.setBlocked",
+        json!({
+            "accountId": account_id,
+            "conversationId": crash_conversation,
+            "kind": "contact",
+            "blocked": true
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-blocked", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid, "the engine actually restarted");
+
+    // No-retry audit: exactly one crashing blocked call across the restart.
+    let crash_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params["conversationId"] == "[fixture-blocked-crash]")
+        .collect();
+    assert_eq!(
+        crash_calls.len(),
+        1,
+        "an unknown blocked outcome is never retried: {crash_calls:?}"
     );
 
     drop(client);
@@ -5729,7 +12791,18 @@ async fn drain_until_response_collecting_opened(
 ) -> (Value, Vec<Value>) {
     let mut opened: Vec<Value> = Vec::new();
     loop {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "drain_until_response_collecting_opened stalled over \
+                 {HARNESS_REQUEST_TIMEOUT:?} waiting for {request_id} (collected {opened:?}):\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame.get("event").and_then(Value::as_str) == Some("message.viewOnceOpened") {
             opened.push(frame["data"].clone());
             continue;
@@ -5745,7 +12818,18 @@ async fn drain_until_response_collecting_opened(
 /// exactly one event (the "exactly once" side is the barrier drain).
 async fn drain_until_opened_event(client: &mut Framed<UnixStream, LinesCodec>) -> Value {
     loop {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "drain_until_opened_event stalled over {HARNESS_REQUEST_TIMEOUT:?} \
+                 without a message.viewOnceOpened frame:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame.get("event").and_then(Value::as_str) == Some("message.viewOnceOpened") {
             return frame["data"].clone();
         }
@@ -5872,15 +12956,15 @@ async fn view_once_send_mark_open_and_sync_burn_reach_the_upstream() {
     let sent_row_id = sent["result"]["id"].as_str().unwrap().to_string();
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(log) = read_send_log(&signal_data).await {
-                if !log.view_once_send_lines().is_empty() {
-                    assert_eq!(log.view_once_send_lines()[0]["viewOnce"], true);
-                    assert_eq!(
-                        log.view_once_send_lines()[0]["recipient"],
-                        json!(["+15555550101"])
-                    );
-                    break;
-                }
+            if let Some(log) = read_send_log(&signal_data).await
+                && !log.view_once_send_lines().is_empty()
+            {
+                assert_eq!(log.view_once_send_lines()[0]["viewOnce"], true);
+                assert_eq!(
+                    log.view_once_send_lines()[0]["recipient"],
+                    json!(["+15555550101"])
+                );
+                break;
             }
             sleep(Duration::from_millis(20)).await;
         }
@@ -5891,10 +12975,10 @@ async fn view_once_send_mark_open_and_sync_burn_reach_the_upstream() {
     // The finish burst's auto delivery receipts: one per incoming dataMessage.
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(log) = read_send_log(&signal_data).await {
-                if log.receipt_lines().len() >= 2 {
-                    break;
-                }
+            if let Some(log) = read_send_log(&signal_data).await
+                && log.receipt_lines().len() >= 2
+            {
+                break;
             }
             sleep(Duration::from_millis(20)).await;
         }
@@ -6083,19 +13167,16 @@ fn spawn_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
 }
 
 async fn spawn_connector_from_stdin(root: &Path, endpoint: &Path, secret: &[u8; 32]) -> Child {
-    let java_home = root.join("jre");
-    fs::create_dir_all(&java_home).unwrap();
-    fs::write(java_home.join("release"), b"JAVA_VERSION=\"test\"\n").unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
     let mut child = command
         .arg("serve")
         .arg("--endpoint")
         .arg(endpoint)
         .arg("--bootstrap-secret-stdin")
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--java-home")
-        .arg(&java_home)
+        .arg(root.join("jre"))
         .arg("--signal-data-dir")
         .arg(root.join("signal-data"))
         .arg("--state-dir")
@@ -6104,8 +13185,7 @@ async fn spawn_connector_from_stdin(root: &Path, endpoint: &Path, secret: &[u8; 
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .env("KT_FAKE_EXPECT_JAVA_OPTS", "-Xms16m -Xmx384m")
-        .env("KT_FAKE_EXPECT_JAVA_HOME", &java_home)
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1")
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
@@ -6140,7 +13220,7 @@ fn spawn_connector_with(
         .arg(endpoint)
         .arg("--bootstrap-secret-file")
         .arg(secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--signal-data-dir")
         .arg(root.join("signal-data"))
@@ -6151,7 +13231,7 @@ fn spawn_connector_with(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     command
-        .env("KT_FAKE_EXPECT_JAVA_OPTS", "-Xms16m -Xmx384m")
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1")
         .env("JAVA_TOOL_OPTIONS", "poison")
         .env("_JAVA_OPTIONS", "poison")
         .env("JDK_JAVA_OPTIONS", "poison");
@@ -6165,7 +13245,7 @@ fn spawn_connector_with(
 }
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 /// Wait for the connector to exit and require a clean status. The connector's
@@ -6196,6 +13276,97 @@ async fn wait_for_path(path: &Path) {
     .expect("connector socket should appear");
 }
 
+/// Read frames until the named response arrives; unrelated responses are
+/// skipped (the delete-hold tests interleave a fire-and-forget delete).
+async fn await_response(client: &mut Framed<UnixStream, LinesCodec>, request_id: &str) -> Value {
+    timeout(HARNESS_REQUEST_TIMEOUT, async {
+        loop {
+            let response: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if response.get("requestId").and_then(Value::as_str) == Some(request_id) {
+                return response;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("response {request_id} did not arrive"))
+}
+
+/// Wait for a fixture marker file (the delete-hold handshake).
+async fn wait_for_marker(path: &Path) {
+    timeout(Duration::from_secs(5), async {
+        while !path.exists() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("fixture marker {} should appear", path.display()));
+}
+
+/// Poll `accounts.list` until the delete's store cleanup lands.
+async fn wait_until_accounts_empty(client: &mut Framed<UnixStream, LinesCodec>, request_id: &str) {
+    let last = std::sync::Arc::new(std::sync::Mutex::new(Value::Null));
+    let observed = std::sync::Arc::clone(&last);
+    let settled = timeout(Duration::from_secs(10), async {
+        let mut attempt = 0_u32;
+        loop {
+            // Unique ids: the host rejects a replayed requestId on the same
+            // session, so a poll loop must not reuse one.
+            attempt += 1;
+            let accounts = request(
+                client,
+                &format!("{request_id}-poll-{attempt}"),
+                "accounts.list",
+                json!({}),
+            )
+            .await;
+            *observed.lock().unwrap() = accounts.clone();
+            if accounts["result"].as_array().is_some_and(Vec::is_empty) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if settled.is_err() {
+        panic!(
+            "{request_id}: accounts did not empty after the delete settled; last list: {}",
+            last.lock().unwrap()
+        );
+    }
+}
+
+/// Poll `accounts.list` until exactly the surviving account remains.
+async fn wait_until_only_account(
+    client: &mut Framed<UnixStream, LinesCodec>,
+    account_id: &str,
+    request_id: &str,
+) {
+    timeout(Duration::from_secs(10), async {
+        let mut attempt = 0_u32;
+        loop {
+            // Unique ids per poll: the host rejects replayed requestIds.
+            attempt += 1;
+            let accounts = request(
+                client,
+                &format!("{request_id}-poll-{attempt}"),
+                "accounts.list",
+                json!({}),
+            )
+            .await;
+            let rows = accounts["result"].as_array().cloned().unwrap_or_default();
+            if rows.len() == 1 && rows[0]["id"].as_str() == Some(account_id) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("{request_id}: account {account_id} did not become the only row after the delete")
+    });
+}
+
 async fn wait_for_process_exit(pid: u32) {
     timeout(Duration::from_secs(2), async {
         while process_exists(pid) {
@@ -6217,7 +13388,27 @@ fn process_exists(pid: u32) -> bool {
 }
 
 async fn authenticate(client: &mut Framed<UnixStream, LinesCodec>, secret: &[u8; 32]) {
-    let challenge: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let (_challenge, response) = authenticate_capture(client, secret).await;
+    assert_eq!(response["result"]["apiVersion"], API_VERSION);
+}
+
+/// The authentication round trip with the handshake response returned —
+/// tests that assert on the advertised `capabilities` reuse it.
+async fn authenticate_capture(
+    client: &mut Framed<UnixStream, LinesCodec>,
+    secret: &[u8; 32],
+) -> (Value, Value) {
+    let challenge: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(challenge) => challenge,
+        Err(_) => panic!(
+            "authentication challenge never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
     let client_nonce = hex::encode([9_u8; 32]);
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
@@ -6240,12 +13431,32 @@ async fn authenticate(client: &mut Framed<UnixStream, LinesCodec>, secret: &[u8;
         )
         .await
         .unwrap();
-    let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
-    assert_eq!(response["result"]["apiVersion"], API_VERSION);
+    let response: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => panic!(
+            "handshake response never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
+    (challenge, response)
 }
 
 async fn reject_authentication(client: &mut Framed<UnixStream, LinesCodec>) {
-    let challenge: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let challenge: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(challenge) => challenge,
+        Err(_) => panic!(
+            "authentication challenge never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     assert_eq!(challenge["event"], "runtime.challenge");
     client
         .send(
@@ -6262,7 +13473,17 @@ async fn reject_authentication(client: &mut Framed<UnixStream, LinesCodec>) {
         )
         .await
         .unwrap();
-    let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let response: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => panic!(
+            "handshake rejection response never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     assert_eq!(response["error"]["code"], "AUTHENTICATION_FAILED");
 }
 
@@ -6272,12 +13493,25 @@ async fn request(
     method: &str,
     params: Value,
 ) -> Value {
-    send_request_frame(client, request_id, method, params).await;
-    loop {
-        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
-        if response.get("requestId").and_then(Value::as_str) == Some(request_id) {
-            return response;
+    let round = timeout(HARNESS_REQUEST_TIMEOUT, async {
+        send_request_frame(client, request_id, method, params).await;
+        loop {
+            let response: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if response.get("requestId").and_then(Value::as_str) == Some(request_id) {
+                return response;
+            }
         }
+    })
+    .await;
+    match round {
+        Ok(response) => response,
+        Err(_) => panic!(
+            "harness request {request_id} ({method}) exceeded {HARNESS_REQUEST_TIMEOUT:?}; \
+             the deadline-less await family turned transient upstream anomalies into \
+             indefinite hangs:\n{}",
+            dump_connector_crash_scene()
+        ),
     }
 }
 
@@ -6287,16 +13521,2908 @@ async fn send_request_frame(
     method: &str,
     params: Value,
 ) {
-    client
-        .send(
-            json!({
-                "apiVersion": API_VERSION,
-                "requestId": request_id,
-                "method": method,
-                "params": params
-            })
-            .to_string(),
+    // The deliberate fire-and-forget face: responses are consumed by the
+    // caller's own drain loops, so nothing is read here. Only the write is
+    // bounded — a connector that stopped reading would otherwise block this
+    // write forever once the socket buffers filled.
+    if timeout(
+        HARNESS_REQUEST_TIMEOUT,
+        client.send(request_frame(request_id, method, params)),
+    )
+    .await
+    .is_err()
+    {
+        panic!(
+            "harness frame write {request_id} ({method}) stalled over \
+             {HARNESS_REQUEST_TIMEOUT:?} (the connector likely stopped reading):\n{}",
+            dump_connector_crash_scene()
+        );
+    }
+}
+
+fn request_frame(request_id: &str, method: &str, params: Value) -> String {
+    json!({
+        "apiVersion": API_VERSION,
+        "requestId": request_id,
+        "method": method,
+        "params": params
+    })
+    .to_string()
+}
+
+/// Contract revision 1.53 (§4.49, capability call-signaling): the connector's
+/// call-signaling pipe. Outbound: `calls.sendSignal` shape-gates the envelope
+/// (the five-value type enum, the positive-u32 callId, the payload mandatory
+/// for the modern faces and optional for the legacy busy/hangup family, the
+/// two-value urgency pass-through) and forwards the resolved direct peer
+/// reference plus the payload verbatim as the engine `sendCallMessage`
+/// upstream face — legacy busy/hangup frames without a payload route the
+/// engine's `legacy` bare-frame face (the official proto shapes, no invented
+/// bytes); every illegal shape refuses locally (refusals never dial
+/// upstream), a group conversation fails closed, an engine crash with the
+/// mutating call in flight answers SEND_OUTCOME_UNKNOWN and is never retried
+/// across the restart. Inbound: the engine's `callMessage` envelope face
+/// lands as exactly one `call.incoming` event carrying the projected payload
+/// verbatim — no row, nothing persisted. The state face: the honest empty
+/// registry, repeatable, and the crash drill proves the send face's no-retry
+/// discipline.
+#[tokio::test]
+async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [45_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-CallP1" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Materialize the peer conversation the way every send face does.
+    let sent = request(
+        &mut client,
+        "call-setup-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "call me",
+            "clientRequestId": "call-setup-0"
+        }),
+    )
+    .await;
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Stage a group envelope so the group route (1.82) has a real local
+    // group row to address (the runtime marker delivers it like every
+    // injected envelope; the group message materializes the group row).
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "timestamp": 80,
+                "dataMessage": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "message": "callless group"
+                }
+            }
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut group_id = String::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("group-poll-{attempt}"),
+            "runtime.status",
+            json!({}),
         )
-        .await
-        .unwrap();
+        .await;
+        let listed = request(
+            &mut client,
+            &format!("group-list-{attempt}"),
+            "conversations.list",
+            json!({ "accountId": account_id, "limit": 50 }),
+        )
+        .await;
+        if let Some(found) = listed["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["type"] == "group")
+            .and_then(|row| row["id"].as_str())
+        {
+            group_id = found.to_string();
+            break;
+        }
+    }
+    assert!(
+        !group_id.is_empty(),
+        "the staged group row must materialize"
+    );
+
+    // getState before any signaling: the honest empty registry, repeatable.
+    for request_id in ["state-before", "state-again"] {
+        let state = request(
+            &mut client,
+            request_id,
+            "calls.getState",
+            json!({ "accountId": account_id }),
+        )
+        .await;
+        assert_eq!(
+            state["result"]["calls"].as_array().unwrap().len(),
+            0,
+            "{state}"
+        );
+        assert_eq!(state["result"]["projection"], "connector-pipe", "{state}");
+    }
+
+    // The offer round trip: the resolved peer reference and the payload
+    // verbatim land on the wire; the answer is the engine's envelope
+    // timestamp as {sentAt}.
+    let offered = request(
+        &mut client,
+        "call-offer",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "type": "offer",
+            "callId": 7,
+            "payload": "c2RwLW9mZmVy"
+        }),
+    )
+    .await;
+    assert_eq!(offered["result"]["sentAt"], 1727000000000u64, "{offered}");
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let call_lines = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| params.get("data").is_some() || params.get("legacy").is_some())
+            .collect()
+    };
+    assert_eq!(call_lines().len(), 1, "{:?}", call_lines());
+    assert_eq!(call_lines()[0]["account"], "+15555550100");
+    assert_eq!(call_lines()[0]["recipient"], "+15555550102");
+    assert_eq!(call_lines()[0]["data"], "c2RwLW9mZmVy");
+
+    // The rest of the frame family rides the same pipe; ICE keeps the u32
+    // ceiling legal and the payload opaque.
+    for (request_id, signal_type, call_id, payload) in [
+        ("call-answer", "answer", 7u64, "c2RwLWFuc3dlcg=="),
+        ("call-ice", "ice", 4294967295u64, "aWNlLTE="),
+    ] {
+        let signaled = request(
+            &mut client,
+            request_id,
+            "calls.sendSignal",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": signal_type,
+                "callId": call_id,
+                "payload": payload
+            }),
+        )
+        .await;
+        assert_eq!(signaled["result"]["sentAt"], 1727000000000u64, "{signaled}");
+    }
+    assert_eq!(call_lines().len(), 3, "{:?}", call_lines());
+
+    // The legacy bare-frame family (1.53): busy/hangup without a payload
+    // route the engine's `legacy` face — the official proto shapes, no
+    // invented bytes; the addressed callId is the frames' id. urgency rides
+    // through on both faces.
+    let legacy_busy = request(
+        &mut client,
+        "call-busy-legacy",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "type": "busy",
+            "callId": 7
+        }),
+    )
+    .await;
+    assert_eq!(
+        legacy_busy["result"]["sentAt"], 1727000000000u64,
+        "{legacy_busy}"
+    );
+    let legacy_hangup = request(
+        &mut client,
+        "call-hangup-legacy",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "type": "hangup",
+            "callId": 7,
+            "urgency": "handleImmediately"
+        }),
+    )
+    .await;
+    assert_eq!(
+        legacy_hangup["result"]["sentAt"], 1727000000000u64,
+        "{legacy_hangup}"
+    );
+    let lines = call_lines();
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    let busy_row = &lines[3];
+    assert_eq!(busy_row["recipient"], "+15555550102");
+    assert_eq!(busy_row["legacy"], json!({"kind": "busy", "id": 7}));
+    assert!(
+        busy_row.get("data").is_none(),
+        "legacy face carries no data"
+    );
+    assert!(
+        busy_row.get("urgency").is_none(),
+        "absent urgency stays absent"
+    );
+    let hangup_row = &lines[4];
+    assert_eq!(hangup_row["legacy"], json!({"kind": "hangup", "id": 7}));
+    assert_eq!(
+        hangup_row["urgency"], "handleImmediately",
+        "urgency pass-through"
+    );
+
+    // The shape gate, locally: unknown type, callId 0, empty payload, an
+    // over-bound payload, a modern type without a payload, an illegal
+    // urgency, an unknown conversation — every refusal precedes any upstream
+    // call, so the log stays at five lines.
+    let oversized = "A".repeat(3 * 1024 * 1024 + 1);
+    for (request_id, expected_code, params) in [
+        (
+            "signal-bad-type",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "sdp",
+                "callId": 7,
+                "payload": "eA=="
+            }),
+        ),
+        (
+            "signal-type-case",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "OFFER",
+                "callId": 7,
+                "payload": "eA=="
+            }),
+        ),
+        (
+            "signal-zero-call",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "offer",
+                "callId": 0,
+                "payload": "eA=="
+            }),
+        ),
+        (
+            "signal-empty-payload",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "offer",
+                "callId": 7,
+                "payload": ""
+            }),
+        ),
+        (
+            "signal-over-bound-payload",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "offer",
+                "callId": 7,
+                "payload": oversized
+            }),
+        ),
+        (
+            "signal-modern-type-payload-less",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "offer",
+                "callId": 7
+            }),
+        ),
+        (
+            "signal-bad-urgency",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "offer",
+                "callId": 7,
+                "payload": "eA==",
+                "urgency": "urgent"
+            }),
+        ),
+        (
+            "signal-unknown-conversation",
+            "CONVERSATION_NOT_FOUND",
+            json!({
+                "accountId": account_id,
+                "conversationId": "no-such-conversation",
+                "type": "offer",
+                "callId": 7,
+                "payload": "eA=="
+            }),
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, "calls.sendSignal", params).await;
+        assert_eq!(
+            rejected["error"]["code"], expected_code,
+            "{request_id}: {rejected}"
+        );
+        assert_eq!(
+            rejected["error"]["retryable"], false,
+            "{request_id}: {rejected}"
+        );
+    }
+    assert_eq!(
+        call_lines().len(),
+        5,
+        "refusals never dial upstream: {:?}",
+        call_lines()
+    );
+
+    // The group route (1.82): the conversation kind decides — the group
+    // conversation forwards the engine group face {account, group, data,
+    // urgency}, no recipient key ever, and the payload-less legacy family
+    // refuses locally (the send log stays at exactly one group row).
+    let group_signaled = request(
+        &mut client,
+        "call-group-offer",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_id,
+            "type": "offer",
+            "callId": 7,
+            "payload": "Z3JvdXAtc2lnbmFsaW5n",
+            "urgency": "handleImmediately"
+        }),
+    )
+    .await;
+    assert_eq!(
+        group_signaled["result"]["sentAt"], 1727000000000u64,
+        "{group_signaled}"
+    );
+    let group_rows: Vec<Value> = call_lines()
+        .into_iter()
+        .filter(|params| params.get("group").is_some())
+        .collect();
+    assert_eq!(group_rows.len(), 1, "{group_rows:?}");
+    assert_eq!(group_rows[0]["account"], "+15555550100");
+    assert_eq!(group_rows[0]["group"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(group_rows[0]["data"], "Z3JvdXAtc2lnbmFsaW5n");
+    assert_eq!(group_rows[0]["urgency"], "handleImmediately");
+    assert!(
+        group_rows[0].get("recipient").is_none(),
+        "the group face carries no recipient key: {group_rows:?}"
+    );
+    let group_legacy = request(
+        &mut client,
+        "call-group-legacy",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_id,
+            "type": "busy",
+            "callId": 7
+        }),
+    )
+    .await;
+    assert_eq!(
+        group_legacy["error"]["code"], "INVALID_REQUEST",
+        "{group_legacy}"
+    );
+    assert_eq!(
+        call_lines()
+            .into_iter()
+            .filter(|params| params.get("group").is_some())
+            .count(),
+        1,
+        "the local legacy refusal never reaches upstream"
+    );
+
+    // Crash with the mutating signaling in flight (fixture sentinel,
+    // os._exit(33)): SEND_OUTCOME_UNKNOWN, never retried across the restart.
+    let crash = request(
+        &mut client,
+        "signal-crash",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "type": "offer",
+            "callId": 9,
+            "payload": "[fixture-call-crash]"
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-call", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid, "the engine actually restarted");
+
+    // No-retry audit: exactly one crashing call across the restart.
+    let crash_calls: Vec<Value> = call_lines()
+        .into_iter()
+        .filter(|params| params["data"] == "[fixture-call-crash]")
+        .collect();
+    assert_eq!(
+        crash_calls.len(),
+        1,
+        "an unknown signaling outcome is never retried: {crash_calls:?}"
+    );
+
+    // getState after everything: still the empty registry — the send face
+    // registers no state by design (the connector is the pipe).
+    let state = request(
+        &mut client,
+        "state-after",
+        "calls.getState",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(state["result"]["calls"].as_array().unwrap().len(), 0);
+    assert_eq!(state["result"]["projection"], "connector-pipe");
+
+    // Inbound: the engine's callMessage face arrives as exactly one
+    // call.incoming event with the payload verbatim — and no message row.
+    let envelope_offer = json!({
+        "source": "+15555550102",
+        "timestamp": 1727000001000u64,
+        "callMessage": {
+            "offer": { "id": 7u64, "type": "audio", "opaque": "aW5ib3VuZC1vZmZlcg==" }
+        }
+    });
+    let envelope_ice = json!({
+        "source": "+15555550102",
+        "timestamp": 1727000002000u64,
+        "callMessage": {
+            "iceUpdate": [{ "id": 7u64, "opaque": "aW5ib3VuZC1pY2U=" }]
+        }
+    });
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [envelope_offer, envelope_ice] }).to_string(),
+    )
+    .unwrap();
+
+    // Drain until both events arrive (the injected envelopes land
+    // asynchronously; each poll drains interleaved frames).
+    let mut incoming: Vec<Value> = Vec::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = send_request_frame(
+            &mut client,
+            &format!("poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        loop {
+            let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+                serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+            })
+            .await
+            {
+                Ok(frame) => frame,
+                Err(_) => panic!(
+                    "the call.incoming poll drain stalled over \
+                     {HARNESS_REQUEST_TIMEOUT:?} with {incoming:?}:\n{}",
+                    dump_connector_crash_scene()
+                ),
+            };
+            if frame.get("event").and_then(Value::as_str) == Some("call.incoming") {
+                incoming.push(frame["data"].clone());
+                continue;
+            }
+            if frame.get("requestId").and_then(Value::as_str)
+                == Some(format!("poll-{attempt}").as_str())
+            {
+                break;
+            }
+        }
+        if incoming.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        incoming.len(),
+        2,
+        "both signaling frames must arrive: {incoming:?} (marker still present: {})",
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-envelopes.json")
+            .exists()
+    );
+    assert_eq!(incoming[0]["accountId"], account_id);
+    assert_eq!(incoming[0]["conversationId"], conversation_id);
+    assert_eq!(incoming[0]["callId"], 7);
+    assert_eq!(incoming[0]["type"], "offer");
+    assert_eq!(
+        incoming[0]["payload"]["offer"]["opaque"],
+        "aW5ib3VuZC1vZmZlcg=="
+    );
+    assert_eq!(incoming[1]["type"], "ice");
+    assert_eq!(
+        incoming[1]["payload"]["iceUpdate"][0]["opaque"],
+        "aW5ib3VuZC1pY2U="
+    );
+
+    // The group-incoming route (1.82): an opaque envelope from a sender with
+    // no local conversation forwards conversation-less instead of dying on
+    // the ladder — exactly one call.groupIncoming and never a call.incoming.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [{
+            "source": "+15555550107",
+            "timestamp": 1727000003000u64,
+            "callMessage": {
+                "opaque": "Z3JvdXAtb3BhcXVl",
+                "urgency": "handleImmediately",
+                "destinationDeviceId": 2
+            }
+        }] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut group_incoming: Vec<Value> = Vec::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = send_request_frame(
+            &mut client,
+            &format!("group-incoming-poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        loop {
+            let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+                serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+            })
+            .await
+            {
+                Ok(frame) => frame,
+                Err(_) => panic!(
+                    "the call.groupIncoming poll drain stalled over \
+                     {HARNESS_REQUEST_TIMEOUT:?} with {group_incoming:?}:\n{}",
+                    dump_connector_crash_scene()
+                ),
+            };
+            match frame.get("event").and_then(Value::as_str) {
+                Some("call.groupIncoming") => group_incoming.push(frame["data"].clone()),
+                Some("call.incoming") => {
+                    panic!("an unresolvable opaque frame must not fire call.incoming: {frame}")
+                }
+                _ => {}
+            }
+            if frame.get("requestId").and_then(Value::as_str)
+                == Some(format!("group-incoming-poll-{attempt}").as_str())
+            {
+                break;
+            }
+        }
+        if !group_incoming.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        group_incoming.len(),
+        1,
+        "the unresolvable opaque frame must arrive conversation-less: {group_incoming:?} \
+         (marker still present: {})",
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-envelopes.json")
+            .exists()
+    );
+    assert_eq!(group_incoming[0]["accountId"], account_id);
+    assert_eq!(group_incoming[0]["sender"], "+15555550107");
+    assert_eq!(group_incoming[0]["payload"], "Z3JvdXAtb3BhcXVl");
+    assert_eq!(group_incoming[0]["urgency"], "handleImmediately");
+    assert_eq!(group_incoming[0]["destinationDeviceId"], 2);
+    assert!(
+        group_incoming[0].get("conversationId").is_none(),
+        "the group face carries no conversationId: {group_incoming:?}"
+    );
+
+    // No row was created by the signaling envelopes.
+    let listed = request(
+        &mut client,
+        "list-after-call",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    let rows = listed["result"]["items"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .all(|row| row["sentAt"].as_u64().unwrap_or(0) < 1727000001000),
+        "call signaling must not create message rows: {rows:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.127 (§4.108): the calls.sendGroupCallUpdate face —
+/// the group-call era update. The conversation row must resolve to a group
+/// kind carrying a 32-byte master key (a direct row and a short-key row
+/// refuse locally with zero upstream frames); the round-trip forwards
+/// {account, groupId, eraId} verbatim and answers the explicit
+/// {"status":"sent"}; the crash-in-flight outcome answers
+/// SEND_OUTCOME_UNKNOWN and is never retried across the restart.
+#[tokio::test]
+async fn group_call_update_round_trips_and_gates_the_group_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [45_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupCallUpdate" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+
+    // Stage a 32-byte master-key group row (the engine's decode_group_id
+    // gate is the shape the update fans out to).
+    let master_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "timestamp": 80,
+                "dataMessage": {
+                    "groupId": master_key,
+                    "message": "group call incoming"
+                }
+            }
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut group_id = String::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("gcu-group-poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let listed = request(
+            &mut client,
+            &format!("gcu-group-list-{attempt}"),
+            "conversations.list",
+            json!({ "accountId": account_id, "limit": 50 }),
+        )
+        .await;
+        // The ingest-built row carries the bare "group" title (the seed
+        // fixture's own "Fixture Group" row is a different, short-key group
+        // the update must never address).
+        if let Some(found) = listed["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["type"] == "group" && row["title"] == "group")
+            .and_then(|row| row["id"].as_str())
+        {
+            group_id = found.to_string();
+            break;
+        }
+    }
+    assert!(
+        !group_id.is_empty(),
+        "the staged group row must materialize"
+    );
+
+    // The round trip: {status:"sent"} and the frame carries the resolved
+    // account, the group master key, and the era string verbatim.
+    let updated = request(
+        &mut client,
+        "gcu-send",
+        "calls.sendGroupCallUpdate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_id,
+            "eraId": "era-1"
+        }),
+    )
+    .await;
+    assert_eq!(updated["result"]["status"], "sent", "{updated}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert!(
+        frames.iter().any(|frame| {
+            frame["account"] == "+15555550100"
+                && frame["groupId"] == master_key
+                && frame["eraId"] == "era-1"
+        }),
+        "expected the group-call-update upstream frame: {frames:?}"
+    );
+
+    // The local ladder: a direct conversation has no group-call face, an
+    // empty eraId is a shape error, an unknown account refuses — every
+    // refusal stays local (the dispatch log gains no frame).
+    let direct_sent = request(
+        &mut client,
+        "gcu-direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "hello",
+            "clientRequestId": "gcu-direct-0"
+        }),
+    )
+    .await;
+    let direct_id = direct_sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let direct_refused = request(
+        &mut client,
+        "gcu-direct",
+        "calls.sendGroupCallUpdate",
+        json!({ "accountId": account_id, "conversationId": direct_id, "eraId": "era-1" }),
+    )
+    .await;
+    assert_eq!(direct_refused["error"]["code"], "INVALID_REQUEST");
+    let empty_era = request(
+        &mut client,
+        "gcu-empty-era",
+        "calls.sendGroupCallUpdate",
+        json!({ "accountId": account_id, "conversationId": group_id, "eraId": "" }),
+    )
+    .await;
+    assert_eq!(empty_era["error"]["code"], "INVALID_REQUEST");
+    let missing = request(
+        &mut client,
+        "gcu-missing-account",
+        "calls.sendGroupCallUpdate",
+        json!({ "accountId": "no-such-account", "conversationId": group_id, "eraId": "era-1" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.get("eraId").is_some())
+            .count(),
+        1,
+        "a refusal never reaches the engine"
+    );
+
+    // The red line: a crash with the mutating call in flight answers
+    // SEND_OUTCOME_UNKNOWN and is never retried — exactly one crashing frame
+    // across the restart.
+    let crash = request(
+        &mut client,
+        "gcu-crash",
+        "calls.sendGroupCallUpdate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_id,
+            "eraId": "[fixture-crash-gcu]"
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "gcu-restart", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["eraId"] == "[fixture-crash-gcu]")
+            .count(),
+        1,
+        "an unknown era-update outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revisions 1.83 + 1.84 (§4.69): the cloud-backup restore round
+/// trip in kt-engine mode (the engine-only face, the §4.68 spawn posture).
+/// The handshake advertises both faces with no new feature tag (the restore
+/// rides `history-import`); the start face answers {"status": "started"}
+/// (spawning the consumption watcher — the seeded registry lets its watch
+/// resolve the cloud archive) and forwards the structured seven-family
+/// ladder verbatim — the three state families content-free, the transport
+/// family with its data.detail, the contract-fixed retryability on every
+/// family; the status face mirrors the three negotiated states with an
+/// absent bytesTotal staying an absent key. The fixture mirrors the
+/// negotiated wire face: these pins cover the connector's routing,
+/// consumption arming, and error fidelity, never real engine restore
+/// behavior.
+#[tokio::test]
+async fn cloud_restore_faces_round_trip_in_kt_engine_mode() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [48_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--bootstrap-secret-file")
+        .arg(&secret_file)
+        .arg("--engine-bin")
+        .arg(fixture())
+        .arg("--java-home")
+        .arg(temp.path().join("no-such-jre"))
+        .arg("--signal-data-dir")
+        .arg(temp.path().join("signal-data"))
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1");
+    let mut connector = command.spawn().unwrap();
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries both faces before anything else runs — and still
+    // no new feature tag: the restore rides the history-import bit.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in [
+        "backups.restoreFromCloud",
+        "backups.cloudStatus",
+        "history-import",
+    ] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-CloudRestore" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The absent snapshot: the honest {present: false} before anything runs.
+    let absent = request(
+        &mut client,
+        "cloud-status-absent",
+        "backups.cloudStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(absent["result"], json!({ "present": false }), "{absent}");
+
+    // The definite acceptance; the whole chain stays in the engine's
+    // background, so the answer is the bare started status. The start face
+    // now spawns the consumption watcher (contract 1.84), so the fixture's
+    // engine face needs the registry the watcher resolves the cloud archive
+    // through — the same seeding the supervisor tests lay out.
+    let signal_data = temp.path().join("signal-data");
+    let account_dir = signal_data.join("accounts").join("lk-abc");
+    fs::create_dir_all(&account_dir).unwrap();
+    fs::write(
+        signal_data.join("engine-state.json"),
+        r#"{"version":2,"accounts":[{"number":"+15555550100","dir":"accounts/lk-abc"}]}"#,
+    )
+    .unwrap();
+    let accepted = request(
+        &mut client,
+        "cloud-restore-start",
+        "backups.restoreFromCloud",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        accepted["result"],
+        json!({ "status": "started" }),
+        "{accepted}"
+    );
+
+    // The structured ladder across the wire: the state families ride
+    // content-free with their deterministic retryability, the transport
+    // family carries the engine's data.detail, and the re-entry gate answers
+    // its own code (the fixture marker plays the engine's atomic gate).
+    let error_marker = signal_data.join(".fixture-cloud-restore-error");
+    let running_marker = signal_data.join(".fixture-cloud-restore-running");
+    for (sentinel, code, retryable, detail) in [
+        ("NOT_PROVISIONED", "BACKUP_NOT_PROVISIONED", false, None),
+        ("AUTH", "BACKUP_AUTH_FAILED", false, None),
+        (
+            "TRANSPORT",
+            "BACKUP_TRANSPORT_FAILED",
+            true,
+            Some("fixture BACKUP_TRANSPORT_FAILED"),
+        ),
+        (
+            "DOWNLOAD",
+            "BACKUP_DOWNLOAD_FAILED",
+            true,
+            Some("fixture BACKUP_DOWNLOAD_FAILED"),
+        ),
+    ] {
+        fs::write(&error_marker, sentinel).unwrap();
+        let refused = request(
+            &mut client,
+            &format!("cloud-refuse-{sentinel}"),
+            "backups.restoreFromCloud",
+            json!({ "accountId": account_id }),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], code, "{refused}");
+        assert_eq!(refused["error"]["retryable"], retryable, "{refused}");
+        match detail {
+            Some(detail) => assert_eq!(
+                refused["error"]["data"],
+                json!({ "detail": detail }),
+                "{refused}"
+            ),
+            None => assert!(
+                refused["error"].get("data").is_none(),
+                "{sentinel} stays content-free across the wire: {refused}"
+            ),
+        }
+    }
+    fs::remove_file(&error_marker).unwrap();
+    fs::write(&running_marker, "1").unwrap();
+    let running = request(
+        &mut client,
+        "cloud-refuse-running",
+        "backups.restoreFromCloud",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(running["error"]["code"], "BACKUP_RUNNING", "{running}");
+    assert_eq!(running["error"]["retryable"], false, "{running}");
+    assert!(
+        running["error"].get("data").is_none(),
+        "the re-entry gate stays content-free: {running}"
+    );
+    fs::remove_file(&running_marker).unwrap();
+
+    // The three status states across the wire: downloading with both byte
+    // counts, downloading with the honest missing total, failed with the
+    // structured errorCode, and the cleared absence again.
+    let status_marker = signal_data.join(".fixture-cloud-status");
+    fs::write(&status_marker, "downloading 1048576 4194304").unwrap();
+    let downloading = request(
+        &mut client,
+        "cloud-status-downloading",
+        "backups.cloudStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        downloading["result"],
+        json!({
+            "present": true,
+            "phase": "downloading",
+            "bytesRead": 1048576,
+            "bytesTotal": 4194304
+        }),
+        "{downloading}"
+    );
+    fs::write(&status_marker, "downloading 1048576").unwrap();
+    let totalless = request(
+        &mut client,
+        "cloud-status-totalless",
+        "backups.cloudStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        totalless["result"],
+        json!({ "present": true, "phase": "downloading", "bytesRead": 1048576 }),
+        "{totalless}"
+    );
+    assert!(
+        totalless["result"].get("bytesTotal").is_none(),
+        "a missing total stays a missing key on the wire: {totalless}"
+    );
+    fs::write(&status_marker, "failed 1048576 BACKUP_DOWNLOAD_FAILED").unwrap();
+    let failed = request(
+        &mut client,
+        "cloud-status-failed",
+        "backups.cloudStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        failed["result"],
+        json!({
+            "present": true,
+            "phase": "failed",
+            "bytesRead": 1048576,
+            "errorCode": "BACKUP_DOWNLOAD_FAILED"
+        }),
+        "{failed}"
+    );
+    fs::remove_file(&status_marker).unwrap();
+    let cleared = request(
+        &mut client,
+        "cloud-status-cleared",
+        "backups.cloudStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(cleared["result"], json!({ "present": false }), "{cleared}");
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.87 (§4.72): the cloud-backup upload round trip in
+/// kt-engine mode (the engine-only face, the §4.69 seam mirrored). The
+/// handshake advertises both faces with no new feature tag (the upload
+/// rides `backup-export`, widened in place); the start face's
+/// connector-owned half lands first — the §10.2 artifact is rebuilt into
+/// the registry-named engine account directory before the engine call (the
+/// fixture's own artifact gate would answer BACKUP_ARTIFACT_MISSING
+/// otherwise) — and a definite acceptance answers {"status": "started"}.
+/// The structured ladder forwards verbatim: the state families
+/// content-free, the three message families with the engine's data.detail,
+/// the contract-fixed retryability on every family — including the
+/// per-face divergence (BACKUP_IO_FAILED retryable=false here while its
+/// §4.46 export face stays retryable=true). The status face mirrors the
+/// three-phase snapshot with an absent bytesTotal staying an absent key.
+/// The fixture mirrors the negotiated wire face: these pins cover the
+/// connector's routing, artifact wiring, and error fidelity, never real
+/// engine upload behavior.
+#[tokio::test]
+async fn cloud_upload_faces_round_trip_in_kt_engine_mode() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [49_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--bootstrap-secret-file")
+        .arg(&secret_file)
+        .arg("--engine-bin")
+        .arg(fixture())
+        .arg("--java-home")
+        .arg(temp.path().join("no-such-jre"))
+        .arg("--signal-data-dir")
+        .arg(temp.path().join("signal-data"))
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1");
+    let mut connector = command.spawn().unwrap();
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries both faces before anything else runs — and
+    // still no new feature tag: the upload rides the backup-export bit.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in [
+        "backups.uploadToCloud",
+        "backups.uploadStatus",
+        "backup-export",
+    ] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-CloudUpload" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The absent snapshot: the honest {present: false} before anything runs.
+    let absent = request(
+        &mut client,
+        "upload-status-absent",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(absent["result"], json!({ "present": false }), "{absent}");
+
+    // The registry the artifact build and the fixture's account resolution
+    // both read — the same seeding the supervisor tests lay out.
+    let signal_data = temp.path().join("signal-data");
+    let account_dir = signal_data.join("accounts").join("lk-abc");
+    fs::create_dir_all(&account_dir).unwrap();
+    fs::write(
+        signal_data.join("engine-state.json"),
+        r#"{"version":2,"accounts":[{"number":"+15555550100","dir":"accounts/lk-abc"}]}"#,
+    )
+    .unwrap();
+
+    // The definite acceptance — and the connector's own half landed: the
+    // §10.2 artifact exists in the engine account directory (the fixture's
+    // artifact gate mirrors the engine's start gate).
+    let accepted = request(
+        &mut client,
+        "cloud-upload-start",
+        "backups.uploadToCloud",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        accepted["result"],
+        json!({ "status": "started" }),
+        "{accepted}"
+    );
+    let artifact = account_dir.join("backup-export-input.ndjson");
+    assert!(
+        artifact.is_file() && fs::metadata(&artifact).unwrap().len() > 0,
+        "the connector built the §10.2 artifact ahead of the start call"
+    );
+
+    // The structured ladder across the wire: the state families ride
+    // content-free with their deterministic retryability, the message
+    // families carry the engine's data.detail — BACKUP_IO_FAILED answering
+    // retryable=false on this face — and the re-entry gate answers its own
+    // code (the fixture marker plays the engine's single-slot gate).
+    let error_marker = signal_data.join(".fixture-cloud-upload-error");
+    let running_marker = signal_data.join(".fixture-cloud-upload-running");
+    for (sentinel, code, retryable, detail) in [
+        ("AUTH", "BACKUP_AUTH_FAILED", false, None),
+        ("NOT_PROVISIONED", "BACKUP_NOT_PROVISIONED", false, None),
+        (
+            "TRANSPORT",
+            "BACKUP_TRANSPORT_FAILED",
+            true,
+            Some("fixture BACKUP_TRANSPORT_FAILED"),
+        ),
+        (
+            "UPLOAD",
+            "BACKUP_UPLOAD_FAILED",
+            true,
+            Some("fixture BACKUP_UPLOAD_FAILED"),
+        ),
+        (
+            "IO",
+            "BACKUP_IO_FAILED",
+            false,
+            Some("fixture BACKUP_IO_FAILED"),
+        ),
+    ] {
+        fs::write(&error_marker, sentinel).unwrap();
+        let refused = request(
+            &mut client,
+            &format!("upload-refuse-{sentinel}"),
+            "backups.uploadToCloud",
+            json!({ "accountId": account_id }),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], code, "{refused}");
+        assert_eq!(refused["error"]["retryable"], retryable, "{refused}");
+        match detail {
+            Some(detail) => assert_eq!(
+                refused["error"]["data"],
+                json!({ "detail": detail }),
+                "{refused}"
+            ),
+            None => assert!(
+                refused["error"].get("data").is_none(),
+                "{sentinel} stays content-free across the wire: {refused}"
+            ),
+        }
+    }
+    fs::remove_file(&error_marker).unwrap();
+    fs::write(&running_marker, "1").unwrap();
+    let running = request(
+        &mut client,
+        "upload-refuse-running",
+        "backups.uploadToCloud",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        running["error"]["code"], "BACKUP_UPLOAD_ALREADY_RUNNING",
+        "{running}"
+    );
+    assert_eq!(running["error"]["retryable"], false, "{running}");
+    assert!(
+        running["error"].get("data").is_none(),
+        "the re-entry gate stays content-free: {running}"
+    );
+    fs::remove_file(&running_marker).unwrap();
+
+    // The status states across the wire: the exporting zero-count face,
+    // uploading with both byte counts, uploading with the honest missing
+    // total, failed with the structured errorCode, and the cleared absence.
+    let status_marker = signal_data.join(".fixture-cloud-upload-status");
+    fs::write(&status_marker, "exporting 0").unwrap();
+    let exporting = request(
+        &mut client,
+        "upload-status-exporting",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        exporting["result"],
+        json!({ "present": true, "phase": "exporting", "bytesRead": 0 }),
+        "{exporting}"
+    );
+    fs::write(&status_marker, "uploading 131072 1048576").unwrap();
+    let uploading = request(
+        &mut client,
+        "upload-status-uploading",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        uploading["result"],
+        json!({
+            "present": true,
+            "phase": "uploading",
+            "bytesRead": 131072,
+            "bytesTotal": 1048576
+        }),
+        "{uploading}"
+    );
+    fs::write(&status_marker, "uploading 131072").unwrap();
+    let totalless = request(
+        &mut client,
+        "upload-status-totalless",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        totalless["result"],
+        json!({ "present": true, "phase": "uploading", "bytesRead": 131072 }),
+        "{totalless}"
+    );
+    assert!(
+        totalless["result"].get("bytesTotal").is_none(),
+        "a missing total stays a missing key on the wire: {totalless}"
+    );
+    fs::write(&status_marker, "failed 131072 BACKUP_UPLOAD_FAILED").unwrap();
+    let failed = request(
+        &mut client,
+        "upload-status-failed",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        failed["result"],
+        json!({
+            "present": true,
+            "phase": "failed",
+            "bytesRead": 131072,
+            "errorCode": "BACKUP_UPLOAD_FAILED"
+        }),
+        "{failed}"
+    );
+    fs::remove_file(&status_marker).unwrap();
+    let cleared = request(
+        &mut client,
+        "upload-status-cleared",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(cleared["result"], json!({ "present": false }), "{cleared}");
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.52 (§4.50): the groups.terminate round trip. The handshake
+/// advertises the method plus the `group-terminate` capability; the terminate
+/// addresses the resolved group row and dispatches the pinned 0.14.8
+/// `terminateGroup {account, groupId}` payload verbatim; the refusal ladder
+/// (unknown conversation, direct addressing) answers before any upstream
+/// call; the upstream non-admin refusal forwards verbatim (UPSTREAM_ERROR);
+/// the crash-with-in-flight-write path pins the SEND_OUTCOME_UNKNOWN answer
+/// and the no-retry discipline across the engine restart.
+#[tokio::test]
+async fn groups_terminate_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [47_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries the new face before anything else runs.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["groups.terminate", "group-terminate"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupTerm" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Stage three extra groups through the runtime injection marker (the
+    // fixture's background watcher delivers each envelope verbatim; a group
+    // dataMessage materializes the group row): the upstream-refusal group
+    // (the fixture answers the non-admin user error) and the crash group
+    // (the fixture crashes with the mutating call in flight), plus one
+    // ordinary terminable group.
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "timestamp": 70,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-terminate-forbidden]",
+                        "type": "UPDATE",
+                        "groupName": "forbidden group",
+                        "revision": 3
+                    }
+                }
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 71,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-terminate-crash]",
+                        "type": "UPDATE",
+                        "groupName": "crash group",
+                        "revision": 3
+                    }
+                }
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 72,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "ZmFlLXRlcm0tZ3JvdXA=",
+                        "type": "UPDATE",
+                        "groupName": "terminable group",
+                        "revision": 3
+                    }
+                }
+            }
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+
+    // The injected envelopes land asynchronously; poll until all three
+    // staged rows materialize (each poll drains interleaved frames).
+    let mut groups: Vec<(String, String)> = Vec::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("group-poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let listed = request(
+            &mut client,
+            &format!("group-list-{attempt}"),
+            "conversations.list",
+            json!({ "accountId": account_id, "limit": 50 }),
+        )
+        .await;
+        groups = listed["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["type"] == "group")
+            .filter_map(|row| {
+                Some((
+                    row["id"].as_str()?.to_string(),
+                    row["title"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let titles: Vec<&str> = groups.iter().map(|(_, name)| name.as_str()).collect();
+        if titles.contains(&"terminable group")
+            && titles.contains(&"forbidden group")
+            && titles.contains(&"crash group")
+        {
+            break;
+        }
+    }
+    let by_title = |title: &str| {
+        groups
+            .iter()
+            .find(|(_, name)| name == title)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| panic!("the staged {title} row must materialize: {groups:?}"))
+    };
+    let terminable = by_title("terminable group");
+    let forbidden = by_title("forbidden group");
+    let crash_group = by_title("crash group");
+
+    // The refusal ladder, each before any upstream call.
+    let unknown = request(
+        &mut client,
+        "terminate-unknown",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation"
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "CONVERSATION_NOT_FOUND");
+    assert_eq!(unknown["error"]["retryable"], false);
+    let bad_params = request(
+        &mut client,
+        "terminate-bad-params",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": terminable,
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert_eq!(bad_params["error"]["code"], "INVALID_REQUEST");
+    let direct_setup = request(
+        &mut client,
+        "direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "direct guard",
+            "clientRequestId": "group-term-0"
+        }),
+    )
+    .await;
+    let direct_conversation = direct_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let direct = request(
+        &mut client,
+        "terminate-direct",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation
+        }),
+    )
+    .await;
+    assert_eq!(direct["error"]["code"], "INVALID_REQUEST");
+
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let terminate_calls = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| {
+                params.get("groupId").is_some()
+                    && params.get("name").is_none()
+                    && params.get("expiration").is_none()
+            })
+            .collect()
+    };
+    let calls_before = terminate_calls().len();
+    let _ = calls_before;
+
+    // The upstream non-admin refusal forwards verbatim: the engine's user
+    // error lands as the UPSTREAM_ERROR family (retryable, like every
+    // upstream protocol refusal the connector forwards).
+    let refused = request(
+        &mut client,
+        "terminate-forbidden",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": forbidden
+        }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "UPSTREAM_ERROR");
+    assert_eq!(refused["error"]["retryable"], true);
+
+    // The definite success: the resolved group row dispatches the pinned
+    // dests verbatim and answers {status: "sent"}.
+    let terminated = request(
+        &mut client,
+        "terminate-group",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": terminable,
+            "operationId": "group-term-op-1"
+        }),
+    )
+    .await;
+    assert_eq!(terminated["result"]["status"], "sent", "{terminated}");
+    let success_calls: Vec<Value> = terminate_calls()
+        .into_iter()
+        .filter(|params| params["groupId"] == "ZmFlLXRlcm0tZ3JvdXA=")
+        .collect();
+    assert_eq!(success_calls.len(), 1, "{:?}", terminate_calls());
+    assert_eq!(success_calls[0]["account"], "+15555550100");
+    assert_eq!(success_calls[0]["groupId"], "ZmFlLXRlcm0tZ3JvdXA=");
+
+    // Crash with the mutating terminate in flight (fixture sentinel,
+    // os._exit(35)): SEND_OUTCOME_UNKNOWN, never retried — exactly one such
+    // call in the recovered log across the restart.
+    let crash = request(
+        &mut client,
+        "terminate-crash",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": crash_group
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    assert_eq!(crash["error"]["retryable"], false);
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-term", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid, "the engine actually restarted");
+    let crash_calls: Vec<Value> = terminate_calls()
+        .into_iter()
+        .filter(|params| params["groupId"] == "[fixture-terminate-crash]")
+        .collect();
+    assert_eq!(
+        crash_calls.len(),
+        1,
+        "an unknown termination outcome is never retried: {crash_calls:?}"
+    );
+    assert_eq!(
+        crash_calls[0]["account"], "+15555550100",
+        "the crashing call carried the resolved payload: {crash_calls:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.58 (§4.53): the groups.approveJoinRequests face. The handshake
+/// advertises the method plus the `group-join-approve` capability; the
+/// fail-closed ladder (unknown conversation, direct addressing, shape
+/// violations) answers before any upstream write; and a fully valid request
+/// rides into the honest engine-face refusal — the engine's updateGroup
+/// carries the expiration family only (its compat §5 batch boundary), so the
+/// member-family write answers CAPABILITY_UNAVAILABLE (retryable=false) with
+/// nothing dispatched.
+#[tokio::test]
+async fn groups_approve_join_requests_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [53_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries the new face before anything else runs.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["groups.approveJoinRequests", "group-join-approve"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupApprove" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Sync so the fixture group row exists, then read its conversation id.
+    let _ = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let listed = request(
+        &mut client,
+        "conversations-list",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == "Fixture Group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture group row must exist");
+
+    // The refusal ladder, each before any upstream write.
+    let unknown = request(
+        &mut client,
+        "approve-unknown",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation",
+            "members": ["+15555550101"],
+            "approve": true
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "CONVERSATION_NOT_FOUND");
+    assert_eq!(unknown["error"]["retryable"], false);
+    let bad_params = request(
+        &mut client,
+        "approve-bad-params",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": ["+15555550101"],
+            "approve": true,
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert_eq!(bad_params["error"]["code"], "INVALID_REQUEST");
+    let empty_members = request(
+        &mut client,
+        "approve-empty",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": [],
+            "approve": true
+        }),
+    )
+    .await;
+    assert_eq!(empty_members["error"]["code"], "INVALID_REQUEST");
+    let direct_setup = request(
+        &mut client,
+        "direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "direct guard",
+            "clientRequestId": "group-approve-0"
+        }),
+    )
+    .await;
+    let direct_conversation = direct_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let direct = request(
+        &mut client,
+        "approve-direct",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "members": ["+15555550102"],
+            "approve": true
+        }),
+    )
+    .await;
+    assert_eq!(direct["error"]["code"], "INVALID_REQUEST");
+
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let member_writes = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| {
+                params.get("members").is_some() || params.get("removeMembers").is_some()
+            })
+            .collect()
+    };
+
+    // A fully valid request rides past the ladder into the honest refusal:
+    // the member-family updateGroup is the engine's compat §5 batch boundary,
+    // so the face answers CAPABILITY_UNAVAILABLE and nothing is dispatched.
+    let refused = request(
+        &mut client,
+        "approve-group",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": ["+15555550101"],
+            "approve": true,
+            "operationId": "approve-op-1"
+        }),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"], "CAPABILITY_UNAVAILABLE",
+        "{refused}"
+    );
+    assert_eq!(refused["error"]["retryable"], false);
+    assert!(
+        member_writes().is_empty(),
+        "a refused approval never reaches the engine: {:?}",
+        member_writes()
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.66 (§4.59): the plural `attachments` form merges a forwarded
+/// multi-attachment message into ONE upstream message — the fake engine's
+/// send log carries the whole array on one line and the sent MessageRecord
+/// one descriptor per entry. The singular/plural forms are mutually
+/// exclusive (mixed keys and plural-with-voiceNote both answer
+/// INVALID_REQUEST before any pending row exists), and an unknown plural
+/// entry payload rejects the whole request with nothing left behind.
+#[tokio::test]
+async fn multi_attachment_send_merges_entries_into_one_upstream_message() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [77_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-FwdAttach" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let listed = request(
+        &mut client,
+        "conversations-1",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 10 }),
+    )
+    .await;
+    let conversation_id = listed["result"]["items"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let attachment_lines = || {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| params.get("attachments").is_some())
+            .collect::<Vec<_>>()
+    };
+
+    // The plural send: one upstream line, both data URIs on the array, the
+    // caption as the message body.
+    let sent = request(
+        &mut client,
+        "multi-send",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "multi-send-1",
+            "attachments": [
+                {
+                    "dataBase64": "YXR0YWNobWVudCBieXRlcw==",
+                    "sizeBytes": 16,
+                    "filename": "notes.txt",
+                    "contentType": "text/plain"
+                },
+                {
+                    "dataBase64": "aGVsbG8=",
+                    "sizeBytes": 5,
+                    "filename": "clip.ogg",
+                    "contentType": "audio/ogg"
+                }
+            ],
+            "text": "two files"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["body"], "two files", "{sent}");
+    let descriptors = sent["result"]["attachments"].as_array().unwrap();
+    assert_eq!(descriptors.len(), 2);
+    assert_eq!(descriptors[0]["filename"], "notes.txt");
+    assert_eq!(descriptors[1]["filename"], "clip.ogg");
+    let lines = attachment_lines();
+    assert_eq!(lines.len(), 1, "one upstream send: {lines:?}");
+    let upstream = lines[0]["attachments"].as_array().unwrap();
+    assert_eq!(upstream.len(), 2);
+    assert_eq!(
+        upstream[0].as_str().unwrap(),
+        "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw=="
+    );
+    assert_eq!(
+        upstream[1].as_str().unwrap(),
+        "data:audio/ogg;filename=clip.ogg;base64,aGVsbG8="
+    );
+
+    // Mixed forms: any singular key beside the array is INVALID_REQUEST —
+    // no upstream line, no pending row.
+    let mixed = request(
+        &mut client,
+        "multi-mixed",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "multi-mixed-1",
+            "dataBase64": "aGVsbG8=",
+            "sizeBytes": 5,
+            "attachments": [
+                { "dataBase64": "aGVsbG8=", "sizeBytes": 5 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(mixed["error"]["code"], "INVALID_REQUEST", "{mixed}");
+    assert_eq!(mixed["error"]["retryable"], false);
+
+    // Plural with voiceNote: the voice flag is a singular-form face.
+    let voiced = request(
+        &mut client,
+        "multi-voice",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "multi-voice-1",
+            "attachments": [
+                {
+                    "dataBase64": "aGVsbG8=",
+                    "sizeBytes": 5,
+                    "contentType": "audio/ogg"
+                }
+            ],
+            "voiceNote": true
+        }),
+    )
+    .await;
+    assert_eq!(voiced["error"]["code"], "INVALID_REQUEST", "{voiced}");
+
+    // A per-entry payload violation (size mismatch) rejects the whole
+    // request with no pending row left behind.
+    let bad_entry = request(
+        &mut client,
+        "multi-bad-entry",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "multi-bad-1",
+            "attachments": [
+                {
+                    "dataBase64": "aGVsbG8=",
+                    "sizeBytes": 4,
+                    "contentType": "text/plain"
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(bad_entry["error"]["code"], "INVALID_REQUEST", "{bad_entry}");
+
+    // Exactly one upstream line landed (the successful plural send) and none
+    // of the rejected requests left a row behind.
+    assert_eq!(attachment_lines().len(), 1);
+    let listed = request(
+        &mut client,
+        "list-final",
+        "messages.list",
+        json!({ "accountId": account_id, "conversationId": conversation_id, "limit": 50 }),
+    )
+    .await;
+    let rows = listed["result"]["items"].as_array().unwrap();
+    for rejected_id in ["multi-mixed-1", "multi-voice-1", "multi-bad-1"] {
+        assert!(
+            rows.iter().all(|row| row["clientRequestId"] != rejected_id),
+            "a rejected request leaves no row: {rejected_id}"
+        );
+    }
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.149 (§4.147): the GIF marker rides the send face verbatim —
+/// the fixture engine's send log carries the `;gif=true` data-URI parameter
+/// byte-for-byte on the flagged entries and nothing on the unflagged ones
+/// (the engine maps the parameter to the official `Flags.GIF=8` bit), the
+/// sent MessageRecord and the stored row both project `isGif` for the
+/// sender's own bubble, and a top-level `gif` beside the plural array is
+/// INVALID_REQUEST before any pending row exists (the plural face carries
+/// per-entry `gif` instead).
+#[tokio::test]
+async fn gif_flag_send_rides_the_data_uri_verbatim() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [77_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GifFlag" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let listed = request(
+        &mut client,
+        "conversations-1",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 10 }),
+    )
+    .await;
+    let conversation_id = listed["result"]["items"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let attachment_lines = || {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| params.get("attachments").is_some())
+            .collect::<Vec<_>>()
+    };
+
+    // The flagged singular send: the engine receives the verbatim parameter
+    // and the response descriptor projects isGif.
+    let sent = request(
+        &mut client,
+        "gif-send",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "gif-send-1",
+            "dataBase64": "YXR0YWNobWVudCBieXRlcw==",
+            "sizeBytes": 16,
+            "filename": "tenor.gif",
+            "contentType": "image/gif",
+            "gif": true
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["attachments"][0]["isGif"], true, "{sent}");
+    let lines = attachment_lines();
+    assert_eq!(lines.len(), 1, "one upstream send: {lines:?}");
+    assert_eq!(
+        lines[0]["attachments"][0].as_str().unwrap(),
+        "data:image/gif;gif=true;filename=tenor.gif;base64,YXR0YWNobWVudCBieXRlcw=="
+    );
+
+    // The stored row carries the flag to the desktop's list face.
+    let listed = request(
+        &mut client,
+        "list-gif",
+        "messages.list",
+        json!({ "accountId": account_id, "conversationId": conversation_id, "limit": 50 }),
+    )
+    .await;
+    let row = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["clientRequestId"] == "gif-send-1")
+        .expect("the gif row is listed");
+    assert_eq!(row["attachments"][0]["isGif"], true);
+
+    // The unflagged send stays byte-identical to the pre-1.149 frame: no
+    // parameter, `isGif` false.
+    let sent = request(
+        &mut client,
+        "plain-send",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "gif-send-2",
+            "dataBase64": "aGVsbG8=",
+            "sizeBytes": 5,
+            "filename": "notes.txt",
+            "contentType": "text/plain"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["attachments"][0]["isGif"], false, "{sent}");
+    let lines = attachment_lines();
+    assert_eq!(lines.len(), 2, "one upstream send per request: {lines:?}");
+    assert_eq!(
+        lines[1]["attachments"][0].as_str().unwrap(),
+        "data:text/plain;filename=notes.txt;base64,aGVsbG8="
+    );
+
+    // The plural face: the flag rides per entry only — the flagged entry's
+    // URI carries it, the plain entry's stays verbatim, and each descriptor
+    // mirrors its own entry in array order.
+    let sent = request(
+        &mut client,
+        "gif-multi",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "gif-send-3",
+            "attachments": [
+                {
+                    "dataBase64": "YXR0YWNobWVudCBieXRlcw==",
+                    "sizeBytes": 16,
+                    "filename": "clip.mp4",
+                    "contentType": "video/mp4",
+                    "gif": true
+                },
+                {
+                    "dataBase64": "aGVsbG8=",
+                    "sizeBytes": 5,
+                    "filename": "notes.txt",
+                    "contentType": "text/plain"
+                }
+            ]
+        }),
+    )
+    .await;
+    let descriptors = sent["result"]["attachments"].as_array().unwrap();
+    assert_eq!(descriptors.len(), 2);
+    assert_eq!(descriptors[0]["isGif"], true);
+    assert_eq!(descriptors[1]["isGif"], false);
+    let lines = attachment_lines();
+    assert_eq!(lines.len(), 3, "one upstream send per request: {lines:?}");
+    let upstream = lines[2]["attachments"].as_array().unwrap();
+    assert_eq!(upstream.len(), 2);
+    assert_eq!(
+        upstream[0].as_str().unwrap(),
+        "data:video/mp4;gif=true;filename=clip.mp4;base64,YXR0YWNobWVudCBieXRlcw=="
+    );
+    assert_eq!(
+        upstream[1].as_str().unwrap(),
+        "data:text/plain;filename=notes.txt;base64,aGVsbG8="
+    );
+
+    // A top-level `gif` beside the array is a singular-form key: the same
+    // deterministic INVALID_REQUEST the voiceNote/viewOnce markers answer,
+    // with no upstream line and no row left behind.
+    let mixed = request(
+        &mut client,
+        "gif-mixed",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "gif-send-4",
+            "attachments": [
+                { "dataBase64": "aGVsbG8=", "sizeBytes": 5 }
+            ],
+            "gif": true
+        }),
+    )
+    .await;
+    assert_eq!(mixed["error"]["code"], "INVALID_REQUEST", "{mixed}");
+    assert_eq!(mixed["error"]["retryable"], false);
+    assert_eq!(attachment_lines().len(), 3);
+    let listed = request(
+        &mut client,
+        "list-final",
+        "messages.list",
+        json!({ "accountId": account_id, "conversationId": conversation_id, "limit": 50 }),
+    )
+    .await;
+    let rows = listed["result"]["items"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .all(|row| row["clientRequestId"] != "gif-send-4"),
+        "the rejected request leaves no row"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.64 (§4.57): the groups.revokeInvites face. The handshake
+/// advertises the method plus the `group-invite-revoke` capability; the
+/// fail-closed ladder (unknown conversation, direct addressing, shape
+/// violations) answers before any upstream write; and a fully valid request
+/// rides into the honest engine-face refusal — the engine's updateGroup
+/// carries the expiration family only (its compat §5 batch boundary), so the
+/// member-family write answers CAPABILITY_UNAVAILABLE (retryable=false) with
+/// nothing dispatched.
+#[tokio::test]
+async fn groups_revoke_invites_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [57_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries the new face before anything else runs.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["groups.revokeInvites", "group-invite-revoke"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupRevoke" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Sync so the fixture group row exists, then read its conversation id.
+    let _ = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let listed = request(
+        &mut client,
+        "conversations-list",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == "Fixture Group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture group row must exist");
+
+    // The refusal ladder, each before any upstream write.
+    let unknown = request(
+        &mut client,
+        "revoke-unknown",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation",
+            "members": ["+15555550101"]
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "CONVERSATION_NOT_FOUND");
+    assert_eq!(unknown["error"]["retryable"], false);
+    let bad_params = request(
+        &mut client,
+        "revoke-bad-params",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": ["+15555550101"],
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert_eq!(bad_params["error"]["code"], "INVALID_REQUEST");
+    let empty_members = request(
+        &mut client,
+        "revoke-empty",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": []
+        }),
+    )
+    .await;
+    assert_eq!(empty_members["error"]["code"], "INVALID_REQUEST");
+    let direct_setup = request(
+        &mut client,
+        "revoke-direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "direct guard",
+            "clientRequestId": "group-revoke-0"
+        }),
+    )
+    .await;
+    let direct_conversation = direct_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let direct = request(
+        &mut client,
+        "revoke-direct",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "members": ["+15555550102"]
+        }),
+    )
+    .await;
+    assert_eq!(direct["error"]["code"], "INVALID_REQUEST");
+
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let revoke_writes = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| params.get("removeMembers").is_some())
+            .collect()
+    };
+
+    // A fully valid request rides past the ladder into the honest refusal:
+    // the member-family updateGroup is the engine's compat §5 batch boundary,
+    // so the face answers CAPABILITY_UNAVAILABLE and nothing is dispatched.
+    let refused = request(
+        &mut client,
+        "revoke-group",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": ["+15555550101"],
+            "operationId": "revoke-op-1"
+        }),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"], "CAPABILITY_UNAVAILABLE",
+        "{refused}"
+    );
+    assert_eq!(refused["error"]["retryable"], false);
+    assert!(
+        revoke_writes().is_empty(),
+        "a refused revoke never reaches the engine: {:?}",
+        revoke_writes()
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.150 (§4.149): the engine's voice-waveform pair rides the live
+/// row verbatim — a voice descriptor carries the fixed 100-byte base64
+/// waveform and the float-second duration byte-for-byte (the connector never
+/// decodes or re-encodes), a plain attachment beside it in the same
+/// dataMessage carries neither key (absent keys stay absent, the two faces
+/// stay independent), and the store round-trip preserves both.
+#[tokio::test]
+async fn voice_waveform_pair_rides_the_live_row_verbatim() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [31_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    // The engine's fixed 100-byte waveform shape (bytes 0..=99, 136 base64
+    // chars) — pinned whole so a re-encode or trim can never slip through.
+    let waveform_100b = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiYw==";
+    assert_eq!(waveform_100b.len(), 136);
+
+    // Stage one envelope carrying a voice attachment and a plain image in
+    // the same dataMessage, delivered in the finishLink receive burst.
+    let extra_receives = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-extra-receives.json");
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        &extra_receives,
+        json!([
+            {
+                "source": "+15555550101",
+                "timestamp": 60,
+                "dataMessage": {
+                    "message": "two attachments",
+                    "attachments": [
+                        {
+                            "id": "att-voice",
+                            "contentType": "audio/aac",
+                            "size": 2048,
+                            "isVoiceNote": true,
+                            "waveform": waveform_100b,
+                            "duration": 3.7
+                        },
+                        {
+                            "id": "att-image",
+                            "contentType": "image/png",
+                            "size": 12
+                        }
+                    ]
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Voice-Waveform" }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let mut finished: Option<Value> = None;
+    let mut upserted: Option<Value> = None;
+    timeout(Duration::from_secs(5), async {
+        while finished.is_none() || upserted.is_none() {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                finished = Some(frame);
+                continue;
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["sentAt"] == 60
+            {
+                upserted = Some(frame);
+            }
+        }
+    })
+    .await
+    .expect("link finish must deliver the two-attachment receive");
+    let account_id = finished.unwrap()["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let upserted = upserted.unwrap();
+    let conversation_id = upserted["data"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The upsert event and the messages.list row are the same projection:
+    // the voice descriptor carries the pair verbatim, the image descriptor
+    // never grows the keys.
+    let face = &upserted["data"]["attachments"];
+    assert_eq!(face[0]["id"], "att-voice");
+    assert_eq!(face[0]["isVoiceNote"], true);
+    assert_eq!(face[0]["waveform"], waveform_100b, "{face}");
+    assert_eq!(face[0]["duration"], 3.7, "{face}");
+    assert_eq!(face[1]["id"], "att-image");
+    assert_eq!(face[1]["isVoiceNote"], false);
+    assert!(
+        face[1].get("waveform").is_none(),
+        "absent keys stay absent: {face}"
+    );
+    assert!(
+        face[1].get("duration").is_none(),
+        "absent keys stay absent: {face}"
+    );
+
+    let listed = request(
+        &mut client,
+        "list-1",
+        "messages.list",
+        json!({ "accountId": account_id, "conversationId": conversation_id, "limit": 50 }),
+    )
+    .await;
+    let row = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["sentAt"] == 60)
+        .expect("the two-attachment row is stored");
+    let descriptors = &row["attachments"];
+    assert_eq!(descriptors.as_array().unwrap().len(), 2);
+    let voice = &descriptors[0];
+    assert_eq!(voice["id"], "att-voice");
+    assert_eq!(voice["isVoiceNote"], true);
+    assert_eq!(voice["waveform"], waveform_100b, "{voice}");
+    assert_eq!(voice["duration"], 3.7, "{voice}");
+    let image = &descriptors[1];
+    assert_eq!(image["id"], "att-image");
+    assert_eq!(image["isVoiceNote"], false);
+    assert!(image.get("waveform").is_none(), "{image}");
+    assert!(image.get("duration").is_none(), "{image}");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.190 (§4.190 ②+⑤) — the group dead-letter fix and the ledger
+/// faces, end to end through a real connector process and the fake engine:
+/// a real `messages.sendText` round trip creates the GROUP's outgoing row,
+/// a group member's DELIVERED receipt envelope (whose own direct
+/// conversation holds no such row — the exact pre-1.190 dead-letter shape)
+/// finds it through the account-level sentAt find, the host lane observes
+/// `message.statusChanged` plus the additive `message.receiptsChanged`, and
+/// the `messages.receipts` read face serves the stamped per-recipient
+/// ledger. The receipt rides the extra-receives marker with the typing send
+/// as the flush trigger.
+#[tokio::test]
+async fn group_receipt_finds_the_group_row_and_serves_the_ledger() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [77_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Group-Receipt" }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let mut account_id = String::new();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                account_id = frame["result"]["id"].as_str().unwrap().to_string();
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the link burst answers the account id");
+
+    // The fixture links with a group conversation; the listing answers its
+    // opaque id (the listing runs before the receipt marker exists, so no
+    // premature flush).
+    let listed = request(
+        &mut client,
+        "list-groups",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation_id = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with a group conversation");
+
+    // The group send whose receipt the member will return.
+    let sent = request(
+        &mut client,
+        "send-group",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "group",
+            "peerKey": "ZmFrZS1ncm91cC0x",
+            "text": "group receipt probe",
+            "clientRequestId": "grp-receipt-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let sent_at = sent["result"]["sentAt"].as_u64().expect("the row's stamp");
+    let message_id = sent["result"]["id"].as_str().unwrap().to_string();
+
+    // The roster member's DELIVERED receipt: the envelope's own timestamp is
+    // the arrival stamp (contract 1.32). The member's own direct
+    // conversation exists (the fixture peer materializes at link) but holds
+    // no row at the group's sentAt — the exact pre-1.190 dead-letter shape
+    // the account-level find fixes; the roster the link-time sync captured
+    // carries the member, so the qualification gate passes.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([{
+            "source": "+15555550101",
+            "timestamp": sent_at + 1000,
+            "receiptMessage": {
+                "isDelivery": true,
+                "timestamp": [sent_at]
+            }
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let mut interleaved = Vec::new();
+    send_request_frame(
+        &mut client,
+        "typing-flush",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "stop": true
+        }),
+    )
+    .await;
+    let typing_reply = timeout(Duration::from_secs(5), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("typing-flush") {
+                return frame;
+            }
+            interleaved.push(frame);
+        }
+    })
+    .await
+    .expect("the typing flush answers");
+    assert!(
+        typing_reply.get("result").is_some(),
+        "the typing flush must succeed: {typing_reply:?}"
+    );
+
+    // The receipt notification precedes the typing reply on the wire, but
+    // the connector ingests it asynchronously — the events may trail the
+    // reply. Keep collecting (bounded quiet window) until the fold's faces
+    // arrive.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").is_none() {
+                interleaved.push(frame);
+                let status = interleaved.iter().any(|frame| {
+                    frame.get("event").and_then(Value::as_str) == Some("message.statusChanged")
+                        && frame["data"]["messageId"] == json!(message_id)
+                        && frame["data"]["status"] == "delivered"
+                });
+                let ledger = interleaved.iter().any(|frame| {
+                    frame.get("event").and_then(Value::as_str) == Some("message.receiptsChanged")
+                        && frame["data"]["messageId"] == json!(message_id)
+                });
+                if status && ledger {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the receipt fold's events ride the host lane");
+
+    let status = interleaved
+        .iter()
+        .find(|frame| {
+            frame.get("event").and_then(Value::as_str) == Some("message.statusChanged")
+                && frame["data"]["messageId"] == json!(message_id)
+                && frame["data"]["status"] == "delivered"
+        })
+        .unwrap_or_else(|| panic!("no delivered transition; interleaved: {interleaved:?}"));
+    assert_eq!(status["data"]["deliveredAt"], json!(sent_at + 1000));
+
+    let ledger_event = interleaved
+        .iter()
+        .find(|frame| frame.get("event").and_then(Value::as_str) == Some("message.receiptsChanged"))
+        .expect("the per-recipient ledger event rides the host lane");
+    assert_eq!(ledger_event["data"]["messageId"], json!(message_id));
+    let receipts = ledger_event["data"]["receipts"].as_array().unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["recipient"], "+15555550101");
+    assert_eq!(receipts[0]["deliveredAt"], json!(sent_at + 1000));
+
+    // The read face serves the same ledger through the wire method.
+    let read = request(
+        &mut client,
+        "read-receipts",
+        "messages.receipts",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "messageId": message_id
+        }),
+    )
+    .await;
+    let items = read["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{read}");
+    assert_eq!(items[0]["recipient"], "+15555550101");
+    assert_eq!(items[0]["deliveredAt"], json!(sent_at + 1000));
+    assert!(items[0].get("readAt").is_none(), "absent tiers stay absent");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
 }

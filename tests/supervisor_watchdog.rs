@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kt_signal_connector::engine::{
-    CallClass, EngineEvent, EngineHandle, SignalCliConfig, event_channel, receive_channel,
+    CallClass, EngineConfig, EngineEvent, EngineHandle, event_channel, receive_channel,
 };
 use kt_signal_connector::store::{Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 /// All watchdog-test stores are encrypted with one fixed key (Phase 3), so a
@@ -35,7 +35,7 @@ fn watchdog_supervisor_with_throttle(
 ) -> (Arc<RuntimeSupervisor>, PathBuf) {
     let store = test_store(temp.path());
     let data_dir = temp.path().join("signal-data");
-    let mut config = SignalCliConfig::new(fixture(), data_dir.clone());
+    let mut config = EngineConfig::new(fixture(), data_dir.clone());
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     config.watchdog_interval = Duration::from_millis(50);
@@ -68,7 +68,7 @@ async fn wait_for_pid_change(supervisor: &Arc<RuntimeSupervisor>, pid_before: u3
 #[tokio::test]
 async fn engine_stderr_lines_are_broadcast_to_subscribers() {
     let temp = TempDir::new().unwrap();
-    let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
+    let mut config = EngineConfig::new(fixture(), temp.path().join("signal-data"));
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     let (events, _) = event_channel();
@@ -99,7 +99,7 @@ async fn engine_stderr_lines_are_broadcast_to_subscribers() {
 #[tokio::test]
 async fn shutdown_completes_when_the_receive_queue_is_full_and_storage_is_down() {
     let temp = TempDir::new().unwrap();
-    let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
+    let mut config = EngineConfig::new(fixture(), temp.path().join("signal-data"));
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     config.receive_enqueue_timeout = Duration::from_millis(50);
@@ -216,6 +216,49 @@ async fn unauthorized_ping_marks_account_device_unlinked_without_restart() {
         .into_iter()
         .find(|account| account.state == "device_unlinked")
         .expect("auth-failed ping must mark the account device_unlinked");
+    assert_eq!(account.unread_count, 0);
+    supervisor.shutdown().await.unwrap();
+}
+
+/// The post-mortem unlink form: after the first authorization failure
+/// signal-cli persists `registered=false` and every later command fails
+/// locally with "User <account> is not registered." (USER_ERROR -1) — the
+/// 0-17 ms instant-failure shape that previously slipped past the
+/// unauthorized classification and churned restarts forever. Same contract
+/// 1.21 outcome as the live form: pid stays put, account flips
+/// `device_unlinked`.
+#[tokio::test]
+async fn unregistered_post_mortem_ping_marks_account_device_unlinked_without_restart() {
+    let temp = TempDir::new().unwrap();
+    {
+        let seed = test_store(temp.path());
+        seed.upsert_account_from_signal(
+            "+15555550100",
+            Some(1),
+            kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
+        )
+        .unwrap();
+    }
+    let (supervisor, data_dir) = watchdog_supervisor(&temp);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join(".fixture-unregistered-user-status"), "").unwrap();
+
+    let pid = supervisor.start().await.unwrap().pid.unwrap();
+    // Several watchdog ticks: post-mortem failures never count as ping failures.
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        supervisor.status().await.pid,
+        Some(pid),
+        "a dead credential must not churn engine restarts"
+    );
+
+    let store = test_store(temp.path());
+    let account = store
+        .list_accounts()
+        .unwrap()
+        .into_iter()
+        .find(|account| account.state == "device_unlinked")
+        .expect("unregistered ping must mark the account device_unlinked");
     assert_eq!(account.unread_count, 0);
     supervisor.shutdown().await.unwrap();
 }

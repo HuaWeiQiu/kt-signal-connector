@@ -56,8 +56,16 @@ pub struct SignatureRef {
 #[serde(deny_unknown_fields)]
 pub struct ComponentSet {
     pub connector: ComponentRef,
-    pub signal_cli: ComponentRef,
-    pub jre: ComponentRef,
+    /// Legacy signal-cli component (ADR 0003 removal): new bundles carry no
+    /// signal-cli, but an LKG rollback can still point at a manifest written
+    /// before the removal — the field deserializes for that read, keeps its
+    /// production gates armed, and round-trips on re-serialize; new manifests
+    /// never emit the key (absent components are skipped, not nulled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_cli: Option<ComponentRef>,
+    /// Legacy JRE component: same rollback tolerance as `signal_cli`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jre: Option<ComponentRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -127,11 +135,7 @@ impl RuntimeManifest {
     pub fn verify_artifacts(&self, root: &Path) -> Result<(), ManifestError> {
         self.validate()?;
         if self.artifacts.is_empty() {
-            for component in [
-                &self.components.connector,
-                &self.components.signal_cli,
-                &self.components.jre,
-            ] {
+            for component in self.component_refs() {
                 verify_artifact(root, &component.artifact)?;
             }
             if let Some(source) = &self.source_archive {
@@ -156,19 +160,15 @@ impl RuntimeManifest {
         if declared != discovered.iter().map(String::as_str).collect::<Vec<_>>() {
             return Err(ManifestError::Invalid);
         }
-        for required in [
-            &self.components.connector,
-            &self.components.signal_cli,
-            &self.components.jre,
-        ] {
+        for required in self.component_refs() {
             if !declared.contains(&required.artifact.path.as_str()) {
                 return Err(ManifestError::Invalid);
             }
         }
-        if let Some(source) = &self.source_archive {
-            if !declared.contains(&source.path.as_str()) {
-                return Err(ManifestError::Invalid);
-            }
+        if let Some(source) = &self.source_archive
+            && !declared.contains(&source.path.as_str())
+        {
+            return Err(ManifestError::Invalid);
         }
         Ok(())
     }
@@ -202,8 +202,16 @@ impl RuntimeManifest {
             self.platform.as_str(),
             "macos-arm64" | "macos-x64" | "windows-x64"
         ) || self.components.connector.name != "kt-signal-connector"
-            || self.components.signal_cli.name != "signal-cli"
-            || self.components.jre.name != "jre"
+            || self
+                .components
+                .signal_cli
+                .as_ref()
+                .is_some_and(|component| component.name != "signal-cli")
+            || self
+                .components
+                .jre
+                .as_ref()
+                .is_some_and(|component| component.name != "jre")
             || self.artifacts.is_empty()
             || self.source_archive.is_none()
             || self.sbom_path.is_none()
@@ -211,12 +219,17 @@ impl RuntimeManifest {
         {
             return Err(ManifestError::IncompleteProductionBundle);
         }
-        for (component, spdx) in [
+        let mut required_licenses = vec![
             ("kt-signal-connector", Some("AGPL-3.0-only")),
-            ("signal-cli", Some("GPL-3.0-only")),
             ("libsignal", Some("AGPL-3.0-only")),
-            ("jre", None),
-        ] {
+        ];
+        if self.components.signal_cli.is_some() {
+            required_licenses.push(("signal-cli", Some("GPL-3.0-only")));
+        }
+        if self.components.jre.is_some() {
+            required_licenses.push(("jre", None));
+        }
+        for (component, spdx) in required_licenses {
             if !self.licenses.iter().any(|license| {
                 license.component == component
                     && spdx.is_none_or(|expected| license.spdx == expected)
@@ -260,6 +273,14 @@ impl RuntimeManifest {
         serde_json::to_vec(&unsigned).map_err(|_| ManifestError::Invalid)
     }
 
+    /// The connector plus whichever legacy components this manifest still
+    /// declares (an LKG rollback can point at a pre-removal bundle).
+    fn component_refs(&self) -> impl Iterator<Item = &ComponentRef> {
+        std::iter::once(&self.components.connector)
+            .chain(self.components.signal_cli.iter())
+            .chain(self.components.jre.iter())
+    }
+
     fn validate(&self) -> Result<(), ManifestError> {
         if self.manifest_version != MANIFEST_VERSION
             || self.bundle_id.is_empty()
@@ -272,11 +293,7 @@ impl RuntimeManifest {
         for artifact in self
             .artifacts
             .iter()
-            .chain([
-                &self.components.connector.artifact,
-                &self.components.signal_cli.artifact,
-                &self.components.jre.artifact,
-            ])
+            .chain(self.component_refs().map(|component| &component.artifact))
             .chain(self.source_archive.iter())
         {
             validate_artifact(artifact)?;
@@ -484,16 +501,11 @@ fn artifacts_for_bundle(root: &Path) -> Result<Vec<ArtifactRef>, ManifestError> 
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_local_unsigned_manifest(
     root: &Path,
     bundle_id: String,
     connector_version: String,
-    signal_cli_version: String,
-    jre_version: String,
     connector_rel: &str,
-    signal_cli_rel: &str,
-    jre_rel: &str,
 ) -> Result<RuntimeManifest, ManifestError> {
     Ok(RuntimeManifest {
         manifest_version: MANIFEST_VERSION.into(),
@@ -506,30 +518,15 @@ pub fn build_local_unsigned_manifest(
                 version: connector_version,
                 artifact: artifact_for_file(root, connector_rel)?,
             },
-            signal_cli: ComponentRef {
-                name: "signal-cli".into(),
-                version: signal_cli_version,
-                artifact: artifact_for_file(root, signal_cli_rel)?,
-            },
-            jre: ComponentRef {
-                name: "jre".into(),
-                version: jre_version,
-                artifact: artifact_for_file(root, jre_rel)?,
-            },
+            signal_cli: None,
+            jre: None,
         },
         artifacts: artifacts_for_bundle(root)?,
-        licenses: vec![
-            LicenseRef {
-                component: "kt-signal-connector".into(),
-                spdx: "AGPL-3.0-only".into(),
-                path: "licenses/kt-signal-connector.AGPL-3.0-only.txt".into(),
-            },
-            LicenseRef {
-                component: "signal-cli".into(),
-                spdx: "GPL-3.0-only".into(),
-                path: "licenses/NOTICE.txt".into(),
-            },
-        ],
+        licenses: vec![LicenseRef {
+            component: "kt-signal-connector".into(),
+            spdx: "AGPL-3.0-only".into(),
+            path: "licenses/kt-signal-connector.AGPL-3.0-only.txt".into(),
+        }],
         sbom_path: Some("sbom.cdx.json".into()),
         source_archive: None,
         build_record_path: Some("build-record.json".into()),
@@ -550,19 +547,15 @@ mod tests {
     fn hashes_and_verifies_local_manifest() {
         let temp = TempDir::new().unwrap();
         fs::write(temp.path().join("connector.bin"), b"connector").unwrap();
-        fs::write(temp.path().join("signal-cli.bin"), b"signal").unwrap();
-        fs::write(temp.path().join("jre.bin"), b"jre").unwrap();
         let manifest = build_local_unsigned_manifest(
             temp.path(),
             "bundle-1".into(),
             "0.1.0".into(),
-            "0.14.7".into(),
-            "25".into(),
             "connector.bin",
-            "signal-cli.bin",
-            "jre.bin",
         )
         .unwrap();
+        assert!(manifest.components.signal_cli.is_none());
+        assert!(manifest.components.jre.is_none());
         manifest.save(&temp.path().join("manifest.json")).unwrap();
         let loaded = RuntimeManifest::load(&temp.path().join("manifest.json")).unwrap();
         loaded.verify_artifacts(temp.path()).unwrap();
@@ -578,6 +571,68 @@ mod tests {
         ));
     }
 
+    /// LKG rollback tolerance (ADR 0003): a manifest written before the
+    /// signal-cli/JRE removal still declares `signalCli`/`jre` components.
+    /// Those fields deserialize, keep their component gates armed, and the
+    /// manifest verifies against a bundle that still contains the files.
+    #[test]
+    fn legacy_manifest_with_signal_cli_and_jre_still_loads_and_verifies() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("connector.bin"), b"connector").unwrap();
+        fs::write(temp.path().join("signal-cli.bin"), b"signal").unwrap();
+        fs::write(temp.path().join("jre.bin"), b"jre").unwrap();
+        let manifest = build_local_unsigned_manifest(
+            temp.path(),
+            "bundle-legacy".into(),
+            "0.1.0".into(),
+            "connector.bin",
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        value["components"]["signalCli"] = serde_json::json!({
+            "name": "signal-cli",
+            "version": "0.14.7",
+            "artifact": artifact_for_file(temp.path(), "signal-cli.bin").unwrap(),
+        });
+        value["components"]["jre"] = serde_json::json!({
+            "name": "jre",
+            "version": "25",
+            "artifact": artifact_for_file(temp.path(), "jre.bin").unwrap(),
+        });
+        fs::write(
+            temp.path().join("manifest.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = RuntimeManifest::load(&temp.path().join("manifest.json")).unwrap();
+        assert_eq!(
+            loaded
+                .components
+                .signal_cli
+                .as_ref()
+                .expect("legacy component must deserialize")
+                .version,
+            "0.14.7"
+        );
+        assert_eq!(
+            loaded
+                .components
+                .jre
+                .as_ref()
+                .expect("legacy component must deserialize")
+                .version,
+            "25"
+        );
+        loaded.verify_artifacts(temp.path()).unwrap();
+        // The legacy components round-trip: a re-saved legacy manifest keeps
+        // declaring them, while a fresh manifest (no components) never gains
+        // the keys (absent is skipped, not nulled).
+        let serialized = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(serialized["components"]["signalCli"]["version"], "0.14.7");
+        assert_eq!(serialized["components"]["jre"]["version"], "25");
+    }
+
     #[test]
     fn production_signature_covers_manifest_and_complete_bundle() {
         let temp = TempDir::new().unwrap();
@@ -591,10 +646,11 @@ mod tests {
             b"AGPL",
         )
         .unwrap();
-        fs::write(temp.path().join("licenses/NOTICE.txt"), b"NOTICE").unwrap();
-        fs::write(temp.path().join("licenses/signal-cli.txt"), b"GPL").unwrap();
         fs::write(temp.path().join("licenses/libsignal.txt"), b"AGPL").unwrap();
-        fs::write(temp.path().join("licenses/jre.txt"), b"JRE license").unwrap();
+        // The legacy rollback leg re-declares the signal-cli/JRE components,
+        // whose required license entries point at these files.
+        fs::write(temp.path().join("licenses/signal-cli.txt"), b"GPL").unwrap();
+        fs::write(temp.path().join("licenses/jre.txt"), b"jre").unwrap();
         fs::write(temp.path().join("sbom.cdx.json"), b"{}").unwrap();
         fs::write(temp.path().join("build-record.json"), b"{}").unwrap();
         fs::write(temp.path().join("source.tar.gz"), b"source").unwrap();
@@ -602,11 +658,7 @@ mod tests {
             temp.path(),
             "bundle-production".into(),
             "0.1.0".into(),
-            "0.14.7".into(),
-            "25".into(),
             "connector.bin",
-            "signal-cli.bin",
-            "jre.bin",
         )
         .unwrap();
         manifest.platform = "macos-arm64".into();
@@ -617,19 +669,9 @@ mod tests {
                 path: "licenses/kt-signal-connector.AGPL-3.0-only.txt".into(),
             },
             LicenseRef {
-                component: "signal-cli".into(),
-                spdx: "GPL-3.0-only".into(),
-                path: "licenses/signal-cli.txt".into(),
-            },
-            LicenseRef {
                 component: "libsignal".into(),
                 spdx: "AGPL-3.0-only".into(),
                 path: "licenses/libsignal.txt".into(),
-            },
-            LicenseRef {
-                component: "jre".into(),
-                spdx: "NOASSERTION".into(),
-                path: "licenses/jre.txt".into(),
             },
         ];
         manifest.source_archive = Some(artifact_for_file(temp.path(), "source.tar.gz").unwrap());
@@ -641,15 +683,88 @@ mod tests {
             .verify_production(temp.path(), "production-1", &signing_key.verifying_key())
             .unwrap();
 
-        let mut missing_license = manifest.clone();
+        // Legacy rollback leg: re-declaring signal-cli/JRE components on the
+        // same bundle restores their production gates — name checks and the
+        // signal-cli GPL / JRE license requirements.
+        let mut legacy = manifest.clone();
+        legacy.components.signal_cli = Some(ComponentRef {
+            name: "signal-cli".into(),
+            version: "0.14.7".into(),
+            artifact: artifact_for_file(temp.path(), "signal-cli.bin").unwrap(),
+        });
+        legacy.components.jre = Some(ComponentRef {
+            name: "jre".into(),
+            version: "25".into(),
+            artifact: artifact_for_file(temp.path(), "jre.bin").unwrap(),
+        });
+        legacy.licenses.push(LicenseRef {
+            component: "signal-cli".into(),
+            spdx: "GPL-3.0-only".into(),
+            path: "licenses/signal-cli.txt".into(),
+        });
+        legacy.licenses.push(LicenseRef {
+            component: "jre".into(),
+            spdx: "NOASSERTION".into(),
+            path: "licenses/jre.txt".into(),
+        });
+        legacy
+            .sign_ed25519("production-1".into(), &signing_key)
+            .unwrap();
+        legacy
+            .verify_production(temp.path(), "production-1", &signing_key.verifying_key())
+            .unwrap();
+
+        let mut wrong_name = legacy.clone();
+        wrong_name.components.signal_cli.as_mut().unwrap().name = "not-signal-cli".into();
+        wrong_name
+            .sign_ed25519("production-1".into(), &signing_key)
+            .unwrap();
+        assert!(matches!(
+            wrong_name.verify_production(temp.path(), "production-1", &signing_key.verifying_key()),
+            Err(ManifestError::IncompleteProductionBundle)
+        ));
+
+        let mut missing_license = legacy.clone();
         missing_license
             .licenses
-            .retain(|license| license.component != "libsignal");
+            .retain(|license| license.component != "signal-cli");
         missing_license
             .sign_ed25519("production-1".into(), &signing_key)
             .unwrap();
         assert!(matches!(
             missing_license.verify_production(
+                temp.path(),
+                "production-1",
+                &signing_key.verifying_key()
+            ),
+            Err(ManifestError::IncompleteProductionBundle)
+        ));
+
+        let mut missing_jre_license = legacy.clone();
+        missing_jre_license
+            .licenses
+            .retain(|license| license.component != "jre");
+        missing_jre_license
+            .sign_ed25519("production-1".into(), &signing_key)
+            .unwrap();
+        assert!(matches!(
+            missing_jre_license.verify_production(
+                temp.path(),
+                "production-1",
+                &signing_key.verifying_key()
+            ),
+            Err(ManifestError::IncompleteProductionBundle)
+        ));
+
+        let mut missing_libsignal = manifest.clone();
+        missing_libsignal
+            .licenses
+            .retain(|license| license.component != "libsignal");
+        missing_libsignal
+            .sign_ed25519("production-1".into(), &signing_key)
+            .unwrap();
+        assert!(matches!(
+            missing_libsignal.verify_production(
                 temp.path(),
                 "production-1",
                 &signing_key.verifying_key()
@@ -688,17 +803,11 @@ mod tests {
     fn rejects_unknown_manifest_fields() {
         let temp = TempDir::new().unwrap();
         fs::write(temp.path().join("connector.bin"), b"connector").unwrap();
-        fs::write(temp.path().join("signal-cli.bin"), b"signal").unwrap();
-        fs::write(temp.path().join("jre.bin"), b"jre").unwrap();
         let manifest = build_local_unsigned_manifest(
             temp.path(),
             "bundle-1".into(),
             "0.1.0".into(),
-            "0.14.7".into(),
-            "25".into(),
             "connector.bin",
-            "signal-cli.bin",
-            "jre.bin",
         )
         .unwrap();
         let mut value = serde_json::to_value(manifest).unwrap();

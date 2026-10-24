@@ -31,17 +31,34 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use kt_signal_connector::PHASE2_CAPABILITIES;
+use kt_signal_connector::engine::{
+    MAX_ATTACHMENT_BLUR_HASH_CHARS, MAX_INBOUND_ATTACHMENTS, MAX_RECEIVE_ID_CHARS,
+    MAX_SYNC_CALL_ID_CHARS, MAX_SYNC_CALL_LINK_KEY_CHARS, MAX_SYNC_DELETE_GROUP_MESSAGES,
+    MAX_SYNC_DELETE_GROUPS, MAX_SYNC_IDENTITY_KEY_CHARS,
+};
+use kt_signal_connector::history_attachment::MAX_PLAINTEXT_BYTES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
 use kt_signal_connector::service::{
-    GROUP_DESCRIPTION_MAX_BYTES, GROUP_MEMBER_LABEL_MAX_BYTES, GROUP_NAME_MAX_BYTES,
-    MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES,
-    MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES,
-    MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
-    MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS, MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS,
-    MAX_STICKER_PACK_ID_CHARS, MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES,
-    STICKER_PACK_BROWSE_ID_HEX_CHARS, STICKER_PACK_SYNC_KEY_B64_CHARS,
+    CALL_GROUP_MASTER_KEY_B64_CHARS, CALL_LINK_ROOM_ID_B64_CHARS, CALL_LINK_ROOT_KEY_B64_MAX_CHARS,
+    GROUP_CHANGED_MAX_CHANGES, GROUP_DESCRIPTION_MAX_BYTES, GROUP_MEMBER_LABEL_MAX_BYTES,
+    GROUP_NAME_MAX_BYTES, IDENTITY_SAFETY_NUMBER_MAX_CHARS, MARK_RECEIPT_MESSAGE_IDS_LIMIT,
+    MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CONTENT_TYPE_BYTES,
+    MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES, MAX_AVATAR_DATA_URI_CHARS,
+    MAX_CALL_LINK_KEY_CHARS, MAX_CHAT_FOLDER_BATCH, MAX_CHAT_FOLDER_ID_CHARS,
+    MAX_DELETE_FOR_ME_MESSAGES, MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_GROUP_MEMBER_ID_CHARS,
+    MAX_GROUP_MEMBERS, MAX_LOCATOR_FIELD_CHARS, MAX_LOCATOR_HASH_CHARS,
+    MAX_NOTIFICATION_PROFILE_BATCH, MAX_NOTIFICATION_PROFILE_ID_CHARS, MAX_OPAQUE_ID_BYTES,
+    MAX_PIN_CONVERSATION_ID_CHARS, MAX_PREVIEW_DESCRIPTION_BYTES, MAX_PREVIEW_IMAGE_DATA_URI_CHARS,
+    MAX_PREVIEW_TITLE_BYTES, MAX_PREVIEW_URL_BYTES, MAX_PROFILE_ABOUT_BYTES,
+    MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS, MAX_SNAPSHOT_DIR_BYTES, MAX_STICKER_EMOJI_CHARS,
+    MAX_STICKER_PACK_ID_CHARS, MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS,
+    MAX_STORY_LIST_BATCH, MAX_STORY_LIST_ID_CHARS, MAX_STORY_PREVIEW_TITLE_BYTES,
+    MAX_STORY_PREVIEW_URL_CHARS, MAX_TEXT_BYTES, PHONE_LOOKUP_MAX_ENTRIES,
+    REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
+    STICKER_PACK_SYNC_KEY_B64_CHARS, USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES,
+    USERNAME_MAX_WIRE_CHARS,
 };
-use kt_signal_connector::store::MAX_PAGE_LIMIT;
+use kt_signal_connector::store::{MAX_MESSAGE_RECEIPT_RECIPIENTS, MAX_PAGE_LIMIT};
 
 /// Events the code emits but the schema event enum does not declare. Currently
 /// none: `runtime.resourcePressure` (emitted by the RSS sampler bridge,
@@ -281,7 +298,8 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 ///
 /// Code-only bounds without a schema representation (internal capacity —
 /// gated by behavior tests per optimization-plan §6.4 M3.5, not by pairs):
-/// - receive queue budgets (256 items / 2 MiB) and internal channel
+/// - receive queue budgets (256 items / 2 MiB global, 64 items / 512 KiB per
+///   account since contract 1.196's internal companion) and internal channel
 ///   capacities: in-process queues, not wire contracts.
 /// - host admission (128 global / 32 per account / 8 MiB aggregate) and
 ///   per-method dispatch lanes: connection-local admission control.
@@ -319,6 +337,59 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 ///   src/service.rs), pinned by the §4.39 unit and integration tests; the
 ///   §4.44 group-management write face (contract 1.45) mirrors both caps in
 ///   the schema and is pinned by the pairs below.
+/// - the blocked-list entry cap (contract 1.46, §4.45,
+///   `MAX_BLOCKED_CONVERSATIONS` = 256): same free-form-result situation,
+///   enforced in `blocked_conversations_result` and pinned by the §4.45 unit
+///   and integration tests; the §4.47 setBlocked result face reuses the same
+///   projection verbatim.
+/// - the §4.47 avatar result-face bound (contract 1.48,
+///   `MAX_AVATAR_DATA_URI_CHARS` = 13,981,080): a coarse result-side guard
+///   enforced in `avatar_from_engine` on the engine result (the schema's
+///   `result` is a free-form object, so there is no schema numeric hook);
+///   the precise decoded budget is the decode + `byteSize` cross-check,
+///   pinned by the §4.47 unit and integration tests.
+/// - the §4.45 avatar budget (`MAX_AVATAR_BYTES` = 10 MiB decoded): the code
+///   bound is on the decoded size, which the schema can only approximate —
+///   the data-URI `maxLength` 13981080 is the padded-base64 encoding of the
+///   ceiling plus a fixed prefix margin, not the enforcement itself, so
+///   pairing it would be fabricated; pinned by the §4.45 unit tests.
+/// - the §4.45 universal-timer face (contract 1.46): `expireSeconds`
+///   maximum 4294967295 is enforced structurally by the `u32` type at params
+///   deserialization (same situation as `stickerPackSetSyncParams.position`);
+///   the schema `maximum` mirrors the type.
+/// - the §4.46 backup-export caps (contract 1.47): the artifact caps
+///   (`MAX_ARTIFACT_LINE_BYTES` 1 MiB / `MAX_ARTIFACT_LINES` 4M /
+///   `MAX_ARTIFACT_TOTAL_BYTES` 2 GiB / `MAX_ARTIFACT_BODY_BYTES` 128 KiB)
+///   bind the connector's own artifact build against the engine's §10.2
+///   gate — there is no params-side schema number to pair them with (the
+///   result mirrors the engine honestly). The wire-side bounds that exist —
+///   `backupsExportFileReadChunkParams.offset` `minimum` 0 (a `u64`, checked
+///   by the sequential-offset rule, not by a constant) and the `file` enum
+///   {metadata, main} (structural, enforced by the two-value match before
+///   the filesystem is touched) — are enforced by mechanism, not by a named
+///   constant. The chunk ceiling (`CHUNK_BYTES` 262_144) is pinned by the
+///   §4.46 integration test's `chunkBytes` assertion.
+/// - the §4.67 story recipient-array cap (contract 1.76,
+///   `MAX_STORY_RECIPIENTS` = 1001): the schema `maxItems` mirrors the
+///   §4.39 roster ceiling, but the pairing stays inventory-side like the
+///   story send's sibling faces — the array is the caller-computed
+///   expansion forwarded verbatim, the prepare ladder owns the cap, and
+///   the §4.67 unit tests pin both sides.
+/// - the §4.78 chat-folder list cap (contract 1.95,
+///   `MAX_CHAT_FOLDERS` = 64): the schema's `result` is a free-form object,
+///   so the cap lives on the engine-result projection
+///   (`chat_folder_syncs_result`) and is pinned by the §4.78 unit and
+///   integration tests; the write-batch and identity bounds that do have a
+///   schema hook are pinned by the pairs below.
+/// - the §4.117 engine-notification event faces (contract 1.134): the
+///   subject-id bounds (`group.terminated` groupId / terminator /
+///   `contact.profileUpdated` aci at maxLength 128/64) ride the receive-id
+///   discipline (`MAX_RECEIVE_ID_CHARS`) and the groupUpdated editor bound,
+///   pinned inventory-side like the story.received sibling event faces; the
+///   `conversation.stateChanged` conversations array carries no connector
+///   cap on purpose — the engine's own 256-entry batch cap and overflow
+///   tail marker govern the wire, and the connector never trims (the F
+///   red line), pinned by the §4.117 unit and integration tests.
 #[test]
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[
@@ -399,6 +470,41 @@ fn schema_numeric_bounds_match_code_constants() {
             "maxLength",
             MAX_TEXT_BYTES as u64,
         ),
+        // §4.127 blur placeholder (contract 1.137): the singular key and the
+        // plural per-entry key share the receive face's own bound — one
+        // constant, both directions.
+        (
+            "/$defs/messagesSendAttachmentParams/properties/blurHash",
+            "maxLength",
+            MAX_ATTACHMENT_BLUR_HASH_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentEntry/properties/blurHash",
+            "maxLength",
+            MAX_ATTACHMENT_BLUR_HASH_CHARS as u64,
+        ),
+        // §4.126 link-preview entry bounds (the §5.10 family, now declared
+        // in the schema together with the 1.137 date key).
+        (
+            "/$defs/messagesSendTextParams/properties/previews/items/properties/url",
+            "maxLength",
+            MAX_PREVIEW_URL_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendTextParams/properties/previews/items/properties/title",
+            "maxLength",
+            MAX_PREVIEW_TITLE_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendTextParams/properties/previews/items/properties/description",
+            "maxLength",
+            MAX_PREVIEW_DESCRIPTION_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendTextParams/properties/previews/items/properties/imageDataUri",
+            "maxLength",
+            MAX_PREVIEW_IMAGE_DATA_URI_CHARS as u64,
+        ),
         (
             "/$defs/messagesSendStickerParams/properties/packId",
             "maxLength",
@@ -440,6 +546,19 @@ fn schema_numeric_bounds_match_code_constants() {
         ),
         (
             "/$defs/conversationsSetPinnedParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        // Conversation avatar + blocked write (contract 1.48, §4.47): both
+        // faces share the pinned face's 256-char conversation bound (the
+        // getAvatar reference and the setBlocked reference).
+        (
+            "/$defs/conversationsGetAvatarParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/conversationsSetBlockedParams/properties/conversationId",
             "maxLength",
             MAX_PIN_CONVERSATION_ID_CHARS as u64,
         ),
@@ -493,6 +612,167 @@ fn schema_numeric_bounds_match_code_constants() {
             "maxLength",
             MAX_GROUP_MEMBER_ID_CHARS as u64,
         ),
+        // Join-request approval (contract 1.58, §4.53): the candidate set
+        // rides the §4.39 roster bounds verbatim (the schema mirrors every
+        // bound the prepare checks enforce).
+        (
+            "/$defs/groupsApproveJoinRequestsParams/properties/members",
+            "maxItems",
+            MAX_GROUP_MEMBERS as u64,
+        ),
+        (
+            "/$defs/groupsApproveJoinRequestsParams/properties/members/items",
+            "maxLength",
+            MAX_GROUP_MEMBER_ID_CHARS as u64,
+        ),
+        // Invite revocation (contract 1.64, §4.57): the same §4.39 roster
+        // bounds verbatim.
+        (
+            "/$defs/groupsRevokeInvitesParams/properties/members",
+            "maxItems",
+            MAX_GROUP_MEMBERS as u64,
+        ),
+        (
+            "/$defs/groupsRevokeInvitesParams/properties/members/items",
+            "maxLength",
+            MAX_GROUP_MEMBER_ID_CHARS as u64,
+        ),
+        // The group.changed change-list cap (contract 1.100, §4.81 D3): the
+        // parse-side truncate bound the event data mirrors. (These allOf
+        // indices shifted +1 when contract 1.158 §4.156 inserted the
+        // story.deleteCandidate branch at allOf/12.)
+        (
+            "/$defs/event/allOf/14/then/properties/data/properties/changes",
+            "maxItems",
+            GROUP_CHANGED_MAX_CHANGES as u64,
+        ),
+        // Delete-for-me sync (contract 1.102, §4.83): the event data mirrors
+        // the parse-side bounds — the group cap, the per-group entry cap,
+        // and the author id bound (the receive-id family).
+        (
+            "/$defs/event/allOf/15/then/properties/data/properties/deletes",
+            "maxItems",
+            MAX_SYNC_DELETE_GROUPS as u64,
+        ),
+        (
+            "/$defs/event/allOf/15/then/properties/data/properties/deletes/items/properties/messages",
+            "maxItems",
+            MAX_SYNC_DELETE_GROUP_MESSAGES as u64,
+        ),
+        (
+            "/$defs/event/allOf/15/then/properties/data/properties/deletes/items/properties/messages/items/properties/author",
+            "maxLength",
+            MAX_RECEIVE_ID_CHARS as u64,
+        ),
+        // Contract 1.196 (§4.196): the attachment arm shares the message
+        // arm's 256-entry batch ceiling (the engine's projection cap is the
+        // same value).
+        (
+            "/$defs/event/allOf/15/then/properties/data/properties/attachmentDeletes",
+            "maxItems",
+            MAX_SYNC_DELETE_GROUP_MESSAGES as u64,
+        ),
+        // Verified sync (contract 1.103, §4.84): the destination mirrors the
+        // receive-id bound (the parse gates the UUID shape verbatim) and the
+        // hex identity key mirrors its own bound (the parse drops an
+        // over-bound key whole — never a truncated fingerprint).
+        (
+            "/$defs/event/allOf/16/then/properties/data/properties/destinationUuid",
+            "maxLength",
+            MAX_RECEIVE_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/event/allOf/16/then/properties/data/properties/identityKey",
+            "maxLength",
+            MAX_SYNC_IDENTITY_KEY_CHARS as u64,
+        ),
+        // Receipts ledger (contract 1.190, §4.190): the recipient key mirrors
+        // the receive-id bound (the envelope source passes it verbatim) and
+        // the ledger array mirrors the roster ceiling (the ledger's own
+        // recipient cap, the store's MAX_MESSAGE_RECEIPT_RECIPIENTS). The
+        // arm sits at allOf/33: receive.decryptionError (§4.163) and
+        // engine.initialSyncComplete landed arms ahead of it, so the
+        // positional pointer moved from the historical allOf/32.
+        (
+            "/$defs/event/allOf/33/then/properties/data/properties/receipts/items/properties/recipient",
+            "maxLength",
+            MAX_RECEIVE_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/event/allOf/33/then/properties/data/properties/receipts",
+            "maxItems",
+            MAX_MESSAGE_RECEIPT_RECIPIENTS as u64,
+        ),
+        // Backfill settle face (contract 1.193, §4.193): the entry array
+        // mirrors the parse bound (§4.175's MAX_INBOUND_ATTACHMENTS — one
+        // entry per remote attachment position).
+        (
+            "/$defs/event/allOf/35/then/properties/data/properties/attachments",
+            "maxItems",
+            MAX_INBOUND_ATTACHMENTS as u64,
+        ),
+        // Call-event sync (contract 1.104, §4.85): the decimal call id
+        // mirrors its own bound (the parse also demands all-ASCII digits);
+        // the conversation identity rides the shared opaqueId def, so no
+        // inline pairing exists to pin.
+        (
+            "/$defs/event/allOf/17/then/properties/data/properties/callId",
+            "maxLength",
+            MAX_SYNC_CALL_ID_CHARS as u64,
+        ),
+        // Call-link update (contract 1.106, §4.87): both base64 keys mirror
+        // their own bound — the root key drops the record whole over it, the
+        // admin key drops per-key (never a truncated call-link address).
+        (
+            "/$defs/event/allOf/20/then/properties/data/properties/rootKey",
+            "maxLength",
+            MAX_SYNC_CALL_LINK_KEY_CHARS as u64,
+        ),
+        (
+            "/$defs/event/allOf/20/then/properties/data/properties/adminKey",
+            "maxLength",
+            MAX_SYNC_CALL_LINK_KEY_CHARS as u64,
+        ),
+        // The device-name/PNI registration ids mirror the parse's u32 range
+        // gate (the std bound the parse enforces through try_from).
+        (
+            "/$defs/event/allOf/22/then/properties/data/properties/deviceId",
+            "maximum",
+            u32::MAX as u64,
+        ),
+        (
+            "/$defs/event/allOf/24/then/properties/data/properties/registrationId",
+            "maximum",
+            u32::MAX as u64,
+        ),
+        // Account settings (contract 1.46, §4.45): the profile text budgets
+        // mirror the official desktop ProfileEditor; the emoji label reuses
+        // the repo-wide bound. The avatar budget (10 MiB decoded) is a
+        // code-side constant without an exact schema length (the data-URI
+        // prefix varies; the schema carries only a coarse maxLength margin) —
+        // inventoried below. The universal-timer u32 face and the blocked-list
+        // entry cap are enforced structurally / on the free-form result and
+        // are inventoried below as well.
+        (
+            "/$defs/accountsSetProfileParams/properties/givenName",
+            "maxLength",
+            MAX_PROFILE_NAME_BYTES as u64,
+        ),
+        (
+            "/$defs/accountsSetProfileParams/properties/familyName",
+            "maxLength",
+            MAX_PROFILE_NAME_BYTES as u64,
+        ),
+        (
+            "/$defs/accountsSetProfileParams/properties/about",
+            "maxLength",
+            MAX_PROFILE_ABOUT_BYTES as u64,
+        ),
+        (
+            "/$defs/accountsSetProfileParams/properties/emoji",
+            "maxLength",
+            MAX_EMOJI_BYTES as u64,
+        ),
         (
             "/$defs/groupsUpdateParams/properties/removeMembers/items",
             "maxLength",
@@ -540,6 +820,304 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/messagesMarkViewedParams/properties/messageIds",
             "maxItems",
             MARK_RECEIPT_MESSAGE_IDS_LIMIT as u64,
+        ),
+        // Report spam (contract 1.49, §4.48): the addressing pair and the
+        // per-id list bounds mirror the prepare ladder's constants.
+        (
+            "/$defs/messagesReportSpamParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesReportSpamParams/properties/messageIds",
+            "maxItems",
+            REPORT_SPAM_MESSAGE_IDS_LIMIT as u64,
+        ),
+        (
+            "/$defs/messagesReportSpamParams/properties/messageIds/items",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        // Username faces (contract 1.59, §4.55): the lookup batch cap and
+        // per-entry frame bound pair with the service-ladder constants; the
+        // setUsername wire bound mirrors the pinned libsignal 3..32 window
+        // (the grammar itself — charset, discriminator forms — is shape
+        // validation below the wire bound and is pinned by unit tests).
+        (
+            "/$defs/accountsSetUsernameParams/properties/username",
+            "maxLength",
+            USERNAME_MAX_WIRE_CHARS as u64,
+        ),
+        (
+            "/$defs/usernameLookupParams/properties/usernames",
+            "maxItems",
+            USERNAME_LOOKUP_MAX_ENTRIES as u64,
+        ),
+        (
+            "/$defs/usernameLookupParams/properties/usernames/items",
+            "maxLength",
+            USERNAME_LOOKUP_ENTRY_MAX_CHARS as u64,
+        ),
+        // Phone lookup (contract 1.164, §4.162): the batch cap mirrors the
+        // engine's own frame bound through the service-ladder constant. The
+        // per-entry shape is the E.164 grammar (pattern + minLength/
+        // maxLength 8..16 in the schema) enforced by the regex-semantics
+        // gate, mechanism-not-constant — no pair (the cursor maxLength
+        // inventory reason).
+        (
+            "/$defs/phoneLookupParams/properties/numbers",
+            "maxItems",
+            PHONE_LOOKUP_MAX_ENTRIES as u64,
+        ),
+        // Safety-number faces (contract 1.68, §4.61): both faces share the
+        // pinned face's 256-char conversation bound; the caller-echoed
+        // verification string carries the IDENTITY_SAFETY_NUMBER_MAX_CHARS
+        // wire bound (the grammar itself is the upstream's parse, not a
+        // connector-enforced shape).
+        (
+            "/$defs/identitiesGetParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/identitiesVerifyParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/identitiesVerifyParams/properties/safetyNumber",
+            "maxLength",
+            IDENTITY_SAFETY_NUMBER_MAX_CHARS as u64,
+        ),
+        // Stories send (contract 1.76, §4.67): the body/preview bounds and
+        // the per-recipient id bound mirror the prepare-ladder constants
+        // (the recipient-array cap mirrors the §4.39 roster ceiling but
+        // stays inventory-side — see the note below).
+        (
+            "/$defs/messagesSendStoryParams/properties/message",
+            "maxLength",
+            MAX_TEXT_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendStoryParams/properties/distributionListId",
+            "maxLength",
+            MAX_STORY_DISTRIBUTION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesSendStoryParams/properties/previewImage",
+            "maxLength",
+            MAX_AVATAR_DATA_URI_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesSendStoryParams/properties/recipients/items",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        // Story link-preview metadata (contract 1.91, §4.74): the url/title
+        // budgets mirror the prepare-ladder constants; the url's
+        // `pattern` (^https://) is the official isValidLink posture and is
+        // structural (no constant to pair).
+        (
+            "/$defs/messagesSendStoryParams/properties/previewUrl",
+            "maxLength",
+            MAX_STORY_PREVIEW_URL_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesSendStoryParams/properties/previewTitle",
+            "maxLength",
+            MAX_STORY_PREVIEW_TITLE_BYTES as u64,
+        ),
+        // Story viewed receipt (contract 1.85, §4.70): the story-author
+        // bound mirrors the story recipients' per-entry bound (the receipt's
+        // single recipient address); storySentAt's minimum 1 is a structural
+        // shape rule (the officially meaningless zero marker), no constant.
+        (
+            "/$defs/storiesMarkViewedParams/properties/storyAuthor",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        // Story reaction send (contract 1.94, §4.77): same story-author
+        // bound, and the reaction emoji rides the shared 32-byte cap.
+        (
+            "/$defs/storiesSendReactionParams/properties/storyAuthor",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        (
+            "/$defs/storiesSendReactionParams/properties/emoji",
+            "maxLength",
+            MAX_EMOJI_BYTES as u64,
+        ),
+        // Official-desktop snapshot import (contract 1.78, §4.68): the
+        // caller-chosen directory path is shape-gated by the connector
+        // (absolute, 1..4096 bytes) before any engine traffic — the connector
+        // never dereferences it. The account id rides the shared opaqueId
+        // `$ref`, whose bound is already paired above — no second pair.
+        (
+            "/$defs/backupsImportSnapshotParams/properties/snapshotDir",
+            "maxLength",
+            MAX_SNAPSHOT_DIR_BYTES as u64,
+        ),
+        // Story-anchored attachment byte faces (contract 1.86, §4.71): the
+        // caller-supplied pointer's landing id rides the attachmentId bound;
+        // the declared size's ceiling is the transit chain's own constant;
+        // and the §4.54 locator-ingest caps mirror onto the caller-supplied
+        // strings (the cdnNumber/uploadTimestamp/type bounds are structural
+        // u32/u64 serde gates, no constants).
+        (
+            "/$defs/storyAttachmentPointerParams/properties/id",
+            "maxLength",
+            MAX_ATTACHMENT_ID_BYTES as u64,
+        ),
+        (
+            "/$defs/storyAttachmentPointerParams/properties/size",
+            "maximum",
+            MAX_PLAINTEXT_BYTES,
+        ),
+        (
+            "/$defs/storyLocatorParams/properties/key",
+            "maxLength",
+            MAX_LOCATOR_FIELD_CHARS as u64,
+        ),
+        (
+            "/$defs/storyLocatorParams/properties/cdnKey",
+            "maxLength",
+            MAX_LOCATOR_FIELD_CHARS as u64,
+        ),
+        (
+            "/$defs/storyLocatorParams/properties/digest",
+            "maxLength",
+            MAX_LOCATOR_FIELD_CHARS as u64,
+        ),
+        (
+            "/$defs/storyLocatorParams/properties/plaintextHash",
+            "maxLength",
+            MAX_LOCATOR_HASH_CHARS as u64,
+        ),
+        (
+            "/$defs/storyOpenAttachmentParams/properties/attachmentId",
+            "maxLength",
+            MAX_ATTACHMENT_ID_BYTES as u64,
+        ),
+        // Call-link credential material faces (contract 1.88, §4.73): the
+        // padded-base64 wire bounds of the engine's fixed byte shapes —
+        // rootKey's widest legal form is the 21-byte V1 (28 chars; the 16-byte
+        // V0 is 24), roomId and groupId are 32-byte fixed (44 chars). The
+        // exact decoded byte length is the prepare ladder's own gate (trim +
+        // canonical decode + 16/21 or 32), pinned by unit tests; the schema
+        // maxLength only bounds absurd input alongside the constant.
+        (
+            "/$defs/callsLinkPresentationParams/properties/rootKey",
+            "maxLength",
+            CALL_LINK_ROOT_KEY_B64_MAX_CHARS as u64,
+        ),
+        (
+            "/$defs/callsCreateLinkAuthParams/properties/rootKey",
+            "maxLength",
+            CALL_LINK_ROOT_KEY_B64_MAX_CHARS as u64,
+        ),
+        (
+            "/$defs/callsCreateLinkAuthParams/properties/roomId",
+            "maxLength",
+            CALL_LINK_ROOM_ID_B64_CHARS as u64,
+        ),
+        (
+            "/$defs/callsGroupProofParams/properties/groupId",
+            "maxLength",
+            CALL_GROUP_MASTER_KEY_B64_CHARS as u64,
+        ),
+        (
+            "/$defs/callsGroupMembersParams/properties/groupId",
+            "maxLength",
+            CALL_GROUP_MASTER_KEY_B64_CHARS as u64,
+        ),
+        // Chat-folder sync (contract 1.95, §4.78): the write-batch caps (both
+        // halves) and the per-identity bound mirror the prepare ladder; the
+        // read-side list cap stays inventory-side (free-form result, see the
+        // note above).
+        (
+            "/$defs/chatFoldersSetRecordsParams/properties/records",
+            "maxItems",
+            MAX_CHAT_FOLDER_BATCH as u64,
+        ),
+        (
+            "/$defs/chatFoldersSetRecordsParams/properties/removeIds",
+            "maxItems",
+            MAX_CHAT_FOLDER_BATCH as u64,
+        ),
+        (
+            "/$defs/chatFoldersSetRecordsParams/properties/records/items/properties/id",
+            "maxLength",
+            MAX_CHAT_FOLDER_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/chatFoldersSetRecordsParams/properties/removeIds/items",
+            "maxLength",
+            MAX_CHAT_FOLDER_ID_CHARS as u64,
+        ),
+        // Notification-profile sync (contract 1.129, §4.110): the §4.78
+        // pair set verbatim over the profile identity key.
+        (
+            "/$defs/notificationProfilesSetRecordsParams/properties/records",
+            "maxItems",
+            MAX_NOTIFICATION_PROFILE_BATCH as u64,
+        ),
+        (
+            "/$defs/notificationProfilesSetRecordsParams/properties/removeIds",
+            "maxItems",
+            MAX_NOTIFICATION_PROFILE_BATCH as u64,
+        ),
+        (
+            "/$defs/notificationProfilesSetRecordsParams/properties/records/items/properties/id",
+            "maxLength",
+            MAX_NOTIFICATION_PROFILE_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/notificationProfilesSetRecordsParams/properties/removeIds/items",
+            "maxLength",
+            MAX_NOTIFICATION_PROFILE_ID_CHARS as u64,
+        ),
+        // Story-distribution-list sync (contract 1.130, §4.111): the §4.78
+        // pair set verbatim over the `identifier` identity key.
+        (
+            "/$defs/storyDistributionListsSetRecordsParams/properties/records",
+            "maxItems",
+            MAX_STORY_LIST_BATCH as u64,
+        ),
+        (
+            "/$defs/storyDistributionListsSetRecordsParams/properties/removeIds",
+            "maxItems",
+            MAX_STORY_LIST_BATCH as u64,
+        ),
+        (
+            "/$defs/storyDistributionListsSetRecordsParams/properties/records/items/properties/identifier",
+            "maxLength",
+            MAX_STORY_LIST_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/storyDistributionListsSetRecordsParams/properties/removeIds/items",
+            "maxLength",
+            MAX_STORY_LIST_ID_CHARS as u64,
+        ),
+        // Storage call-link faces (contract 1.131, §4.112): the identity
+        // and passkey bounds mirror the prepare ladder; the ingest faces
+        // are single-parameter reads with no numeric schema hook.
+        (
+            "/$defs/storageSetCallLinkParams/properties/rootKey",
+            "maxLength",
+            MAX_CALL_LINK_KEY_CHARS as u64,
+        ),
+        (
+            "/$defs/storageSetCallLinkParams/properties/adminPasskey",
+            "maxLength",
+            MAX_CALL_LINK_KEY_CHARS as u64,
+        ),
+        // Message-level delete-for-me (contract 1.197, §4.197): the local
+        // row-id list mirrors the engine's single-request ceiling.
+        (
+            "/$defs/messagesDeleteForMeMessagesParams/properties/messageIds",
+            "maxItems",
+            MAX_DELETE_FOR_ME_MESSAGES as u64,
         ),
     ];
     assert!(!pairs.is_empty());

@@ -1,5 +1,10 @@
 # signal-cli 升级 SOP
 
+> **状态：已退役（2026-10-10）。** ADR 0003 §4 批次删除了 signal-cli 双引擎
+> （JVM/native 模式），kt engine 是唯一引擎，本仓库不再预装或升级 signal-cli，
+> bundle manifest 不再携带 signal-cli/JRE 组件。本文仅作历史记录保留；
+> 引擎依赖版本治理移至 kt-signal-engine 仓库。
+
 本仓库把 signal-cli 作为**固定版本、外部预装**的运行时依赖：connector 永不自动下载、
 永不自动更新 signal-cli。版本基线见 `implementation-plan.md`（当前 v0.14.7，
 unmodified），bundle manifest 逐文件记录 SHA-256。升级 signal-cli 是一个有门禁的

@@ -1,11 +1,15 @@
 # KT Signal Connector
 
-`kt-signal-connector` is the local open-source boundary between KT Desktop and the unofficial
-[`signal-cli`](https://github.com/AsamK/signal-cli) runtime.
+`kt-signal-connector` is the local open-source boundary between KT Desktop and the Signal
+engine runtime.
 
-The connector is designed to run as an independent process. It supervises an unmodified
-`signal-cli` child process, translates its JSON-RPC interface into a stable host contract, and
-keeps Signal account keys outside the KT renderer and feature runtime.
+The connector is designed to run as an independent process. It supervises a Signal engine
+child process — the self-hosted `kt-signal-engine` (Rust) is the only runtime in production
+and development (ADR 0003) — translates the engine's JSON-RPC interface into a stable host
+contract, and keeps Signal account keys outside the KT renderer and feature runtime. The
+pinned upstream `signal-cli` is historical context only: it survives in compatibility
+surfaces (legacy manifest components, the hidden `--signal-cli` argv alias) and forensic
+notes, never on the runtime path.
 
 ## Status
 
@@ -18,21 +22,27 @@ Connector Phases 1–4 are implemented for local development and Desktop integra
 
 Production runtime hardening is implemented but not release-provisioned: manifests use real
 Ed25519 signatures, cover the exact bundle file set, require corresponding source/SBOM/build and
-license records, use immutable staged versions with atomic active/LKG pointers, and pin the bundled
-JRE. The Desktop trust root is intentionally empty until a release public key is approved and
+license records, and use immutable staged versions with atomic active/LKG pointers. A legacy
+manifest may still declare the pinned `signal-cli`/`jre` components for rollback tolerance
+(the Rust engine needs neither at runtime); new bundles declare only the connector. The Desktop
+trust root is intentionally empty until a release public key is approved and
 compiled into the application.
 
 The Phase 4 KT Desktop integration is locally merged in the separate `kt-desktop` repository:
 
-- connector: local `main` HEAD (`link.finish` uses an independent bounded wait lane; account exit is
-  durable and idempotent)
-- desktop integration: `codex/signal-test-main-latest` local HEAD
+- connector: local `main` (ahead of `origin/main`; see the repository's own history for the
+  current HEAD and the per-batch contract record in
+  [`docs/implementation-plan.md`](docs/implementation-plan.md))
+- desktop integration: the desktop repository's `signal/parity-protocol-wiring` branch (the
+  former `codex/signal-test-main-latest` head is frozen and archived)
 - source boundary: the Desktop launches this independent executable over authenticated local IPC;
   connector source is not copied or linked into the Desktop repository
 
 The connector is not ready for production use. Signed target bundles and release keys have not been
-provisioned, Windows runtime acceptance is pending a Windows host, no remote repository is
-configured, and the 24/72-hour and real multi-account capacity gates are still pending.
+provisioned, Windows runtime acceptance is pending a Windows host, and the 24/72-hour and real
+multi-account capacity gates are still pending. The contract surface keeps growing locally
+(revision 1.133 at this writing); the authoritative per-revision record is
+[`docs/implementation-plan.md`](docs/implementation-plan.md).
 
 The complete implementation and acceptance plan is in
 [`docs/implementation-plan.md`](docs/implementation-plan.md).
@@ -77,14 +87,17 @@ Prerequisites:
 
 - Rust 1.85 or newer.
 - Python 3 for the Unix fake-engine integration fixture.
-- A pinned, compatible `signal-cli` and JRE 25 bundle for real integration tests.
+- An engine binary for end-to-end runs: `kt-signal-engine` is the runtime path (ADR 0003).
+  The legacy `packaging/scripts/dev-setup.sh` still provisions a pinned `signal-cli` + JRE
+  bundle for the frozen compatibility/bootstrap flow — a development aid, not a runtime
+  dependency.
 
 ### Desktop development setup (one command)
 
 `packaging/scripts/dev-setup.sh` provisions everything the KT Desktop development resolver
 needs: it builds the release connector, downloads the pinned `signal-cli` release (SHA-256
-verified), locates a JRE >= 21, runs the smoke check, and writes the `KT_SIGNAL_*` environment
-variables to `~/.kt-desktop-signal-dev/env.sh`.
+verified; legacy bootstrap only, ADR 0003), locates a JRE >= 21, runs the smoke check, and
+writes the `KT_SIGNAL_*` environment variables to `~/.kt-desktop-signal-dev/env.sh`.
 
 ```bash
 ./packaging/scripts/dev-setup.sh
@@ -97,7 +110,7 @@ The script is idempotent and never updates `signal-cli` on its own; upgrades fol
 
 Platform support: macOS and Linux are verified. On Windows, run the script inside WSL2 —
 native Windows has no test host yet, and the full chain (Desktop spawning the connector, the
-connector spawning `signal-cli.bat`) remains unverified there; do not treat native Windows as
+connector spawning the engine child) remains unverified there; do not treat native Windows as
 supported until runtime acceptance has been executed on a Windows machine.
 
 Local checks:
@@ -108,6 +121,12 @@ cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
+
+`scripts/run-cargo-gates.sh` [fmt|clippy|test|build|all] runs the same gates inside a
+throwaway process group and reaps the whole group on timeout (default 1800s, override with
+`GATE_TIMEOUT_SECS`), so a hung test binary, connector, or fixture process cannot orphan into
+launchd/init and outlive the run. CI uses it for the `cargo test` gate
+(`.github/workflows/ci.yml`).
 
 Real Signal account tests are intentionally separate from mocked tests and must never use production
 customer accounts or commit account data.

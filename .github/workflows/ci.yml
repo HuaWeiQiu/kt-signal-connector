@@ -1,0 +1,61 @@
+# Cargo quality gates, mirroring the local gate set exactly (AGENTS.md delivery
+# discipline): cargo fmt --check, cargo clippy --all-targets --all-features
+# -- -D warnings, cargo test. The server_integration test binary drives a
+# python fixture; ubuntu-latest ships python3, no extra setup step needed.
+#
+# Gate 3/3 runs through scripts/run-cargo-gates.sh: cargo (and everything it
+# spawns — test binaries, the connector, the python fixture) is placed in a
+# fresh process group (POSIX::setsid via perl; ubuntu-latest has no
+# util-linux setsid(1) either), and the group is reaped on timeout so a stuck
+# test cannot orphan into init and burn the 30-minute job ceiling. fmt/clippy
+# spawn no long-lived test processes, so they stay unwrapped.
+#
+# Toolchain: rust-toolchain.toml pins channel = "1.99.0" for local rustup and
+# CI alike. Note: Cargo.toml says rust-version = "1.87", but that MSRV claim is
+# stale — verified 2026-10-06 the tree does not build on 1.87.0 (E0658
+# let-chains, stabilized 1.88) nor on 1.88.0 (E0716 in src/service.rs +
+# clippy uninlined_format_args drift). 1.99.0 is the local stable the gates
+# were verified green on; fixing the rust-version claim is a separate task.
+#
+# Action version baseline verified 2026-10-06 via `gh api repos/<action>/releases/latest`:
+#   actions/checkout v7.0.1 (re-verified; in use at v7 since the 2026-08-26 baseline)
+#   Swatinem/rust-cache v2.9.2
+# dtolnay/rust-toolchain has no semver releases: ref @1.99.0 is a maintained
+#   version branch (HEAD 70dec6087f2c, 2026-10-01) selecting toolchain 1.99.0.
+# (KT policy: latest stable major only; see skill cicd-action-version-policy)
+name: CI
+
+run-name: >-
+  ${{ github.event_name == 'push'
+      && format('CI | cargo gates | {0}', github.ref_name)
+      || format('CI | cargo gates | PR #{0} by {1}', github.event.number, github.actor) }}
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-gates:
+    name: Cargo gates (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Gate 1/3 — cargo fmt --check
+        run: cargo fmt --check
+
+      - name: Gate 2/3 — cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Gate 3/3 — cargo test (process-group wrapped, orphans reaped on timeout)
+        run: scripts/run-cargo-gates.sh test

@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Bounded inbound media ingest (ADR 0002): the two connector-side machines
+//! Bounded inbound media ingest (ADR 0004): the two connector-side machines
 //! that make lifting `--ignore-attachments` survivable.
 //!
 //! [`MediaGovernor`] bounds the disk pressure signal-cli's eager downloads
-//! create: a pass over one engine's `attachments/` directories deletes files
-//! older than the TTL and, when the total exceeds the quota, the
-//! oldest-`mtime` files until the directory is back inside it. Deletion is
-//! ledger-free by design — signal-cli's `AttachmentStore` is a stateless file
-//! store, so a deleted id simply makes the later fetch answer `UPSTREAM_ERROR`.
+//! create. `[KT 适配]` (audit §9.10): the official desktop is a single-account
+//! install, so its media directory has no account dimension. This connector
+//! serves several accounts per engine/proxy group, so every byte it writes
+//! lives under a per-account path
+//! (`<data-dir>/media/<account-id>/attachments/`): quota and LRU are
+//! account-local—one account's flood can never evict another account's
+//! media—and a view-once burn or `deleteLocalData` only touches the addressed
+//! account's subtree. Legacy signal-cli layouts stay readable (and TTL
+//! governed) for upgrades.
+//!
+//! A pass deletes files older than the TTL and, when one account's total
+//! exceeds [`MEDIA_QUOTA_BYTES`], that account's oldest-`mtime` files until it
+//! is back inside its own quota. Deletion is ledger-free by design —
+//! signal-cli's `AttachmentStore` is a stateless file store, so a deleted id
+//! simply makes the later fetch answer `UPSTREAM_ERROR`.
 //!
 //! [`MediaHandleTable`] bounds the delivery side: `open` mints a random
 //! 128-bit handle bound to one resolved (account, conversation, message,
@@ -17,7 +27,7 @@
 //! memory is one chunk, never the file, and no filesystem path ever crosses
 //! the host boundary.
 //!
-//! Trigger discipline for both (ADR 0002): one pass at process start plus one
+//! Trigger discipline for both (ADR 0004): one pass at process start plus one
 //! per [`GOVERNOR_INBOUND_MESSAGE_INTERVAL`] inbound messages — a counter, no
 //! resident timer thread. Filesystem work never holds the store lock; these
 //! types take no store dependency at all.
@@ -29,36 +39,53 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ids::random_id;
 
-/// How long a downloaded attachment stays fetchable (ADR 0002): seven days,
+/// How long a downloaded attachment stays fetchable (ADR 0004): seven days,
 /// mirroring Signal's own server-side retention expectations. Age is the
 /// file's `mtime`, which signal-cli sets at download time.
 pub const MEDIA_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// Total attachment bytes one engine's data directory may retain (ADR 0002):
-/// 2 GiB across all of the engine's accounts. Bounds *retention*, not the
-/// instantaneous write — signal-cli downloads before the connector can veto,
-/// and the blast radius of one oversized download is the server's own
-/// 100 MiB per-attachment cap (ADR 0002).
+/// Total attachment bytes one account may retain (ADR 0004; `[KT 适配]`
+/// audit §9.10): 2 GiB **per account**, not per engine. The official desktop
+/// keeps one account per install, so its single quota is per-account by
+/// construction; KT's many-accounts-per-engine shape needs the same unit.
+/// A group-wide cap would have to evict across account boundaries once one
+/// account filled it, which is exactly the cross-account eviction this fix
+/// forbids, so the quota is enforced per bucket and nowhere else. Bounds
+/// *retention*, not the instantaneous write — signal-cli downloads before the
+/// connector can veto, and the blast radius of one oversized download is the
+/// server's own 100 MiB per-attachment cap (ADR 0004).
 pub const MEDIA_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// Deletions one governor pass may perform (ADR 0002). A directory far over
+/// Deletions one governor pass may perform (ADR 0004). A directory far over
 /// quota or full of expired files walks back inside the budget over several
 /// passes instead of stalling one.
 pub const MAX_DELETIONS_PER_PASS: usize = 256;
-/// Inbound messages that accumulate before the next governor pass (ADR 0002):
+/// Inbound messages that accumulate before the next governor pass (ADR 0004):
 /// once per process start plus once per 200 inbound messages, whichever
 /// first. A counter, never a resident timer thread.
 pub const GOVERNOR_INBOUND_MESSAGE_INTERVAL: u64 = 200;
-/// Raw bytes per `messages.attachments.readChunk` (ADR 0002). Base64 expands
+/// Raw bytes per `messages.attachments.readChunk` (ADR 0004). Base64 expands
 /// one full chunk to `4 * ceil(262_144 / 3)` = 349_528 characters, far under
 /// the 160 MiB host frame limit (`DEFAULT_HOST_FRAME_LIMIT`); resident memory
 /// per request is one chunk, never the file.
 pub const MEDIA_CHUNK_BYTES: u64 = 256 * 1024;
-/// Handle lifetime (ADR 0002): 300 seconds. `closeHandle` releases early;
+/// Handle lifetime (ADR 0004): 300 seconds. `closeHandle` releases early;
 /// the TTL is the backstop so an abandoned renderer loop cannot pin memory
 /// or an open-handle slot.
 pub const MEDIA_HANDLE_TTL: Duration = Duration::from_secs(300);
-/// Live handles one account may hold at once (ADR 0002). A leaking renderer
+/// Live handles one account may hold at once (ADR 0004). A leaking renderer
 /// loop is refused at `open` instead of growing without bound.
 pub const MAX_MEDIA_HANDLES_PER_ACCOUNT: usize = 8;
+
+/// Root of the per-account media namespace (`[KT 适配]`, audit §9.10):
+/// `<data-dir>/media/<account-id>/attachments/`. Deliberately its own root,
+/// so the legacy signal-cli probes (`<data-dir>/attachments/` and
+/// `<data-dir>/<account>/attachments/`) keep their meaning and stay readable
+/// during upgrades.
+const ACCOUNT_MEDIA_ROOT: &str = "media";
+const ATTACHMENTS_DIR_NAME: &str = "attachments";
+/// Longest account id accepted as a path component. Production ids are
+/// 32-hex (`ids::random_id`); the bound keeps a hostile or corrupt id from
+/// producing an overlong component.
+const MAX_ACCOUNT_KEY_BYTES: usize = 64;
 
 /// What one governor pass did. Counts and bytes only — never paths or ids
 /// (AGENTS.md log discipline).
@@ -68,9 +95,9 @@ pub struct GovernorStats {
     pub bytes_deleted: u64,
 }
 
-/// One engine's media retention machinery over its signal-cli data directory
-/// (ADR 0002). State by construction: every pass recomputes reality from the
-/// filesystem, so a crash mid-pass leaves nothing to clean up.
+/// One proxy group's media retention machinery over its engine data
+/// directory (ADR 0004). State by construction: every pass recomputes reality
+/// from the filesystem, so a crash mid-pass leaves nothing to clean up.
 #[derive(Clone, Debug)]
 pub struct MediaGovernor {
     data_dir: PathBuf,
@@ -81,147 +108,295 @@ impl MediaGovernor {
         Self { data_dir }
     }
 
-    /// The `attachments/` directories this engine may hold media in, probed
-    /// per signal-cli's `PathConfig` layout (verified against the v0.14.8
-    /// source): attachment files live under an `attachments/` directory next
-    /// to the account settings. The single-account layout is
-    /// `<data-dir>/attachments/`; with more than one account, signal-cli
-    /// nests one directory per account under the data dir, so the probe
-    /// falls back to scanning `<data-dir>` one level deep for subdirectories
-    /// that contain their own `attachments/`. The eager `<data-dir>/attachments`
-    /// probe always wins when it exists, matching the single-account install
-    /// shape; the scan is sorted for deterministic pass order.
-    pub fn attachments_dirs(&self) -> Vec<PathBuf> {
-        let direct = self.data_dir.join("attachments");
-        if direct.is_dir() {
-            return vec![direct];
-        }
+    /// The group data directory the probes anchor at.
+    pub fn data_dir(&self) -> &PathBuf {
+        &self.data_dir
+    }
+
+    /// `[KT 适配]` (audit §9.10): the account's own media directory,
+    /// `<data-dir>/media/<account-id>/attachments/`. `None` means the id
+    /// cannot be a path component (empty, overlong, a separator, `.` or
+    /// `..`); production ids are 32-hex and always pass. Every new write is
+    /// scoped here, which is what makes quota, LRU, burn, and account deletion
+    /// account-local by construction.
+    pub fn account_attachments_dir(&self, account_id: &str) -> Option<PathBuf> {
+        let key = account_key(account_id)?;
+        Some(
+            self.data_dir
+                .join(ACCOUNT_MEDIA_ROOT)
+                .join(key)
+                .join(ATTACHMENTS_DIR_NAME),
+        )
+    }
+
+    /// Create (on the first media write) and return the account's media
+    /// directory. The legacy probes are read/TTL compatibility only; this is
+    /// the single write target.
+    pub fn ensure_account_attachments_dir(&self, account_id: &str) -> std::io::Result<PathBuf> {
+        let dir = self.account_attachments_dir(account_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "media account key")
+        })?;
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// The legacy `attachments/` directories an upgraded install may still
+    /// hold (ADR 0004's original signal-cli `PathConfig` probe): the flat
+    /// `<data-dir>/attachments/` (the pre-isolation connector layout) and
+    /// every `<data-dir>/<account>/attachments/` (signal-cli's multi-account
+    /// layout). These are **read-only compatibility surfaces**: new writes
+    /// always land in [`Self::account_attachments_dir`], so a flat file
+    /// cannot be attributed to one of this connector's accounts. The direct
+    /// flat probe comes first, then the sorted scan—deterministic pass order.
+    pub fn legacy_attachments_dirs(&self) -> Vec<PathBuf> {
         let mut found = Vec::new();
+        let direct = self.data_dir.join(ATTACHMENTS_DIR_NAME);
+        if direct.is_dir() {
+            found.push(direct);
+        }
         let Ok(entries) = std::fs::read_dir(&self.data_dir) else {
             return found;
         };
+        let mut scanned = Vec::new();
         for entry in entries.flatten() {
-            let candidate = entry.path().join("attachments");
+            let candidate = entry.path().join(ATTACHMENTS_DIR_NAME);
             if entry.path().is_dir() && candidate.is_dir() {
-                found.push(candidate);
+                scanned.push(candidate);
             }
         }
-        found.sort();
+        scanned.sort();
+        found.extend(scanned);
         found
     }
 
-    /// Run one bounded pass (ADR 0002): orphaned/superseded `*.preview`
-    /// files first, then the 7-day TTL, then the quota LRU — all sharing one
-    /// [`MAX_DELETIONS_PER_PASS`] batch. Never called while holding the store
-    /// lock; the caller runs it on its own task.
+    /// Run one bounded pass (ADR 0004): orphaned/superseded `*.preview`
+    /// files first, then the 7-day TTL, then the per-account quota LRU — all
+    /// sharing one [`MAX_DELETIONS_PER_PASS`] batch. Never called while
+    /// holding the store lock; the caller runs it on its own task.
+    ///
+    /// `[KT 适配]` (audit §9.10): each account bucket is swept on its own.
+    /// The LRU only ever sees the files of the bucket that is over its own
+    /// quota, so one account's flood cannot select another account's bytes.
+    /// The flat legacy pool is TTL-only for the same reason: its files have
+    /// no provable owner, and an mtime-ordered sweep there could evict the
+    /// wrong account's media.
     pub fn run_pass(&self) -> GovernorStats {
         let mut stats = GovernorStats::default();
-        let dirs = self.attachments_dirs();
-        if dirs.is_empty() {
-            return stats;
-        }
-        let mut files = Vec::new();
-        for dir in &dirs {
-            collect_regular_files(dir, &mut files);
-        }
-        let now = SystemTime::now();
         let mut budget = MAX_DELETIONS_PER_PASS;
-        // Everything deleted so far this pass, so later phases neither
-        // re-delete (NotFound would still report success) nor double-count.
-        let mut deleted_paths: std::collections::HashSet<PathBuf> =
-            std::collections::HashSet::new();
 
-        // Preview cleanup first, so stale previews never count toward the
-        // quota accounting below. A preview is stale when its main file is
-        // gone (true orphan) or was re-downloaded after it (superseded).
-        for (path, size, mtime) in &files {
+        for dir in self.account_bucket_dirs() {
+            sweep_dir(&dir, Some(MEDIA_QUOTA_BYTES), &mut budget, &mut stats);
             if budget == 0 {
                 return stats;
             }
-            let is_stale_preview = path
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .and_then(|name| name.strip_suffix(".preview"))
-                .map(|stem| {
-                    let main = path.with_file_name(stem);
-                    match std::fs::symlink_metadata(&main) {
-                        Err(_) => true,
-                        Ok(main_meta) => main_meta
-                            .modified()
-                            .ok()
-                            .is_some_and(|main_mtime| *mtime < main_mtime),
-                    }
-                })
-                .unwrap_or(false);
-            if is_stale_preview && delete_file(path) {
-                stats.deleted += 1;
-                stats.bytes_deleted += size;
-                deleted_paths.insert(path.clone());
-                budget -= 1;
-            }
         }
 
-        // 7-day TTL.
-        let mut remaining: Vec<&(PathBuf, u64, SystemTime)> = Vec::with_capacity(files.len());
-        for entry in &files {
-            let (path, size, mtime) = entry;
+        let flat = self.data_dir.join(ATTACHMENTS_DIR_NAME);
+        let mut seen = std::collections::HashSet::new();
+        for dir in self.legacy_attachments_dirs() {
+            if !seen.insert(dir.clone()) {
+                continue;
+            }
+            let quota = (dir != flat).then_some(MEDIA_QUOTA_BYTES);
+            sweep_dir(&dir, quota, &mut budget, &mut stats);
             if budget == 0 {
                 break;
-            }
-            if deleted_paths.contains(path) {
-                continue;
-            }
-            if now.duration_since(*mtime).is_ok_and(|age| age > MEDIA_TTL) {
-                if delete_file(path) {
-                    stats.deleted += 1;
-                    stats.bytes_deleted += size;
-                    deleted_paths.insert(path.clone());
-                    budget -= 1;
-                }
-                continue;
-            }
-            remaining.push(entry);
-        }
-
-        // Quota LRU: oldest mtime first until the survivor total is inside
-        // the budget (ADR 0002 gate: ≤ quota after enough passes).
-        let mut total: u64 = remaining.iter().map(|(_, size, _)| *size).sum();
-        if total > MEDIA_QUOTA_BYTES {
-            remaining.sort_by_key(|(_, _, mtime)| *mtime);
-            for (path, size, _) in remaining {
-                if budget == 0 || total <= MEDIA_QUOTA_BYTES {
-                    break;
-                }
-                if delete_file(path) {
-                    stats.deleted += 1;
-                    stats.bytes_deleted += size;
-                    total = total.saturating_sub(*size);
-                    budget -= 1;
-                }
             }
         }
         stats
     }
 
-    /// Burn one view-once message's media (contract revision 1.38, §4.37):
-    /// delete the attachment file and its preview from every candidate
-    /// `attachments/` directory. Best-effort by design — a missing file is
-    /// success (the same `NotFound`-is-success rule the retention passes
-    /// follow), a real I/O failure logs by class and keeps the burn moving so
-    /// the row projection and the host event never depend on the filesystem
-    /// answering. Returns how many files were removed.
-    pub fn delete_attachment(&self, sanitized_id: &str) -> u64 {
+    /// The account buckets this governor owns, sorted for deterministic pass
+    /// order: `<data-dir>/media/<account-id>/attachments/`.
+    fn account_bucket_dirs(&self) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(self.data_dir.join(ACCOUNT_MEDIA_ROOT)) else {
+            return Vec::new();
+        };
+        let mut found: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.path().join(ATTACHMENTS_DIR_NAME))
+            .filter(|dir| dir.is_dir())
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Burn one view-once message's media (contract revision 1.38, §4.37;
+    /// `[KT 适配]` audit §9.10): delete the attachment file and its preview
+    /// from the addressed account's bucket only, so two accounts that happen
+    /// to carry the same attachment id can never erase each other's bytes.
+    /// Legacy pre-isolation files are deliberately not deleted here —
+    /// ownership cannot be proven, and the TTL pass bounds them instead.
+    /// Best-effort by design — a missing file is success (the same
+    /// `NotFound`-is-success rule the retention passes follow), a real I/O
+    /// failure logs by class and keeps the burn moving so the row projection
+    /// and the host event never depend on the filesystem answering. Returns
+    /// how many files were removed.
+    pub fn delete_attachment(&self, account_id: &str, sanitized_id: &str) -> u64 {
+        let Some(dir) = self.account_attachments_dir(account_id) else {
+            return 0;
+        };
         let mut removed = 0_u64;
-        for dir in self.attachments_dirs() {
-            for suffix in ["", ".preview"] {
-                let candidate = dir.join(format!("{sanitized_id}{suffix}"));
-                if delete_file(&candidate) {
-                    removed += 1;
-                }
+        for suffix in ["", ".preview"] {
+            if delete_file(&dir.join(format!("{sanitized_id}{suffix}"))) {
+                removed += 1;
             }
         }
         removed
     }
+
+    /// Delete one account's whole media subtree (the `deleteLocalData` hook,
+    /// `[KT 适配]` audit §9.10). Account-scoped by construction: other
+    /// accounts' buckets are never enumerated, let alone removed, and the
+    /// same file name under another account stays untouched. Returns what was
+    /// removed for the caller's count-only log.
+    pub fn clear_account(&self, account_id: &str) -> GovernorStats {
+        let Some(dir) = self.account_attachments_dir(account_id) else {
+            return GovernorStats::default();
+        };
+        let mut stats = GovernorStats::default();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(metadata) = entry.metadata()
+                    && metadata.is_file()
+                {
+                    stats.deleted += 1;
+                    stats.bytes_deleted += metadata.len();
+                }
+            }
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return GovernorStats::default();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    kind = %error.kind(),
+                    "media governor could not clear an account directory"
+                );
+                return GovernorStats::default();
+            }
+        }
+        // Drop the now-empty `<data-dir>/media/<account-id>` parent too;
+        // failure means something else lives there and is left alone.
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+        stats
+    }
+}
+
+/// One bounded sweep of one media directory. `quota` is `Some` for a bucket
+/// with a provable owner (an account's own directory, including a legacy
+/// signal-cli `<account>/attachments/`) and `None` for the unattributable
+/// flat legacy pool, where only the preview and TTL phases may run.
+fn sweep_dir(dir: &Path, quota: Option<u64>, budget: &mut usize, stats: &mut GovernorStats) {
+    let mut files = Vec::new();
+    collect_regular_files(dir, &mut files);
+    if files.is_empty() {
+        return;
+    }
+    let now = SystemTime::now();
+    // Everything deleted so far this sweep, so later phases neither
+    // re-delete (NotFound would still report success) nor double-count.
+    let mut deleted_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    // Preview cleanup first, so stale previews never count toward the
+    // quota accounting below. A preview is stale when its main file is
+    // gone (true orphan) or was re-downloaded after it (superseded).
+    for (path, size, mtime) in &files {
+        if *budget == 0 {
+            return;
+        }
+        let is_stale_preview = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| name.strip_suffix(".preview"))
+            .map(|stem| {
+                let main = path.with_file_name(stem);
+                match std::fs::symlink_metadata(&main) {
+                    Err(_) => true,
+                    Ok(main_meta) => main_meta
+                        .modified()
+                        .ok()
+                        .is_some_and(|main_mtime| *mtime < main_mtime),
+                }
+            })
+            .unwrap_or(false);
+        if is_stale_preview && delete_file(path) {
+            stats.deleted += 1;
+            stats.bytes_deleted += size;
+            deleted_paths.insert(path.clone());
+            *budget -= 1;
+        }
+    }
+
+    // 7-day TTL.
+    let mut remaining: Vec<&(PathBuf, u64, SystemTime)> = Vec::with_capacity(files.len());
+    for entry in &files {
+        let (path, size, mtime) = entry;
+        if *budget == 0 {
+            break;
+        }
+        if deleted_paths.contains(path) {
+            continue;
+        }
+        if now.duration_since(*mtime).is_ok_and(|age| age > MEDIA_TTL) {
+            if delete_file(path) {
+                stats.deleted += 1;
+                stats.bytes_deleted += size;
+                deleted_paths.insert(path.clone());
+                *budget -= 1;
+            }
+            continue;
+        }
+        remaining.push(entry);
+    }
+
+    // Per-account quota LRU: oldest mtime first until the survivor total is
+    // inside this bucket's own budget (ADR 0004 gate: ≤ quota after enough
+    // passes). `remaining` holds only this directory's files, so the LRU can
+    // never reach another account's media.
+    let Some(quota) = quota else {
+        return;
+    };
+    let mut total: u64 = remaining.iter().map(|(_, size, _)| *size).sum();
+    if total > quota {
+        remaining.sort_by_key(|(_, _, mtime)| *mtime);
+        for (path, size, _) in remaining {
+            if *budget == 0 || total <= quota {
+                break;
+            }
+            if delete_file(path) {
+                stats.deleted += 1;
+                stats.bytes_deleted += size;
+                total = total.saturating_sub(*size);
+                *budget -= 1;
+            }
+        }
+    }
+}
+
+/// `[KT 适配]`: one account id, one directory component. Account ids are
+/// minted as 32-hex (`ids::random_id`), so this accepts the generated shape
+/// and the fixture shapes and refuses anything that could escape the media
+/// root or collide after sanitizing. Refusal fails the media face closed
+/// (the stash reports a class, the download answers its IO face) instead of
+/// inventing a shared fallback directory.
+fn account_key(account_id: &str) -> Option<&str> {
+    if account_id.is_empty()
+        || account_id.len() > MAX_ACCOUNT_KEY_BYTES
+        || account_id == "."
+        || account_id == ".."
+    {
+        return None;
+    }
+    account_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        .then_some(account_id)
 }
 
 fn collect_regular_files(dir: &Path, out: &mut Vec<(PathBuf, u64, SystemTime)>) {
@@ -267,7 +442,7 @@ pub enum MediaHandleError {
     /// three answer the caller identically (the wire code is INVALID_REQUEST),
     /// because the distinction would only help someone probing handle space.
     NotFound,
-    /// `readChunk` offsets must be strictly sequential (ADR 0002): this
+    /// `readChunk` offsets must be strictly sequential (ADR 0004): this
     /// offset is not exactly the next unread byte.
     NotSequential { expected: u64 },
     /// The `open` was refused because the account already holds the
@@ -281,7 +456,7 @@ pub enum MediaHandleError {
 
 /// Binding recorded at `open`: the resolved host addressing tuple plus the
 /// local file the open resolved to. The path stays connector-side forever —
-/// only the random handle crosses the wire (ADR 0002). The tuple fields are
+/// only the random handle crosses the wire (ADR 0004). The tuple fields are
 /// the binding record of the stream (what `open` resolved, for tests and
 /// future account-session enforcement); only `account_id` is read on the
 /// release path, so the struct carries the dead-field allowance explicitly.
@@ -305,7 +480,7 @@ pub struct MediaChunk {
     pub eof: bool,
 }
 
-/// Process-wide table of live chunk streams (ADR 0002). One instance serves
+/// Process-wide table of live chunk streams (ADR 0004). One instance serves
 /// every proxy group: `readChunk`/`closeHandle` carry no accountId on the
 /// wire, so the table — not the routing — is the single-origin authority.
 /// Handles are unguessable random 128-bit tokens bound to one resolved
@@ -363,7 +538,7 @@ impl MediaHandleTable {
     }
 
     /// Read the next sequential chunk of one handle's file. `offset` must be
-    /// exactly the bytes already delivered on this handle (ADR 0002: no
+    /// exactly the bytes already delivered on this handle (ADR 0004: no
     /// random-access scanning, so a hostile renderer cannot turn the handle
     /// into a seek oracle). The read is one bounded chunk; the file is never
     /// held open across calls.
@@ -394,7 +569,7 @@ impl MediaHandleTable {
         Ok(MediaChunk { data, eof })
     }
 
-    /// Explicit early release (ADR 0002). Idempotent by design: a caller that
+    /// Explicit early release (ADR 0004). Idempotent by design: a caller that
     /// closes after the TTL already reaped the handle still observes a
     /// released stream instead of a race-dependent error. Returns whether a
     /// live handle was released.
@@ -404,7 +579,7 @@ impl MediaHandleTable {
     }
 
     /// Drop every handle bound to one account. Runs when the account's local
-    /// data is deleted (ADR 0002 gate 3: a handle cannot outlive its account
+    /// data is deleted (ADR 0004 gate 3: a handle cannot outlive its account
     /// session); the TTL backstops every other kind of abandonment. Returns
     /// how many handles were released.
     pub fn clear_account(&self, account_id: &str) -> usize {
@@ -487,6 +662,26 @@ mod tests {
         path
     }
 
+    /// Quota accounting uses metadata sizes, so sparse `set_len` files keep
+    /// a 2 GiB quota test off a 2 GiB write.
+    fn set_sparse_size(path: &Path, size: u64) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+    }
+
+    /// Create and return one account's media bucket.
+    fn account_bucket(governor: &MediaGovernor, account_id: &str) -> PathBuf {
+        let dir = governor
+            .account_attachments_dir(account_id)
+            .expect("fixture account id");
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// A data dir laid out like signal-cli's multi-account shape:
     /// `<data>/<account>/attachments/`.
     fn account_attachments_dir() -> (TempDir, PathBuf) {
@@ -497,16 +692,16 @@ mod tests {
     }
 
     #[test]
-    fn attachments_probe_prefers_the_single_account_layout() {
+    fn legacy_probe_prefers_the_single_account_layout() {
         let temp = TempDir::new().unwrap();
         let direct = temp.path().join("attachments");
         fs::create_dir_all(&direct).unwrap();
         let governor = MediaGovernor::new(temp.path().to_path_buf());
-        assert_eq!(governor.attachments_dirs(), vec![direct]);
+        assert_eq!(governor.legacy_attachments_dirs(), vec![direct]);
     }
 
     #[test]
-    fn attachments_probe_scans_one_level_for_account_subdirectories() {
+    fn legacy_probe_scans_one_level_for_account_subdirectories() {
         let (temp, attachments) = account_attachments_dir();
         // A second account directory joins the scan (sorted, deterministic);
         // a sibling without its own `attachments/` is ignored.
@@ -514,7 +709,10 @@ mod tests {
         fs::create_dir_all(&second).unwrap();
         fs::create_dir_all(temp.path().join("plain")).unwrap();
         let governor = MediaGovernor::new(temp.path().to_path_buf());
-        assert_eq!(governor.attachments_dirs(), vec![attachments, second]);
+        assert_eq!(
+            governor.legacy_attachments_dirs(),
+            vec![attachments, second]
+        );
     }
 
     #[test]
@@ -562,6 +760,163 @@ mod tests {
         assert!(!oldest.exists());
         assert!(middle.exists());
         assert!(newest.exists());
+    }
+
+    #[test]
+    fn account_media_paths_are_scoped_and_refuse_unsafe_ids() {
+        let temp = TempDir::new().unwrap();
+        let governor = MediaGovernor::new(temp.path().to_path_buf());
+        assert_eq!(
+            governor.account_attachments_dir("acct-a"),
+            Some(temp.path().join("media").join("acct-a").join("attachments"))
+        );
+        for unsafe_id in ["", ".", "..", "a/b", "a\\b", "a b", "../acct-b"] {
+            assert_eq!(
+                governor.account_attachments_dir(unsafe_id),
+                None,
+                "{unsafe_id:?} must not name a media directory"
+            );
+        }
+        assert_eq!(governor.account_attachments_dir(&"a".repeat(65)), None);
+    }
+
+    /// Audit §9.10 rule: one account's flood never evicts another account's
+    /// media. B's file is the oldest file in the whole data dir, so a
+    /// group-global LRU would pick it first; the per-account sweep must leave
+    /// it untouched and evict only from the over-quota account.
+    #[test]
+    fn a_flood_in_one_account_never_evicts_another_accounts_media() {
+        let temp = TempDir::new().unwrap();
+        let governor = MediaGovernor::new(temp.path().to_path_buf());
+        let bucket_a = account_bucket(&governor, "acct-a");
+        let bucket_b = account_bucket(&governor, "acct-b");
+
+        let a_oldest = write_file(&bucket_a, "a-oldest.dat", b"a");
+        let a_middle = write_file(&bucket_a, "a-middle.dat", b"b");
+        let a_newest = write_file(&bucket_a, "a-newest.dat", b"c");
+        for (path, age, size) in [
+            (&a_oldest, 300, MEDIA_QUOTA_BYTES / 2 + 1_000),
+            (&a_middle, 200, MEDIA_QUOTA_BYTES / 2),
+            (&a_newest, 100, MEDIA_QUOTA_BYTES / 2),
+        ] {
+            set_sparse_size(path, size);
+            backdate(path, age);
+        }
+        let b_file = write_file(&bucket_b, "b.dat", b"b");
+        set_sparse_size(&b_file, MEDIA_QUOTA_BYTES / 2);
+        backdate(&b_file, 1_000);
+
+        let stats = governor.run_pass();
+
+        assert_eq!(stats.deleted, 1);
+        assert!(
+            !a_oldest.exists(),
+            "the over-quota account evicts its own oldest"
+        );
+        assert!(a_middle.exists());
+        assert!(a_newest.exists());
+        assert!(
+            b_file.exists(),
+            "an under-quota account's media is never selected, however old"
+        );
+    }
+
+    /// The per-account quota is a boundary, not a trigger: exactly the quota
+    /// survives a pass, and one byte more evicts only the oldest file of that
+    /// account.
+    #[test]
+    fn per_account_quota_boundary_keeps_exactly_the_quota() {
+        let temp = TempDir::new().unwrap();
+        let governor = MediaGovernor::new(temp.path().to_path_buf());
+        let bucket = account_bucket(&governor, "acct-a");
+        let first = write_file(&bucket, "first.dat", b"a");
+        let second = write_file(&bucket, "second.dat", b"b");
+        for (path, age) in [(&first, 300), (&second, 200)] {
+            set_sparse_size(path, MEDIA_QUOTA_BYTES / 2);
+            backdate(path, age);
+        }
+
+        let at_quota = governor.run_pass();
+        assert_eq!(at_quota.deleted, 0);
+        assert!(first.exists());
+        assert!(second.exists());
+
+        let third = write_file(&bucket, "third.dat", b"c");
+        set_sparse_size(&third, 1);
+        backdate(&third, 100);
+        let over = governor.run_pass();
+        assert_eq!(over.deleted, 1);
+        assert!(!first.exists());
+        assert!(second.exists());
+        assert!(third.exists());
+    }
+
+    /// The `deleteLocalData` hook removes one account's whole subtree and
+    /// nothing else — the same file name under another account survives.
+    #[test]
+    fn clearing_one_account_removes_only_that_accounts_media() {
+        let temp = TempDir::new().unwrap();
+        let governor = MediaGovernor::new(temp.path().to_path_buf());
+        let bucket_a = account_bucket(&governor, "acct-a");
+        let bucket_b = account_bucket(&governor, "acct-b");
+        write_file(&bucket_a, "same.dat", b"aaaa");
+        write_file(&bucket_a, "other.dat", b"aa");
+        let b_file = write_file(&bucket_b, "same.dat", b"bbbb");
+
+        let stats = governor.clear_account("acct-a");
+
+        assert_eq!(stats.deleted, 2);
+        assert_eq!(stats.bytes_deleted, 6);
+        assert!(!bucket_a.exists());
+        assert!(b_file.exists());
+        assert_eq!(fs::read(&b_file).unwrap(), b"bbbb");
+    }
+
+    /// The view-once burn is account-scoped: the same attachment id under a
+    /// second account keeps its bytes and preview.
+    #[test]
+    fn burning_one_accounts_media_never_touches_another_accounts_same_id() {
+        let temp = TempDir::new().unwrap();
+        let governor = MediaGovernor::new(temp.path().to_path_buf());
+        let bucket_a = account_bucket(&governor, "acct-a");
+        let bucket_b = account_bucket(&governor, "acct-b");
+        let a_file = write_file(&bucket_a, "same-id.dat", b"aaaa");
+        let a_preview = write_file(&bucket_a, "same-id.dat.preview", b"p");
+        let b_file = write_file(&bucket_b, "same-id.dat", b"bbbb");
+        let b_preview = write_file(&bucket_b, "same-id.dat.preview", b"q");
+
+        assert_eq!(governor.delete_attachment("acct-a", "same-id.dat"), 2);
+
+        assert!(!a_file.exists());
+        assert!(!a_preview.exists());
+        assert!(b_file.exists());
+        assert!(b_preview.exists());
+        assert_eq!(governor.delete_attachment("../acct-b", "same-id.dat"), 0);
+        assert!(b_file.exists());
+    }
+
+    /// The pre-isolation flat pool has no provable owner: the TTL still
+    /// bounds it, but an over-quota file there is never selected by an
+    /// mtime-ordered LRU (that selection is exactly what could evict another
+    /// account's bytes).
+    #[test]
+    fn legacy_flat_pool_is_ttl_only_never_quota_evicted() {
+        let temp = TempDir::new().unwrap();
+        let governor = MediaGovernor::new(temp.path().to_path_buf());
+        let flat = temp.path().join("attachments");
+        fs::create_dir_all(&flat).unwrap();
+        let huge = write_file(&flat, "huge.dat", b"h");
+        set_sparse_size(&huge, MEDIA_QUOTA_BYTES * 2);
+        backdate(&huge, 60);
+
+        let fresh = governor.run_pass();
+        assert_eq!(fresh.deleted, 0);
+        assert!(huge.exists());
+
+        backdate(&huge, 8 * 24 * 60 * 60);
+        let expired = governor.run_pass();
+        assert_eq!(expired.deleted, 1);
+        assert!(!huge.exists());
     }
 
     #[test]

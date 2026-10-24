@@ -72,8 +72,30 @@ static REQUESTS: [ClassMetrics; METHOD_CLASSES.len()] =
 
 static RECEIVE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG_RESTARTS: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_RESTART_DEFERRALS: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_RESTART_FAILURES: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_RESTART_SUPPRESSIONS: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_PING_TARGETS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_LIVENESS_TICKS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static HOST_PENDING_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static HOST_ACCOUNT_LANE_WAITS: AtomicU64 = AtomicU64::new(0);
+static HOST_GLOBAL_LANE_WAITS: AtomicU64 = AtomicU64::new(0);
 static RECEIVE_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static DECRYPTION_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Read-watermark write seams by source (contract revision 1.216, §4.216):
+/// `byMessage` counts the explicit `messageId` target form, `byLatest` the
+/// pre-1.216 whole-conversation form. The split is what makes the desktop's
+/// migration to message-granular reads visible in the snapshot.
+static READ_WATERMARK_BY_MESSAGE: AtomicU64 = AtomicU64::new(0);
+static READ_WATERMARK_BY_LATEST: AtomicU64 = AtomicU64::new(0);
+/// Explicit read targets refused because the id did not name a message of
+/// the addressed account+conversation (or failed the opaque-id shape gate).
+/// A rejection never moves the watermark.
+static READ_WATERMARK_TARGETS_REJECTED: AtomicU64 = AtomicU64::new(0);
+/// Read-watermark advances that hit the store (either source). Kept apart
+/// from target rejections: this is an infrastructure fault, not a caller
+/// mistake.
+static READ_WATERMARK_STORE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 fn class_metrics(method_class: &str) -> &'static ClassMetrics {
     let index = METHOD_CLASSES
@@ -105,14 +127,161 @@ pub fn record_receive_drop() {
     RECEIVE_DROPPED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The watchdog executed an engine restart (initial or pending retry).
+/// The engine reported a decryption-error receive envelope (contract 1.165,
+/// §4.163): an inbound envelope failed to decrypt and carries no message row.
+/// Consumption counting only — the arm never acts on it (no session reset,
+/// no retry), the count is what makes the failure class visible.
+pub fn record_decryption_error() {
+    DECRYPTION_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-lifetime decryption-error envelope count, for the metrics
+/// snapshot (§4.163) — read back.
+pub fn decryption_errors_total() -> u64 {
+    DECRYPTION_ERRORS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// A read leg used the explicit `messageId` target form and the advance
+/// succeeded (contract revision 1.216, §4.216).
+pub fn record_read_watermark_by_message() {
+    READ_WATERMARK_BY_MESSAGE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A read leg used the whole-conversation (absent `messageId`) form — the
+/// pre-1.216 behavior. Counted per prepare, including a conversation with
+/// no incoming row (the no-op still took this path).
+pub fn record_read_watermark_by_latest() {
+    READ_WATERMARK_BY_LATEST.fetch_add(1, Ordering::Relaxed);
+}
+
+/// An explicit read target was refused: it named no message of the
+/// addressed account+conversation (or failed the id shape gate). The
+/// watermark is untouched and the request answers INVALID_REQUEST.
+pub fn record_read_watermark_target_rejected() {
+    READ_WATERMARK_TARGETS_REJECTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A read-watermark advance hit the store (either source). The receipt legs
+/// may still have ridden on the best-effort path; this counter keeps the
+/// durable-divider cost visible.
+pub fn record_read_watermark_store_failure() {
+    READ_WATERMARK_STORE_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-lifetime read-watermark counters, for the metrics snapshot and
+/// tests: `(by_message, by_latest, targets_rejected, store_failures)`.
+pub fn read_watermark_counters() -> (u64, u64, u64, u64) {
+    (
+        READ_WATERMARK_BY_MESSAGE.load(Ordering::Relaxed),
+        READ_WATERMARK_BY_LATEST.load(Ordering::Relaxed),
+        READ_WATERMARK_TARGETS_REJECTED.load(Ordering::Relaxed),
+        READ_WATERMARK_STORE_FAILURES.load(Ordering::Relaxed),
+    )
+}
+
+/// The watchdog executed an engine restart (immediate, or after its
+/// backoff window elapsed).
 pub fn record_watchdog_restart() {
     WATCHDOG_RESTARTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-lifetime watchdog restart count, for the `runtime.doctor`
+/// network face (§4.79) — the existing metric, read back.
+pub fn watchdog_restarts_total() -> u64 {
+    WATCHDOG_RESTARTS.load(Ordering::Relaxed)
+}
+
+/// The watchdog deferred a due restart behind its backoff window. Every
+/// deferral is "the frequency budget said wait", never "the fault was
+/// dropped": a dead receive path still has an armed deadline.
+pub fn record_watchdog_restart_deferred() {
+    WATCHDOG_RESTART_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-lifetime deferred-restart count, for the metrics snapshot.
+pub fn watchdog_restart_deferrals_total() -> u64 {
+    WATCHDOG_RESTART_DEFERRALS.load(Ordering::Relaxed)
+}
+
+/// A watchdog restart attempt failed to bring the engine up. The deferred
+/// backstop stays armed and retries; the counter keeps the failure class
+/// visible instead of it disappearing behind a returned `Err`.
+pub fn record_watchdog_restart_failed() {
+    WATCHDOG_RESTART_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-lifetime failed-restart-attempt count, for the metrics snapshot.
+pub fn watchdog_restart_failures_total() -> u64 {
+    WATCHDOG_RESTART_FAILURES.load(Ordering::Relaxed)
+}
+
+/// A watchdog restart was suppressed because a link flow is in flight
+/// (restarting would invalidate the deviceLinkUri). Safety gate, not a
+/// fault: it clears when the flow ends.
+pub fn record_watchdog_restart_suppressed() {
+    WATCHDOG_RESTART_SUPPRESSIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-lifetime link-suppressed restart count, for the metrics snapshot.
+pub fn watchdog_restart_suppressions_total() -> u64 {
+    WATCHDOG_RESTART_SUPPRESSIONS.load(Ordering::Relaxed)
+}
+
+/// One account left the liveness-ping candidate set because the engine does
+/// not serve it: a store row absent from the engine's own account list, or a
+/// `getUserStatus` the probe attributed to the account (another candidate
+/// answered right after it). The row is never deleted here — reconciliation
+/// owns that — this counter is what makes the exclusion visible.
+pub fn record_watchdog_ping_target_skipped() {
+    WATCHDOG_PING_TARGETS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-lifetime excluded-ping-target count, for the metrics snapshot.
+pub fn watchdog_ping_targets_skipped_total() -> u64 {
+    WATCHDOG_PING_TARGETS_SKIPPED.load(Ordering::Relaxed)
+}
+
+/// One watchdog tick had no engine-confirmed ping target and skipped
+/// liveness instead of counting a failure. A skip is never a restart cause:
+/// pinging an account the engine does not serve proves nothing about the
+/// receive path, it only churns the engine.
+pub fn record_watchdog_liveness_tick_skipped() {
+    WATCHDOG_LIVENESS_TICKS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-lifetime liveness-skip tick count, for the metrics snapshot.
+pub fn watchdog_liveness_ticks_skipped_total() -> u64 {
+    WATCHDOG_LIVENESS_TICKS_SKIPPED.load(Ordering::Relaxed)
+}
+
+/// Process-lifetime degraded-receive drop count, for the `runtime.doctor`
+/// network face (§4.79) — the existing metric, read back.
+pub fn receive_dropped_total() -> u64 {
+    RECEIVE_DROPPED.load(Ordering::Relaxed)
+}
+
+/// 某次 dispatch 在它自己的 per-account lane 上排队了（ADR 0005）：同账号
+/// 并发是正常信号，持续增长说明单账号 lane 容量与桌面节奏不匹配。
+pub fn record_host_account_lane_wait() {
+    HOST_ACCOUNT_LANE_WAITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 某次 dispatch 在全局兜底 lane 上排队了（ADR 0005）：正常容量下应长期
+/// 为 0，增长意味着账号数或并发已超过「每账号容量 × 典型账号数」。
+pub fn record_host_global_lane_wait() {
+    HOST_GLOBAL_LANE_WAITS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Current number of admitted-but-unfinished host requests.
 pub fn set_host_pending(depth: usize) {
     HOST_PENDING_REQUESTS.store(depth as u64, Ordering::Relaxed);
+}
+
+/// Read back the admitted-but-unfinished host request gauge (`runtime.doctor`
+/// forensics and tests): the §4.168 bounded-answer face and the connection
+/// exit reset both keep this value a truthful picture of the dispatch set.
+pub fn host_pending_requests() -> u64 {
+    HOST_PENDING_REQUESTS.load(Ordering::Relaxed)
 }
 
 /// A receive entered the persistence queue.
@@ -132,8 +301,25 @@ pub fn log_snapshot() {
         target: "metrics",
         receive_dropped_total = RECEIVE_DROPPED.load(Ordering::Relaxed),
         watchdog_restarts_total = WATCHDOG_RESTARTS.load(Ordering::Relaxed),
+        watchdog_restart_deferrals_total = WATCHDOG_RESTART_DEFERRALS.load(Ordering::Relaxed),
+        watchdog_restart_failures_total = WATCHDOG_RESTART_FAILURES.load(Ordering::Relaxed),
+        watchdog_restart_suppressions_total =
+            WATCHDOG_RESTART_SUPPRESSIONS.load(Ordering::Relaxed),
+        watchdog_ping_targets_skipped_total =
+            WATCHDOG_PING_TARGETS_SKIPPED.load(Ordering::Relaxed),
+        watchdog_liveness_ticks_skipped_total =
+            WATCHDOG_LIVENESS_TICKS_SKIPPED.load(Ordering::Relaxed),
         host_pending_requests = HOST_PENDING_REQUESTS.load(Ordering::Relaxed),
+        host_account_lane_waits_total = HOST_ACCOUNT_LANE_WAITS.load(Ordering::Relaxed),
+        host_global_lane_waits_total = HOST_GLOBAL_LANE_WAITS.load(Ordering::Relaxed),
         receive_queue_depth = RECEIVE_QUEUE_DEPTH.load(Ordering::Relaxed),
+        decryption_errors_total = DECRYPTION_ERRORS_TOTAL.load(Ordering::Relaxed),
+        read_watermark_by_message_total = READ_WATERMARK_BY_MESSAGE.load(Ordering::Relaxed),
+        read_watermark_by_latest_total = READ_WATERMARK_BY_LATEST.load(Ordering::Relaxed),
+        read_watermark_targets_rejected_total =
+            READ_WATERMARK_TARGETS_REJECTED.load(Ordering::Relaxed),
+        read_watermark_store_failures_total =
+            READ_WATERMARK_STORE_FAILURES.load(Ordering::Relaxed),
         "connector metrics snapshot"
     );
     for (index, class) in METHOD_CLASSES.iter().enumerate() {
@@ -280,9 +466,18 @@ mod tests {
         let output = captured_output(|| {
             record_request("send", "ok", Duration::from_millis(3));
             record_receive_drop();
+            record_decryption_error();
             record_watchdog_restart();
+            record_watchdog_restart_deferred();
+            record_watchdog_restart_failed();
+            record_watchdog_restart_suppressed();
+            record_watchdog_ping_target_skipped();
+            record_watchdog_liveness_tick_skipped();
             set_host_pending(2);
             log_snapshot();
+            // Leave the shared gauge clean for parallel tests (the §4.168
+            // exit-reset semantics keep the honest value at zero).
+            set_host_pending(0);
             log_engine_rss(&[
                 ("default".to_string(), Some(196 * 1024 * 1024)),
                 ("team-a".to_string(), None),
@@ -293,8 +488,21 @@ mod tests {
         // the series keys, never exact values.
         assert!(output.contains("receive_dropped_total="));
         assert!(output.contains("watchdog_restarts_total="));
+        // The watchdog's new visibility series: deferrals (backoff held a
+        // restart back), failed attempts, and link-flow safety suppressions.
+        assert!(output.contains("watchdog_restart_deferrals_total="));
+        assert!(output.contains("watchdog_restart_failures_total="));
+        assert!(output.contains("watchdog_restart_suppressions_total="));
+        // The stale-row incident's visibility series: excluded ping targets
+        // (an account the engine does not serve) and skipped liveness ticks
+        // (no verified target — never a restart cause).
+        assert!(output.contains("watchdog_ping_targets_skipped_total="));
+        assert!(output.contains("watchdog_liveness_ticks_skipped_total="));
         assert!(output.contains("host_pending_requests="));
         assert!(output.contains("receive_queue_depth="));
+        // §4.163: the decryption-error consumption counter rides the same
+        // snapshot series (count-only, never content).
+        assert!(output.contains("decryption_errors_total="));
         assert!(output.contains("host request metrics"));
         assert!(output.contains("method_class=\"send\""));
         // Per-engine RSS gauges (M3.4): one line per sampled group, keyed by

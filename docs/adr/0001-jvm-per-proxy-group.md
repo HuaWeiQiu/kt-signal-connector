@@ -1,6 +1,6 @@
 # ADR 0001: One signal-cli engine per proxy group
 
-- Status: accepted as design; implementation pending (optimization-plan Phase 4)
+- Status: implementation superseded by ADR 0003 (kt-engine single-engine runtime, 2026-10-10 — signal-cli JVM/native runtime removed); the per-proxy-group engine isolation design itself remains accepted
 - Date: 2026-08-26
 - Supersedes: the single-engine reading of AGENTS.md "one signal-cli JVM serves all accounts"
   (revised in the same change)

@@ -1,10 +1,10 @@
-# ADR 0002: Bounded inbound media ingest (PoC)
+# ADR 0004: Bounded inbound media ingest (PoC)
 
 - Status: accepted as design; implementation in progress
 - Date: 2026-09-23
 - Amends: implementation-plan §6.7 (Media limitation) — the boundary stays, the
   unlock path is defined here
-- Depends on: ADR 0001 (namespace/data-dir disjointness), §7.1 data ownership
+- Depends on: ADR 0002 (the multiple-instances namespace/data-dir disjointness rules), §7.1 data ownership
 
 ## Context
 
@@ -37,9 +37,27 @@ runtimes first; signed bundles adopt it after the capacity gates pass.
 
 ### 2. Media governor (bounded disk pressure)
 
-A governor pass runs over each account's `attachments/` directory
-(`<signal-data-dir>/<account>/attachments/`, per signal-cli `PathConfig` — the exact
-per-account layout is verified at implementation time from a live data dir):
+A governor pass runs over each account's media directory. The official desktop is a
+single-account install, so its media directory has no account dimension; KT serves up to
+eight accounts per engine/proxy group and therefore adds one (`[KT 适配]`, audit §9.10):
+
+- **Account-owned path**: every new write lands in
+  `<signal-data-dir>/media/<account-id>/attachments/`. The account id is the connector's
+  opaque account id (32-hex in production). Legacy signal-cli layouts
+  (`<signal-data-dir>/attachments/` and `<signal-data-dir>/<account>/attachments/`) stay
+  readable so an upgrade never loses an already-downloaded file.
+- **Per-account quota + LRU**: the 2 GiB quota below is enforced **per account bucket**,
+  and the mtime-ordered deletion only ever considers that bucket's files. One account's
+  flood can never evict another account's media. There is deliberately no group-wide
+  eviction cap: enforcing one would require selecting files across accounts, which is the
+  cross-account eviction this adaptation forbids.
+- **Account-scoped deletion**: a view-once burn deletes only the addressed account's
+  `<id>` and `<id>.preview`; `deleteLocalData` removes the account's whole
+  `<signal-data-dir>/media/<account-id>/` subtree. Two accounts that carry the same
+  attachment id cannot erase or overwrite each other.
+- **Legacy pool**: the flat pre-isolation directory has no provable owner, so it is
+  TTL/preview governed only — never quota-evicted (an mtime LRU there could pick the
+  wrong account's bytes) and never deleted by a burn.
 
 - **TTL**: files older than 7 days are deleted (a received attachment stays fetchable
   for a week, mirroring Signal's own server-side retention expectations).
@@ -101,11 +119,13 @@ fetch API keeps its Promise shape; chunking is invisible above Main.
 
 ## Acceptance gates (from §6.7, made concrete)
 
-1. **Disk**: seed > quota of synthetic media; after one pass the directory holds
-   ≤ quota + one file.
+1. **Disk**: seed > quota of synthetic media in one account; after one pass that
+   account's directory holds ≤ quota + one file, and a second account's under-quota
+   media is untouched.
 2. **Memory**: stream a 100 MiB file chunk-by-chunk; connector RSS growth < 50 MiB.
 3. **Security**: path-traversal ids (`../`, absolute, `\`) fail closed; handles are
-   single-origin, expire, and cannot outlive their account session.
+   single-origin, expire, and cannot outlive their account session; a burn or account
+   deletion never touches another account's same-id file.
 4. **Frame safety**: chunk base64 length < host frame limit with margin.
 5. **Opt-out**: without `--media-ingest`, the three methods answer
    `capability_unavailable` and spawn argv is byte-identical to today's.

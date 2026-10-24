@@ -1,0 +1,14 @@
+# Pins the toolchain for local rustup and CI (.github/workflows/ci.yml uses
+# dtolnay/rust-toolchain@1.99.0) to the same version, so the local gate set
+# (cargo fmt --check, cargo clippy --all-targets --all-features -- -D warnings,
+# cargo test) runs on the exact toolchain CI runs.
+#
+# rust-version in Cargo.toml was bumped to "1.99" (commit 8c7b7b3) to match:
+# the earlier "1.87" claim was false — the tree fails to build on 1.87.0
+# (E0658 let-chains, stabilized 1.88; src/service.rs E0716 temp-lifetime
+# needs newer rustc) and on 1.88.0 (E0716 + clippy uninlined_format_args
+# drift). 1.99.0 is the local stable the green gates were verified on.
+# Action branch verified 2026-10-06 (dtolnay/rust-toolchain has no semver
+# releases; version branch HEAD 70dec6087f2c, 2026-10-01).
+[toolchain]
+channel = "1.99.0"

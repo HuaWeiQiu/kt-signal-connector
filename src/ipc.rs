@@ -9,13 +9,81 @@ use std::path::PathBuf;
 #[cfg(unix)]
 mod platform {
     use std::fs;
+    use std::net::SocketAddr;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
-    use tokio::net::{UnixListener, UnixStream};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 
     use super::*;
 
-    pub type LocalStream = UnixStream;
+    /// One accepted host connection on either transport leg. The UDS leg is
+    /// the pre-R2 face (contract 1.147, §4.145 keeps it until the batch-4
+    /// retirement); the TCP leg is a loopback stream with the same framing.
+    pub enum LocalStream {
+        Uds(UnixStream),
+        Tcp(TcpStream),
+    }
+
+    impl AsyncRead for LocalStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.get_mut() {
+                Self::Uds(stream) => Pin::new(stream).poll_read(cx, buf),
+                Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            }
+        }
+    }
+
+    impl AsyncWrite for LocalStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            match self.get_mut() {
+                Self::Uds(stream) => Pin::new(stream).poll_write(cx, buf),
+                Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            }
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            match self.get_mut() {
+                Self::Uds(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+                Self::Tcp(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            }
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            match self {
+                Self::Uds(stream) => stream.is_write_vectored(),
+                Self::Tcp(stream) => stream.is_write_vectored(),
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            match self.get_mut() {
+                Self::Uds(stream) => Pin::new(stream).poll_flush(cx),
+                Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            match self.get_mut() {
+                Self::Uds(stream) => Pin::new(stream).poll_shutdown(cx),
+                Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            }
+        }
+    }
 
     /// `bind(2)` copies the socket path into `sockaddr_un::sun_path`, a
     /// fixed-size array: 104 bytes on macOS (`sys/socket.h`) and 108 on
@@ -47,11 +115,17 @@ mod platform {
         Ok(())
     }
 
-    pub struct LocalListener {
-        inner: UnixListener,
-        path: PathBuf,
-        device: u64,
-        inode: u64,
+    /// The listening half of either transport leg. The UDS arm keeps the
+    /// private-socket lifecycle (staging bind, 0600 publish, drop-unlink)
+    /// unchanged; the TCP arm is the R2 loopback listener.
+    pub enum LocalListener {
+        Uds {
+            inner: UnixListener,
+            path: PathBuf,
+            device: u64,
+            inode: u64,
+        },
+        Tcp(TcpListener),
     }
 
     impl LocalListener {
@@ -74,7 +148,7 @@ mod platform {
                     return Err(error);
                 }
             };
-            Ok(Self {
+            Ok(Self::Uds {
                 inner,
                 path,
                 device: metadata.dev(),
@@ -82,20 +156,69 @@ mod platform {
             })
         }
 
+        /// Contract 1.147 (§4.145): the R2 TCP leg. The address must be an
+        /// IPv4 loopback one (the launcher passes `127.0.0.1:0`; anything
+        /// non-loopback, wildcard, or IPv6 fails closed here). `std` and
+        /// tokio never set `SO_REUSEADDR`, so a live listener's port cannot
+        /// be re-bound by another process for as long as it lives, and the
+        /// kernel hands the port back when the process dies — zero
+        /// filesystem residue either way.
+        pub async fn bind_tcp(address: SocketAddr) -> io::Result<Self> {
+            if !(address.is_ipv4() && address.ip().is_loopback()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "tcp listen address must be an IPv4 loopback host:port",
+                ));
+            }
+            Ok(Self::Tcp(TcpListener::bind(address).await?))
+        }
+
+        /// The bound address of the TCP leg — the only leg that has one. The
+        /// launcher announces it on stdout after a successful bind.
+        pub fn tcp_address(&self) -> io::Result<SocketAddr> {
+            match self {
+                Self::Tcp(listener) => listener.local_addr(),
+                Self::Uds { .. } => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the unix-socket leg has no socket address",
+                )),
+            }
+        }
+
         pub async fn accept(&self) -> io::Result<LocalStream> {
-            self.inner.accept().await.map(|(stream, _)| stream)
+            match self {
+                Self::Uds { inner, .. } => inner
+                    .accept()
+                    .await
+                    .map(|(stream, _)| LocalStream::Uds(stream)),
+                Self::Tcp(inner) => inner
+                    .accept()
+                    .await
+                    .map(|(stream, _)| LocalStream::Tcp(stream)),
+            }
         }
     }
 
     impl Drop for LocalListener {
         fn drop(&mut self) {
-            let should_remove = fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+            let (path, device, inode) = match self {
+                Self::Uds {
+                    path,
+                    device,
+                    inode,
+                    ..
+                } => (path.as_path(), *device, *inode),
+                // The TCP leg holds no filesystem name: the kernel reclaims
+                // the port on drop.
+                Self::Tcp(_) => return,
+            };
+            let should_remove = fs::symlink_metadata(path).is_ok_and(|metadata| {
                 metadata.file_type().is_socket()
-                    && metadata.dev() == self.device
-                    && metadata.ino() == self.inode
+                    && metadata.dev() == device
+                    && metadata.ino() == inode
             });
             if should_remove {
-                let _ = fs::remove_file(&self.path);
+                let _ = fs::remove_file(path);
             }
         }
     }
@@ -169,6 +292,84 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddrV6};
+
+        fn loopback_port(port: u16) -> SocketAddr {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+        }
+
+        /// Contract 1.147 (§4.145): the TCP leg binds a kernel-assigned
+        /// loopback port that is real and usable.
+        #[tokio::test]
+        async fn tcp_leg_binds_a_kernel_assigned_loopback_port() {
+            let listener = LocalListener::bind_tcp(loopback_port(0)).await.unwrap();
+            let address = listener.tcp_address().unwrap();
+            assert!(address.port() > 0, "port 0 must resolve to a bound port");
+            assert!(address.ip().is_loopback());
+        }
+
+        /// The §4.145 exposure boundary: only an IPv4 loopback bind is ever
+        /// accepted — wildcard, off-host, and IPv6 loopback all fail closed
+        /// at bind, before any port exists.
+        #[tokio::test]
+        async fn tcp_leg_rejects_non_loopback_binds() {
+            for address in [
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 0),
+                SocketAddrV6::new("::1".parse().unwrap(), 0, 0, 0).into(),
+            ] {
+                match LocalListener::bind_tcp(address).await {
+                    Ok(_) => panic!("a non-(IPv4-loopback) bind must be rejected: {address}"),
+                    Err(error) => {
+                        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                        assert!(
+                            error.to_string().contains("loopback"),
+                            "error must name the loopback boundary: {error}"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// The no-`SO_REUSEADDR` discipline: while the leg lives, nobody can
+        /// re-bind its port (the announce's port is exclusively ours), and
+        /// once it is dropped the kernel hands the port straight back.
+        #[tokio::test]
+        async fn a_live_tcp_leg_blocks_a_rebind_and_releases_on_drop() {
+            let listener = LocalListener::bind_tcp(loopback_port(0)).await.unwrap();
+            let address = listener.tcp_address().unwrap();
+            assert!(
+                std::net::TcpListener::bind(address).is_err(),
+                "a live TCP leg's port must not be re-bindable"
+            );
+            drop(listener);
+            std::net::TcpListener::bind(address)
+                .expect("a dropped TCP leg must release its port to the kernel");
+        }
+
+        /// The TCP leg's stream carries frames both ways: the AsyncRead /
+        /// AsyncWrite delegation must behave like the raw stream it wraps.
+        #[tokio::test]
+        async fn tcp_leg_transports_frames_both_ways() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = LocalListener::bind_tcp(loopback_port(0)).await.unwrap();
+            let address = listener.tcp_address().unwrap();
+            let mut client = TcpStream::connect(address).await.unwrap();
+            let mut stream = listener.accept().await.unwrap();
+            client.write_all(b"ping\n").await.unwrap();
+            let mut buffer = [0_u8; 5];
+            stream.read_exact(&mut buffer).await.unwrap();
+            assert_eq!(&buffer, b"ping\n");
+            if let LocalStream::Tcp(stream) = &mut stream {
+                stream.write_all(b"pong\n").await.unwrap();
+            } else {
+                panic!("the TCP leg must accept into a TCP stream");
+            }
+            let mut buffer = [0_u8; 5];
+            client.read_exact(&mut buffer).await.unwrap();
+            assert_eq!(&buffer, b"pong\n");
+        }
 
         #[tokio::test]
         async fn socket_is_private_and_removed_with_listener() {

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 pub mod auth;
+pub mod backup_export;
 pub mod datalock;
+pub mod doctor;
 pub mod engine;
 pub mod groups;
+pub mod history_attachment;
 pub mod history_import;
 pub mod host;
 pub mod ids;
@@ -14,7 +17,10 @@ pub mod manifest;
 pub mod media;
 pub mod methods;
 pub mod metrics;
+pub mod migrate;
 pub mod parent;
+pub mod perf_metrics;
+pub mod pool;
 pub mod protocol;
 pub mod registry;
 pub mod resource;
@@ -46,6 +52,18 @@ pub const PHASE2_CAPABILITIES: &[&str] = &methods::METHOD_NAMES;
 /// 1.34: `send-receipts`; contract revision 1.35: `send-sticker`; contract
 /// revision 1.36: `sticker-pack-browse`, `conversation-pin-sync`; contract
 /// revision 1.37: `sticker-pack-sync`; contract revision 1.38: `view-once`).
-pub fn advertised_capabilities() -> Vec<&'static str> {
-    [&methods::METHOD_NAMES[..], methods::FEATURE_CAPABILITIES].concat()
+///
+/// Contract revision 1.98: `attachment-download` joins the payload only when
+/// `media_ingest` is armed — the effective launcher decision (passed through
+/// verbatim since 1.121, §4.102) and the exact gate every media method
+/// answers. A runtime without the media table omits the tag, so the desktop
+/// takes the honest metadata-only path instead of calling a face that
+/// answers `CAPABILITY_UNAVAILABLE` for every download; with the table
+/// armed, the payload is unchanged from the pre-1.98 advertisement.
+pub fn advertised_capabilities(media_ingest: bool) -> Vec<&'static str> {
+    let mut capabilities = [&methods::METHOD_NAMES[..], methods::FEATURE_CAPABILITIES].concat();
+    if !media_ingest {
+        capabilities.retain(|capability| *capability != methods::ATTACHMENT_DOWNLOAD_CAPABILITY);
+    }
+    capabilities
 }

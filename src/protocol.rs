@@ -81,6 +81,23 @@ pub struct ApiError {
     pub code: &'static str,
     pub message: String,
     pub retryable: bool,
+    /// Contract 1.50: optional engine-supplied error facts, pass-through only.
+    /// Carried today by `PROFILE_UPLOAD_FAILED` (`{retryable, textSaved}` —
+    /// the engine's honest "the text face landed, the avatar upload failed"
+    /// partial-success report; since contract 1.89 the group-faced
+    /// `GROUP_AVATAR_UPLOAD_FAILED` carries the same shape),
+    /// `GROUP_TERMINATE_FAILED`/`REPORT_SPAM_*`
+    /// HTTP status echoes, the promised `{detail}` face of the
+    /// message-carrying cloud-backup families (since 1.83 the restore four,
+    /// since 1.87 the upload three — engine cloud-backup-contract §2/§6.2),
+    /// and, since contract 1.164, the `PHONE_RATE_LIMITED` `{retryAfterSeconds}`
+    /// backoff face (the engine's honest retry-after seconds, the caller's
+    /// wait decision). The connector never invents a `data` object and never
+    /// strips keys from
+    /// one the engine sent; hosts that predate this field ignore it as an
+    /// unknown JSON member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl ApiError {
@@ -89,6 +106,19 @@ impl ApiError {
             code,
             message: message.into(),
             retryable,
+            data: None,
+        }
+    }
+
+    pub fn with_data(code: &'static str, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retryable: data
+                .get("retryable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            data: Some(data),
         }
     }
 }

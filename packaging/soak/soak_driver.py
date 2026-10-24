@@ -10,7 +10,7 @@ One driver run:
   for `default` plus `g1..gN-1` proxy groups) and a two-line bootstrap
   payload (handshake secret + fixed store key),
 - spawns one connector (release binary) whose engines are the fake
-  signal-cli (real signal-cli works too: pass --signal-cli/--java-home),
+  signal-cli (a real engine binary works too: pass --signal-cli),
 - opens exactly ONE authenticated host connection and keeps it for the whole
   run (closing it ends the connector process, by contract),
 - every --status-interval seconds records one `runtime.status` aggregate
@@ -122,10 +122,6 @@ class Driver:
             # Allocation placeholders: the fake engine never dials them. A
             # real-engine run must pass proxies that actually route.
             command += ["--proxy-group", f"{group_id}=127.0.0.1:19080"]
-        if self.args.java_home:
-            command += ["--java-home", str(self.args.java_home)]
-        if self.args.native:
-            command += ["--signal-cli-native"]
         connector_log = (self.run_dir / "connector.log").open("wb")
         self.connector = subprocess.Popen(
             command,
@@ -393,9 +389,7 @@ def parse_args(argv):
     parser.add_argument("--load-steps", default="", help="comma-separated msg/min per account, e.g. 1,5,20")
     parser.add_argument("--load-accounts", type=int, default=2)
     parser.add_argument("--connector", default=str(root / "target/release/kt-signal-connector"))
-    parser.add_argument("--signal-cli", default=str(root / "tests/fixtures/fake-signal-cli.py"))
-    parser.add_argument("--java-home", default=None)
-    parser.add_argument("--native", action="store_true")
+    parser.add_argument("--signal-cli", default=str(root / "tests/fixtures/fake-engine.py"))
     parser.add_argument(
         "--store-key",
         default="5a" * 32,

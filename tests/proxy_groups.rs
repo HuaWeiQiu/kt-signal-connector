@@ -28,12 +28,23 @@ const API_VERSION: &str = "1.0";
 /// Same fixed key discipline as server_integration.rs.
 const TEST_STORE_KEY: [u8; 32] = [0x5A; 32];
 
+/// Upper bound for one harness request round trip (write + response wait) —
+/// the harness-timeout discipline from server_integration.rs: a deadline-less
+/// read turned any transient upstream anomaly into an indefinite hang.
+const HARNESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound for the handshake faces (challenge read + proof response read).
+const HARNESS_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[path = "common/harness_scene.rs"]
+mod harness_scene;
+use harness_scene::dump_connector_crash_scene;
+
 fn bootstrap_payload(secret: &[u8; 32]) -> String {
     format!("{}\n{}", hex::encode(secret), hex::encode(TEST_STORE_KEY))
 }
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 fn write_secret_file(path: &Path, secret: &[u8; 32]) {
@@ -57,7 +68,7 @@ fn spawn_group_connector(
         .arg(endpoint)
         .arg("--bootstrap-secret-file")
         .arg(secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--signal-data-dir")
         .arg(root.join("signal-data"))
@@ -71,7 +82,7 @@ fn spawn_group_connector(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .env("KT_FAKE_EXPECT_JAVA_OPTS", "-Xms16m -Xmx384m")
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1")
         .env("JAVA_TOOL_OPTIONS", "poison")
         .env("_JAVA_OPTIONS", "poison")
         .env("JDK_JAVA_OPTIONS", "poison")
@@ -123,7 +134,17 @@ async fn drain_stderr(connector: &mut Child) -> String {
 }
 
 async fn authenticate(client: &mut Framed<UnixStream, LinesCodec>, secret: &[u8; 32]) {
-    let challenge: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let challenge: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(challenge) => challenge,
+        Err(_) => panic!(
+            "authentication challenge never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
     let client_nonce = hex::encode([9_u8; 32]);
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
@@ -146,7 +167,17 @@ async fn authenticate(client: &mut Framed<UnixStream, LinesCodec>, secret: &[u8;
         )
         .await
         .unwrap();
-    let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let response: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => panic!(
+            "handshake response never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     assert_eq!(response["result"]["apiVersion"], API_VERSION);
 }
 
@@ -156,18 +187,33 @@ async fn send_request_frame(
     method: &str,
     params: Value,
 ) {
-    client
-        .send(
-            json!({
-                "apiVersion": API_VERSION,
-                "requestId": request_id,
-                "method": method,
-                "params": params
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap();
+    // The deliberate fire-and-forget face: responses are consumed by the
+    // caller's own drain loops, so nothing is read here. Only the write is
+    // bounded — a connector that stopped reading would otherwise block this
+    // write forever once the socket buffers filled.
+    if timeout(
+        HARNESS_REQUEST_TIMEOUT,
+        client.send(request_frame(request_id, method, params)),
+    )
+    .await
+    .is_err()
+    {
+        panic!(
+            "harness frame write {request_id} ({method}) stalled over \
+             {HARNESS_REQUEST_TIMEOUT:?} (the connector likely stopped reading):\n{}",
+            dump_connector_crash_scene()
+        );
+    }
+}
+
+fn request_frame(request_id: &str, method: &str, params: Value) -> String {
+    json!({
+        "apiVersion": API_VERSION,
+        "requestId": request_id,
+        "method": method,
+        "params": params
+    })
+    .to_string()
 }
 
 /// Send a request and return its response, skipping interleaved event frames.
@@ -177,12 +223,25 @@ async fn request(
     method: &str,
     params: Value,
 ) -> Value {
-    send_request_frame(client, request_id, method, params).await;
-    loop {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
-        if frame.get("requestId").and_then(Value::as_str) == Some(request_id) {
-            return frame;
+    let round = timeout(HARNESS_REQUEST_TIMEOUT, async {
+        send_request_frame(client, request_id, method, params).await;
+        loop {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some(request_id) {
+                return frame;
+            }
         }
+    })
+    .await;
+    match round {
+        Ok(frame) => frame,
+        Err(_) => panic!(
+            "harness request {request_id} ({method}) exceeded {HARNESS_REQUEST_TIMEOUT:?}; \
+             the deadline-less await family turned transient upstream anomalies into \
+             indefinite hangs:\n{}",
+            dump_connector_crash_scene()
+        ),
     }
 }
 
@@ -194,7 +253,17 @@ async fn wait_for_event(
     mut predicate: impl FnMut(&Value) -> bool,
 ) -> Value {
     loop {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "wait_for_event({event_name}) stalled over {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame.get("event").and_then(Value::as_str) == Some(event_name)
             && predicate(&frame["data"])
         {
@@ -308,11 +377,22 @@ async fn proxy_groups_launch_route_and_fail_closed_end_to_end() {
     .await;
     let mut responses = HashMap::new();
     while responses.len() < 2 {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
-        if let Some(id) = frame.get("requestId").and_then(Value::as_str) {
-            if id == "link-a" || id == "link-b" {
-                responses.insert(id.to_string(), frame.clone());
-            }
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "the parallel link responses (link-a/link-b) stalled over \
+                 {HARNESS_REQUEST_TIMEOUT:?} with {responses:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
+        if let Some(id) = frame.get("requestId").and_then(Value::as_str)
+            && (id == "link-a" || id == "link-b")
+        {
+            responses.insert(id.to_string(), frame.clone());
         }
     }
     let start_a = &responses["link-a"];
