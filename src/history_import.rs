@@ -1687,8 +1687,20 @@ impl<'a> Importer<'a> {
                     .map(sanitize_inbound_filename)
                     .filter(|text| !text.is_empty()),
                 size: raw.get("size").and_then(Value::as_u64),
-                width: None,
-                height: None,
+                // Contract 1.254 (§4.38 S8 close-out): the engine's v2
+                // export projects width/height (project_pointer_common —
+                // Some(0) 也是档案陈述) and the live face carries the same
+                // keys; the import arm consumes them with the live parse's
+                // u32 clamp, so an imported descriptor is wire-identical to
+                // its live twin instead of silently dropping the media face.
+                width: raw
+                    .get("width")
+                    .and_then(Value::as_u64)
+                    .map(|value| value.min(u32::MAX as u64) as u32),
+                height: raw
+                    .get("height")
+                    .and_then(Value::as_u64)
+                    .map(|value| value.min(u32::MAX as u64) as u32),
                 is_voice_note: flag == Some(ATTACHMENT_FLAG_VOICE_MESSAGE),
                 caption: raw
                     .get("caption")
@@ -2482,6 +2494,7 @@ mod tests {
                         "contentType": "image/png", "fileName": "p.png", "flag": 0, "size": 12,
                         "caption": "hello", "blurHash": "LEHV6nWB2yk8pyo0adR*.7kCMdnj",
                         "incrementalMac": "AQIDBA==", "chunkSize": 8192,
+                        "width": 640u64, "height": 480u64,
                         "locator": {
                             "key": key_b64, "cdnKey": "t1a2b3c", "cdnNumber": 0,
                             "uploadTimestamp": 1_700_000_000_000_u64,
@@ -2564,6 +2577,10 @@ mod tests {
         let full_attachment = &full.attachments[0];
         assert_eq!(full_attachment.content_type.as_deref(), Some("image/png"));
         assert_eq!(full_attachment.size, Some(12));
+        // Contract 1.254: the archive's media face survives onto the wire
+        // descriptor, same keys the live face carries (Some(0) included).
+        assert_eq!(full_attachment.width, Some(640));
+        assert_eq!(full_attachment.height, Some(480));
         assert_eq!(
             full.id,
             stable_hash_id(&[

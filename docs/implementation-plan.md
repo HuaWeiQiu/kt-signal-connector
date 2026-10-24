@@ -17,6 +17,21 @@
   document for the official anchor and the event mapping.
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.254 (2026-10-24; §4.38 the archive-import media
+  face close-out — batch U, ledger §29.64: the engine's v2 export already
+  projects `width`/`height` on every attachment line
+  (history.rs `project_pointer_common`, Some(0) is a stated archive
+  value) and the live receive face carries the same keys
+  (engine.rs `normalized_attachment`), but the history-import arm
+  hardcoded both to absent — an imported descriptor was silently
+  narrower than its live twin. The import arm now consumes them with
+  the live parse's u32 clamp, so an imported wire descriptor is
+  key-identical to the live one. Purely additive on an existing
+  optional key pair: pre-1.254 hosts read imported rows byte-identically
+  (absent stays absent), the pointer faces (locator ingest column,
+  download ladder) are unchanged and already pointer-complete on this
+  baseline — the batch's end-to-end regression pins the batch-T
+  no-pointer scenario to the Ready arm.)
 - Contract revision: 1.253 (2026-10-24; §4.238 the message-request
   response timeline system row — batch O, ledger §29.46: the official
   desktop persists a bodyless `message-request-response-event` row on

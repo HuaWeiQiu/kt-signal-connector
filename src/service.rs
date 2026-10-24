@@ -41400,6 +41400,104 @@ mod tests {
         assert!(!error.retryable);
     }
 
+    /// Batch U S8 (ledger §29.63): the archive-import row keeps the full
+    /// attachment pointer — `attachments.download` answers the Ready arm
+    /// with the locator intact for an imported outgoing voice row, the
+    /// exact face the batch-T evidence saw as the no-pointer INVALID_REQUEST
+    /// (locator ladder live∪history empty). The pointer source is the
+    /// engine's v2 NDJSON (compat §5 附件指针投影面): the importer lands it
+    /// index-aligned in the internal column and the download ladder resolves
+    /// it through the history arm without any live-echo repair.
+    #[test]
+    fn imported_outgoing_row_downloads_through_its_preserved_pointer() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap());
+        let data_dir = temp.path().join("signal-data");
+        std::fs::create_dir_all(data_dir.join("attachments")).unwrap();
+        let service = ConnectorService::with_media(
+            Arc::clone(&store),
+            Some(MediaIngest::new(
+                data_dir,
+                Arc::new(MediaHandleTable::new()),
+            )),
+        );
+        let account = store
+            .upsert_account_from_signal("+15555550100", None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        // Engine-shaped v2 archive: one direct chat, one outgoing voice row
+        // carrying the complete transit pointer (the batch-T evidence face).
+        let key_b64 = "q83vLNoechoM6CiZ+hr3P5ePE3YGAibLE4bAl1jv20Y=";
+        let hash_hex = "a".repeat(64);
+        let archive = temp.path().join("history-import.ndjson");
+        let lines = [
+            serde_json::json!({
+                "type": "recipient", "id": 1, "kind": "contact", "name": "Peer",
+                "aci": "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "e164": "+15550000001"
+            })
+            .to_string(),
+            serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+            serde_json::json!({
+                "type": "message", "chatId": 10, "authorId": 1, "dateSent": 700,
+                "direction": "outgoing", "text": "voice note",
+                "attachments": [{
+                    "contentType": "audio/aac", "fileName": "voice.aac", "flag": 1,
+                    "size": 267_000u64, "width": 0u64, "height": 0u64,
+                    "locator": {
+                        "key": key_b64, "cdnKey": "t1a2b3c", "cdnNumber": 0,
+                        "uploadTimestamp": 1_700_000_000_000u64,
+                        "plaintextHash": hash_hex
+                    }
+                }]
+            })
+            .to_string(),
+        ];
+        std::fs::write(&archive, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let counters = crate::history_import::run_import(
+            &store,
+            &account.id,
+            "+15555550100",
+            &archive,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(counters.imported, 1, "the outgoing voice row imports");
+
+        let conversation = crate::ids::stable_hash_id(&[&account.id, "direct", "+15550000001"]);
+        let row = service
+            .list_messages(&account.id, &conversation, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .expect("the imported row lists");
+
+        let prepared = service
+            .prepare_attachment_download(&account.id, &conversation, &row.id, 0)
+            .expect("the preserved pointer answers the ready arm, not the miss");
+        let PreparedHistoryDownload::Ready {
+            locator,
+            descriptor_size,
+            ..
+        } = prepared
+        else {
+            panic!("an imported pointer-complete row is downloadable");
+        };
+        assert_eq!(descriptor_size, Some(267_000));
+        // Contract 1.254: the media face rides the wire descriptor too —
+        // Some(0) is a stated archive value, never dropped into absence.
+        assert_eq!(row.attachments.len(), 1);
+        assert_eq!(row.attachments[0].width, Some(0));
+        assert_eq!(row.attachments[0].height, Some(0));
+        assert_eq!(locator.key.as_deref(), Some(key_b64));
+        assert_eq!(locator.cdn_key.as_deref(), Some("t1a2b3c"));
+        assert_eq!(locator.cdn_number, Some(0), "CDN0 stays a legal face");
+        assert_eq!(locator.upload_timestamp, Some(1_700_000_000_000));
+        assert_eq!(locator.plaintext_hash.as_deref(), Some(hash_hex.as_str()));
+        assert!(locator.digest.is_none(), "the oneof integrity stays one-of");
+    }
+
     /// §4.183: the stash is best-effort — when the attachments directory
     /// cannot be written (here a regular file occupies the
     /// `<data>/attachments` name, so the fallback create fails), the send
