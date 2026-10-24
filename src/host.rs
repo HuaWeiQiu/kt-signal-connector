@@ -4355,6 +4355,20 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
             "conversation.changed",
             serde_json::to_value(conversation).unwrap_or(Value::Null),
         )),
+        HostSideEvent::ConversationMerged {
+            account_id,
+            from_conversation_id,
+            to_conversation,
+        } => Ok(HostEvent::new(
+            // Contract 1.259 (§4.243): the completed direct-identity fold —
+            // the shell row is gone, the canonical summary rides `to`.
+            "conversation.merged",
+            json!({
+                "accountId": account_id,
+                "fromConversationId": from_conversation_id,
+                "to": serde_json::to_value(to_conversation).unwrap_or(Value::Null),
+            }),
+        )),
         HostSideEvent::MessageUpserted(message) => Ok(HostEvent::new(
             "message.upserted",
             serde_json::to_value(message).unwrap_or(Value::Null),

@@ -1188,6 +1188,21 @@ pub enum HostSideEvent {
     },
     AccountChanged(AccountSummary),
     ConversationChanged(ConversationSummary),
+    /// Contract 1.259 (§4.243, batch Z1 · S14): one direct-identity fold
+    /// completed — the number-keyed shell row named by `from_conversation_id`
+    /// is gone, its material lives under the canonical ACI-keyed row carried
+    /// in `to_conversation` (our projection of the official
+    /// combineConversations action, ConversationController.preload.ts:1288-1515
+    /// — the official queue item is the merge request, this frame is the
+    /// completed merge). The A5 conversation-merge notice, when the official
+    /// gate minted one, rides its own `message.upserted` frame beside this
+    /// one. A missed frame self-heals on the next list read (the shell row no
+    /// longer answers).
+    ConversationMerged {
+        account_id: String,
+        from_conversation_id: String,
+        to_conversation: Box<ConversationSummary>,
+    },
     MessageUpserted(MessageRecord),
     MessageStatusChanged {
         account_id: String,
@@ -10429,23 +10444,53 @@ impl ConnectorService {
             self.store
                 .attach_quote_snapshot_ids(&account.id, std::slice::from_mut(&mut message))?;
         }
-        let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
-            message,
-        ))];
-        events.extend(landed_events);
-        events.extend(landed_receipt_events);
         // §4.37: record the ACI→peer-key identity the envelope revealed, so a
         // later view-once open sync (which names the author by ACI only) can
         // find this conversation. One bounded row per (account, ACI); only
         // incoming envelopes carry someone else's identity, and only when the
         // resolved peer key differs from the raw ACI.
+        //
+        // Contract 1.259 (§4.243): the binding write is also the discovery
+        // moment — when a number-keyed shell row sits beside this envelope's
+        // ACI-keyed row, the pair folds now (the official merge-request
+        // semantics). The just-landed row re-keys with its conversation (row
+        // ids never change), so the upserted frame below carries the
+        // canonical conversation id, the fold's notice and merged frames ride
+        // after the landed ones, and the stale summary push below answers the
+        // surviving row (a folded shell answers no summary).
+        let mut merge_events: Vec<HostSideEvent> = Vec::new();
+        let mut landed = message;
         if direction == "incoming"
             && let Some(aci) = receive.source_uuid.as_deref()
             && aci != peer_key
         {
             self.store
                 .upsert_peer_identity(&account.id, aci, &peer_key)?;
+            if let Some(outcome) = self
+                .store
+                .merge_peer_identity(&account.id, aci, &peer_key)?
+            {
+                if landed.conversation_id == outcome.obsolete_conversation_id {
+                    landed.conversation_id = outcome.canonical_summary.id.clone();
+                }
+                if let Some(notice) = outcome.merge_notice {
+                    merge_events.push(HostSideEvent::MessageUpserted(project_message_for_host(
+                        notice,
+                    )));
+                }
+                merge_events.push(HostSideEvent::ConversationMerged {
+                    account_id: account.id.clone(),
+                    from_conversation_id: outcome.obsolete_conversation_id,
+                    to_conversation: Box::new(outcome.canonical_summary),
+                });
+            }
         }
+        let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
+            landed,
+        ))];
+        events.extend(landed_events);
+        events.extend(landed_receipt_events);
+        events.extend(merge_events);
         if let Some(conversation) = self
             .store
             .conversation_summary(&account.id, &conversation.id)?
@@ -13558,6 +13603,11 @@ impl ConnectorService {
             return Ok(Vec::new());
         }
         let mut synced: Vec<(String, String, String)> = Vec::new();
+        // Contract 1.259 (§4.243): the bindings this batch writes, collected
+        // for the post-write fold sweep — a binding is the same-person
+        // discovery moment, and the fold runs only after the passive write
+        // face below has done its ladder work.
+        let mut bindings_written: Vec<(String, String)> = Vec::new();
         for record in contacts {
             let peer_key = record
                 .number
@@ -13569,6 +13619,7 @@ impl ConnectorService {
             if record.number.is_some() && record.aci != peer_key {
                 self.store
                     .upsert_peer_identity(&account.id, &record.aci, &peer_key)?;
+                bindings_written.push((record.aci.clone(), peer_key.clone()));
             }
             let title = record
                 .name
@@ -13604,8 +13655,34 @@ impl ConnectorService {
         let changed = self
             .store
             .upsert_passive_contacts(&account.id, &entries, now_ms())?;
+        // Contract 1.259 (§4.243): the fold sweep. A number-keyed shell row
+        // beside the binding's ACI-keyed row folds now — after the passive
+        // write face, so a title upgrade this batch landed on the shell rides
+        // `changed` and is filtered here when the shell folded away; the
+        // merged frame carries the fresh canonical summary, the A5 notice
+        // (when the official gate minted one) rides its own upserted frame.
+        let mut merge_events: Vec<HostSideEvent> = Vec::new();
+        let mut folded_shells: Vec<String> = Vec::new();
+        for (aci, number) in &bindings_written {
+            if let Some(outcome) = self.store.merge_peer_identity(&account.id, aci, number)? {
+                folded_shells.push(outcome.obsolete_conversation_id.clone());
+                if let Some(notice) = outcome.merge_notice {
+                    merge_events.push(HostSideEvent::MessageUpserted(project_message_for_host(
+                        notice,
+                    )));
+                }
+                merge_events.push(HostSideEvent::ConversationMerged {
+                    account_id: account.id.clone(),
+                    from_conversation_id: outcome.obsolete_conversation_id,
+                    to_conversation: Box::new(outcome.canonical_summary),
+                });
+            }
+        }
         let mut events = Vec::new();
         for conversation_id in changed {
+            if folded_shells.contains(&conversation_id) {
+                continue;
+            }
             if let Some(conversation) = self
                 .store
                 .conversation_summary(&account.id, &conversation_id)?
@@ -13613,6 +13690,7 @@ impl ConnectorService {
                 events.push(HostSideEvent::ConversationChanged(conversation));
             }
         }
+        events.extend(merge_events);
         Ok(events)
     }
 
@@ -40996,6 +41074,346 @@ mod tests {
         assert_eq!(row.attachments[0].id, "att-1");
         assert_eq!(row.attachments[0].filename.as_deref(), Some("shot.png"));
         assert_eq!(row.attachments[0].size, Some(2048));
+    }
+
+    /// Contract 1.259 (§4.243, batch Z1 · S14), the receive seam: an
+    /// inbound envelope whose contacts-hit peer key (the number) differs
+    /// from the envelope ACI writes the bridge binding and — when a
+    /// number-keyed shell row sits beside the ACI-keyed row — folds the
+    /// pair. The just-landed row re-keys with its conversation (its id never
+    /// changes), the A5 notice (the official gate minted one) and the
+    /// `conversation.merged` frame ride after the landed frames, and the
+    /// folded shell answers no trailing summary.
+    #[test]
+    fn ingest_receive_folds_the_discovered_double_row_and_reroutes_the_landed_row() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        const PEER_ACI: &str = "22222222-2222-4222-8222-222222222222";
+        let peer_number = "+15555550101";
+        let receive = |source: Option<&str>,
+                       source_uuid: Option<&str>,
+                       text: &str,
+                       peer_name: Option<&str>,
+                       ts: u64| {
+            NormalizedReceive {
+                required_protocol_version: None,
+                timestamp: Some(ts),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: source.map(str::to_string),
+                source_uuid: source_uuid.map(str::to_string),
+                peer_name: peer_name.map(str::to_string),
+                group_id: None,
+                text: Some(text.into()),
+                text_bytes: Some(text.len() as u32),
+                text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                control: None,
+                server_guid: None,
+                reporting_token: None,
+                server_timestamp: None,
+            }
+        };
+        // The ACI-keyed live row first (the sealed-sender world: the
+        // engine's peer resolution fell to sourceUuid, so the envelope's
+        // source IS the ACI — the ingest keys the row on it and the binding
+        // write skips its degenerate face).
+        service
+            .ingest_receive(
+                receive(Some(PEER_ACI), Some(PEER_ACI), "live hello", None, 1_000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        // The number-keyed shell row (the send-by-number / legacy world).
+        service
+            .ingest_receive(
+                receive(
+                    Some(peer_number),
+                    None,
+                    "shell hello",
+                    Some("Shell Peer"),
+                    2_000,
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let shell = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", peer_number)
+            .unwrap()
+            .expect("the shell row exists pre-fold");
+        let live = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", PEER_ACI)
+            .unwrap()
+            .expect("the ACI row exists pre-fold");
+        assert_ne!(shell.id, live.id);
+
+        let events = service
+            .ingest_receive(
+                receive(
+                    Some(peer_number),
+                    Some(PEER_ACI),
+                    "fold hello",
+                    Some("Shell Peer"),
+                    3_000,
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+
+        // The landed row rides the canonical conversation id.
+        let landed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record)
+                    if record.text.as_deref() == Some("fold hello") =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("the landed row upserts");
+        assert_eq!(
+            landed.conversation_id, live.id,
+            "the landed row re-keys with its conversation"
+        );
+        // The fold's frames: the A5 notice (both sides had messages, the
+        // shell title useful) and the merged frame naming shell → canonical.
+        let notice = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) if record.direction == "system" => {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("the A5 notice rides its own upserted frame");
+        let merge = notice
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.conversation_merge.as_ref())
+            .expect("the notice carries the conversationMerge face");
+        assert_eq!(
+            merge.obsolete_conversation_title.as_deref(),
+            Some("Shell Peer")
+        );
+        assert_eq!(
+            merge.obsolete_conversation_number.as_deref(),
+            Some(peer_number)
+        );
+        let merged = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationMerged {
+                    account_id,
+                    from_conversation_id,
+                    to_conversation,
+                } => Some((account_id, from_conversation_id, to_conversation)),
+                _ => None,
+            })
+            .expect("the merged frame rides");
+        assert_eq!(merged.0, &account.id);
+        assert_eq!(merged.1, &shell.id);
+        assert_eq!(merged.2.id, live.id);
+        // No trailing summary frame for the folded shell.
+        assert!(events.iter().all(|event| match event {
+            HostSideEvent::ConversationChanged(summary) => summary.id != shell.id,
+            _ => true,
+        }));
+        // The store: the shell is gone, the canonical row holds the union
+        // (two seeded rows plus the landed one plus the minted notice).
+        let store = service.store_ref();
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", peer_number)
+                .unwrap()
+                .is_none()
+        );
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![live.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 4);
+        let shell_leftovers: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![shell.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shell_leftovers, 0);
+    }
+
+    /// Contract 1.259 (§4.243), the sync seam: `apply_sync_contacts` runs
+    /// the fold sweep after its passive write face — a number-keyed shell
+    /// beside the record's ACI-keyed row folds, the shell's changed frame
+    /// filters, the merged frame carries the fresh canonical summary, and
+    /// the ladder's title upgrade lands on the surviving row.
+    #[test]
+    fn sync_contacts_folds_the_discovered_double_row_and_frames_the_merge() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        const PEER_ACI: &str = "33333333-3333-4333-8333-333333333333";
+        let peer_number = "+15555550101";
+        let receive = |source: Option<&str>,
+                       source_uuid: Option<&str>,
+                       text: &str,
+                       peer_name: Option<&str>| {
+            NormalizedReceive {
+                required_protocol_version: None,
+                timestamp: Some(1_000),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: source.map(str::to_string),
+                source_uuid: source_uuid.map(str::to_string),
+                peer_name: peer_name.map(str::to_string),
+                group_id: None,
+                text: Some(text.into()),
+                text_bytes: Some(text.len() as u32),
+                text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                control: None,
+                server_guid: None,
+                reporting_token: None,
+                server_timestamp: None,
+            }
+        };
+        service
+            .ingest_receive(
+                receive(Some(PEER_ACI), Some(PEER_ACI), "live hello", None),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        service
+            .ingest_receive(
+                receive(Some(peer_number), None, "shell hello", Some("+1555***101")),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let shell = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", peer_number)
+            .unwrap()
+            .expect("the shell row exists pre-fold");
+        let live = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", PEER_ACI)
+            .unwrap()
+            .expect("the ACI row exists pre-fold");
+
+        let account_row = service
+            .store_ref()
+            .account_by_id(&account.id)
+            .unwrap()
+            .expect("the synced account row");
+        let events = service
+            .apply_sync_contacts(
+                &account_row,
+                &[crate::engine::SyncContactRecord {
+                    aci: PEER_ACI.into(),
+                    number: Some(peer_number.into()),
+                    name: Some("Sync Peer".into()),
+                }],
+            )
+            .unwrap();
+
+        let merged = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationMerged {
+                    from_conversation_id,
+                    to_conversation,
+                    ..
+                } => Some((from_conversation_id, to_conversation)),
+                _ => None,
+            })
+            .expect("the merged frame rides");
+        assert_eq!(merged.0, &shell.id);
+        assert_eq!(merged.1.id, live.id);
+        // The A5 notice fires here: the sync's passive write face upgraded
+        // the shell's masked title to the sync's real name BEFORE the fold
+        // sweep read it, so the official titleIsUseful gate reads a useful
+        // title at merge time — the official order (write face, then merge,
+        // then the notice reads the obsolete row's title).
+        let notice = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) if record.direction == "system" => {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("the sync's title upgrade makes the shell title useful: the notice fires");
+        let merge_face = notice
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.conversation_merge.as_ref())
+            .expect("the notice carries the conversationMerge face");
+        assert_eq!(
+            merge_face.obsolete_conversation_title.as_deref(),
+            Some("Sync Peer")
+        );
+        assert_eq!(
+            merge_face.obsolete_conversation_number.as_deref(),
+            Some(peer_number)
+        );
+        // The surviving row's own title is never copied (the official pick
+        // list carries no title key); the display material self-heals
+        // through the §4.229 read face — the summary's systemName probes the
+        // contacts row by the identity set.
+        let folded_summary = &merged.1;
+        assert_eq!(folded_summary.system_name.as_deref(), Some("Sync Peer"));
+        // No changed frame names the folded shell.
+        assert!(events.iter().all(|event| match event {
+            HostSideEvent::ConversationChanged(summary) => summary.id != shell.id,
+            _ => true,
+        }));
+        let store = service.store_ref();
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", peer_number)
+                .unwrap()
+                .is_none()
+        );
+        // The surviving row keeps its own title (nothing copied); the sync's
+        // real name rides the §4.229 systemName face asserted above.
+        let folded = store
+            .conversation_summary(&account.id, &live.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(folded.title, "333***33");
     }
 
     /// The engine's P14 metadata faces (contract 1.107, §4.88) ride the
