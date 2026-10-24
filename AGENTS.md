@@ -39,14 +39,24 @@ Before implementation changes, read:
   each instance owns its own state-dir store (the store has no cross-process lock).
   Data-dir occupancy is enforced by a kernel lock at startup; endpoint collisions
   and over-limit endpoint paths fail closed at bind.
-- Inside one connector process, one engine per proxy
-  group. Proxy groups are bounded (hard ceiling 8, product default 4), are defined
-  by the trusted launcher at spawn, and are never created, reconfigured, or
-  reassigned over IPC (ADR 0001).
+- Engine topology has exactly two modes, chosen by the trusted launcher
+  (`--per-account-engines`, default off) and never over IPC (implementation-plan §4.217):
+  - **legacy** (default): one engine per proxy group. Proxy groups are bounded
+    (hard ceiling 8, product default 4), are defined by the launcher at spawn,
+    and are never created, reconfigured, or reassigned over IPC (ADR 0001).
+  - **full pool**: one engine per account under `<signal-data>/engines/<accountId>/`,
+    no group engine. The hard ceiling is 8 account engines and, by default, **all
+    linked accounts stay resident** (the resident window equals the ceiling,
+    because real-time receive is a product invariant); an operator on a
+    low-memory host may opt into a smaller window with
+    `KT_SIGNAL_POOL_MAX_RESIDENT` (e.g. 5), which re-enables idle demotion.
+    The link entry refuses beyond the ceiling. There is no mixed mode.
 - An account's proxy group is fixed when the account is linked and immutable for the life of
   that link; moving an account means deleting its local data and linking it again.
-- Never spawn one engine per account, conversation, or feature: accounts that share a proxy
-  group share its engine, data directory, watchdog, and RSS budget.
+- Never spawn one engine per conversation or feature. In legacy mode, accounts that share a
+  proxy group share its engine, data directory, watchdog, and RSS budget. In full-pool mode
+  the one-engine-per-account topology is the product decision recorded above, and each slot
+  owns its own data directory, occupancy lock, watchdog, and logs.
 - Do not use fixed HTTP/TCP ports. Prefer a private Unix socket or Windows named pipe.
 - Do not log message bodies, phone numbers, contacts, QR payloads, secrets, tokens, or key paths.
 - An unknown send outcome must not be retried automatically.

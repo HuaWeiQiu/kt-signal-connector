@@ -2285,7 +2285,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "conversationId"],
-      "description": "Send the upstream read receipt for messages the peers authored (contract revision 1.34; official sendReceipts per-author fan-out, one engine sendReadReceipt per author with that author's timestamps, the engine chunking 100 per envelope). messageIds is optional: absent means every receipt-eligible incoming row of the conversation in ascending sentAt order, both forms bounded at 512 (an explicit list beyond 512 is truncated, not rejected). Only incoming rows qualify — outgoing and system rows are skipped; rows whose author cannot be resolved from local data (group rows carry only a local sender hash) are skipped from the fan-out, not an error. The connector does not persist our own read state (the desktop owns its unread state), so the absent form may re-receipt rows the desktop already marked — duplicates are protocol-idempotent for the peer. The result is {status: 'sent'} when every per-author upstream call confirmed, or {status: 'unknown'} when any failed (including an indeterminate outcome); a receipt failure never fails the request and 'unknown' is never retried automatically. Zero eligible rows is a trivial {status: 'sent'} no-op. Stopgap (§4.119, connector-internal, no wire change): the absent form selects only rows newer than seven days — the upstream rejects stale receipt timestamps, so older rows drop out of the selection; the explicit messageIds form is unfiltered.",
+      "description": "Send the upstream read receipt for messages the peers authored (contract revision 1.34; official sendReceipts per-author fan-out, one engine sendReadReceipt per author with that author's timestamps, the engine chunking 100 per envelope). messageIds is optional: absent means every receipt-eligible incoming row of the conversation in ascending sentAt order, both forms bounded at 512 (an explicit list beyond 512 is truncated, not rejected). Only incoming rows qualify — outgoing and system rows are skipped; rows whose author cannot be resolved from local data (group rows carry only a local sender hash) are skipped from the fan-out, not an error. The connector does not persist our own read state (the desktop owns its unread state), so the absent form may re-receipt rows the desktop already marked — duplicates are protocol-idempotent for the peer. The result is {status: 'sent'} when every per-author upstream call confirmed, or {status: 'unknown'} when any failed (including an indeterminate outcome); a receipt failure never fails the request and 'unknown' is never retried automatically. Zero eligible rows is a trivial {status: 'sent'} no-op. Stopgap (§4.119, connector-internal, no wire change): the absent form selects only rows newer than seven days — the upstream rejects stale receipt timestamps, so older rows drop out of the selection; the explicit messageIds form is unfiltered. Contract revision 1.216 (§4.216) adds the optional messageId read-position target: when present, the conversation's authoritative read watermark (readWatermarkMs) advances to that message's sentAt, validated against the addressed account and conversation — an unknown, foreign, or clock-less target answers INVALID_REQUEST and leaves the watermark untouched (never a silent advance). When absent, the watermark keeps advancing to the newest incoming row (the pre-1.216 behavior). messageId is independent of messageIds, which still governs the receipt selection; both write seams fold monotonically (MAX — the position never rewinds).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -2294,7 +2294,8 @@
           "maxItems": 512,
           "items": { "$ref": "#/$defs/opaqueId" },
           "description": "Optional explicit selection; only incoming rows of this conversation qualify, others are skipped."
-        }
+        },
+        "messageId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "messagesMarkViewedParams": {
@@ -2317,7 +2318,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "conversationId"],
-      "description": "Send the read SELF-SYNC for messages the peers authored (contract revision 1.108, §4.89): the engine markRead face — SyncMessage.read to the account's own devices — so the account's other linked phones/desktops converge the read state. The channel is independent of the peer receipt (messages.markRead's sendReadReceipt face) and is NOT gated by the account's readReceipts configuration flag. Addressing, selection bounds (512 cap, truncation not rejection), direct-conversation author resolution, receipt-class {status: sent|unknown} aggregation, and the never-retry degradation are identical to messages.markRead; only the upstream face and its entry shape differ (the engine carries {sender, timestamp} per entry and chunks 100 per envelope internally). Zero eligible rows is a trivial {status: 'sent'} no-op; zero local writes (the desktop owns its read state). Stopgap (§4.119, connector-internal, no wire change): the absent form selects only rows newer than seven days (the §4.29 stopgap filters ride the one shared selection path).",
+      "description": "Send the read SELF-SYNC for messages the peers authored (contract revision 1.108, §4.89): the engine markRead face — SyncMessage.read to the account's own devices — so the account's other linked phones/desktops converge the read state. The channel is independent of the peer receipt (messages.markRead's sendReadReceipt face) and is NOT gated by the account's readReceipts configuration flag. Addressing, selection bounds (512 cap, truncation not rejection), direct-conversation author resolution, receipt-class {status: sent|unknown} aggregation, and the never-retry degradation are identical to messages.markRead; only the upstream face and its entry shape differ (the engine carries {sender, timestamp} per entry and chunks 100 per envelope internally). Zero eligible rows is a trivial {status: 'sent'} no-op; zero local writes (the desktop owns its read state). Stopgap (§4.119, connector-internal, no wire change): the absent form selects only rows newer than seven days (the §4.29 stopgap filters ride the one shared selection path). Contract revision 1.216 (§4.216): messages.syncRead accepts the same optional messageId read-position target as messages.markRead — when present, the conversation's read watermark (readWatermarkMs) advances to that message's sentAt, validated against the addressed account and conversation (an unknown, foreign, or clock-less target answers INVALID_REQUEST without moving it); when absent, the newest-incoming advance is byte-identical to the pre-1.216 behavior. The fold stays monotonic (MAX).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -2326,7 +2327,8 @@
           "maxItems": 512,
           "items": { "$ref": "#/$defs/opaqueId" },
           "description": "Optional explicit selection; only incoming rows of this conversation qualify, others are skipped."
-        }
+        },
+        "messageId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "messagesSyncViewedParams": {
@@ -4727,6 +4729,7 @@
             "story.recipientUpdate",
             "group.changed",
             "message.deleteForMe",
+            "identity.changed",
             "identity.verifiedChanged",
             "call.historyEvent",
             "settings.configurationSync",
@@ -6141,6 +6144,33 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "identity.changed" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "sourceUuid", "timestamp"],
+                "description": "Contract §4.226 (ledger §27.10): a peer's safety number (identity key) changed — the engine's receive identity-changed notification forwarded so the host renders the timeline system row. Observability only: the connector never resets sessions, trust, or verification on this event (the trust decision stays with the user, the §4.223 discipline) and nothing retries on this face. sourceUuid is the peer's ServiceId UUID exactly as the engine projected it (never resolved or rewritten); timestamp is the engine-supplied change moment in epoch milliseconds.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "sourceUuid": {
+                    "type": "string",
+                    "description": "The peer's ServiceId UUID as the engine's notification carried it."
+                  },
+                  "timestamp": {
+                    "type": "integer",
+                    "description": "Epoch milliseconds of the change, as the engine supplied it."
+                  }
+                }
+              }
+            }
+          }
         }
       ]
     },
@@ -6165,6 +6195,9 @@
             "LINK_EXPIRED",
             "LINK_CANCELLED",
             "ACCOUNT_LIMIT_REACHED",
+            "ACCOUNT_ALREADY_LINKED",
+            "ENGINE_POOL_FULL",
+            "ENGINE_NOT_PROVISIONED",
             "ACCOUNT_NOT_FOUND",
             "CONVERSATION_NOT_FOUND",
             "CONVERSATION_NOT_RESOLVED",

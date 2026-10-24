@@ -4,6 +4,7 @@
 import base64
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import threading
@@ -356,6 +357,19 @@ def argument_value(name):
 
 SIGNAL_DATA_DIR = Path(argument_value("--data-dir") or "/tmp/kt-signal-fixture")
 SIGNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log_pid_line():
+    logs_dir = SIGNAL_DATA_DIR / "logs"
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        with (logs_dir / "engine-stderr.log").open("a") as log:
+            log.write("pid=" + str(os.getpid()) + "\n")
+    except OSError:
+        pass
+
+
+log_pid_line()
 # Phase 4: every group engine shares the connector's environment, so group
 # identity can only come from the data directory each engine is launched with.
 # A non-default group answers with a distinct number, otherwise two engines
@@ -403,7 +417,44 @@ ACCOUNT_LINKED = not DELETED_MARKER.exists()
 # it, so a group can link up to its account ceiling and engine restarts keep
 # reporting every number handed out so far.
 MULTI_ACCOUNT = os.environ.get("KT_FAKE_MULTI_ACCOUNT") == "1"
-ACCOUNT_NUMBERS_LOG = SIGNAL_DATA_DIR / ".fixture-linked-numbers"
+# Per-account pool mode (§4.217): every account engine owns a private
+# `--data-dir` under <signal-data>/engines/<accountId>. The number ladder
+# must then live on the shared engines/ root — a per-engine log would hand
+# +15565550001 to every engine, and the second finishLink would collide on
+# the number (the registry answers ACCOUNT_ALREADY_LINKED). A pool engine
+# is ONE account (unlike a group engine that reports the whole ladder), so
+# the allocated number is also remembered in the engine's own data dir and
+# listAccounts answers that one account only.
+POOL_ACCOUNT_SHAPE = re.fullmatch(
+    r"(?P<root>.*/engines)/[0-9a-fA-F]{32}", str(SIGNAL_DATA_DIR)
+)
+POOL_ACCOUNT_MODE = POOL_ACCOUNT_SHAPE is not None
+LADDER_ACCOUNT_MODE = MULTI_ACCOUNT or POOL_ACCOUNT_MODE
+LADDER_DIR = (
+    Path(POOL_ACCOUNT_SHAPE.group("root")) if POOL_ACCOUNT_SHAPE else SIGNAL_DATA_DIR
+)
+ACCOUNT_NUMBERS_LOG = LADDER_DIR / ".fixture-linked-numbers"
+OWN_NUMBER_MARKER = SIGNAL_DATA_DIR / ".fixture-own-number"
+
+
+def own_number():
+    if not OWN_NUMBER_MARKER.exists():
+        return None
+    return OWN_NUMBER_MARKER.read_text().strip() or None
+
+
+def state_file_number():
+    state = SIGNAL_DATA_DIR / "engine-state.json"
+    if not state.exists():
+        return None
+    try:
+        data = json.loads(state.read_text())
+    except (ValueError, OSError):
+        return None
+    accounts = data.get("accounts") or []
+    if accounts:
+        return accounts[0].get("number")
+    return None
 
 
 def linked_multi_numbers():
@@ -449,6 +500,8 @@ def account_entry(number):
 # number when one exists (so post-link receives land on a linked account and
 # the store count matches the link count), otherwise the fixed fixture number.
 def receiving_account():
+    if POOL_ACCOUNT_MODE:
+        return own_number() or LINKED_ACCOUNT
     numbers = linked_multi_numbers()
     return numbers[-1] if MULTI_ACCOUNT and numbers else LINKED_ACCOUNT
 
@@ -730,10 +783,21 @@ def emit_json_after(value, delay_seconds):
     emit_json(value)
 
 
+def log_method_line(name):
+    logs_dir = SIGNAL_DATA_DIR / "logs"
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        with (logs_dir / "engine-stderr.log").open("a") as log:
+            log.write("method=" + str(name) + "\n")
+    except OSError:
+        pass
+
+
 for line in sys.stdin:
     request = json.loads(line)
     request_id = request.get("id")
     method = request.get("method")
+    log_method_line(method)
     params = request.get("params") or {}
     emit_receive_after = False
 
@@ -789,11 +853,28 @@ for line in sys.stdin:
         # mode keeps the fixed fixture number every existing test expects.
         # Contract 1.142 (§4.138): the answer may carry the account's own ACI
         # beside the number (absent under KT_FAKE_OMIT_ACCOUNT_ACI=1).
-        number = next_multi_number() if MULTI_ACCOUNT else LINKED_ACCOUNT
+        number = next_multi_number() if LADDER_ACCOUNT_MODE else LINKED_ACCOUNT
+        if POOL_ACCOUNT_MODE:
+            OWN_NUMBER_MARKER.write_text(number + "\n")
+            registry = SIGNAL_DATA_DIR / "engine-state.json"
+            registry.write_text(json.dumps({
+                "version": 2,
+                "accounts": [{
+                    "number": number,
+                    "dir": "accounts/lk-fixture",
+                }],
+            }))
         result = account_entry(number)
         emit_receive_after = True
     elif method == "listAccounts":
-        if MULTI_ACCOUNT:
+        if POOL_ACCOUNT_MODE:
+            number = own_number() or state_file_number()
+            result = (
+                [account_entry(number)]
+                if ACCOUNT_LINKED and number is not None
+                else []
+            )
+        elif MULTI_ACCOUNT:
             result = [account_entry(number) for number in linked_multi_numbers()]
         else:
             result = [account_entry(LINKED_ACCOUNT)] if ACCOUNT_LINKED else []
@@ -985,7 +1066,20 @@ for line in sys.stdin:
                 while not release.exists():
                     time.sleep(0.02)
                 ACCOUNT_LINKED = False
-                if MULTI_ACCOUNT:
+                if POOL_ACCOUNT_MODE:
+                    number = own_number()
+                    if number is not None:
+                        with WRITE_LOCK:
+                            numbers = [
+                                entry
+                                for entry in linked_multi_numbers()
+                                if entry != number
+                            ]
+                            ACCOUNT_NUMBERS_LOG.write_text(
+                                "\n".join(numbers) + ("\n" if numbers else ""),
+                            )
+                    OWN_NUMBER_MARKER.unlink(missing_ok=True)
+                elif MULTI_ACCOUNT:
                     # The multi-account list is the persisted numbers log;
                     # deleting an account removes it from the engine's list
                     # exactly like the real engine's registry removal.
@@ -1005,7 +1099,20 @@ for line in sys.stdin:
             threading.Thread(target=release_delete, daemon=True).start()
             continue
         ACCOUNT_LINKED = False
-        if MULTI_ACCOUNT:
+        if POOL_ACCOUNT_MODE:
+            number = own_number()
+            if number is not None:
+                with WRITE_LOCK:
+                    numbers = [
+                        entry
+                        for entry in linked_multi_numbers()
+                        if entry != number
+                    ]
+                    ACCOUNT_NUMBERS_LOG.write_text(
+                        "\n".join(numbers) + ("\n" if numbers else ""),
+                    )
+            OWN_NUMBER_MARKER.unlink(missing_ok=True)
+        elif MULTI_ACCOUNT:
             with WRITE_LOCK:
                 numbers = [
                     number

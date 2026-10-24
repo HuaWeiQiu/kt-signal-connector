@@ -689,14 +689,17 @@ fn schema_numeric_bounds_match_code_constants() {
         // Receipts ledger (contract 1.190, §4.190): the recipient key mirrors
         // the receive-id bound (the envelope source passes it verbatim) and
         // the ledger array mirrors the roster ceiling (the ledger's own
-        // recipient cap, the store's MAX_MESSAGE_RECEIPT_RECIPIENTS).
+        // recipient cap, the store's MAX_MESSAGE_RECEIPT_RECIPIENTS). The
+        // arm sits at allOf/33: receive.decryptionError (§4.163) and
+        // engine.initialSyncComplete landed arms ahead of it, so the
+        // positional pointer moved from the historical allOf/32.
         (
-            "/$defs/event/allOf/32/then/properties/data/properties/receipts/items/properties/recipient",
+            "/$defs/event/allOf/33/then/properties/data/properties/receipts/items/properties/recipient",
             "maxLength",
             MAX_RECEIVE_ID_CHARS as u64,
         ),
         (
-            "/$defs/event/allOf/32/then/properties/data/properties/receipts",
+            "/$defs/event/allOf/33/then/properties/data/properties/receipts",
             "maxItems",
             MAX_MESSAGE_RECEIPT_RECIPIENTS as u64,
         ),
@@ -704,7 +707,7 @@ fn schema_numeric_bounds_match_code_constants() {
         // mirrors the parse bound (§4.175's MAX_INBOUND_ATTACHMENTS — one
         // entry per remote attachment position).
         (
-            "/$defs/event/allOf/34/then/properties/data/properties/attachments",
+            "/$defs/event/allOf/35/then/properties/data/properties/attachments",
             "maxItems",
             MAX_INBOUND_ATTACHMENTS as u64,
         ),

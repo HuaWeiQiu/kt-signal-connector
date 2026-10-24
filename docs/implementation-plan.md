@@ -18774,8 +18774,9 @@ MessageRecord（src/store.rs:1708）未接收，字段在 connector → 桌面�
 **写入纪律**：
 
 1. **只由实时接收路径写真实值**（engine envelope value 在手的位置）；
-2. 其余构造路径（历史导入、备份导出、迁移、测试桩）一律写缺席值
-   （None / false），**不得伪造**；
+2. 其余构造路径（备份导出、迁移、测试桩）一律写缺席值
+   （None / false），**不得伪造**——is_erased 的历史导入臂随后由
+   §4.221 接真值（导入记录是它的唯一真值来源），该字段不再走本条；
 3. 序列化：Option 用 skip_serializing_if = Option::is_none，bool 用
    skip_serializing_if = std::ops::Not::not（与既有 mentions_self 同纪律），
    保证旧行为逐字节不变。
@@ -18794,6 +18795,99 @@ MessageRecord 有 113 处完整字面量构造点。加 Default 再让各处补 
 
 **门禁**：cargo fmt --check、cargo clippy --all-targets -- -D warnings、
 cargo test --lib、cargo build --release。
+
+## §4.221 历史导入 isErased 真值接线（补 §4.220 写入纪律第 2 条）
+
+**背景**：§4.220 定契约时，历史导入路径的 is_erased 未接导入记录真值
+（占位 false）。接线后：history_import.rs 从导入记录 value 读
+`isErased`（engine history.rs:1139 只在「阅后即焚已查看」置 true），
+导入记录成为 is_erased 的唯一真值来源。
+
+**纪律**：只认布尔（`Value::as_bool`）；缺席/非布尔一律 false——
+绝不把「没写」当成「已擦除」。
+
+**边界**：官方 isErased 另一来源是保留期到期主动擦除
+（cleanup.preload.ts:60-85 eraseMessageContents），到期半面由 §4.228
+（契约 1.218）承接，两来源闭环。
+
+---
+
+## §4.222 限流错误时长透传（retryAfterSecs）
+
+**背景**：上游限流错误（429/413）本带服务端给出的等待时长，归型
+`{..}` 丢弃后宿主只能按固定 60 秒重试（官方 DEFAULT_RETRY_AFTER）。
+被限流期间每 60 秒撞一次，等待窗口不断刷新，实测长时间发不出去。
+
+**契约**：
+
+| wire 键 | Rust 字段 | 类型 | 语义 | 缺席语义 |
+|---|---|---|---|---|
+| error.data.retryAfterSecs | EngineError::RateLimited { retry_after_secs } → ApiError::with_data(SEND_RATE_LIMITED, data) | Option<u64> | 服务端 429/413 给出的等待秒数 | 键缺席 = 引擎未带（旧版本），宿主回落官方一分钟默认 |
+
+**投影链**：engine send_error data → connector ApiError.data 原样透传
+（connector 永不发明/剥离 data 键，同既有 ApiError.data 纪律）。
+
+**测试**：分类带秒数 → data.retryAfterSecs 出现；缺席 → data 键不出现。
+
+---
+
+## §4.223 identities.verify 信任重置臂（state=default / sendAnyway）
+
+**背景**：官方 SafetyNumberChangeDialog 给两条出口——「标记为已验证」
+（比对安全码）与「仍然发送 (icu:sendAnyway)」（跳过比对）。connector
+此前只有 verifiedSafetyNumber 比对臂。
+
+**契约**：identities.verify 的 safetyNumber 与 state **两臂恰一**
+（supervisor 路由闸双臂/双缺 fail-closed INVALID_REQUEST，同 engine
+trust 语义）：
+
+| 臂 | engine trust 面 | 语义 |
+|---|---|---|
+| safetyNumber: String | verifiedSafetyNumber（比对闸） | 标记为已验证 |
+| state: "default" | (None, Some("default")) 信任重置 | sendAnyway（无比对） |
+
+**测试**：两臂各自路由正确；双臂/双缺 INVALID_REQUEST。
+
+---
+
+## §4.224 删除失败态持久化（deleteFailed / deleteFailedAt）
+
+**背景**：删除（为所有人）发送失败后的失败态此前是桌面内存视图旗标，
+客户端重启即丢——用户会误以为删除成功。
+
+**契约**：
+
+| wire 键 | Rust 字段 | 类型 | 语义 | 缺席语义 |
+|---|---|---|---|---|
+| deleteFailed | delete_failed | bool | 墓碑已落但删除请求未确认成功 | false（skip 键） |
+| deleteFailedAt | delete_failed_at | Option<u64> | 失败发生时刻（ms） | None（skip 键） |
+
+官方词形（model-types.d.ts:330 deletedForEveryoneFailed）为语义对位
+记档；KT wire 面沿用结构体 camelCase 投影词，命名纪律同 §4.47 段
+（serde rename 才回官方名，本字段未 rename）。
+
+**写入纪律**：supervisor 删除结算三臂——成功清旗标清时刻；未知/失败
+落旗标 + now（持久化，重启后桌面仍可见「删除失败可重试」）。结果本身
+不自动重试（unknown_outcome 纪律，同 AGENTS）。
+
+**迁移**：messages 表 ADD COLUMN delete_failed INTEGER NOT NULL DEFAULT 0
++ delete_failed_at INTEGER（照 admin_deleted 先例，附加列不回填历史行）。
+
+**测试**：结算三臂各落正确值；wire 键 camelCase；缺席键不出现。
+
+---
+
+## §4.225 已知边界（如实记档，非本批缺陷）
+
+- isErased「阅后即焚已查看」半面已接（§4.221）；保留期到期主动擦除的
+  到期半面已由 §4.228（契约 1.218）落地——官方两来源闭环；
+- deletedForEveryoneSendStatus（逐收件人发送状态）依赖逐人发送模型，
+  本端发送模型无逐人态，随 P1 模型批评估；
+- DeliveryIssueNotification 未实现（台账 §27.6）；对端安全码变更的
+  时间线系统行已由 §4.226 identity.changed 观测事件承接（只转发落行，
+  本端不自动重置会话，信任决定权在用户）。
+
+---
 
 ## §4.228 保留期到期主动擦除（eraseMessageContents 到期半面）
 
