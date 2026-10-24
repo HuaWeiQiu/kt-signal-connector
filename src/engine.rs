@@ -1420,6 +1420,16 @@ pub enum ControlReceive {
         signal_type: &'static str,
         payload: Value,
     },
+    /// 群通话 era 更新控制接收（契约 1.260，§4.244）：引擎 live 投影
+    /// `dataMessage.groupCallUpdate {eraId}`。官方 handleGroupCallUpdateMessage
+    /// 姿态（background.preload.ts:3534-3563）：非渲染行、零持久化，消费面 =
+    /// peek 触发（`peekNotConnectedGroupCall`）。仅群上下文进本臂（官方闸
+    /// `message.groupV2 && type===GROUP`）：eraId 非空且 ≤256 字符、group 键
+    /// （32B 主键标准 base64）必在——era 缺席/超帽/无群键 = 整面掉落（官方
+    /// warn-and-ignore 臂），信封原样走既有 fall-through，1:1 腿零变化。
+    GroupCallUpdate {
+        era_id: String,
+    },
     /// The official `syncMessage.messageRequestResponse` mirror (contract
     /// 1.70, §4.58 consume batch): one of our own linked devices answered the
     /// conversation's message request. `response_type` is the protocol enum
@@ -2321,6 +2331,10 @@ const GROUP_UPDATED_EDITOR_MAX_BYTES: usize = 64;
 const MAX_CALL_ID: u64 = u32::MAX as u64;
 const MAX_CALL_OPAQUE_CHARS: usize = 3 * 1024 * 1024;
 const MAX_CALL_ICE_FRAMES: usize = 64;
+/// 群通话 era 身份串帽（契约 1.260，§4.244）：与发送面
+/// `prepare_calls_send_group_call_update` 的 eraId ≤256 闸同域——收侧同帽，
+/// 超帽整面丢弃（宁缺勿错，不截断不发明）。
+const MAX_GROUP_CALL_ERA_CHARS: usize = 256;
 /// The official desktop's `GROUPV2_ID_LENGTH` (MessageReceiver.preload.ts
 /// :3274-3309, contract 1.70 §4.58 consume batch): the group master key is a
 /// 32-byte value carried on the wire as standard base64; any other decoded
@@ -6422,6 +6436,31 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
                     target_timestamp: target,
                 },
             });
+        }
+        // 群通话 era 更新（契约 1.260，§4.244）：官方 handleGroupCallUpdateMessage
+        // 臂（background.preload.ts:3534-3563）——非渲染行零持久化，控制事件面
+        // 即 peek 触发。群闸在先（官方 `message.groupV2 && GROUP`）：eraId 非空
+        // ≤256、group 键必在；era 缺席/超帽/无群键 = 官方 warn-and-ignore，整面
+        // 掉落（不路由、不铸行变化——信封走下方既有 fall-through，1:1 腿字节级
+        // 不变）。
+        if let Some(update) = data_message
+            .get("groupCallUpdate")
+            .and_then(Value::as_object)
+        {
+            let era_id = update
+                .get("eraId")
+                .and_then(Value::as_str)
+                .filter(|era| !era.is_empty() && era.chars().count() <= MAX_GROUP_CALL_ERA_CHARS);
+            if let (Some(era_id), true) = (era_id, group_id.is_some()) {
+                return Some(ControlRouting {
+                    direction: "incoming",
+                    source: envelope_peer_source(envelope),
+                    group_id,
+                    control: ControlReceive::GroupCallUpdate {
+                        era_id: era_id.to_string(),
+                    },
+                });
+            }
         }
         // Pin family (contract 1.33): per-conversation pin state and the
         // admin-delete tombstone, projected by the service layer.
@@ -12807,7 +12846,7 @@ mod tests {
         control_routing(json!({ "groupChanged": change }).as_object().unwrap()).is_none()
     }
 
-    /// Contract 1.134 (§4.117): the engine's `groupTerminated` projection
+    /// 群通话 era 更新收面（契约 1.260，§4.244）：群 face 路由为控制接收——\n    /// eraId 逐字、群键随路；era 缺席/超帽/无群键 = 官方 warn-and-ignore，\n    /// 整面掉落（信封走既有 fall-through，1:1 腿不路由钉形）。\n    #[test]\n    fn group_call_update_routes_group_face_and_drops_the_rest() {\n        let routed = control_routing(\n            json!({\n                "timestamp": 1727000000000u64,\n                "source": "+15555550101",\n                "dataMessage": {\n                    "groupCallUpdate": { "eraId": "era-1" },\n                    "groupInfo": { "groupId": "ZmFrZS1ncm91cC0x" },\n                },\n            })\n            .as_object()\n            .unwrap(),\n        )\n        .expect("group face routes as control");\n        assert_eq!(routed.group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));\n        assert_eq!(routed.direction, "incoming");\n        assert_eq!(routed.source.as_deref(), Some("+15555550101"));\n        assert!(matches!(\n            routed.control,\n            ControlReceive::GroupCallUpdate { ref era_id } if era_id == "era-1"\n        ));\n\n        // era 缺席（引擎空串整键缺席的同域防御）= 官方 warn-and-ignore。\n        assert!(control_routing(\n            json!({\n                "timestamp": 1727000000000u64,\n                "dataMessage": {\n                    "groupCallUpdate": {},\n                    "groupInfo": { "groupId": "ZmFrZS1ncm91cC0x" },\n                },\n            })\n            .as_object()\n            .unwrap(),\n        )\n        .is_none());\n\n        // 超帽 era = 整面掉落（不截断不发明；帽 = §4.108 发送闸同域 256）。\n        let oversized = "e".repeat(257);\n        assert!(control_routing(\n            json!({\n                "timestamp": 1727000000000u64,\n                "dataMessage": {\n                    "groupCallUpdate": { "eraId": oversized },\n                    "groupInfo": { "groupId": "ZmFrZS1ncm91cC0x" },\n                },\n            })\n            .as_object()\n            .unwrap(),\n        )\n        .is_none());\n\n        // 无群键 = 官方群闸挡住（信封走 fall-through；1:1 腿零变化钉形）。\n        assert!(control_routing(\n            json!({\n                "timestamp": 1727000000000u64,\n                "dataMessage": { "groupCallUpdate": { "eraId": "era-1" } },\n            })\n            .as_object()\n            .unwrap(),\n        )\n        .is_none());\n    }\n    /// Contract 1.134 (§4.117): the engine's `groupTerminated` projection
     /// routes as a conversation-less transient control addressed by its own
     /// groupId; a face with no subject fails closed to the plain skip.
     #[test]

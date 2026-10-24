@@ -1319,6 +1319,23 @@ pub enum HostSideEvent {
         call_id: u64,
         signal_type: &'static str,
         payload: Value,
+        /// 契约 1.259（§4.243）：offer 帧的 proto video 位（引擎
+        /// offer_type_json 词表 "audio"|"video"）升为事件加性词——官方
+        /// IncomingCallBar isVideoCall 面的协议半边（modern opaque 面该位在
+        /// RingRTC 序列化字节内不可达，缺席 = 未知，桌面真相收编走 sidecar
+        /// call.state hasVideo 面）。缺席键 = 旧宿主零变化。
+        call_kind: Option<&'static str>,
+    },
+    /// 群通话 era 更新触达（契约 1.260，§4.244）：引擎 live
+    /// `dataMessage.groupCallUpdate {eraId}` 的控制事件投影——官方
+    /// handleGroupCallUpdateMessage 姿态（background.preload.ts:3534-3563）的
+    /// KT 管道半边：非渲染行零持久化，事件即 peek 触发，桌面拉 SFU peek 后
+    /// 点亮 Join 强钮。瞬态如 `call.incoming`：错过不自愈（官方 peeks 重试同
+    /// 域，后续 era 更新重触发）。
+    CallGroupCallUpdate {
+        account_id: String,
+        conversation_id: String,
+        era_id: String,
     },
     /// Envelope-level opaque signaling whose conversation ladder resolved to
     /// nothing (contract 1.82, §4.49.2): the group-signaling shape. The
@@ -12306,13 +12323,41 @@ impl ConnectorService {
                 call_id,
                 signal_type,
                 payload,
-            } => Ok(vec![HostSideEvent::CallIncoming {
-                account_id: account.id,
-                conversation_id: conversation.id,
-                call_id,
-                signal_type,
-                payload,
-            }]),
+            } => {
+                // 契约 1.259（§4.243）：offer 帧的 proto video 位随载荷逐字
+                // 在场（引擎 offer_type_json 词表 "audio"|"video"）——升为事件
+                // 加性 `callKind` 词，词表外/缺席 = 键不在（modern opaque 面
+                // 该位不可达，绝不发明）。旧宿主读 pre-1.259 事件逐字节同形。
+                let call_kind = payload
+                    .get("offer")
+                    .and_then(|offer| offer.get("type"))
+                    .and_then(Value::as_str)
+                    .and_then(|word| match word {
+                        "audio" => Some("audio"),
+                        "video" => Some("video"),
+                        _ => None,
+                    });
+                Ok(vec![HostSideEvent::CallIncoming {
+                    account_id: account.id,
+                    conversation_id: conversation.id,
+                    call_id,
+                    signal_type,
+                    payload,
+                    call_kind,
+                }])
+            }
+            // 群通话 era 更新（契约 1.260，§4.244）：非渲染行零持久化——事件即
+            // peek 触发（官方 handleGroupCallUpdateMessage 臂的管道半边）。瞬态
+            // 如 `call.incoming`：错过不自愈，后续 era 更新重触发（官方 peek 重
+            // 试同域）。群 ladder 已把 group 主键解到 conversation——事件寻址即
+            // 它的诚实答案。
+            ControlReceive::GroupCallUpdate { era_id } => {
+                Ok(vec![HostSideEvent::CallGroupCallUpdate {
+                    account_id: account.id,
+                    conversation_id: conversation.id,
+                    era_id,
+                }])
+            }
             // The read/viewed sync is intercepted before the conversation
             // ladder (its entries span conversations); this arm is the same
             // unreachable-in-practice guard the other cross-conversation
@@ -31137,6 +31182,7 @@ mod tests {
             call_id,
             signal_type,
             payload,
+            call_kind,
         } = &events[0]
         else {
             panic!("expected a CallIncoming event: {events:?}");
@@ -31146,6 +31192,8 @@ mod tests {
         assert_eq!(*call_id, 7);
         assert_eq!(*signal_type, "offer");
         assert_eq!(payload["offer"]["opaque"], "c2Rw");
+        // 引擎 offer 投影未携 type 位（缺席键）= callKind 缺席（绝不发明）。
+        assert!(call_kind.is_none(), "a type-less offer answers no callKind");
 
         // Nothing persisted: no row, no store write, nothing to self-heal.
         let listed = service
@@ -34969,6 +35017,130 @@ mod tests {
         assert_eq!(absent_account.into_api().code, "ACCOUNT_NOT_FOUND");
     }
 
+    /// 契约 1.260（§4.244）：群通话 era 控制接收 → 瞬态 CallGroupCallUpdate
+    /// 事件，寻址 = 群 ladder 解到的会话；零行零持久化（错过不自愈域）。
+    #[test]
+    fn ingest_group_call_update_event_addresses_the_group_row() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let mut receive = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::GroupCallUpdate {
+                era_id: "era-1".into(),
+            },
+        );
+        receive.group_id = Some("group-id-1".into());
+        let events = service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::CallGroupCallUpdate {
+            account_id,
+            conversation_id,
+            era_id,
+        } = &events[0]
+        else {
+            panic!("expected a CallGroupCallUpdate event: {events:?}");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(conversation_id, &conversation.id);
+        assert_eq!(era_id, "era-1");
+        let listed = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        assert!(listed.items.is_empty(), "no row may be created");
+    }
+
+    /// 契约 1.259（§4.243）：legacy offer 帧的 proto video 位升为事件加性
+    /// callKind——引擎词表（audio|video）内逐字透出；词表外折缺席（modern
+    /// opaque 面同域——桌面真相收编走 sidecar hasVideo 面，绝不发明）。
+    #[test]
+    fn call_incoming_call_kind_rides_the_offer_word_list() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "direct")
+            .unwrap();
+        let call = |signal_type: &'static str, payload: Value| {
+            control_receive(
+                "+15555550100",
+                "+15555550101",
+                ControlReceive::Call {
+                    call_id: 7,
+                    signal_type,
+                    payload,
+                },
+            )
+        };
+        let events = service
+            .ingest_receive(
+                call("offer", json!({ "offer": { "id": 7, "type": "video" } })),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let HostSideEvent::CallIncoming { call_kind, .. } = &events[0] else {
+            panic!("expected a CallIncoming event: {events:?}");
+        };
+        assert_eq!(*call_kind, Some("video"));
+
+        let events = service
+            .ingest_receive(
+                call("offer", json!({ "offer": { "id": 7, "type": "audio" } })),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let HostSideEvent::CallIncoming { call_kind, .. } = &events[0] else {
+            panic!("expected a CallIncoming event: {events:?}");
+        };
+        assert_eq!(*call_kind, Some("audio"));
+
+        // 词表外 = 键不在（绝不发明 kind）。
+        let events = service
+            .ingest_receive(
+                call("offer", json!({ "offer": { "id": 7, "type": "mystery" } })),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let HostSideEvent::CallIncoming { call_kind, .. } = &events[0] else {
+            panic!("expected a CallIncoming event: {events:?}");
+        };
+        assert!(call_kind.is_none());
+
+        // modern opaque 面：位在 RingRTC 字节内不可达 = 恒缺席。
+        let events = service
+            .ingest_receive(
+                call(
+                    "opaque",
+                    json!({ "opaque": "c2Rw", "urgency": "droppable" }),
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let HostSideEvent::CallIncoming { call_kind, .. } = &events[0] else {
+            panic!("expected a CallIncoming event: {events:?}");
+        };
+        assert!(call_kind.is_none());
+        let _ = &conversation;
+    }
     /// Builds a control-carrying receive addressed to this account/peer.
     fn control_receive(account: &str, source: &str, control: ControlReceive) -> NormalizedReceive {
         NormalizedReceive {

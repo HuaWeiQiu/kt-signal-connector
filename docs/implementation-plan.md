@@ -82,6 +82,8 @@
   the avatar member of the group change word list); the refreshed or
   honestly-cleared projection rides `conversation.changed`. No wire
   removal anywhere: pre-1.258 hosts read every face byte-identically.)
+- Contract revision: 1.259 (2026-10-24; §4.243 the incoming-call kind face — batch Z3, ledger §29.80: the official video-call protocol half gets its wire word — the legacy offer frame's proto `Offer.type` the engine already projects as the words `audio`|`video` (offer_type_json, mod.rs offer arm, test :19483-19489) rides the `call.incoming` event additively as `callKind`. The official desktop learns `isVideoCall` from RingRTC's offer parse; on the modern opaque face that bit lives inside the RingRTC-serialized bytes and is unreachable connector-side, so the key stays absent and the desktop's truth-adoption path is the sidecar `call.state` `hasVideo` face (the RingRTC Call.isVideoCall the sidecar already projects) — the wire word covers the legacy face, the truth path covers the modern one, and the banner never invents a kind. Absent-key additive: pre-1.259 hosts read the event byte-identically.)
+- Contract revision: 1.260 (2026-10-24; §4.244 the group-call era receive face — batch Z3, ledger §29.80: the official `handleGroupCallUpdateMessage` posture (background.preload.ts:3534-3563) gets its receive half — the engine's live `DataMessage.groupCallUpdate {eraId}` projection (field 19, mod.rs Q4 arm) routed as a control face (no renderable row, zero persistence — the official consumes the message as `peekNotConnectedGroupCall({conversationId})` and nothing else) and forwarded as the transient `call.groupCallUpdate` event {accountId, conversationId, eraId}. Group context only (the official gate `message.groupV2 && type===GROUP`): an era-less, oversized (the §4.108 send gate's own 256-char cap), or groupless update drops the face — the official warn-and-ignore leg — and the envelope keeps its pre-existing fall-through, so the 1:1 leg stays byte-identical. The send side already rode `calls.sendGroupCallUpdate` (§4.108); this closes the loop: join arm sends the era update, receivers peek and light the header Join face from the peek truth. Transient like `call.incoming`: a missed delivery stays missed, the next era update re-triggers (the official peek-refresh posture).)
 - Contract revision: 1.254 (2026-10-24; §4.38 the archive-import media
   face close-out — batch U, ledger §29.64: the engine's v2 export already
   projects `width`/`height` on every attachment line
@@ -19345,3 +19347,50 @@ pre-1.256 宿主逐字节同形。
 pre-1.257 宿主逐字节同形。
 **测试**：verbatim 三臂（true/false/无戳）+ 反演面不动钉形 + 群行缺席 +
 wire 缺席键钉形。
+
+## §4.243 来电 callKind 位（契约 1.259 · 批 Z3 · 台账 §29.80）
+
+官方锚：`IncomingCallBar.dom.tsx:193`（`isVideoCall` → 视频变体三钮）、
+`:315-341`（接视频/接音频/拒绝钮序）；官方 hasVideo 真相 = RingRTC offer
+解析（`calling.preload.ts` handleIncomingCall → `call.isVideoCall`）。
+引擎面：`project_call_message` 的 offer 臂已投 `offer.type`
+（`offer_type_json`：OfferVideoCall→"video"，缺席/其他→"audio"；钉形
+mod.rs:19483-19489）。
+
+我方数据面：legacy offer 帧的该位随 payload 逐字在场——本批把它升为
+`call.incoming` 事件加性 `callKind`（词表 "audio"|"video" 闭集，词表外/
+缺席 = 键不在）。modern opaque 面（生产路径）该位在 RingRTC 序列化字节
+内，连接器侧不可达——缺席 = 未知，桌面 hasVideo 真相收编走 sidecar
+`call.state` 的 `hasVideo`（RingRTC `Call.isVideoCall` 直投影，
+call-controller.ts:658/:854 已在场）。两半边合成官方真相路径：协议位
+（legacy wire 词）+ RingRTC 位（modern 帧投影），横幅绝不发明 kind。
+
+**wire**：`call.incoming` additive absent-key `callKind`（仅 legacy
+offer 面、引擎词在词表时）；pre-1.259 宿主逐字节同形。
+**测试**：video/audio/缺席三臂 + 词表外折叠 + modern opaque 恒缺席钉形。
+
+## §4.244 群通话 era 收面（契约 1.260 · 批 Z3 · 台账 §29.80）
+
+官方锚：`background.preload.ts:3534-3563` handleGroupCallUpdateMessage
+（群门 → `peekNotConnectedGroupCall`，非渲染行零持久化）；engine Q4 收
+投影（mod.rs:10125-10130，eraId 空串整键缺席）；发送半
+`calls.sendGroupCallUpdate`（§4.108，契约 1.127）。官方发送语义
+（calling.preload.ts:1699-1706/:1720-1735/:1906-1917）：join 态 Joined
+一次性发 eraX，leave（NotConnected 且已发过 join）再发同 eraX——era
+更新自身不分开始/结束，真相在 peek（RingRTC
+`peekGroupCall(sfuUrl, proof, members)`）。
+
+我方数据面：engine live `dataMessage.groupCallUpdate {eraId}` 路由为
+控制面（`ControlReceive::GroupCallUpdate`，非渲染行零持久化——顺带退役
+「群通话更新落空 body 行」的噪声行铸造，官方本就不渲染该行），转发瞬态
+`call.groupCallUpdate {accountId, conversationId, eraId}`。群门（官方
+`message.groupV2 && type===GROUP`）：era 非空 ≤256（§4.108 发送门同帽）、
+group 键必在；era 缺席/超帽/无群键 = 官方 warn-and-ignore，信封走既有
+fall-through（1:1 腿字节级不变）。消费半（桌面）：事件即 peek 触发——
+桌面取 §4.73 proof/member 材料 + §8.9 sfuUrl，经 sidecar RingRTC
+stateless peek（`peekGroupCall`），peek 真相点亮头部 Join 强钮。
+
+**wire**：新瞬态事件 `call.groupCallUpdate`（三键必在；eraId 1..256）；
+零行、零持久化、错过不自愈（后续 era 更新重触发 = 官方 peek 刷新同域）。
+**测试**：路由三臂（群 face 进控制/era 缺席掉落/无群键掉落）+ 1:1 腿
+不路由钉形 + 服务层事件寻址（群 ladder 解到会话）+ wire 事件 JSON 钉形。

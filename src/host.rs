@@ -4516,14 +4516,32 @@ fn host_event_frame(event: HostSideEvent) -> Result<HostEvent<Value>, HostError>
             call_id,
             signal_type,
             payload,
-        } => Ok(HostEvent::new(
-            "call.incoming",
-            json!({
+            call_kind,
+        } => {
+            // 契约 1.259（§4.243）：callKind 加性可选词（audio|video）——缺席
+            // 键不在，pre-1.259 宿主读字节同形。
+            let mut data = json!({
                 "accountId": account_id,
                 "conversationId": conversation_id,
                 "callId": call_id,
                 "type": signal_type,
                 "payload": payload,
+            });
+            if let Some(kind) = call_kind {
+                data["callKind"] = json!(kind);
+            }
+            Ok(HostEvent::new("call.incoming", data))
+        }
+        HostSideEvent::CallGroupCallUpdate {
+            account_id,
+            conversation_id,
+            era_id,
+        } => Ok(HostEvent::new(
+            "call.groupCallUpdate",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "eraId": era_id,
             }),
         )),
         HostSideEvent::CallGroupIncoming {
@@ -6500,7 +6518,7 @@ mod tests {
         hex::encode(mac.finalize().into_bytes())
     }
 
-    /// The `story.received` wire frame (contract 1.91, §4.74): the story
+    /// 契约 1.259/1.260（§4.243/§4.244）：callKind 加性可选词——缺席键不在，\n    /// pre-1.259 宿主读字节同形；群 era 更新事件三键逐字上 wire。\n    #[test]\n    fn call_events_encode_the_additive_faces() {\n        let frame: Value = serde_json::to_value(\n            host_event_frame(HostSideEvent::CallIncoming {\n                account_id: "acct-1".into(),\n                conversation_id: "conv-1".into(),\n                call_id: 7,\n                signal_type: "offer",\n                payload: json!({ "offer": { "id": 7, "type": "video" } }),\n                call_kind: Some("video"),\n            })\n            .unwrap(),\n        )\n        .unwrap();\n        assert_eq!(frame["event"], "call.incoming");\n        assert_eq!(frame["data"]["callKind"], "video");\n        assert_eq!(frame["data"]["type"], "offer");\n\n        let frame: Value = serde_json::to_value(\n            host_event_frame(HostSideEvent::CallIncoming {\n                account_id: "acct-1".into(),\n                conversation_id: "conv-1".into(),\n                call_id: 0,\n                signal_type: "opaque",\n                payload: json!({ "opaque": "c2Rw", "urgency": "droppable" }),\n                call_kind: None,\n            })\n            .unwrap(),\n        )\n        .unwrap();\n        assert!(\n            frame["data"].get("callKind").is_none(),\n            "absent kind stays a absent key, never null"\n        );\n\n        let frame: Value = serde_json::to_value(\n            host_event_frame(HostSideEvent::CallGroupCallUpdate {\n                account_id: "acct-1".into(),\n                conversation_id: "conv-1".into(),\n                era_id: "era-1".into(),\n            })\n            .unwrap(),\n        )\n        .unwrap();\n        assert_eq!(frame["event"], "call.groupCallUpdate");\n        assert_eq!(frame["data"]["eraId"], "era-1");\n        assert_eq!(frame["data"]["conversationId"], "conv-1");\n    }\n    /// The `story.received` wire frame (contract 1.91, §4.74): the story
     /// object rides the event payload verbatim — the engine-projected
     /// `textAttachment.preview.url`/`.title` reach the desktop byte-for-byte
     /// (and a key the contract never named rides the same way), while the
