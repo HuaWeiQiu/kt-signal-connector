@@ -17,6 +17,7 @@ use crate::engine::{
     receive_channel,
 };
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
+use crate::link::now_ms;
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
@@ -11271,9 +11272,17 @@ async fn engine_event_watch_loop(
                 // 契约 1.261 §4.245（批 Z12 · S15）：引擎 session-reset 投影的
                 // 消费臂——官方两类 session-reset 时间线系统行落地面（词臂
                 // endSession/chatSessionRefresh → 桌面 wire 键 1.181）。
+                // sentAt 缺席臂（引擎 chatSessionRefresh 发送侧时刻未知时整
+                // 键缺席，eba82d3 契约注）→ 行钟标本机时钟（identityChanged
+                // 模板），事件绝不丢。
                 let forwarded = {
                     let guard = service.lock().await;
-                    guard.forward_session_reset(&account, &peer_aci, &word, sent_at)
+                    guard.forward_session_reset(
+                        &account,
+                        &peer_aci,
+                        &word,
+                        sent_at.unwrap_or_else(now_ms),
+                    )
                 };
                 emit_forwarded(&host_events, forwarded);
             }

@@ -525,7 +525,7 @@ pub enum EngineEvent {
         account: String,
         peer_aci: String,
         word: String,
-        sent_at: u64,
+        sent_at: Option<u64>,
     },
 }
 
@@ -3843,11 +3843,17 @@ async fn handle_upstream_line(
                 .and_then(|params| params.get("word"))
                 .and_then(Value::as_str)
                 .filter(|word| *word == "endSession" || *word == "chatSessionRefresh");
+            // sentAt = additive absent discipline (engine commit eba82d3
+            // contract note): the endSession arm always carries it; the
+            // chatSessionRefresh arm omits the whole key when the send-side
+            // client timestamp is unknown — absence is a valid face, the
+            // row clock degrades to the local one (the identityChanged
+            // template), never a dropped event.
             let sent_at = params
                 .and_then(|params| params.get("sentAt"))
                 .and_then(Value::as_u64);
-            match (account, peer_aci, word, sent_at) {
-                (Some(account), Some(peer_aci), Some(word), Some(sent_at)) => {
+            match (account, peer_aci, word) {
+                (Some(account), Some(peer_aci), Some(word)) => {
                     let _ = events.send(EngineEvent::SessionReset {
                         account: account.to_string(),
                         peer_aci: peer_aci.to_string(),
@@ -13270,7 +13276,7 @@ mod tests {
         assert_eq!(account, "+15555550100");
         assert_eq!(peer_aci, "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10");
         assert_eq!(word, "endSession");
-        assert_eq!(sent_at, 1_700_000_000_000);
+        assert_eq!(sent_at, Some(1_700_000_000_000));
 
         // The refreshed word arm rides the same grammar.
         handle_upstream_line(
@@ -13296,8 +13302,38 @@ mod tests {
         };
         assert_eq!(word, "chatSessionRefresh");
 
-        // Bad shapes (word out of the closed list, missing sentAt, wrong
-        // types) fold into the unknown-notification warning, never a guess.
+        // The refreshed word arm's additive absent face (eba82d3 contract
+        // note): sentAt omitted whole-key when the send-side timestamp is
+        // unknown — the event rides, the row clock degrades to the local one.
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "engine.sessionReset",
+                "params": {
+                    "account": "+15555550100",
+                    "peerAci": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                    "word": "chatSessionRefresh",
+                },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        let EngineEvent::SessionReset { word, sent_at, .. } = event_rx.recv().await.unwrap() else {
+            panic!("expected the SessionReset event");
+        };
+        assert_eq!(word, "chatSessionRefresh");
+        assert!(
+            sent_at.is_none(),
+            "absent sentAt rides as None, never a guessed clock"
+        );
+
+        // Bad shapes（词表越界/必要四面缺失 → unknownNotification，绝不猜发；
+        // extra 键 additive 安全不入清单——strict 词表在发射端，
+        // initialSyncComplete 臂同款消费姿态。）:
         for bad in [
             json!({
                 "jsonrpc": "2.0",
@@ -13312,21 +13348,6 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "method": "engine.sessionReset",
-                "params": {
-                    "account": "+15555550100",
-                    "peerAci": "aci",
-                    "word": "endSession",
-                },
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "method": "engine.sessionReset",
-                "params": {
-                    "account": "+15555550100",
-                    "peerAci": "aci",
-                    "word": "endSession",
-                    "sentAt": "now",
-                },
             }),
         ] {
             handle_upstream_line(&line(bad), &mut pending, &events, &ingress, &mut degraded)
