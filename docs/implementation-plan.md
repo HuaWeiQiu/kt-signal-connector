@@ -82,6 +82,39 @@
   the avatar member of the group change word list); the refreshed or
   honestly-cleared projection rides `conversation.changed`. No wire
   removal anywhere: pre-1.258 hosts read every face byte-identically.)
+- Contract revision: 1.259 (2026-10-24; §4.243 the verified storage-projection
+  face — batch Z4, ledger §29.81, the §29.77 structure-list S11 closure:
+  the official `verified` belongs to the contact storage projection
+  (`ConversationAttributes.verified` number, ts/model-types.d.ts:477;
+  `updateVerified` copies the protocol-store trust onto the record and
+  `DataWriter.updateConversation` lands it, models/conversations.preload.ts:
+  3042-3069; the render reads the record synchronously) while this chain read
+  the trust state at render time through the async `identities.get`
+  narrow read (batch V's recorded "needs the data plane first"). The data
+  plane: the conversations row gains the `identity_verified_json` stamp —
+  the pinned upstream `trustLevel` word verbatim
+  (UNTRUSTED | TRUSTED_UNVERIFIED | TRUSTED_VERIFIED, TrustLevel.java:5-8) —
+  landed at three storage-consumption faces: the throttled listContacts
+  enrich window now also fires one full read-only `listIdentities` pass
+  (the recipient omitted, the pinned ListIdentitiesCommand full-account
+  face) and stamps every named peer (both uuid/e164 spellings), sweeping
+  the unnamed rows with the probed-absent `{}` marker (the official
+  `safeGetVerified` DEFAULT face) so the trigger self-extinguishes;
+  `identities.verify` success write-through stamps the deterministic
+  post-image (verified arm → TRUSTED_VERIFIED, the trust-reset
+  `state="default"` arm → TRUSTED_UNVERIFIED — the official
+  `#_setVerified` write-then-land shape); the §4.84
+  `syncMessage.verified` forward converges the resolved direct row with
+  the event's own state word mapped onto the vocabulary (verified →
+  TRUSTED_VERIFIED, default → TRUSTED_UNVERIFIED, unverified → UNTRUSTED —
+  the §4.84 "no trust bit to mirror" discretion is retired by this data
+  plane). The wire carries the additive absent-key `verified` bit on
+  direct non-self summary rows (true = verified, false = probed-unverified
+  including the `{}` DEFAULT fold, absent = unknown — never probed, a
+  group row, the self row, or a pre-1.259 connector); the desktop reads the
+  projection first and demotes the `identities.get` async read to the
+  fallback (the S11 repair's render side). Pre-1.259 hosts read every row
+  byte-identically.)
 - Contract revision: 1.254 (2026-10-24; §4.38 the archive-import media
   face close-out — batch U, ledger §29.64: the engine's v2 export already
   projects `width`/`height` on every attachment line
@@ -19439,3 +19472,40 @@ pre-1.256 宿主逐字节同形。
 pre-1.257 宿主逐字节同形。
 **测试**：verbatim 三臂（true/false/无戳）+ 反演面不动钉形 + 群行缺席 +
 wire 缺席键钉形。
+
+## §4.243 会话行 verified 存储投影位（契约 1.259 · 批 Z4 · 台账 §29.81）
+
+官方锚：`verified` 属联系人存储投影——`ConversationAttributes.verified`
+数值字段（ts/model-types.d.ts:477），`updateVerified()` 从 protocol store
+读信任态写到记录并 `DataWriter.updateConversation` 落库
+（ts/models/conversations.preload.ts:3042-3069，触发面 = 首载 initialPromise、
+:551 事件监听、本机他设备 Verified sync）；渲染面同步读记录位
+（AboutContactModal.dom.tsx:288-296 `contact.isVerified` verified 行、
+SafetyNumberViewer.dom.tsx:65-67 钮文案翻转、ConversationHeader.dom.tsx:
+581-583 头部徽记——三者全吃投影位，不做渲染时 protocol 异步读）。
+上游引擎面 = `listIdentities` `JsonIdentity.trustLevel` 三值词
+（TrustLevel.java:5-8），官方 isVerified 臂 = verified === VERIFIED。
+
+我方数据面（S11 结构差闭环）：`identity_verified_json` 戳列——信任词
+原词（或 `{}` probed-absent = 官方 DEFAULT 面），三个存储消费落位点：
+①throttled listContacts enrich 同窗加一条全量 `listIdentities` 只读往返
+（钉定上游 ListIdentitiesCommand 全账号面，recipient 缺席），点名 peer 的
+直聊行落词（uuid/e164 两种拼写各落各行），未点名行扫 `{}`（触发计数
+自熄，60s 窗纪律不变）；②`identities.verify` 成功写穿（verified 臂 →
+TRUSTED_VERIFIED；`state="default"` 信任重置臂 → TRUSTED_UNVERIFIED——
+官方 `#_setVerified` 写穿后落记录同构）；③§4.84 syncMessage.verified
+转发时按事件 state 词映射收敛落位（verified→TRUSTED_VERIFIED /
+default→TRUSTED_UNVERIFIED / unverified→UNTRUSTED；§4.84「无信任位可镜像」
+记档随本面翻案）。NULL = 从未探明，永不回填。
+
+**wire**：摘要行 additive absent-key `verified` 位（直聊非 self 行；
+true=已验证、false=已探明未验证（含 `{}` DEFAULT 折叠）、缺席=未知
+——群行/self 行/pre-1.259 连接器/从未探明）；读侧
+`identity_verified_bit_of_stamp` 单源投影（TRUSTED_VERIFIED 即官方
+verified 臂，malformed 戳 = 缺席，§4.50 纪律）。pre-1.259 宿主逐字节
+同形。桌面消费：成员卡/About 卡/信息页安全码行读投影位先行，
+identities.get 异步读退役为兜底（位缺席时）。
+**测试**：读投影四臂（TRUSTED_VERIFIED→true / 其余词→false / `{}`→
+false / NULL→缺席）+ 群行/self 行缺席 + 戳写穿（peer 键与 conversation
+键两形）+ 盲扫 `{}` 自熄计数 + verify 写穿两臂 + §4.84 收敛词映射
+三臂。

@@ -3995,7 +3995,7 @@ impl RuntimeSupervisor {
         &self,
         account_id: &str,
     ) -> Result<(), ServiceError> {
-        let (peers, mrr_missing) = tokio::task::spawn_blocking({
+        let (peers, mrr_missing, trust_missing) = tokio::task::spawn_blocking({
             let store = Arc::clone(&self.store);
             let account_id = account_id.to_string();
             move || {
@@ -4011,12 +4011,22 @@ impl RuntimeSupervisor {
                 } else {
                     0
                 };
-                Ok((peers, mrr_missing))
+                // Contract 1.259 (§4.243): the verified probe only widens the
+                // trigger further — read when the title and factor fast paths
+                // would both otherwise skip the engine call (one full
+                // `listIdentities` read stamps the whole account, so the
+                // count self-extinguishes after one pass).
+                let trust_missing = if peers.is_empty() && mrr_missing == 0 {
+                    store.count_direct_conversations_without_identity_verified(&account_id)?
+                } else {
+                    0
+                };
+                Ok((peers, mrr_missing, trust_missing))
             }
         })
         .await
         .unwrap_or(Err(StoreError::Unavailable(None)))?;
-        if peers.is_empty() && mrr_missing == 0 {
+        if peers.is_empty() && mrr_missing == 0 && trust_missing == 0 {
             return Ok(());
         }
         let now_ms = SystemTime::now()
@@ -4086,6 +4096,63 @@ impl RuntimeSupervisor {
                         &factors,
                     );
                 }
+            }
+        })
+        .await
+        .map_err(|_| StoreError::Unavailable(None))?;
+        // Contract 1.259 (§4.243): the verified storage-consumption leg —
+        // the same one engine window, one full read-only `listIdentities`
+        // round trip (the recipient omitted, the pinned
+        // ListIdentitiesCommand full-account face). Every named peer's direct
+        // row carries the pinned `trustLevel` word verbatim — the
+        // storage-projection landing the official `updateVerified` →
+        // `DataWriter.updateConversation` record write mirrors; the rows
+        // the answer does not name take the probed-absent `{}` marker (the
+        // official DEFAULT face) so the trigger self-extinguishes. Store-only
+        // writes on the blocking pool, warn-silent per row (one bad stamp
+        // never fails the list that triggered the enrich — the title-pass
+        // discipline).
+        let identities = engine
+            .call(
+                "listIdentities",
+                json!({
+                    "account": number,
+                }),
+                CallClass::ReadOnly,
+            )
+            .await
+            .map_err(ServiceError::Engine)?;
+        let identity_entries = identities.as_array().cloned().unwrap_or_default();
+        tokio::task::spawn_blocking({
+            let store = Arc::clone(&self.store);
+            let account_id = account_id.to_string();
+            move || {
+                for entry in &identity_entries {
+                    let Some(word) = entry.get("trustLevel").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if !IDENTITY_TRUST_WORDS.contains(&word) {
+                        continue;
+                    }
+                    // Both spellings stamp their own row form (the uuid and
+                    // the e164 name the same peer identity; the conversations
+                    // row key follows the creating capture's spelling).
+                    for key in ["uuid", "number"] {
+                        let Some(peer_key) = entry.get(key).and_then(Value::as_str).map(str::trim)
+                        else {
+                            continue;
+                        };
+                        if peer_key.is_empty() {
+                            continue;
+                        }
+                        let _ = store.set_conversation_identity_verified_for_peer(
+                            &account_id,
+                            peer_key,
+                            word,
+                        );
+                    }
+                }
+                let _ = store.stamp_identity_verified_absent_rows(&account_id);
             }
         })
         .await
@@ -6466,7 +6533,7 @@ impl RuntimeSupervisor {
         params: IdentitiesVerifyParams,
     ) -> Result<IdentityVerifyOutcome, ServiceError> {
         let engine = self.running_engine().await?;
-        let upstream = {
+        let (upstream, stamp_word) = {
             let service = self.service.lock().await;
             // 契约 §4.223：两臂恰一路由（双臂/双缺 fail-closed 同 engine）。
             let intent = match (params.safety_number.as_deref(), params.state.as_deref()) {
@@ -6482,14 +6549,39 @@ impl RuntimeSupervisor {
                     )));
                 }
             };
-            service.prepare_identities_verify(
-                &params.account_id,
-                &params.conversation_id,
-                &intent,
-            )?
+            // Contract 1.259 (§4.243): the write-through stamp word — the
+            // official `#_setVerified` arm writes the protocol store AND
+            // lands the record (`DataWriter.updateConversation`), so the
+            // projection the render reads is the deterministic post-image of
+            // the write. Verified arm → TRUSTED_VERIFIED (the engine trust
+            // verifiedSafetyNumber post-image); trust-reset arm (state
+            // "default", the official DEFAULT write) → TRUSTED_UNVERIFIED
+            // (first-use trust restored, the word the next `listIdentities`
+            // read answers).
+            let stamp_word = match intent {
+                IdentitiesVerifyIntent::Verified { .. } => "TRUSTED_VERIFIED",
+                IdentitiesVerifyIntent::TrustDefault => "TRUSTED_UNVERIFIED",
+            };
+            (
+                service.prepare_identities_verify(
+                    &params.account_id,
+                    &params.conversation_id,
+                    &intent,
+                )?,
+                stamp_word,
+            )
         };
         match engine.call("trust", upstream, CallClass::Mutating).await {
-            Ok(_) => Ok(IdentityVerifyOutcome { status: "verified" }),
+            Ok(_) => {
+                let _ = self
+                    .store
+                    .set_conversation_identity_verified_for_conversation(
+                        &params.account_id,
+                        &params.conversation_id,
+                        stamp_word,
+                    );
+                Ok(IdentityVerifyOutcome { status: "verified" })
+            }
             Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
                 "SEND_OUTCOME_UNKNOWN",
                 "mutating request has an unknown outcome",
@@ -11401,6 +11493,13 @@ fn find_contact_display_name(items: &[Value], peer_key: &str) -> Option<String> 
 /// [`find_contact_display_name`] runs, exposed for the §4.58 factor stamp so
 /// both consumers of one listContacts answer can never disagree about which
 /// identity a row is addressed by. First present non-empty identity wins.
+/// Contract 1.259 (§4.243): the pinned upstream `trustLevel` vocabulary
+/// (TrustLevel.java:5-8) — the only words the identity trust leg stamps.
+/// An engine answer outside the vocabulary is not stored (the row keeps
+/// NULL and the sweep answers the probed-absent marker): the connector
+/// never persists an unknown word as trust material.
+const IDENTITY_TRUST_WORDS: &[&str] = &["UNTRUSTED", "TRUSTED_UNVERIFIED", "TRUSTED_VERIFIED"];
+
 fn contact_item_peer_key(item: &Value) -> Option<&str> {
     ["number", "uuid", "numberUuid"].iter().find_map(|key| {
         item.get(*key)
