@@ -115,6 +115,10 @@ const EXPIRE_SWEEP_STARTUP_SETTLE: Duration = Duration::from_secs(5);
 /// Capacity of the auto delivery-receipt queue (contract revision 1.34):
 /// bounded, lossy by design — a full queue drops the job, never the receive.
 const DELIVERY_RECEIPT_QUEUE_CAP: usize = 512;
+/// §4.244 verified 探针窗帽（Z25 根因批）：单引用 listIdentities 读每窗
+/// 最多行数——hidden 回写纯面帽 16 同款纪律，余行留下一窗（60s 节流），
+/// 有界自熄。
+const VERIFIED_PROBE_WINDOW_CAP: usize = 16;
 
 /// Batch X · S6①: the stale-avatar refetch queue cap. Profile-change and
 /// group-avatar-change events are rare by protocol construction (the engine's
@@ -4155,62 +4159,99 @@ impl RuntimeSupervisor {
         .await
         .map_err(|_| StoreError::Unavailable(None))?;
         // Contract 1.260 (§4.244): the verified storage-consumption leg —
-        // the same one engine window, one full read-only `listIdentities`
-        // round trip (the recipient omitted, the pinned
-        // ListIdentitiesCommand full-account face). Every named peer's direct
-        // row carries the pinned `trustLevel` word verbatim — the
-        // storage-projection landing the official `updateVerified` →
-        // `DataWriter.updateConversation` record write mirrors; the rows
-        // the answer does not name take the probed-absent `{}` marker (the
-        // official DEFAULT face) so the trigger self-extinguishes. Store-only
-        // writes on the blocking pool, warn-silent per row (one bad stamp
-        // never fails the list that triggered the enrich — the title-pass
-        // discipline).
-        let identities = engine
-            .call(
-                "listIdentities",
-                json!({
-                    "account": number,
-                }),
-                CallClass::ReadOnly,
-            )
-            .await
-            .map_err(ServiceError::Engine)?;
-        let identity_entries = identities.as_array().cloned().unwrap_or_default();
-        tokio::task::spawn_blocking({
+        // Z25 根因修复（2026-10-25，台账 §29.118）：引擎 listIdentities 面
+        // 是单引用窄读（engine compat §3/§5 行：number 必填，账号全量清单
+        // 形态不提供）。本臂原发 {account} 缺 number，引擎按契约恒
+        // -32603（duration_ms=0），? 把整条 enrich 中断：verified 戳永不落
+        // → 触发计数永不自熄 → 60s internal_error 无限循环（活体事故实
+        // 证）。改为对欠戳行逐行单引用读 {account, number: peer_key}：
+        // 有界（VERIFIED_PROBE_WINDOW_CAP/窗，hidden 回写纯面帽同款），
+        // 自熄语义逐字保留——读到词行落词戳（uuid/number 双拼写同前），
+        // 读成功而无 identity（官方 SafetyNumberNotReady 态，非错误）落该
+        // 行 probed-absent {}；引擎错误行保持 NULL 下一窗重试（60s 节流即
+        // 窗内退避，绝不窗内重试轰炸引擎）。store 写单趟 blocking 池，逐行
+        // best-effort（一行失败不炸本窗——title-pass 纪律）。
+        let owed_peers = tokio::task::spawn_blocking({
             let store = Arc::clone(&self.store);
             let account_id = account_id.to_string();
             move || {
-                for entry in &identity_entries {
-                    let Some(word) = entry.get("trustLevel").and_then(Value::as_str) else {
+                store.direct_peers_without_identity_verified(&account_id, VERIFIED_PROBE_WINDOW_CAP)
+            }
+        })
+        .await
+        .map_err(|_| StoreError::Unavailable(None))??;
+        // (owed peer key, stamp keys, word) 收集在 await 循环，store 写单趟。
+        let mut probed: Vec<(String, Vec<String>, Option<String>)> = Vec::new();
+        for peer_key in owed_peers {
+            let identities = engine
+                .call(
+                    "listIdentities",
+                    json!({
+                        "account": number,
+                        "number": peer_key,
+                    }),
+                    CallClass::ReadOnly,
+                )
+                .await;
+            let entries = match identities {
+                Ok(value) => value.as_array().cloned().unwrap_or_default(),
+                Err(error) => {
+                    tracing::warn!(
+                        kind = "identity_verified_probe",
+                        class = error.class(),
+                        "engine listIdentities read failed; the row stays owed for the next window",
+                    );
+                    continue;
+                }
+            };
+            let word = entries.iter().find_map(|entry| {
+                let word = entry.get("trustLevel").and_then(Value::as_str)?;
+                IDENTITY_TRUST_WORDS
+                    .contains(&word)
+                    .then(|| word.to_string())
+            });
+            // 词戳双拼写同前（uuid/e164 各落己行形，row key 随创建捕获拼
+            // 写）；无词 = probed-absent，只落欠戳行本身（单引用读答不出
+            // 的拼写无从落）。
+            let mut keys = vec![peer_key.clone()];
+            if word.is_some() {
+                for entry in &entries {
+                    for key in ["uuid", "number"] {
+                        if let Some(spelling) = entry
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|spelling| {
+                                !spelling.is_empty() && !keys.iter().any(|k| k == spelling)
+                            })
+                        {
+                            keys.push(spelling.to_string());
+                        }
+                    }
+                }
+            }
+            probed.push((peer_key, keys, word));
+        }
+        let _ = tokio::task::spawn_blocking({
+            let store = Arc::clone(&self.store);
+            let account_id = account_id.to_string();
+            move || {
+                for (owed_peer, keys, word) in &probed {
+                    let Some(word) = word else {
+                        let _ = store.stamp_identity_verified_absent_peer(&account_id, owed_peer);
                         continue;
                     };
-                    if !IDENTITY_TRUST_WORDS.contains(&word) {
-                        continue;
-                    }
-                    // Both spellings stamp their own row form (the uuid and
-                    // the e164 name the same peer identity; the conversations
-                    // row key follows the creating capture's spelling).
-                    for key in ["uuid", "number"] {
-                        let Some(peer_key) = entry.get(key).and_then(Value::as_str).map(str::trim)
-                        else {
-                            continue;
-                        };
-                        if peer_key.is_empty() {
-                            continue;
-                        }
+                    for key in keys {
                         let _ = store.set_conversation_identity_verified_for_peer(
                             &account_id,
-                            peer_key,
+                            key,
                             word,
                         );
                     }
                 }
-                let _ = store.stamp_identity_verified_absent_rows(&account_id);
             }
         })
-        .await
-        .map_err(|_| StoreError::Unavailable(None))?;
+        .await;
         // 引擎存储回写（两仓契约的 connector 半）：有界/轮（纯面帽 16），
         // best-effort warn-only——丢失的回写让引擎读臂暂退批 W 反演近似，
         // 下一次 hidden 变化自然再火，绝不阻断 enrich。uuid = 引擎

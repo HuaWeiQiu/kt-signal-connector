@@ -19697,6 +19697,19 @@ TRUSTED_VERIFIED；`state="default"` 信任重置臂 → TRUSTED_UNVERIFIED—�
 default→TRUSTED_UNVERIFIED / unverified→UNTRUSTED；§4.84「无信任位可镜像」
 记档随本面翻案）。NULL = 从未探明，永不回填。
 
+> **§4.244 勘误（Z25 根因批，2026-10-25，台账 §29.118）**：①的全账号面
+> 前提不成立——kt 引擎 `listIdentities` 面是单引用窄读（engine compat
+> §3/§5 行：`number` 必填，账号全量清单形态不提供；`{account}` 缺
+> `number` 按契约恒 -32603）。Z4 批落地的全量往返自 dev.31 起每次
+> internal_error（duration_ms=0），`?` 中断整条 enrich——verified 戳永不
+> 落、触发计数永不自熄，60s 无限循环（活体实证）。①改为对欠戳行逐行
+> 单引用读 `{account, number: peer_key}`：每窗帽 16 行（hidden 回写纯
+> 面帽同款），行序 rowid；词行落词戳（uuid/number 双拼写同前），读成功
+> 而无 identity（官方 SafetyNumberNotReady 态，非错误）落该行
+> `{}`（per-row，语义同原未点名行扫）；引擎错误行保持 NULL 下一窗重试
+> （60s 节流即窗内退避，绝不窗内重试）。wire 位/词表/写穿/收敛三腿零
+> 变化。引擎仓零改动（协议权威，face 原样）。
+
 **wire**：摘要行 additive absent-key `verified` 位（直聊非 self 行；
 true=已验证、false=已探明未验证（含 `{}` DEFAULT 折叠）、缺席=未知
 ——群行/self 行/pre-1.260 连接器/从未探明）；读侧

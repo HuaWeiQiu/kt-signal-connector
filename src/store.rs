@@ -4918,6 +4918,64 @@ impl Store {
         .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
+    /// Contract 1.260 (§4.244, Z25 root-cause batch): the owed peer keys —
+    /// the same population the trigger count reads, as a deterministic
+    /// (rowid order) list bounded by the caller's per-window cap. The engine
+    /// listIdentities face is the single-reference narrow read only (compat
+    /// §3/§5: number required, no account-wide list form), so the enrich
+    /// consumes it one owed peer per call and this list is its work queue.
+    pub fn direct_peers_without_identity_verified(
+        &self,
+        account_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT peer_key FROM conversations
+                 WHERE account_id=?1 AND kind='direct'
+                   AND identity_verified_json IS NULL AND peer_key != ''
+                   AND peer_key != (SELECT signal_account FROM accounts WHERE id=?1)
+                   AND peer_key != COALESCE(
+                         (SELECT aci FROM accounts WHERE id=?1), '')
+                 ORDER BY rowid LIMIT ?2",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = statement
+            .query_map(params![account_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut peers = Vec::new();
+        for row in rows {
+            peers.push(row.map_err(|error| StoreError::Unavailable(Some(error)))?);
+        }
+        Ok(peers)
+    }
+
+    /// Contract 1.260 (§4.244, Z25 root-cause batch): the per-row probed-
+    /// absent marker ('{}') — the single-reference probe's honest DEFAULT
+    /// face (the engine answered and named no identity for this peer, the
+    /// official SafetyNumberNotReady state), the same self-extinguishing
+    /// stamp the account-wide arm used to write wholesale. NULL-guarded so
+    /// a stamped word is never clobbered and the write is idempotent.
+    pub fn stamp_identity_verified_absent_peer(
+        &self,
+        account_id: &str,
+        peer_key: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let updated = conn
+            .execute(
+                "UPDATE conversations SET identity_verified_json='{}'
+                 WHERE account_id=?1 AND kind='direct' AND peer_key=?2
+                   AND identity_verified_json IS NULL",
+                params![account_id, peer_key],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(updated > 0)
+    }
+
     /// Contract 1.70 (§4.58 consume batch): merge the authoritative
     /// `messageRequestResponseType` face into one direct conversation's
     /// factor stamp. The stamp is read-modify-written so the sync face never
@@ -18890,6 +18948,120 @@ mod tests {
                 assert!(row["verified"].is_boolean(), "row {}", row["id"]);
             }
         }
+    }
+
+    /// Z25 root-cause batch (§4.244 erratum): the owed-peer list and the
+    /// per-row absent stamp — the single-reference probe's store face. The
+    /// list answers the never-probed direct non-self rows in rowid order,
+    /// respects the caller cap, and excludes the self spellings (empty key,
+    /// the signal account, the account ACI); the per-row `{}` stamp is
+    /// NULL-guarded (never clobbers a word stamp, idempotent) and
+    /// extinguishes the trigger count row by row.
+    #[test]
+    fn verified_probe_owed_peer_list_and_absent_stamp() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let absent = store
+            .ensure_conversation(&account.id, "direct", "+15555550103", "A")
+            .unwrap();
+        let worded = store
+            .ensure_conversation(
+                &account.id,
+                "direct",
+                "11111111-1111-4111-8111-111111111111",
+                "B",
+            )
+            .unwrap();
+        let fresh = store
+            .ensure_conversation(&account.id, "direct", "+15555550104", "C")
+            .unwrap();
+        // Self spellings and a group row: never owed.
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "self")
+            .unwrap();
+        store
+            .ensure_conversation(&account.id, "group", "Z3Jw", "Group")
+            .unwrap();
+
+        // Owed list: rowid order, all three non-self direct rows.
+        let owed = store
+            .direct_peers_without_identity_verified(&account.id, 16)
+            .unwrap();
+        assert_eq!(
+            owed,
+            vec![
+                "+15555550103".to_string(),
+                "11111111-1111-4111-8111-111111111111".to_string(),
+                "+15555550104".to_string(),
+            ]
+        );
+
+        // The cap bounds the window (deterministic head of the queue).
+        let owed = store
+            .direct_peers_without_identity_verified(&account.id, 2)
+            .unwrap();
+        assert_eq!(
+            owed,
+            vec![
+                "+15555550103".to_string(),
+                "11111111-1111-4111-8111-111111111111".to_string(),
+            ]
+        );
+
+        // Per-row absent stamp: lands `{}` (the read face folds to the
+        // official DEFAULT false), extinguishes exactly that row, is
+        // idempotent under the NULL guard, and never clobbers a word stamp.
+        assert!(
+            store
+                .stamp_identity_verified_absent_peer(&account.id, "+15555550103")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .stamp_identity_verified_absent_peer(&account.id, "+15555550103")
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &absent.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.verified, Some(false));
+        store
+            .set_conversation_identity_verified_for_peer(
+                &account.id,
+                "11111111-1111-4111-8111-111111111111",
+                "TRUSTED_VERIFIED",
+            )
+            .unwrap();
+        assert!(
+            !store
+                .stamp_identity_verified_absent_peer(
+                    &account.id,
+                    "11111111-1111-4111-8111-111111111111"
+                )
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &worded.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.verified, Some(true));
+
+        // Only the untouched row stays owed; the window extinguishes.
+        let owed = store
+            .direct_peers_without_identity_verified(&account.id, 16)
+            .unwrap();
+        assert_eq!(owed, vec!["+15555550104".to_string()]);
+        assert_eq!(
+            store
+                .count_direct_conversations_without_identity_verified(&account.id)
+                .unwrap(),
+            1
+        );
+        let _ = fresh;
     }
 
     fn test_store_key() -> StoreKey {
