@@ -54,6 +54,28 @@ pub const METHODS: &[MethodRow] = &[
     // `avatar-fetch`.
     ("conversations.getAvatar", Lane::Read, false, "read"),
     ("messages.list", Lane::Read, false, "read"),
+    // Persisted attachment dimensions, read half (contract revision 1.271,
+    // §4.255): one bounded store-only projection of the conversation's
+    // `attachments_json` width/height faces — no upstream traffic, no
+    // mutation, no unread side effect (the §4.76 adjacentMedia posture).
+    // This is the desktop's open-conversation warm-up: it answers the sizes
+    // the official model always has (Attachment.width/height) so every media
+    // box is laid out from data before the first scroll. Advertised through
+    // `attachment-dimensions`.
+    (
+        "messages.listAttachmentDimensions",
+        Lane::Read,
+        false,
+        "read",
+    ),
+    // Persisted attachment dimensions, write half (contract revision 1.271,
+    // §4.255): the desktop's own measurement (the official
+    // VisualAttachment.dom.ts width/height capture) lands in the row's
+    // descriptor face. A local store write on the send lane — the
+    // conversations.saveDraft class (account-scoped mutex and delete barrier,
+    // zero engine frames, zero upstream traffic); idempotent, so a replay of
+    // the same pair answers updated=false instead of rewriting the row.
+    ("messages.setAttachmentDimensions", Lane::Send, true, "send"),
     // Adjacent visual-media probe (contract 1.93, §4.76): a bounded
     // store-only read over one conversation's media-bearing rows — no
     // upstream traffic, no mutation; advertised through
@@ -1002,6 +1024,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "delete-for-me",
     "storage-sync",
     "phone-lookup",
+    "attachment-dimensions",
 ];
 
 #[cfg(test)]
@@ -1018,6 +1041,7 @@ mod tests {
             "conversations.getBlocked",
             "conversations.getAvatar",
             "messages.list",
+            "messages.listAttachmentDimensions",
             "messages.adjacentMedia",
             "messages.getText",
             "messages.receipts",
@@ -1142,6 +1166,7 @@ mod tests {
             "storage.setCallLink",
             "messages.deleteForMe",
             "messages.deleteForMeMessages",
+            "messages.setAttachmentDimensions",
         ];
         let mutating = [
             "messages.sendText",
@@ -1221,6 +1246,7 @@ mod tests {
             "storage.setCallLink",
             "messages.deleteForMe",
             "messages.deleteForMeMessages",
+            "messages.setAttachmentDimensions",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

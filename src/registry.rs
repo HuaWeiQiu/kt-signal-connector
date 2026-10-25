@@ -1499,6 +1499,27 @@ impl ProxyGroupRuntime {
         slot.supervisor.story_open_attachment(params).await
     }
 
+    /// messages.setAttachmentDimensions (contract revision 1.271, §4.255):
+    /// the owning group's local write (no engine), routed like every other
+    /// account-scoped store face.
+    pub async fn set_attachment_dimensions(
+        &self,
+        params: crate::service::MessagesSetAttachmentDimensionsParams,
+    ) -> Result<crate::service::AttachmentDimensionsWriteResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.set_attachment_dimensions(params).await
+    }
+
+    /// messages.listAttachmentDimensions (contract revision 1.271, §4.255): the
+    /// owning group's bounded read.
+    pub async fn list_attachment_dimensions(
+        &self,
+        params: crate::service::MessagesListAttachmentDimensionsParams,
+    ) -> Result<crate::service::AttachmentDimensionsListResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.list_attachment_dimensions(params).await
+    }
+
     pub async fn list_messages(
         &self,
         account_id: String,

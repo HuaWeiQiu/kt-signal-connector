@@ -514,6 +514,18 @@ pub const MAX_PAGE_LIMIT: u32 = 200;
 /// navigation step like the official `limit: 1`; the wider bound exists so a
 /// future strip prefetch never pages unbounded.
 pub const MAX_ADJACENT_MEDIA_LIMIT: u32 = 20;
+/// One persisted attachment dimension pair (contract revision 1.271, §4.255):
+/// the read face behind `messages.listAttachmentDimensions` — the desktop's
+/// one-shot warm-up so every media box renders from data before the first
+/// scroll. Only entries that carry both dimensions are listed (an attachment
+/// never measured simply stays absent — never a guessed 0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAttachmentDimension {
+    pub message_id: String,
+    pub attachment_id: String,
+    pub width: u32,
+    pub height: u32,
+}
 /// One keyset chunk of the adjacent-media scan: rows are inspected in
 /// bounded reads until enough media-bearing rows match (or the range is
 /// exhausted), so a media-sparse conversation never loads its whole history
@@ -565,6 +577,18 @@ pub enum StoreError {
     /// — the caller named a bad target — instead of a NOT_FOUND lookup.
     #[error("read watermark target is not a message of the conversation")]
     ReadWatermarkTargetInvalid,
+    /// messages.setAttachmentDimensions (contract revision 1.271, §4.255):
+    /// the named attachment id is not a descriptor of the addressed row — the
+    /// §4.54 attachment ladder's own refusal (a caller mistake, never a silent
+    /// no-op), answered as INVALID_REQUEST by the service mapping.
+    #[error("attachmentId does not name an attachment of this message")]
+    AttachmentNotFound,
+    /// messages.setAttachmentDimensions (contract revision 1.271, §4.255): the
+    /// row's persisted attachment face is NULL / not an array / not JSON.
+    /// Fail closed — the write never overwrites bytes it cannot read (the
+    /// §4.11 posture), and no descriptor array is invented.
+    #[error("message attachments are not readable")]
+    AttachmentFaceUnreadable,
     /// Fail closed (optimization-plan Phase 3): existing plaintext history is
     /// never opened for serving without a store key to encrypt it with.
     #[error(
@@ -605,6 +629,8 @@ impl StoreError {
             StoreError::OperationConflict => "operation_conflict",
             StoreError::InvalidCursor => "invalid_cursor",
             StoreError::ReadWatermarkTargetInvalid => "read_watermark_target_invalid",
+            StoreError::AttachmentNotFound => "attachment_not_found",
+            StoreError::AttachmentFaceUnreadable => "attachment_face_unreadable",
             StoreError::PlaintextStoreRequiresKey => "plaintext_store_requires_key",
             StoreError::StoreKeyRequired => "store_key_required",
             StoreError::StoreKeyRejected => "store_key_rejected",
@@ -6010,6 +6036,175 @@ impl Store {
             self.attach_quote_snapshot_ids(account_id, std::slice::from_mut(record))?;
         }
         Ok(record)
+    }
+
+    /// messages.setAttachmentDimensions (contract revision 1.271, §4.255):
+    /// persist one attachment descriptor's measured pixel size into the row's
+    /// `attachments_json` face — the official data-model shape
+    /// (Attachment.width/height, ts/types/Attachment.std.ts:18-19, measured at
+    /// receive per ts/types/VisualAttachment.dom.ts, so every render reads the
+    /// declaration instead of probing).
+    ///
+    /// Discipline:
+    /// - The row must exist in the addressed account+conversation, else
+    ///   MESSAGE_NOT_FOUND (the §4.4 ladder — the caller named a row this
+    ///   store does not hold).
+    /// - `attachmentId` must name a descriptor of that row, else
+    ///   InvalidRequest (the §4.54 attachment ladder's own refusal: a size for
+    ///   an attachment that is not there is a caller mistake, never a silent
+    ///   no-op).
+    /// - Idempotent: writing the same pair again changes nothing visible; the
+    ///   full descriptor array is rewritten with only the addressed entry's
+    ///   width/height replaced, every other key and entry byte-identical.
+    /// - Fail-closed on unreadable shapes: a non-array / malformed
+    ///   `attachments_json` cell answers `AttachmentFaceUnreadable` instead of
+    ///   inventing a descriptor array (the §4.11 posture); a NULL face is the
+    ///   honest "no descriptors on this row" and answers `AttachmentNotFound`.
+    ///
+    /// Returns whether anything actually changed (false = the same pair was
+    /// already stored), so the supervisor can keep the answer honest.
+    pub fn set_attachment_dimensions(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.lock_conn()?;
+        let transaction = conn
+            .transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let attachments_json: Option<String> = transaction
+            .query_row(
+                "SELECT attachments_json FROM messages
+                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                params![message_id, account_id, conversation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .ok_or(StoreError::MessageNotFound)?;
+        // A NULL face means the row carries no descriptor at all — an id that
+        // names one is the same caller mistake as an index miss (§4.54), never
+        // a silent no-op and never a "created" descriptor array.
+        let Some(raw) = attachments_json else {
+            return Err(StoreError::AttachmentNotFound);
+        };
+        let parsed: Value =
+            serde_json::from_str(&raw).map_err(|_| StoreError::AttachmentFaceUnreadable)?;
+        let Some(entries) = parsed.as_array() else {
+            return Err(StoreError::AttachmentFaceUnreadable);
+        };
+        let mut next = entries.clone();
+        let mut found = false;
+        let mut changed = false;
+        for entry in next.iter_mut() {
+            let Some(object) = entry.as_object_mut() else {
+                return Err(StoreError::AttachmentFaceUnreadable);
+            };
+            if object.get("id").and_then(Value::as_str) != Some(attachment_id) {
+                continue;
+            }
+            found = true;
+            let same = object.get("width").and_then(Value::as_u64) == Some(u64::from(width))
+                && object.get("height").and_then(Value::as_u64) == Some(u64::from(height));
+            if same {
+                break;
+            }
+            object.insert("width".to_string(), json!(width));
+            object.insert("height".to_string(), json!(height));
+            changed = true;
+            break;
+        }
+        if !found {
+            return Err(StoreError::AttachmentNotFound);
+        }
+        if !changed {
+            return Ok(false);
+        }
+        let encoded = serde_json::to_string(&Value::Array(next))
+            .map_err(|_| StoreError::Unavailable(None))?;
+        transaction
+            .execute(
+                "UPDATE messages SET attachments_json=?4
+                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                params![message_id, account_id, conversation_id, encoded],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(true)
+    }
+
+    /// messages.listAttachmentDimensions (contract revision 1.271, §4.255):
+    /// scan one conversation's attachment-bearing rows newest-first, bounded
+    /// by `row_limit`, and project every descriptor that carries both a
+    /// positive width and height. Bounded by construction: the scan reads at
+    /// most `row_limit` rows and the caller caps the entry list — a media
+    /// heavy conversation warms the newest window first, never the whole
+    /// archive.
+    pub fn list_attachment_dimensions(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        row_limit: u32,
+    ) -> Result<Vec<StoredAttachmentDimension>, StoreError> {
+        let rows: Vec<(String, String)> = {
+            let conn = self.read_conn()?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, attachments_json FROM messages
+                      WHERE account_id=?1 AND conversation_id=?2
+                        AND attachments_json IS NOT NULL
+                      ORDER BY sent_at DESC, id DESC
+                      LIMIT ?3",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let mapped = stmt
+                .query_map(
+                    params![account_id, conversation_id, row_limit as i64],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+        };
+        let mut entries = Vec::new();
+        for (message_id, raw) in rows {
+            let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+                continue; // 坏面单行跳过：一次投影绝不因一行形状坏而整体失败
+            };
+            let Some(list) = parsed.as_array() else {
+                continue;
+            };
+            for descriptor in list {
+                let Some(object) = descriptor.as_object() else {
+                    continue;
+                };
+                let Some(attachment_id) = object.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let width = object.get("width").and_then(Value::as_u64);
+                let height = object.get("height").and_then(Value::as_u64);
+                let (Some(width), Some(height)) = (width, height) else {
+                    continue;
+                };
+                if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+                    continue;
+                }
+                entries.push(StoredAttachmentDimension {
+                    message_id: message_id.clone(),
+                    attachment_id: attachment_id.to_string(),
+                    width: width as u32,
+                    height: height as u32,
+                });
+            }
+        }
+        Ok(entries)
     }
 
     pub fn message_by_signal_identity(
@@ -32057,5 +32252,256 @@ mod tests {
             !map.contains_key("+15555550102"),
             "a foreign account's rows never leak across accounts"
         );
+    }
+
+    use crate::engine::NormalizedAttachment;
+
+    /// Contract revision 1.271 (§4.255): the persisted attachment dimension
+    /// write is a descriptor-face patch — the addressed entry gains
+    /// width/height, every other key and every other entry stays byte-level
+    /// untouched, and a replay of the same pair answers unchanged.
+    #[test]
+    fn attachment_dimensions_are_written_into_the_descriptor_face_idempotently() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut row = pin_test_message(&account.id, &conversation.id, "m-1", 1_000);
+        row.attachments = vec![
+            NormalizedAttachment {
+                id: "att-image".into(),
+                content_type: Some("image/png".into()),
+                filename: Some("a.png".into()),
+                size: Some(4096),
+                width: None,
+                height: None,
+                is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
+                locator: None,
+                waveform: None,
+                duration: None,
+            },
+            NormalizedAttachment {
+                id: "att-file".into(),
+                content_type: Some("application/pdf".into()),
+                filename: Some("b.pdf".into()),
+                size: Some(2048),
+                width: None,
+                height: None,
+                is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
+                locator: None,
+                waveform: None,
+                duration: None,
+            },
+        ];
+        store.insert_message(&row, None, None, false).unwrap();
+
+        // 第一次写：真的改了面。
+        assert!(
+            store
+                .set_attachment_dimensions(
+                    &account.id,
+                    &conversation.id,
+                    "m-1",
+                    "att-image",
+                    1280,
+                    720,
+                )
+                .unwrap()
+        );
+        let stored = store
+            .message_by_id(&account.id, &conversation.id, "m-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attachments[0].width, Some(1280));
+        assert_eq!(stored.attachments[0].height, Some(720));
+        assert_eq!(stored.attachments[0].filename.as_deref(), Some("a.png"));
+        assert_eq!(stored.attachments[0].size, Some(4096));
+        // 未寻址的条目逐字不变（宽度仍缺席）。
+        assert_eq!(stored.attachments[1].width, None);
+        assert_eq!(stored.attachments[1].height, None);
+        assert_eq!(stored.attachments[1].filename.as_deref(), Some("b.pdf"));
+
+        // 同值重放：幂等（updated=false，字节不再改写）。
+        assert!(
+            !store
+                .set_attachment_dimensions(
+                    &account.id,
+                    &conversation.id,
+                    "m-1",
+                    "att-image",
+                    1280,
+                    720,
+                )
+                .unwrap()
+        );
+        // 换值重写：只动该条目的两个键。
+        assert!(
+            store
+                .set_attachment_dimensions(
+                    &account.id,
+                    &conversation.id,
+                    "m-1",
+                    "att-image",
+                    800,
+                    600,
+                )
+                .unwrap()
+        );
+        let rewritten = store
+            .message_by_id(&account.id, &conversation.id, "m-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rewritten.attachments[0].width, Some(800));
+        assert_eq!(rewritten.attachments[0].height, Some(600));
+        assert_eq!(rewritten.attachments[1].width, None);
+    }
+
+    /// Contract revision 1.271 (§4.255): the write fails closed on every
+    /// target it cannot honour — a missing row, an attachment id that names no
+    /// descriptor, and a row whose attachment face is not a readable array.
+    #[test]
+    fn attachment_dimension_write_fails_closed_on_bad_targets() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        // 无附件的普通行：id 不指名任何描述符。
+        let plain = pin_test_message(&account.id, &conversation.id, "m-plain", 2_000);
+        store.insert_message(&plain, None, None, false).unwrap();
+        assert!(matches!(
+            store.set_attachment_dimensions(
+                &account.id,
+                &conversation.id,
+                "m-plain",
+                "att-image",
+                10,
+                10
+            ),
+            Err(StoreError::AttachmentNotFound)
+        ));
+        // 行不存在 → MessageNotFound（§4.4 阶梯，不是空写）。
+        assert!(matches!(
+            store.set_attachment_dimensions(
+                &account.id,
+                &conversation.id,
+                "m-gone",
+                "att-image",
+                10,
+                10
+            ),
+            Err(StoreError::MessageNotFound)
+        ));
+        // 坏面（非 JSON 数组）→ 整体拒，绝不覆盖读不懂的字节。
+        let mut broken = pin_test_message(&account.id, &conversation.id, "m-broken", 3_000);
+        broken.attachments = Vec::new();
+        store.insert_message(&broken, None, None, false).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET attachments_json='{\"not\":\"an array\"}' WHERE id='m-broken'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.set_attachment_dimensions(
+                &account.id,
+                &conversation.id,
+                "m-broken",
+                "att-image",
+                10,
+                10
+            ),
+            Err(StoreError::AttachmentFaceUnreadable)
+        ));
+    }
+
+    /// Contract revision 1.271 (§4.255): the read face lists only measured
+    /// descriptors (both dimensions present, in the legal pixel domain),
+    /// newest message first, and the row window bounds the scan.
+    #[test]
+    fn attachment_dimension_list_projects_only_measured_entries_newest_first() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let descriptor = |id: &str, width: Option<u32>, height: Option<u32>| NormalizedAttachment {
+            id: id.into(),
+            content_type: Some("image/png".into()),
+            filename: None,
+            size: Some(1024),
+            width,
+            height,
+            is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
+            locator: None,
+            waveform: None,
+            duration: None,
+        };
+        let mut older = pin_test_message(&account.id, &conversation.id, "m-older", 1_000);
+        older.attachments = vec![descriptor("att-old", Some(640), Some(480))];
+        store.insert_message(&older, None, None, false).unwrap();
+        let mut newer = pin_test_message(&account.id, &conversation.id, "m-newer", 2_000);
+        newer.attachments = vec![
+            descriptor("att-new", None, None),
+            descriptor("att-new-measured", Some(1920), Some(1080)),
+        ];
+        store.insert_message(&newer, None, None, false).unwrap();
+
+        let listed = store
+            .list_attachment_dimensions(&account.id, &conversation.id, 200)
+            .unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                StoredAttachmentDimension {
+                    message_id: "m-newer".into(),
+                    attachment_id: "att-new-measured".into(),
+                    width: 1920,
+                    height: 1080,
+                },
+                StoredAttachmentDimension {
+                    message_id: "m-older".into(),
+                    attachment_id: "att-old".into(),
+                    width: 640,
+                    height: 480,
+                },
+            ],
+            "只有量过的条目入表，新消息在前"
+        );
+        // 行窗口有界：只扫 1 行 = 只有最新消息的条目。
+        let bounded = store
+            .list_attachment_dimensions(&account.id, &conversation.id, 1)
+            .unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].message_id, "m-newer");
     }
 }

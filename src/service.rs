@@ -318,6 +318,21 @@ pub const MAX_SEND_MENTIONS: usize = 64;
 /// bound. A larger list answers INVALID_REQUEST; a destructive intent is
 /// never silently truncated (the §4.99 discipline).
 pub const MAX_DELETE_FOR_ME_MESSAGES: usize = 256;
+/// The official Attachment.width/height domain (contract revision 1.271,
+/// §4.255): a measured pixel dimension is a positive integer up to this
+/// ceiling (16 384 = the largest texture edge any Signal client uploads today;
+/// beyond it the value is a caller bug, so the ladder refuses instead of
+/// persisting a number no renderer can use). Mirrored by the schema's
+/// `maximum` and pinned by the schema-consistency bounds test.
+pub const MAX_ATTACHMENT_DIMENSION_PX: u32 = 16_384;
+/// Default row window of `messages.listAttachmentDimensions` (contract
+/// revision 1.271, §4.255): the newest 200 attachment-bearing rows — the same
+/// order of magnitude as one `messages.list` page, so opening a conversation
+/// warms exactly the window the desktop is about to render.
+pub const DEFAULT_ATTACHMENT_DIMENSION_ROWS: u32 = 200;
+/// Ceiling of that window: a caller may not ask the connector to walk more
+/// than this many rows in one warm-up call (bounded work per request).
+pub const MAX_ATTACHMENT_DIMENSION_ROWS: u32 = 1_000;
 /// The multi-attachment send cap (contract revision 1.66, §4.59): the
 /// upstream engine's own per-message attachment ceiling (pinned signal-cli /
 /// kt-engine `ATTACHMENT_MAX_COUNT` = 32) mirrored — a `messages.attachments.
@@ -449,6 +464,21 @@ impl ServiceError {
             // caller mistake, not a missing-resource lookup — the request
             // must fail closed instead of advancing the watermark past what
             // the caller actually read.
+            // Contract revision 1.271, §4.255: a dimension write that names
+            // no descriptor of the addressed row is a caller mistake (the
+            // §4.54 attachment ladder's own refusal), and an unreadable
+            // persisted face fails closed instead of overwriting bytes the
+            // store cannot read.
+            ServiceError::Store(StoreError::AttachmentNotFound) => ApiError::new(
+                "INVALID_REQUEST",
+                "attachmentId does not name an attachment of this message",
+                false,
+            ),
+            ServiceError::Store(StoreError::AttachmentFaceUnreadable) => ApiError::new(
+                "INVALID_REQUEST",
+                "message attachments are not readable",
+                false,
+            ),
             ServiceError::Store(StoreError::ReadWatermarkTargetInvalid) => ApiError::new(
                 "INVALID_REQUEST",
                 "messageId does not name a message of this conversation",
@@ -15155,6 +15185,110 @@ fn super_supervisor_label_bound(value: Option<&str>, max_bytes: usize) -> Option
         .map(str::to_owned)
 }
 
+/// messages.setAttachmentDimensions (contract revision 1.271, §4.255): the
+/// write ladder for the official data-model shape. The account and the
+/// conversation resolve first (the §4.4 wire order: ACCOUNT_NOT_FOUND then
+/// CONVERSATION_NOT_FOUND), then the store's own row+descriptor ladders answer
+/// MESSAGE_NOT_FOUND / INVALID_REQUEST. `width`/`height` are gated here —
+/// positive integers within [`MAX_ATTACHMENT_DIMENSION_PX`] — before the write,
+/// so an absurd measurement never lands in the persisted face.
+///
+/// Local store only: no engine frame, no upstream traffic. The engine is the
+/// producer of the declared size when it has one; this face is the desktop's
+/// own measurement (the official `VisualAttachment.dom.ts` width/height at
+/// receive) for the faces the engine cannot state.
+pub(crate) fn store_set_attachment_dimensions(
+    store: &Store,
+    params: &MessagesSetAttachmentDimensionsParams,
+) -> Result<AttachmentDimensionsWriteResult, ServiceError> {
+    validate_opaque_id(&params.account_id, "accountId")?;
+    validate_opaque_id(&params.conversation_id, "conversationId")?;
+    validate_opaque_id(&params.message_id, "messageId")?;
+    if params.attachment_id.is_empty() || params.attachment_id.len() > MAX_ATTACHMENT_ID_BYTES {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachmentId must contain between 1 and 128 bytes",
+            false,
+        )));
+    }
+    if params.width < 1 || params.height < 1 {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "width and height must be positive integers",
+            false,
+        )));
+    }
+    if params.width > MAX_ATTACHMENT_DIMENSION_PX || params.height > MAX_ATTACHMENT_DIMENSION_PX {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "width and height must not exceed 16384",
+            false,
+        )));
+    }
+    if store.account_by_id(&params.account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    if store
+        .conversation_by_id(&params.account_id, &params.conversation_id)?
+        .is_none()
+    {
+        return Err(ServiceError::Store(StoreError::ConversationNotFound));
+    }
+    let updated = store.set_attachment_dimensions(
+        &params.account_id,
+        &params.conversation_id,
+        &params.message_id,
+        &params.attachment_id,
+        params.width,
+        params.height,
+    )?;
+    Ok(AttachmentDimensionsWriteResult { updated })
+}
+
+/// messages.listAttachmentDimensions (contract revision 1.271, §4.255): the
+/// read ladder — the same account/conversation resolution as
+/// `store_list_messages`, deliberately without the unread side effect (a
+/// warm-up read is not viewing the thread, the §4.76 adjacentMedia posture).
+/// The row window is bounded (`limit` clamped to
+/// [`MAX_ATTACHMENT_DIMENSION_ROWS`]); an empty table answers an empty list.
+pub(crate) fn store_list_attachment_dimensions(
+    store: &Store,
+    params: &MessagesListAttachmentDimensionsParams,
+) -> Result<AttachmentDimensionsListResult, ServiceError> {
+    validate_opaque_id(&params.account_id, "accountId")?;
+    validate_opaque_id(&params.conversation_id, "conversationId")?;
+    if store.account_by_id(&params.account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    if store
+        .conversation_by_id(&params.account_id, &params.conversation_id)?
+        .is_none()
+    {
+        return Err(ServiceError::Store(StoreError::ConversationNotFound));
+    }
+    let requested = params.limit.unwrap_or(DEFAULT_ATTACHMENT_DIMENSION_ROWS);
+    if !(1..=MAX_ATTACHMENT_DIMENSION_ROWS).contains(&requested) {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "limit must be between 1 and 1000",
+            false,
+        )));
+    }
+    let rows =
+        store.list_attachment_dimensions(&params.account_id, &params.conversation_id, requested)?;
+    let truncated = rows.len() == requested as usize;
+    let entries = rows
+        .into_iter()
+        .map(|row| AttachmentDimensionEntry {
+            message_id: row.message_id,
+            attachment_id: row.attachment_id,
+            width: row.width,
+            height: row.height,
+        })
+        .collect();
+    Ok(AttachmentDimensionsListResult { entries, truncated })
+}
+
 pub(crate) fn store_list_messages(
     store: &Store,
     account_id: &str,
@@ -16480,6 +16614,73 @@ pub struct MessagesListParams {
     pub conversation_id: String,
     pub before: Option<String>,
     pub limit: u32,
+}
+
+/// `messages.setAttachmentDimensions` params (contract revision 1.271,
+/// §4.255): the measured pixel size of one attachment, written into the row's
+/// persisted descriptor face — the official data-model shape. `width`/`height`
+/// are u32 at the deserializer, and the service ladder additionally requires
+/// 1..=[`MAX_ATTACHMENT_DIMENSION_PX`] (the official Attachment.width/height
+/// domain; 0 would be a "measured nothing" lie, so it fails closed).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSetAttachmentDimensionsParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub attachment_id: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// `messages.listAttachmentDimensions` params (contract revision 1.271,
+/// §4.255): one conversation's persisted dimension table, bounded. `limit`
+/// counts attachment-bearing rows scanned newest-first (default
+/// [`DEFAULT_ATTACHMENT_DIMENSION_ROWS`], ceiling
+/// [`MAX_ATTACHMENT_DIMENSION_ROWS`]) — the desktop's open-conversation
+/// warm-up asks for the default and never pages the whole archive.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesListAttachmentDimensionsParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// The §4.255 write answer: `updated` is false only when the addressed
+/// descriptor already carried exactly this pair (the idempotent replay), so a
+/// caller can tell "wrote it now" from "it was already there" without a second
+/// read.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDimensionsWriteResult {
+    pub updated: bool,
+}
+
+/// One §4.255 dimension entry: the attachment identity plus the persisted
+/// pixel size. Keys are the same `messageId`/`attachmentId` pair the desktop's
+/// attachment state key is built from.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDimensionEntry {
+    pub message_id: String,
+    pub attachment_id: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The §4.255 read answer: every measured attachment of the conversation
+/// window, in scan order (newest message first). An empty list is the honest
+/// "nothing measured yet" answer.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDimensionsListResult {
+    pub entries: Vec<AttachmentDimensionEntry>,
+    /// True when the row scan stopped at the row bound — the caller can ask
+    /// again with an older anchor once paging lands (the window is complete
+    /// for the newest rows either way).
+    pub truncated: bool,
 }
 
 /// messages.adjacentMedia direction (contract 1.93, §4.76): `older` probes
@@ -46874,5 +47075,220 @@ mod tests {
             .expect("legacy row");
         assert_eq!(legacy_row.id.len(), 32);
         assert_ne!(legacy_row.id, slot_id);
+    }
+
+    /// Contract revision 1.271 (§4.255): the service write ladder refuses the
+    /// pixel domain and the account/conversation resolution before any store
+    /// write, and the read ladder clamps the row window.
+    #[test]
+    fn attachment_dimension_ladders_gate_the_pixel_domain_and_the_scope() {
+        let (_temp, service) = service();
+        let store = Arc::clone(&service.store);
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let params = |width: u32, height: u32| MessagesSetAttachmentDimensionsParams {
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            message_id: "m-1".into(),
+            attachment_id: "att-1".into(),
+            width,
+            height,
+        };
+
+        // 像素域：0 与越界一律 INVALID_REQUEST（写之前，不落库）。
+        for (width, height) in [(0, 10), (10, 0), (MAX_ATTACHMENT_DIMENSION_PX + 1, 10)] {
+            let error =
+                store_set_attachment_dimensions(&store, &params(width, height)).unwrap_err();
+            match error {
+                ServiceError::Api(error) => assert_eq!(error.code, "INVALID_REQUEST"),
+                other => panic!("expected INVALID_REQUEST, got {other:?}"),
+            }
+        }
+        // 账号/会话阶梯：ACCOUNT_NOT_FOUND → CONVERSATION_NOT_FOUND → MESSAGE_NOT_FOUND。
+        let mut wrong_account = params(10, 10);
+        wrong_account.account_id = "nope".into();
+        assert!(matches!(
+            store_set_attachment_dimensions(&store, &wrong_account),
+            Err(ServiceError::Store(StoreError::AccountNotFound))
+        ));
+        let mut wrong_conversation = params(10, 10);
+        wrong_conversation.conversation_id = "nope".into();
+        assert!(matches!(
+            store_set_attachment_dimensions(&store, &wrong_conversation),
+            Err(ServiceError::Store(StoreError::ConversationNotFound))
+        ));
+        assert!(matches!(
+            store_set_attachment_dimensions(&store, &params(10, 10)),
+            Err(ServiceError::Store(StoreError::MessageNotFound))
+        ));
+
+        // 读阶梯：limit 域 + 同一条账号/会话链；空表答空列表（诚实零）。
+        let read = |limit: Option<u32>| MessagesListAttachmentDimensionsParams {
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            limit,
+        };
+        for bad in [Some(0), Some(MAX_ATTACHMENT_DIMENSION_ROWS + 1)] {
+            let error = store_list_attachment_dimensions(&store, &read(bad)).unwrap_err();
+            match error {
+                ServiceError::Api(error) => assert_eq!(error.code, "INVALID_REQUEST"),
+                other => panic!("expected INVALID_REQUEST, got {other:?}"),
+            }
+        }
+        let empty = store_list_attachment_dimensions(&store, &read(None)).unwrap();
+        assert!(empty.entries.is_empty());
+        assert!(!empty.truncated);
+    }
+
+    /// Contract revision 1.271 (§4.255): the write lands in the same
+    /// `attachments_json` the read face projects, so `messages.list` carries
+    /// the measured pair out with **zero shape change** (the keys were already
+    /// on the descriptor whitelist). This is the data-model parity claim the
+    /// desktop batches depend on — no new key, no new envelope.
+    #[test]
+    fn attachment_dimensions_ride_the_messages_list_projection() {
+        let (_temp, service) = service();
+        let store = Arc::clone(&service.store);
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut row = expire_record_fixture(&account.id, &conversation.id, "m-1");
+        row.attachments = vec![crate::engine::NormalizedAttachment {
+            id: "att-1".into(),
+            content_type: Some("image/png".into()),
+            filename: Some("a.png".into()),
+            size: Some(1024),
+            width: None,
+            height: None,
+            is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
+            locator: None,
+            waveform: None,
+            duration: None,
+        }];
+        store.insert_message(&row, None, None, false).unwrap();
+
+        // 写之前的投影：keys 缺席（旧行为逐字）。
+        let before = store_list_messages(&store, &account.id, &conversation.id, 10, None).unwrap();
+        let before_wire = serde_json::to_value(&before.items[0]).unwrap();
+        assert!(before_wire["attachments"][0].get("width").is_none());
+
+        store_set_attachment_dimensions(
+            &store,
+            &MessagesSetAttachmentDimensionsParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                message_id: "m-1".into(),
+                attachment_id: "att-1".into(),
+                width: 1280,
+                height: 720,
+            },
+        )
+        .unwrap();
+
+        // 写之后的同一投影：width/height 自然带出，其余键逐字不变。
+        let after = store_list_messages(&store, &account.id, &conversation.id, 10, None).unwrap();
+        let after_wire = serde_json::to_value(&after.items[0]).unwrap();
+        assert_eq!(
+            after_wire["attachments"][0]["width"],
+            serde_json::json!(1280)
+        );
+        assert_eq!(
+            after_wire["attachments"][0]["height"],
+            serde_json::json!(720)
+        );
+        assert_eq!(
+            after_wire["attachments"][0]["contentType"],
+            serde_json::json!("image/png")
+        );
+        assert_eq!(
+            after_wire["attachments"][0]["size"],
+            serde_json::json!(1024)
+        );
+        // messages.list 的行形状零变化：同一批键仍在（无新增信封键）。
+        assert_eq!(
+            before_wire
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            after_wire
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+    }
+
+    /// Contract revision 1.271 (§4.255): the warm-up read answers exactly the
+    /// pairs the list projection carries — one call, no paging, bounded.
+    #[test]
+    fn attachment_dimension_warmup_read_matches_the_list_projection() {
+        let (_temp, service) = service();
+        let store = Arc::clone(&service.store);
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut row = expire_record_fixture(&account.id, &conversation.id, "m-1");
+        row.attachments = vec![crate::engine::NormalizedAttachment {
+            id: "att-1".into(),
+            content_type: Some("image/png".into()),
+            filename: None,
+            size: Some(1024),
+            width: None,
+            height: None,
+            is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
+            locator: None,
+            waveform: None,
+            duration: None,
+        }];
+        store.insert_message(&row, None, None, false).unwrap();
+        store_set_attachment_dimensions(
+            &store,
+            &MessagesSetAttachmentDimensionsParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                message_id: "m-1".into(),
+                attachment_id: "att-1".into(),
+                width: 800,
+                height: 600,
+            },
+        )
+        .unwrap();
+        let warm = store_list_attachment_dimensions(
+            &store,
+            &MessagesListAttachmentDimensionsParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(warm.entries.len(), 1);
+        assert_eq!(warm.entries[0].message_id, "m-1");
+        assert_eq!(warm.entries[0].attachment_id, "att-1");
+        assert_eq!((warm.entries[0].width, warm.entries[0].height), (800, 600));
+        assert!(!warm.truncated);
     }
 }

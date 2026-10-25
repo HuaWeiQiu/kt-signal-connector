@@ -4276,6 +4276,32 @@ impl RuntimeSupervisor {
         Ok(())
     }
 
+    /// messages.setAttachmentDimensions (contract revision 1.271, §4.255): a
+    /// local store write on the send lane — the conversations.saveDraft class
+    /// (mutating, account-scoped mutex and delete barrier, no engine frame, no
+    /// upstream traffic). The lane/mutex classification lives in the method
+    /// table; this wrapper only hands the work to the blocking pool.
+    pub async fn set_attachment_dimensions(
+        &self,
+        params: crate::service::MessagesSetAttachmentDimensionsParams,
+    ) -> Result<crate::service::AttachmentDimensionsWriteResult, ServiceError> {
+        let store = Arc::clone(&self.store);
+        blocking_service(move || crate::service::store_set_attachment_dimensions(&store, &params))
+            .await
+    }
+
+    /// messages.listAttachmentDimensions (contract revision 1.271, §4.255): a
+    /// bounded store-only read on the read lane — no upstream traffic, no
+    /// mutation, and no unread side effect (the §4.76 adjacentMedia posture).
+    pub async fn list_attachment_dimensions(
+        &self,
+        params: crate::service::MessagesListAttachmentDimensionsParams,
+    ) -> Result<crate::service::AttachmentDimensionsListResult, ServiceError> {
+        let store = Arc::clone(&self.store);
+        blocking_service(move || crate::service::store_list_attachment_dimensions(&store, &params))
+            .await
+    }
+
     pub async fn list_messages(
         &self,
         account_id: String,

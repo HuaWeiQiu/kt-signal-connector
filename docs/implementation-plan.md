@@ -17,6 +17,23 @@
   document for the official anchor and the event mapping.
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.271 (2026-10-25; §4.255 the persisted attachment
+  dimensions face — batch Z32, ledger §29.124: the official data-model shape
+  restored to the connector. The official desktop's Attachment carries optional
+  `width`/`height` (ts/types/Attachment.std.ts:18-19/:77-78/:223-224) filled at
+  receive by the image measurement (ts/types/VisualAttachment.dom.ts:38), so
+  `getImageDimensionsForTimeline` (ts/util/Attachment.std.ts:407) always has a
+  declaration and the timeline box is reserved on the first frame. The connector's
+  `attachments_json` already held those keys, but nothing ever wrote them for
+  rows the engine could not measure — the desktop therefore fell back to an
+  asynchronous probe and the media box grew from the minimum box on every first
+  scroll. Two methods close that gap: `messages.setAttachmentDimensions` (a
+  local store write on the send lane, idempotent, pixel-domain gated, fail-closed
+  on an unreadable descriptor face) and `messages.listAttachmentDimensions`
+  (a bounded store-only read on the read lane, newest first, no unread side
+  effect) carrying the same pairs `messages.list` already projects — zero shape
+  change on the list row. Advertised through the new `attachment-dimensions`
+  feature tag; pre-1.271 hosts read every existing frame byte-identically.)
 - Contract revision: 1.262 (2026-10-24; S13 §4.46 amendment — the v1 line
 - Contract revision: 1.262 (2026-10-25; S21 §4.245 amendment — imported
   inbound rows land the archive member ACI **as the row sender**:
@@ -20029,3 +20046,71 @@ ingest privacy hash）——桌面成员卡 member id 显示该哈希、作者�
 （imported=0）；live 重放（source=号码 + sourceUuid=ACI）对 ACI 形
 导入行去重单行钉形；S12 金钉（prepared 帧 author=成员 ACI）随批
 加 sender=ACI 断言。
+
+## §4.255 附件尺寸进消息数据（契约 1.271 · 批 Z32 · 台账 §29.124）
+
+**症状（第 N 次用户实测）**：滑动仍现媒体「从小变大」。已交付三层
+（§29.121 Z29 渲染测量缓存 / §29.123 Z31 磁盘 meta / Z27 aspect-ratio）
+全部绕不过同一层：**渲染时尺寸异步拿不到**——首帧只能落官方缺省盒
+200×50，`@load` 后按实测重算行高 = 虚拟列表位移 = 用户看到「从小变大」。
+
+**真根因（数据模型差，不是渲染算法）**。官方锚（Signal-Desktop 只读）：
+
+| 面 | 官方 | 本端（1.271 前） |
+|---|---|---|
+| 尺寸字段 | `Attachment.width?/height?`（`ts/types/Attachment.std.ts:18-19`、`:77-78`、`:223-224`） | wire 形状**同构**（`NormalizedAttachment.width/height`），但**没有写面**——引擎不投影的行走不到值 |
+| 取值算法 | `getImageDimensionsForTimeline`（`ts/util/Attachment.std.ts:407`）：有声明就用，没有就 `MIN_TIMELINE_IMAGE_*` | 桌面 `signalAttachmentDisplayBox` 已逐值同构（Z27/Z28 对齐） |
+| 尺寸从哪来 | 下载面测量入库：`VisualAttachment.dom.ts:38` `width: image.naturalWidth, height: image.naturalHeight`，随消息持久化 | **缺这一环**：桌面只能用异步探针（Z29 localStorage 缓存 / Z31 盘面 sidecar），两条都是「首帧之后」 |
+
+结论：缺的不是渲染算法，是**数据里没有尺寸**。官方渲染之所以零跳动，
+是因为它读的是消息数据里的字段，永远同步可得。
+
+**契约（两个方法，wire additive）**：
+
+| 方法 | lane | 语义 |
+|---|---|---|
+| `messages.setAttachmentDimensions` | Send + account-scoped mutating | 把一次测量写进该行 `attachments_json` 对应描述符的 `width`/`height`。本地 store 写，**零引擎帧零上游**（`conversations.saveDraft` 同族）；同账号互斥与 delete barrier 同在 |
+| `messages.listAttachmentDimensions` | Read | 一次取该会话已落库的尺寸表（新消息在前，行窗口有界）。纯本地读，**无未读副作用**（§4.76 adjacentMedia 同纪律）；桌面开会话即预载，渲染前同步命中 |
+
+参数面：
+
+- 写：`{accountId, conversationId, messageId, attachmentId, width, height}`。
+- 读：`{accountId, conversationId, limit?}`——`limit` 计扫过的**带附件行**
+  （缺省 200，1..=1000）。
+- 写应答 `{updated: boolean}`：`false` = 同一对值已在库（幂等重放，
+  字节不重写）。读应答 `{entries: [{messageId, attachmentId, width, height}],
+  truncated: boolean}`。
+
+**写纪律（逐条 fail-closed）**：
+
+1. 阶梯：账号 → 会话 → 消息（`ACCOUNT_NOT_FOUND` / `CONVERSATION_NOT_FOUND`
+   / `MESSAGE_NOT_FOUND`），全部在写之前。
+2. `attachmentId` 必须指名该行的一个描述符，否则 `INVALID_REQUEST`
+   （§4.54 附件阶梯同款：给不存在的附件报尺寸是调用方错误，绝不静默空写）。
+3. 像素域：正整数且 ≤ **16384**（官方 `Attachment.width/height` 域），
+   越界 `INVALID_REQUEST`——荒谬的测量永不落库。
+4. 读不懂的 `attachments_json`（非数组/非 JSON）→ `INVALID_REQUEST`，
+   **绝不覆盖读不懂的字节**（§4.11 姿态）；NULL 面 = 该行没有描述符，
+   答 `AttachmentNotFound`（同 2 的语义）。
+5. 幂等：同值重放答 `updated=false` 且不改写；换值只重写被寻址条目的
+   两个键，其余键与其余条目**逐字不变**。
+
+**读纪律**：号/会话阶梯同上；`limit` 域外 `INVALID_REQUEST`；单行形状坏
+（坏 JSON / 非对象描述符）**单行跳过**，绝不让一行坏面拖垮整次预载；只列出
+同时带正 `width` 与 `height` 且落在像素域内的条目——没量过的诚实缺席，
+绝不发明 0。
+
+**wire 面零形状变化**：`messages.list` 的行形状不变（`attachments[]` 的
+`width`/`height` 早就在白名单上，见 §4.88 描述符族）——写面落地后这两键
+自然从「恒缺席」变成「量过就在」，pre-1.271 宿主读同一行逐字节不变。
+
+**能力位**：新 feature tag `attachment-dimensions`（表序广告；旧连接器缺
+tag = 桌面按既有异步臂诚实降级，不报错）。
+
+**测试**：store 三例（描述符面幂等补写 + 其余键/条目逐字不变 / 三路
+fail-closed / 只投影已量条目且新消息在前 + 行窗口有界）；service 三例
+（像素域与号/会话/消息阶梯 + `limit` 域 + 空表诚实零 / 写后
+`messages.list` 自然带出且行键集不变 / 预载读与 list 投影逐值一致）；
+host 一例（两 params 面严格 `deny_unknown_fields`、负值在反序列化层即拒、
+`limit` 可选）；schema-consistency 补三条 bounds 对（`attachmentId`
+maxLength 128、两处 `maximum` 16384、`limit` maximum 1000）。
