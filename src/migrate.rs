@@ -96,6 +96,7 @@ pub struct MigrationReport {
     pub entries: Vec<MigrationEntry>,
     pub migrated: usize,
     pub already_migrated: usize,
+    pub unprovisioned: usize,
     pub orphans_removed: usize,
 }
 
@@ -123,6 +124,7 @@ pub fn run(
         entries: Vec::new(),
         migrated: 0,
         already_migrated: 0,
+        unprovisioned: 0,
         orphans_removed: 0,
     };
     for row in &rows {
@@ -137,6 +139,7 @@ pub fn run(
         match entry.action.as_str() {
             "migrated" => report.migrated += 1,
             "alreadyMigrated" => report.already_migrated += 1,
+            "unprovisioned" => report.unprovisioned += 1,
             _ => {}
         }
         report.entries.push(entry);
@@ -148,8 +151,11 @@ pub fn run(
             None,
             None,
             &format!(
-                "migrated={} already={} orphans={}",
-                report.migrated, report.already_migrated, report.orphans_removed
+                "migrated={} already={} unprovisioned={} orphans={}",
+                report.migrated,
+                report.already_migrated,
+                report.unprovisioned,
+                report.orphans_removed
             ),
         );
     }
@@ -263,10 +269,28 @@ fn migrate_account(
     }
 
     let Some(entry) = legacy_entry else {
-        return Err(pool_invalid(format!(
-            "account {} has no legacy engine data to migrate; refusing to serve a half-migrated pool",
-            row.id
-        )));
+        // A store row with no legacy data and no target slot has no credentials
+        // to move. Blocking every healthy account on such an orphan turns one
+        // stale row into a total outage; keep it unprovisioned so addressed
+        // requests answer ENGINE_NOT_PROVISIONED while the rest of the pool
+        // serves normally. Unsafe cases (target registry present but empty)
+        // were rejected above.
+        journal_record(
+            &mut journal,
+            "plan",
+            Some(&row.id),
+            Some(&row.proxy_group),
+            if dry_run {
+                "wouldUnprovision"
+            } else {
+                "unprovisioned"
+            },
+        );
+        return Ok(MigrationEntry {
+            account_id: row.id.clone(),
+            proxy_group: row.proxy_group.clone(),
+            action: "unprovisioned".to_string(),
+        });
     };
     let Some(relative) = entry.dir.as_deref() else {
         return Err(pool_invalid(format!(
@@ -964,6 +988,29 @@ mod tests {
                 .is_file(),
             "fail closed must leave both copies intact"
         );
+    }
+
+    #[test]
+    fn store_row_without_any_engine_data_is_unprovisioned_not_fatal() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("signal-data");
+        let state_dir = temp.path().join("state");
+        fs::create_dir_all(&root).unwrap();
+        let store = test_store(&state_dir);
+        let id = account_id(8);
+        store
+            .upsert_account_from_signal_with_id(
+                "+15550000008",
+                Some(1),
+                DEFAULT_PROXY_GROUP_ID,
+                Some(&id),
+            )
+            .unwrap();
+
+        let report = run(&store, &root, &state_dir, false).expect("orphan row is not fatal");
+        assert_eq!(report.unprovisioned, 1);
+        assert_eq!(report.migrated, 0);
+        assert!(!root.join(ENGINE_SLOT_SUBDIR).join(id).exists());
     }
 
     #[test]

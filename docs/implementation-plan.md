@@ -17,6 +17,34 @@
   document for the official anchor and the event mapping.
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.274 (2026-10-27; §4.258 the per-recipient delete
+  settlement and content-erasure completion: remoteDelete results are expanded
+  into `deletedForEveryoneSendStatus` (success=true / failure=false), persisted
+  in the existing `send_outcomes_json` face with `delete_failed`, and
+  `mark_remote_deleted` now erases body/attachments/locators/rich/quote fields
+  and marks reaction events removed. This completes the official
+  `applyDeleteForEveryone` + `eraseMessageContents` structure instead of a
+  status-only tombstone.)
+- Contract revision: 1.273 (2026-10-27; §4.257 the local remote-delete
+  tombstone completion: after a confirmed upstream `remoteDelete`, the
+  connector now marks the target outgoing row `remote-deleted` through the
+  existing author-scoped `store.mark_remote_deleted` helper and emits
+  `ConversationChanged`. The previous prepare-only behavior returned
+  `deleted` while leaving `messages.list` at `read`/`sent`, so a refresh
+  restored the original bubble. The local completion matches the official
+  `applyDeleteForEveryone` persistent tombstone semantics; unknown outcomes
+  still never mark the row or retry automatically.)
+- Contract revision: 1.272 (2026-10-27; §4.256 the authoritative oldest-unseen
+  anchor projection: `ConversationSummary.oldestUnseenMessageId` is an additive,
+  optional field on `conversations.list` and every `conversation_summary`
+  consumer (including `ConversationChanged`). The connector derives it from its
+  own message store using the same authoritative rule as the unread counter and
+  `read_watermark_ms`: only when `unread_count > 0`, the earliest incoming
+  row with `sent_at > COALESCE(read_watermark_ms, 0)`, ordered by
+  `(sent_at ASC, id ASC)`. No row means absent, never a guessed id. This gives
+  the desktop the official `metrics.oldestUnseen.id` fact for the unread divider
+  and replaces its `length - unreadCount` approximation; no engine JSON-RPC or
+  storage schema change is required.)
 - Contract revision: 1.271 (2026-10-25; §4.255 the persisted attachment
   dimensions face — batch Z32, ledger §29.124: the official data-model shape
   restored to the connector. The official desktop's Attachment carries optional
@@ -20114,3 +20142,64 @@ fail-closed / 只投影已量条目且新消息在前 + 行窗口有界）；ser
 host 一例（两 params 面严格 `deny_unknown_fields`、负值在反序列化层即拒、
 `limit` 可选）；schema-consistency 补三条 bounds 对（`attachmentId`
 maxLength 128、两处 `maximum` 16384、`limit` maximum 1000）。
+
+## §4.256 权威最旧未读锚投影（契约 1.272）
+
+**问题**：官方未读分隔线以 `metrics.oldestUnseen.id` 定位最旧未读消息；
+桌面此前只有 `unreadCount` 与 `read_watermark_ms`，不得不用
+`length - unreadCount` 近似，出站消息穿插时锚会错位。
+
+**实现**：`ConversationSummary` 新增可选 `oldestUnseenMessageId`。
+`conversations.list` 与 `conversation_summary`（含 `ConversationChanged`）
+共用同一 store 查询：仅 `unread_count > 0` 时，取
+`direction='incoming' AND sent_at > COALESCE(read_watermark_ms, 0)`
+的最早一行，按 `(sent_at ASC, id ASC)` 排序；无具体行则键缺席。
+没有改 engine JSON-RPC、消息表结构或既有字段，旧宿主按可选字段忽略即可。
+
+**桌面消费**：优先按该 id 定位；只有 pre-1.272 connector 缺字段时才回退到
+`incoming` 计数推导。显式 id 尚未被当前窗口覆盖时继续回拉，不以近似锚冒充。
+
+**测试**：store 一例同时覆盖：
+- 出站消息穿插不改变最旧未读锚（`m2` 而非按末尾 N 条错算）；
+- `conversations.list` 与 `conversation_summary` 投影一致；
+- 水位前进后锚从 `m2` 精确移动到 `m4`；
+- 全读时字段缺席（JSON 中无 `oldestUnseenMessageId`）。
+桌面 `resolveOldestUnreadAnchorIndex` 测试覆盖精确 id 优先、旧 connector
+回退、显式 id 未覆盖返回 -1。
+
+## §4.257 远端删除确认后的本地墓碑完成半（契约 1.273）
+
+**问题**：此前 `messages.remoteDelete` 是 prepare-only：上行返回
+`deleted` 后既不更新本地消息行，也不发事件。桌面虽会短暂写
+`remoteDeleted`，但下一次 `messages.list` 仍返回 `read/sent`，原气泡恢复。
+用户实测「对所有人删除」后仍显示原文，而官方保留删除墓碑。
+
+**实现**：supervisor 在上行确认后调用
+`service.complete_remote_delete`，复用收件侧 author-scoped
+`store.mark_remote_deleted` 将目标行改为 `remote-deleted`，并发出
+`MessageStatusChanged` 与 `ConversationChanged`。若被删行正占摘要槽，清空
+旧 `last_message_preview`，避免左栏继续残留正文。未知结果仍不落墓碑、
+绝不自动重试；重复完成保持幂等。
+
+**测试**：service 一例验证上行确认后的行状态持久化、摘要预览清空、重复
+完成无二次事件；同时通过 `cargo check`、fmt、clippy 与 release build。
+
+## §4.258 逐收件人删除结算与内容擦除（契约 1.274）
+
+**问题**：官方 `deletedForEveryoneSendStatus` 是逐收件人布尔位图，
+`applyDeleteForEveryone` 还会经 `eraseMessageContents` 清空正文、附件、
+引用/富文本与回应。KT 此前只有 remoteDeleted/deleteFailed 单标志，且
+remoteDelete 只改 status，正文仍留在库里。
+
+**实现**：
+- engine remoteDelete 直聊/群聊返回 `results[]`（success/failure）。
+- connector 将结果展开为 `deletedForEveryoneSendStatus` 并复用
+  `send_outcomes_json` 持久化；桌面归一化到官方顶层字段。
+- `delete_failed` 由消息行投影为官方 `deletedForEveryoneFailed`，不再写死 false。
+- `mark_remote_deleted` 清 body/body_bytes/attachments/locators/rich/quote，
+  并把 reaction events 标记 removed；末条摘要清旧 preview。
+- `delete_failed/delete_failed_at` 补入 schema v42（此前 setter 已用但列缺席）。
+
+**测试**：service completion 覆盖逐人 map、正文/附件/富文本擦除、摘要清空、
+幂等；supervisor 部分成功/失败结果解析；全量 connector 测试通过。
+桌面本地持久化 store 覆盖 pending/success/failure 与重载回填。

@@ -3046,6 +3046,7 @@ pub fn open_group_runtime_with_options(
         tracing::info!(
             migrated = report.migrated,
             already_migrated = report.already_migrated,
+            unprovisioned = report.unprovisioned,
             orphans_removed = report.orphans_removed,
             "engine pool migration pass complete"
         );
@@ -3072,12 +3073,20 @@ pub fn open_group_runtime_with_options(
             policy: options.pool_policy.clone(),
             watchdog_interval: options.watchdog_interval,
         });
-        if pool.len() != rows.len() {
+        if pool.len() > rows.len() {
             return Err(StoreError::EnginePoolInvalid(format!(
                 "{} account rows but {} engine slots after migration",
                 rows.len(),
                 pool.len()
             )));
+        }
+        if pool.len() < rows.len() {
+            tracing::warn!(
+                accounts = rows.len(),
+                slots = pool.len(),
+                unprovisioned = rows.len() - pool.len(),
+                "engine pool starts with unprovisioned account rows"
+            );
         }
         let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runtime = ProxyGroupRuntime::full_pool_with_running(
