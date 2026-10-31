@@ -4527,6 +4527,7 @@ impl RuntimeSupervisor {
         let mut counted = crate::store::MessageSendOutcomes {
             succeeded: 0,
             failed: 0,
+            deleted_for_everyone_send_status: None,
         };
         for entry in entries {
             if entry.get("success").is_some() {
@@ -4563,7 +4564,7 @@ impl RuntimeSupervisor {
                     recipient: recipient.to_string(),
                     succeeded: true,
                 });
-            } else if entry.get("failure").is_some() {
+            } else if entry.get("failure").is_some() || entry.get("error").is_some() {
                 seeds.push(crate::store::SendReceiptSeed {
                     recipient: recipient.to_string(),
                     succeeded: false,
@@ -4571,6 +4572,18 @@ impl RuntimeSupervisor {
             }
         }
         (!seeds.is_empty()).then_some(seeds)
+    }
+
+    /// 契约 1.274：把 remoteDelete 的逐收件人 results 展开为
+    /// deletedForEveryoneSendStatus（success=true / failure=false）。
+    fn deleted_for_everyone_send_status_from_reply(
+        result: &Value,
+    ) -> std::collections::BTreeMap<String, bool> {
+        let mut status = std::collections::BTreeMap::new();
+        for seed in Self::send_receipt_seeds_from_reply(result).unwrap_or_default() {
+            status.insert(seed.recipient, seed.succeeded);
+        }
+        status
     }
 
     async fn dispatch_prepared(
@@ -7736,12 +7749,10 @@ impl RuntimeSupervisor {
             .map_err(ServiceError::from)
     }
 
-    /// Best-effort "Delete for everyone" for one own sent message
-    /// (docs/remote-delete-l2-plan.md): local prepare under the service lock,
-    /// upstream `remoteDelete` call without it — the same shape as
-    /// `send_text`. No local row is created or changed and no event is
-    /// emitted; an indeterminate mutating outcome maps to the explicit
-    /// `{"status":"unknown"}` response, never to an automatic retry.
+    /// "Delete for everyone" for one own sent message: local prepare under
+    /// the service lock, upstream `remoteDelete` without it, then the
+    /// contract-1.273 local tombstone completion on confirmation. Indeterminate
+    /// outcomes still answer `{"status":"unknown"}` and never auto-retry.
     pub async fn remote_delete(
         &self,
         account_id: String,
@@ -7765,7 +7776,39 @@ impl RuntimeSupervisor {
             let _ = service.set_message_delete_failed(&account_id, &message_id, failed);
         }
         match outcome {
-            Ok(_) => Ok("deleted"),
+            Ok(result) => {
+                // 契约 1.273 + 1.274：上行确认后落本地墓碑，并持久化逐收件人
+                // 删除状态。部分失败保留 success=true 的条目，同时置 failed。
+                let send_status = Self::deleted_for_everyone_send_status_from_reply(&result);
+                let failed = send_status.values().any(|succeeded| !succeeded);
+                let completed = {
+                    let service = self.service.lock().await;
+                    service.complete_remote_delete(
+                        &prepared.account_id,
+                        &prepared.conversation_id,
+                        &prepared.message_id,
+                        prepared.target_sent_at,
+                        send_status,
+                        failed,
+                    )?
+                };
+                if let Some((record, summary)) = completed {
+                    let _ = self.host_events.send(HostSideEvent::MessageStatusChanged {
+                        account_id: record.account_id,
+                        message_id: record.id,
+                        status: record.status,
+                        delivered_at: None,
+                        read_at: None,
+                        viewed_at: None,
+                    });
+                    if let Some(summary) = summary {
+                        let _ = self
+                            .host_events
+                            .send(HostSideEvent::ConversationChanged(summary));
+                    }
+                }
+                Ok("deleted")
+            }
             Err(EngineError::UnknownOutcome) => Ok("unknown"),
             Err(error) => Err(error.into()),
         }
@@ -11690,6 +11733,7 @@ async fn receive_persistence_loop(
                         tracing::warn!(
                             state = "unavailable",
                             error_class = error.class(),
+                            error = ?error,
                             "receive persistence failed; retrying"
                         );
                         let _ = host_events.send(HostSideEvent::StorageChanged {
@@ -12162,6 +12206,18 @@ mod tests {
     /// totals; direct sends (no array), empty arrays, and shape-hostile
     /// entries degrade to `None` (the pre-1.173 shape — no outcomes face).
     #[test]
+    fn remote_delete_send_status_tracks_partial_recipient_results() {
+        let map = RuntimeSupervisor::deleted_for_everyone_send_status_from_reply(&json!({
+            "results": [
+                { "recipientNumber": "+1", "success": { "timestamp": 7 } },
+                { "recipientNumber": "+2", "failure": { "type": "NetworkFailure" } },
+            ]
+        }));
+        assert_eq!(map.get("+1"), Some(&true));
+        assert_eq!(map.get("+2"), Some(&false));
+    }
+
+    #[test]
     fn send_outcomes_from_reply_counts_group_results_entries() {
         assert_eq!(
             RuntimeSupervisor::send_outcomes_from_reply(&json!({
@@ -12175,6 +12231,7 @@ mod tests {
             Some(crate::store::MessageSendOutcomes {
                 succeeded: 2,
                 failed: 1,
+                deleted_for_everyone_send_status: None,
             })
         );
         // No recognizable entry counts as no face (never an all-zero Some).

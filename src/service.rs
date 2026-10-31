@@ -2252,6 +2252,12 @@ impl ConnectorService {
         media: Option<MediaIngest>,
         preferred_account_id: Option<String>,
     ) -> Self {
+        if let Err(error) = store.backfill_incoming_author_aci() {
+            tracing::warn!(
+                error_class = error.class(),
+                "incoming author ACI backfill failed"
+            );
+        }
         Self {
             store,
             link: None,
@@ -8304,8 +8310,49 @@ impl ConnectorService {
             account_id: account_id.to_string(),
             conversation_id: conversation_id.to_string(),
             message_id: message_id.to_string(),
+            target_sent_at: message.sent_at,
             params,
         })
+    }
+
+    /// Confirmed remoteDelete 的本地完成半（契约 1.273 / 官方
+    /// applyDeleteForEveryone 持久墓碑语义）。此前 prepare-only 在上行成功后
+    /// 完全不改本地行，导致 messages.list 继续返回旧正文并覆盖桌面临时墓碑。
+    /// 复用收件侧同一 author-scoped mark_remote_deleted，成功后返回行变化与
+    /// 会话摘要供 supervisor 发 MessageStatusChanged + ConversationChanged。
+    /// 幂等：已 remote-deleted 的行不重复发事件。
+    pub fn complete_remote_delete(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        target_sent_at: u64,
+        send_status: std::collections::BTreeMap<String, bool>,
+        failed: bool,
+    ) -> Result<Option<(MessageRecord, Option<ConversationSummary>)>, ServiceError> {
+        let Some((record, changed)) = self.store.mark_remote_deleted(
+            account_id,
+            conversation_id,
+            target_sent_at,
+            account_id,
+        )?
+        else {
+            return Ok(None);
+        };
+        if !changed {
+            return Ok(None);
+        }
+        self.store.set_deleted_for_everyone_send_status(
+            account_id,
+            message_id,
+            send_status,
+            failed,
+            failed.then_some(now_ms() as i64),
+        )?;
+        let summary = self
+            .store
+            .conversation_summary(account_id, conversation_id)?;
+        Ok(Some((record, summary)))
     }
 
     /// Pure local validation for `messages.sendReaction`
@@ -10636,15 +10683,23 @@ impl ConnectorService {
             is_erased: false,
             delete_failed: false,
             required_protocol_version: receive.required_protocol_version,
-            // Contract 1.191 (§4.191): the incoming author's protocol identity
-            // — the envelope's `sourceUuid` member ACI, verbatim. Outgoing
-            // rows name the account itself (its number is the protocol face),
-            // system rows name nobody; both stay NULL. This is the face the
-            // backfill request arm resolves on group rows — the row's
-            // `sender_id` is the ingest privacy hash and never leaves the
-            // store in that seat.
+            // Contract 1.191 (§4.191): the incoming author's protocol identity.
+            // Prefer the envelope's `sourceUuid` member ACI; some engines only
+            // carry the ACI in `source`, so fall back to it when it canonicalizes.
+            // Without this fallback the row keeps only the ingest privacy hash
+            // and every group member renders as「未知联系人」. Outgoing rows name
+            // the account itself; system rows name nobody — both stay NULL.
             author_aci: if direction == "incoming" {
-                receive.source_uuid.clone()
+                receive
+                    .source_uuid
+                    .as_deref()
+                    .and_then(crate::store::canonical_aci)
+                    .or_else(|| {
+                        receive
+                            .source
+                            .as_deref()
+                            .and_then(crate::store::canonical_aci)
+                    })
             } else {
                 None
             },
@@ -15565,6 +15620,9 @@ pub struct PreparedRemoteDelete {
     pub account_id: String,
     pub conversation_id: String,
     pub message_id: String,
+    /// Upstream timestamp of the target row, reused by the local tombstone
+    /// completion after a confirmed remoteDelete (contract 1.273).
+    pub target_sent_at: u64,
     pub params: Value,
 }
 
@@ -21179,6 +21237,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
         };
+        let mut source_only = receive.clone();
         let events = service
             .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
@@ -21210,6 +21269,26 @@ mod tests {
             })
             .unwrap();
         assert_eq!(prepared["author"], json!(member_aci));
+
+        // Some engines carry the author ACI only in `source` (no sourceUuid).
+        // The fallback must still capture it, otherwise group names resolve to
+        //「未知联系人」even though every contact is present.
+        source_only.timestamp = Some(1726999999005);
+        source_only.source_uuid = None;
+        source_only.source = Some(member_aci.to_string());
+        source_only.text = Some("photo2".into());
+        service
+            .ingest_receive(source_only, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let rows = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        let fallback_row = rows
+            .iter()
+            .find(|row| row.text.as_deref() == Some("photo2"))
+            .expect("the source-only group row lands");
+        assert_eq!(fallback_row.author_aci.as_deref(), Some(member_aci));
         assert_eq!(prepared["groupId"], json!("ZmFrZS1ncm91cA=="));
         assert_eq!(prepared["sentTimestamp"], json!(1726999999004u64));
         assert_ne!(
@@ -25737,6 +25816,106 @@ mod tests {
         assert_eq!(prepared.params["targetTimestamp"], json!(888));
         assert_eq!(prepared.params["groupId"], json!("Z3JvdXAtaWQ="));
         assert!(prepared.params.get("recipient").is_none());
+    }
+
+    /// 契约 1.273：上行确认后的本地完成半必须持久化墓碑，且重复完成
+    /// 不重复发事件；否则 messages.list 会把桌面临时墓碑覆盖回旧正文。
+    #[test]
+    fn complete_remote_delete_persists_tombstone_and_is_idempotent() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let message_id = match service
+            .prepare_send_text(
+                &account.id,
+                &direct.id,
+                "Really",
+                "req-rd-complete",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&message_id, &account.id, &direct.id, 17_000, None)
+            .unwrap();
+        let prepared = service
+            .prepare_remote_delete(&account.id, &direct.id, &message_id)
+            .unwrap();
+
+        let send_status = std::collections::BTreeMap::from([
+            ("peer-a".to_string(), true),
+            ("peer-b".to_string(), false),
+        ]);
+        let (record, summary) = service
+            .complete_remote_delete(
+                &account.id,
+                &direct.id,
+                &message_id,
+                prepared.target_sent_at,
+                send_status.clone(),
+                true,
+            )
+            .unwrap()
+            .expect("confirmed delete must transition the row");
+        assert_eq!(record.status, "remote-deleted");
+        let stored = service
+            .store_ref()
+            .message_by_id(&account.id, &direct.id, &message_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "remote-deleted");
+        assert_eq!(stored.text, None, "正文必须按 eraseMessageContents 擦除");
+        assert!(stored.attachments.is_empty(), "附件必须擦除");
+        assert!(stored.rich.is_none(), "富文本必须擦除");
+        assert_eq!(
+            stored
+                .send_outcomes
+                .as_ref()
+                .and_then(|outcomes| outcomes.deleted_for_everyone_send_status.clone()),
+            Some(send_status),
+        );
+        assert!(stored.delete_failed, "删除失败位必须持久化");
+        assert_eq!(
+            serde_json::to_value(&stored)
+                .unwrap()
+                .get("deletedForEveryoneFailed")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "wire 字段必须是官方 deletedForEveryoneFailed 名称",
+        );
+        assert_eq!(summary.expect("summary").last_message_preview, None);
+
+        // 幂等：同一删除回显/重放不重复产生状态事件。
+        assert!(
+            service
+                .complete_remote_delete(
+                    &account.id,
+                    &direct.id,
+                    &message_id,
+                    prepared.target_sent_at,
+                    std::collections::BTreeMap::new(),
+                    false,
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The eligibility guard is deterministic and local: pending, failed and
@@ -40169,15 +40348,11 @@ mod tests {
             .list_messages(&account.id, &group.id, 10, None)
             .unwrap()
             .items;
-        let status_of = |source: &str| {
-            rows.iter()
-                .find(|row| row.text.as_deref() == Some(&format!("from {source}")))
-                .map(|row| row.status)
-        };
-        assert_eq!(status_of("+15555550101"), Some("remote-deleted"));
+        let status_count = |status: &str| rows.iter().filter(|row| row.status == status).count();
+        assert_eq!(status_count("remote-deleted"), 1);
         assert_eq!(
-            status_of("+15555550102"),
-            Some("delivered"),
+            status_count("delivered"),
+            1,
             "a foreign member's row at the same timestamp is never the target"
         );
 
@@ -41341,13 +41516,9 @@ mod tests {
             .list_messages(&account.id, &group.id, 10, None)
             .unwrap()
             .items;
-        let status_of = |source: &str| {
-            rows.iter()
-                .find(|row| row.text.as_deref() == Some(&format!("from {source}")))
-                .map(|row| row.status)
-        };
-        assert_eq!(status_of("+15555550102"), Some("delivered"));
-        assert_eq!(status_of("+15555550101"), Some("remote-deleted"));
+        let status_count = |status: &str| rows.iter().filter(|row| row.status == status).count();
+        assert_eq!(status_count("delivered"), 1);
+        assert_eq!(status_count("remote-deleted"), 1);
     }
 
     /// Contract 1.110 (§4.91) bounds: the buffer holds at most 512 entries

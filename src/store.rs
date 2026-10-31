@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 41;
+const SCHEMA_VERSION: i64 = 42;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -288,6 +288,8 @@ CREATE TABLE IF NOT EXISTS messages (
   first_send_attempted_at INTEGER,
   retry_attempt_count INTEGER NOT NULL DEFAULT 0,
   next_attempt_at INTEGER,
+  delete_failed INTEGER NOT NULL DEFAULT 0,
+  delete_failed_at INTEGER,
   FOREIGN KEY(account_id) REFERENCES accounts(id),
   FOREIGN KEY(conversation_id) REFERENCES conversations(id)
 );
@@ -846,6 +848,12 @@ pub struct ConversationSummary {
     /// authoritative read position", never zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_watermark_ms: Option<u64>,
+    /// Contract 1.272 (section 4.256): the authoritative oldest-unseen anchor,
+    /// the local-store counterpart of official metrics.oldestUnseen.id. Present
+    /// only while unread_count > 0 and a concrete incoming row exists after the
+    /// read watermark; absent on fully-read or evidence-less conversations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_unseen_message_id: Option<String>,
     pub muted: bool,
     /// 契约 1.206（M5）：通知细分四开关——官方 `notifyForCallsIfMuted` /
     /// `notifyForMentionsIfMuted` / `notifyForRepliesIfMuted` /
@@ -2182,6 +2190,11 @@ pub struct MessageSendOutcomes {
     pub succeeded: u32,
     #[serde(default)]
     pub failed: u32,
+    /// 契约 1.274：官方 deletedForEveryoneSendStatus 的持久化半面。
+    /// 复用既有 send_outcomes_json 列，避免为新状态再做一次 schema 迁移；
+    /// 桌面把它映射回 MessageRecord 顶层同名字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_for_everyone_send_status: Option<std::collections::BTreeMap<String, bool>>,
 }
 
 /// §4.179 unknown-outcome reconciliation batch entry: one unsettled outgoing
@@ -2217,7 +2230,10 @@ pub struct MessageRecord {
     /// model-types.d.ts:330 deletedForEveryoneFailed 对位）。真值 =
     /// 墓碑已落但删除请求未确认成功，桌面渲染删除失败可重试行。
     /// 内存失败旗标跨重启丢失的持久化半面（台账 §26.17）。
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "deletedForEveryoneFailed",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub delete_failed: bool,
     pub account_id: String,
     pub conversation_id: String,
@@ -3062,6 +3078,82 @@ impl Store {
         Ok(true)
     }
 
+    /// Backfill the protocol author identity for legacy incoming rows whose
+    /// only identity is the ingest privacy hash. The hash is stable over the
+    /// account, conversation kind, and author address, so once contacts (or a
+    /// direct conversation) carries the ACI we can recover it without asking
+    /// the engine for history again. Rows that already have an author ACI are
+    /// untouched; no candidate match means no guess.
+    pub fn backfill_incoming_author_aci(&self) -> Result<usize, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let candidates: Vec<(String, String)> = transaction
+            .prepare(
+                "SELECT account_id, peer_key FROM contacts WHERE kind='contact'
+                 UNION
+                 SELECT account_id, peer_key FROM conversations WHERE kind='direct'",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut by_hash: BTreeMap<(String, String, String), String> = BTreeMap::new();
+        for (account_id, peer_key) in candidates {
+            let Some(aci) = canonical_aci(&peer_key) else {
+                continue;
+            };
+            for kind in ["direct", "group"] {
+                let hash = stable_hash_id(&[&account_id, kind, &aci]);
+                by_hash.insert((account_id.clone(), kind.to_string(), hash), aci.clone());
+            }
+        }
+        if by_hash.is_empty() {
+            return Ok(0);
+        }
+        let rows: Vec<(String, String, String, String)> = transaction
+            .prepare(
+                "SELECT m.id, m.account_id, m.sender_id, c.kind
+                 FROM messages m
+                 JOIN conversations c ON c.id=m.conversation_id AND c.account_id=m.account_id
+                 WHERE m.direction='incoming'
+                   AND (m.author_aci IS NULL OR m.author_aci='')",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut changed = 0usize;
+        for (id, account_id, sender_id, kind) in rows {
+            let Some(aci) = by_hash.get(&(account_id, kind, sender_id)) else {
+                continue;
+            };
+            changed += transaction
+                .execute(
+                    "UPDATE messages SET author_aci=?1
+                     WHERE id=?2 AND (author_aci IS NULL OR author_aci='')",
+                    params![aci, id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed)
+    }
+
     pub fn upsert_account_from_signal(
         &self,
         signal_account: &str,
@@ -3103,10 +3195,16 @@ impl Store {
         }
         let id = preferred_id.map(str::to_string).unwrap_or_else(random_id);
         let masked = mask_address(signal_account);
+        // finishLink 与首条 receive 可能并发 upsert 同一账号。先查再插会让
+        // 第二个 INSERT 撞 UNIQUE(signal_account)，必须把裁决下放到 SQLite。
+        // 冲突时只恢复 ready/linked_at，proxy_group 仍保持链接时不可变。
         self.lock_conn()?
             .execute(
                 "INSERT INTO accounts(id, signal_account, masked_address, display_name, state, linked_at, unread_count, proxy_group)
-                 VALUES(?1, ?2, ?3, NULL, 'ready', ?4, 0, ?5)",
+                 VALUES(?1, ?2, ?3, NULL, 'ready', ?4, 0, ?5)
+                 ON CONFLICT(signal_account) DO UPDATE SET
+                   state='ready',
+                   linked_at=COALESCE(accounts.linked_at, ?4)",
                 params![
                     id,
                     signal_account,
@@ -3116,7 +3214,10 @@ impl Store {
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        self.account_summary(&id)?
+        let existing = self
+            .account_by_signal(signal_account)?
+            .ok_or(StoreError::AccountNotFound)?;
+        self.account_summary(&existing.id)?
             .ok_or(StoreError::AccountNotFound)
     }
 
@@ -5364,6 +5465,13 @@ impl Store {
                         conversation_naming_material(&conn, account_id, kind, &peer_key);
                     // 契约 1.209：群名册（官方 membersV2 投影；缺席 = 未知）。
                     let roster = conversation_roster(&conn, account_id, kind, &peer_key);
+                    let oldest_unseen = oldest_unseen_message_id(
+                        &conn,
+                        account_id,
+                        &row.get::<_, String>(0)?,
+                        row.get(6)?,
+                        row.get(13)?,
+                    )?;
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
@@ -5387,6 +5495,7 @@ impl Store {
                         unread_count: row.get::<_, i64>(6)? as u32,
                         unread_mentions: row.get::<_, i64>(7)? as u32,
                         read_watermark_ms: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
+                        oldest_unseen_message_id: oldest_unseen,
                         muted: row.get::<_, i64>(8)? != 0,
                         // 契约 1.206（M5）：通知细分四开关（裸 bool，恒序列化）。
                         notify_for_calls_if_muted: row.get::<_, i64>(14)? != 0,
@@ -5597,7 +5706,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -5659,7 +5768,8 @@ impl Store {
         let anchor_sent_at: i64 = self
             .lock_conn()?
             .query_row(
-                "SELECT sent_at FROM messages
+                "SELECT sent_at , delete_failed
+                 FROM messages
                   WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![anchor_id, account_id, conversation_id],
                 |row| row.get(0),
@@ -5673,7 +5783,7 @@ impl Store {
         let mut older: Vec<MessageRecord> = {
             let conn = self.read_conn()?;
             let mut stmt = conn
-                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -5699,7 +5809,8 @@ impl Store {
         let anchor: MessageRecord = {
             let conn = self.read_conn()?;
             conn.query_row(
-                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci, is_erased FROM messages WHERE id=?1 AND account_id=?2",
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci, is_erased , delete_failed
+                 FROM messages WHERE id=?1 AND account_id=?2",
                 params![anchor_id, account_id],
                 message_record_from_row,
             )
@@ -5708,7 +5819,7 @@ impl Store {
         let mut newer: Vec<MessageRecord> = {
             let conn = self.read_conn()?;
             let mut stmt = conn
-                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
@@ -5780,7 +5891,8 @@ impl Store {
         let anchor_id: Option<String> = self
             .read_conn()?
             .query_row(
-                "SELECT m.id FROM messages m
+                "SELECT m.id , delete_failed
+                 FROM messages m
                    JOIN conversations c
                      ON c.id = m.conversation_id AND c.account_id = m.account_id
                   WHERE m.account_id=?1 AND m.conversation_id=?2
@@ -5848,7 +5960,7 @@ impl Store {
                     AdjacentMediaDirection::Older => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -5858,7 +5970,7 @@ impl Store {
                     AdjacentMediaDirection::Newer => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
@@ -5952,8 +6064,8 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
-                     FROM messages
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
+                 FROM messages
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -6002,7 +6114,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -6022,7 +6134,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -6078,7 +6190,8 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let attachments_json: Option<String> = transaction
             .query_row(
-                "SELECT attachments_json FROM messages
+                "SELECT attachments_json , delete_failed
+                 FROM messages
                   WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 |row| row.get(0),
@@ -6221,7 +6334,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -6552,7 +6665,8 @@ impl Store {
         // everything before the epoch".
         let newest: Option<i64> = conn
             .query_row(
-                "SELECT MAX(sent_at) FROM messages
+                "SELECT MAX(sent_at) , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'",
                 params![account_id, conversation_id],
                 |row| row.get(0),
@@ -6721,7 +6835,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -6769,7 +6883,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -6896,7 +7010,7 @@ impl Store {
                 .query_row(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                      FROM messages WHERE id=?1",
                     params![message_id],
                     message_record_from_row,
@@ -6930,6 +7044,7 @@ impl Store {
             .query_row(
                 "SELECT direction, body, client_request_id, retry_attempt_count,
                         first_send_attempted_at, account_id, attachments_json
+                 , delete_failed
                  FROM messages WHERE id=?1 AND status='failed'",
                 params![message_id],
                 |row| {
@@ -7241,7 +7356,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -7282,7 +7397,8 @@ impl Store {
         // Contract-1.32 snapshot: the body this host-initiated edit replaces.
         let prior: Option<(String, String)> = transaction
             .query_row(
-                "SELECT body, body_bytes FROM messages
+                "SELECT body, body_bytes , delete_failed
+                 FROM messages
                  WHERE id=?1 AND account_id=?2 AND direction='outgoing'",
                 params![message_id, account_id],
                 |row| {
@@ -7317,7 +7433,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -7351,7 +7467,8 @@ impl Store {
         // replaces, read under the same predicate the UPDATE below guards.
         let prior: Option<(String, String)> = transaction
             .query_row(
-                "SELECT id, body FROM messages
+                "SELECT id, body , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
                    AND status NOT IN ('remote-deleted', 'system')
@@ -7390,7 +7507,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -7518,7 +7635,8 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let candidates: Vec<(String, Option<String>)> = transaction
             .prepare(
-                "SELECT id, rich_json FROM messages
+                "SELECT id, rich_json , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
                    AND status NOT IN ('remote-deleted', 'system')
@@ -7574,7 +7692,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE id=?1",
                 params![message_id],
@@ -7615,7 +7733,16 @@ impl Store {
         let changed = transaction
             .execute(
                 "UPDATE messages
-                 SET status='remote-deleted'
+                 SET status='remote-deleted',
+                     body=NULL,
+                     body_bytes=NULL,
+                     body_truncated=0,
+                     attachments_json=NULL,
+                     attachment_locators=NULL,
+                     live_attachment_locators=NULL,
+                     rich_json=NULL,
+                     quote_message_id=NULL,
+                     quote_snapshot=NULL
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id=?4
                    AND status NOT IN ('remote-deleted', 'system')",
@@ -7631,7 +7758,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3 AND sender_id=?4
                  ORDER BY id ASC LIMIT 1",
@@ -7645,6 +7772,36 @@ impl Store {
             )
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // 官方 eraseMessageContents：同时终结该消息上的回应（保留墓碑行，
+        // 但正文/附件/引用/富文本与 reaction 不再可见）。
+        if changed > 0 {
+            transaction
+                .execute(
+                    "UPDATE message_events
+                     SET removed=1
+                     WHERE account_id=?1 AND conversation_id=?2 AND target_timestamp=?3",
+                    params![account_id, conversation_id, target_sent_at as i64],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        // 若被删行正占摘要槽，清掉旧正文预览；conversation_summary 随后
+        // 仍会从该行 status=remote-deleted 计算 last_message_status，桌面据此
+        // 显示官方删除墓碑，而不是摘要继续残留旧正文。
+        if changed > 0
+            && let Some(latest) = record.as_ref()
+        {
+            transaction
+                .execute(
+                    "UPDATE conversations
+                     SET last_message_preview=NULL
+                     WHERE id=?1
+                       AND (SELECT id FROM messages
+                            WHERE conversation_id=?1
+                            ORDER BY sent_at DESC, id DESC LIMIT 1)=?2",
+                    params![conversation_id, latest.id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
         transaction
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -8109,6 +8266,50 @@ impl Store {
         Ok(())
     }
 
+    /// 契约 1.274：持久化 deletedForEveryoneSendStatus + deleteFailed。
+    /// 复用 send_outcomes_json，保留已有计数，不改消息发送结果面。
+    pub fn set_deleted_for_everyone_send_status(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        send_status: std::collections::BTreeMap<String, bool>,
+        failed: bool,
+        failed_at: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        let existing = conn
+            .query_row(
+                "SELECT send_outcomes_json FROM messages WHERE account_id=?1 AND id=?2",
+                params![account_id, message_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .flatten();
+        let mut outcomes = existing
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<MessageSendOutcomes>(json).ok())
+            .unwrap_or(MessageSendOutcomes {
+                succeeded: 0,
+                failed: 0,
+                deleted_for_everyone_send_status: None,
+            });
+        outcomes.deleted_for_everyone_send_status = if send_status.is_empty() {
+            None
+        } else {
+            Some(send_status)
+        };
+        let json = serde_json::to_string(&outcomes).map_err(|_| StoreError::Unavailable(None))?;
+        conn.execute(
+            "UPDATE messages
+             SET send_outcomes_json=?3, delete_failed=?4, delete_failed_at=?5
+             WHERE account_id=?1 AND id=?2",
+            params![account_id, message_id, json, failed as i64, failed_at],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
     pub fn mark_admin_deleted(
         &self,
         account_id: &str,
@@ -8132,7 +8333,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -8356,6 +8557,7 @@ impl Store {
                 "SELECT direction, sender_id, sent_at, received_at, body, body_truncated,
                         status, admin_deleted, quote_message_id, attachments_json,
                         attachment_locators, rich_json, sticker_json
+                 , delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2
                  ORDER BY sent_at ASC, id ASC",
@@ -9071,7 +9273,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY received_at DESC",
@@ -9284,7 +9486,8 @@ impl Store {
                 _ => "IN (?5, ?6, ?7)",
             };
             let sql = format!(
-                "SELECT id, attachments_json FROM messages
+                "SELECT id, attachments_json , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3
                    AND sent_at=?4 AND sender_id {sender_clause}
                  LIMIT 1"
@@ -9459,7 +9662,7 @@ impl Store {
                     m.body, m.body_bytes, m.body_truncated, m.status, m.quote_message_id, m.client_request_id,
                     m.quote_snapshot, m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
                     m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
-                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,m.is_erased
+                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,m.is_erased,delete_failed
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id AND c.account_id = m.account_id
              WHERE m.account_id = ?1 AND m.sent_at = ?2 AND m.rich_json IS NOT NULL
@@ -9511,7 +9714,8 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let rich_json: Option<String> = transaction
             .query_row(
-                "SELECT rich_json FROM messages
+                "SELECT rich_json , delete_failed
+                 FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 |row| row.get(0),
@@ -9541,7 +9745,7 @@ impl Store {
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
                         quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self,
-                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
@@ -9616,9 +9820,9 @@ impl Store {
                             m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
                             m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
                             m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid,
-                            m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,m.is_erased,
+                            m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,m.is_erased, delete_failed,
                             c.kind, c.peer_key
-                     FROM messages m
+                 FROM messages m
                      JOIN conversations c ON c.id = m.conversation_id
                      WHERE m.account_id=?1 AND m.sent_at=?2 AND m.direction='outgoing'
                      ORDER BY m.id ASC LIMIT 8",
@@ -9633,7 +9837,7 @@ impl Store {
                 let rows: Vec<(MessageRecord, String, String)> = stmt
                     .query_map(params![account_id, timestamp as i64], |row| {
                         let record = message_record_from_row(row)?;
-                        Ok((record, row.get::<_, String>(32)?, row.get::<_, String>(33)?))
+                        Ok((record, row.get::<_, String>(33)?, row.get::<_, String>(34)?))
                     })
                     .map_err(|error| StoreError::Unavailable(Some(error)))?
                     .collect::<Result<_, _>>()
@@ -10091,7 +10295,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming' AND sent_at=?3",
             )
@@ -10144,7 +10348,8 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let mut delete = transaction
             .prepare(
-                "DELETE FROM messages
+                "DELETE , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  RETURNING id",
             )
@@ -10480,7 +10685,7 @@ impl Store {
         let sql = format!(
             "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
                    AND sent_at > ?3
@@ -10519,7 +10724,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3 AND direction='incoming'",
             )
@@ -10976,7 +11181,7 @@ impl Store {
                 let sql = format!(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND id IN ({placeholders})"
                 );
@@ -11141,7 +11346,8 @@ impl Store {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, direction, sender_id FROM messages
+                "SELECT id, direction, sender_id , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC",
             )
@@ -11356,7 +11562,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -11386,7 +11592,8 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let previous_status: Option<String> = transaction
             .query_row(
-                "SELECT status FROM messages
+                "SELECT status , delete_failed
+                 FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 |row| row.get(0),
@@ -11531,6 +11738,13 @@ impl Store {
                         conversation_naming_material(&conn, account_id, kind, &peer_key);
                     // 契约 1.209：群名册（官方 membersV2 投影；缺席 = 未知）。
                     let roster = conversation_roster(&conn, account_id, kind, &peer_key);
+                    let oldest_unseen = oldest_unseen_message_id(
+                        &conn,
+                        account_id,
+                        &row.get::<_, String>(0)?,
+                        row.get(6)?,
+                        row.get(13)?,
+                    )?;
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
@@ -11554,6 +11768,7 @@ impl Store {
                         unread_count: row.get::<_, i64>(6)? as u32,
                         unread_mentions: row.get::<_, i64>(7)? as u32,
                         read_watermark_ms: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
+                        oldest_unseen_message_id: oldest_unseen,
                         muted: row.get::<_, i64>(8)? != 0,
                         // 契约 1.206（M5）：通知细分四开关（裸 bool，恒序列化）。
                         notify_for_calls_if_muted: row.get::<_, i64>(14)? != 0,
@@ -14440,6 +14655,23 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 42 {
+        // 契约 1.274：delete_failed / delete_failed_at 是删除失败态的持久化
+        // 列。既有 set_delete_failed 已在使用它们，旧库缺列会在删除结算时
+        // 报 no such column；本步补列并保留历史行默认未失败，不回填旧事实。
+        for (column, kind) in [
+            ("delete_failed", "INTEGER NOT NULL DEFAULT 0"),
+            ("delete_failed_at", "INTEGER"),
+        ] {
+            if !table_has_column(conn, "messages", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE messages ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+    }
     if current < 40 {
         // 契约 1.217（§29.2，头像字节面）：conversation_avatars 缓存表——
         // getAvatar 下行字节的第一块持久化家（官方桌面把头像落盘
@@ -14890,6 +15122,31 @@ fn pinned_messages_for_conversation(
     Ok(pins)
 }
 
+// Contract 1.272 (section 4.256): exact oldest-unseen anchor from the store.
+// Reuse the same incoming + watermark rule as the unread counter rather than
+// estimating an index from the unread count and window length.
+fn oldest_unseen_message_id(
+    conn: &Connection,
+    account_id: &str,
+    conversation_id: &str,
+    unread_count: i64,
+    read_watermark_ms: Option<i64>,
+) -> Result<Option<String>, rusqlite::Error> {
+    if unread_count <= 0 {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT id FROM messages
+         WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
+           AND sent_at > COALESCE(?3, 0)
+         ORDER BY sent_at ASC, id ASC
+         LIMIT 1",
+        params![account_id, conversation_id, read_watermark_ms],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
 fn conversation_last_message_meta(
     conn: &Connection,
     account_id: &str,
@@ -15175,36 +15432,38 @@ fn message_has_visual_media(record: &MessageRecord) -> bool {
 }
 
 fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
-    let text: Option<String> = row.get(7)?;
+    let text: Option<String> = row.get("body")?;
     let text_bytes = row
-        .get::<_, Option<i64>>(8)?
+        .get::<_, Option<i64>>("body_bytes")?
         .map(|value| value.max(0).min(u32::MAX as i64) as u32)
         .or_else(|| {
             text.as_ref()
                 .map(|value| value.len().min(u32::MAX as usize) as u32)
         });
-    let persisted_truncated = row.get::<_, i64>(9)? != 0;
-    let quote_snapshot: Option<String> = row.get(13)?;
-    let attachments_json: Option<String> = row.get(14)?;
-    let rich_json: Option<String> = row.get(15)?;
+    let persisted_truncated = row.get::<_, i64>("body_truncated")? != 0;
+    let quote_snapshot: Option<String> = row.get("quote_snapshot")?;
+    let attachments_json: Option<String> = row.get("attachments_json")?;
+    let rich_json: Option<String> = row.get("rich_json")?;
     Ok(MessageRecord {
-        is_erased: row.get::<_, i64>(31)? != 0,
-        delete_failed: false,
+        is_erased: row.get::<_, i64>("is_erased")? != 0,
+        delete_failed: row.get::<_, i64>("delete_failed")? != 0,
         required_protocol_version: None,
-        id: row.get(0)?,
-        account_id: row.get(1)?,
-        conversation_id: row.get(2)?,
-        direction: static_direction(row.get::<_, String>(3)?),
-        sender_id: row.get(4)?,
-        sent_at: row.get::<_, i64>(5)? as u64,
-        received_at: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+        id: row.get("id")?,
+        account_id: row.get("account_id")?,
+        conversation_id: row.get("conversation_id")?,
+        direction: static_direction(row.get::<_, String>("direction")?),
+        sender_id: row.get("sender_id")?,
+        sent_at: row.get::<_, i64>("sent_at")? as u64,
+        received_at: row
+            .get::<_, Option<i64>>("received_at")?
+            .map(|value| value as u64),
         text_retrievable: text.is_some() && !persisted_truncated,
         text,
         text_bytes,
         text_truncated: persisted_truncated,
-        status: static_status(row.get::<_, String>(10)?),
-        client_request_id: row.get(12)?,
-        quote_message_id: row.get(11)?,
+        status: static_status(row.get::<_, String>("status")?),
+        client_request_id: row.get("client_request_id")?,
+        quote_message_id: row.get("quote_message_id")?,
         quote_snapshot: quote_snapshot
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
@@ -15216,34 +15475,42 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         rich: rich_json
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
-        edited_at: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
-        sender_name: row.get(17)?,
-        mentions_self: row.get::<_, i64>(18)? != 0,
+        edited_at: row
+            .get::<_, Option<i64>>("edited_at")?
+            .map(|value| value as u64),
+        sender_name: row.get("sender_name")?,
+        mentions_self: row.get::<_, i64>("mentions_self")? != 0,
         reactions: Vec::new(),
         edits: Vec::new(),
-        delivered_at: row.get::<_, Option<i64>>(19)?.map(|value| value as u64),
-        read_at: row.get::<_, Option<i64>>(20)?.map(|value| value as u64),
-        viewed_at: row.get::<_, Option<i64>>(28)?.map(|value| value as u64),
-        admin_deleted: row.get::<_, i64>(21)? != 0,
+        delivered_at: row
+            .get::<_, Option<i64>>("delivered_at")?
+            .map(|value| value as u64),
+        read_at: row
+            .get::<_, Option<i64>>("read_at")?
+            .map(|value| value as u64),
+        viewed_at: row
+            .get::<_, Option<i64>>("viewed_at")?
+            .map(|value| value as u64),
+        admin_deleted: row.get::<_, i64>("admin_deleted")? != 0,
         sticker: row
-            .get::<_, Option<String>>(22)?
+            .get::<_, Option<String>>("sticker_json")?
             .and_then(|json| serde_json::from_str(&json).ok()),
         send_outcomes: row
-            .get::<_, Option<String>>(29)?
+            .get::<_, Option<String>>("send_outcomes_json")?
             .and_then(|json| serde_json::from_str(&json).ok()),
         expire_seconds: row
-            .get::<_, Option<i64>>(23)?
+            .get::<_, Option<i64>>("expire_seconds")?
             .map(|value| value.max(0) as u64),
         expire_start_at: row
-            .get::<_, Option<i64>>(24)?
+            .get::<_, Option<i64>>("expire_start_at")?
             .map(|value| value.max(0) as u64),
-        server_guid: row.get(26)?,
+        server_guid: row.get("server_guid")?,
         server_timestamp: row
-            .get::<_, Option<i64>>(27)?
+            .get::<_, Option<i64>>("server_timestamp")?
             .map(|value| value.max(0) as u64),
         is_story: false,
         story_message: None,
-        author_aci: row.get(30)?,
+        author_aci: row.get("author_aci")?,
     })
 }
 
@@ -29908,9 +30175,129 @@ mod tests {
         assert_eq!(other.id.len(), 32);
     }
 
+    #[test]
+    fn upsert_is_atomic_when_finish_link_and_receive_race() {
+        let temp = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(temp.path(), Some(test_store_key())).unwrap());
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let store = std::sync::Arc::clone(&store);
+            workers.push(std::thread::spawn(move || {
+                store.upsert_account_from_signal_with_id(
+                    "+15555550179",
+                    Some(9),
+                    DEFAULT_PROXY_GROUP_ID,
+                    Some("fedcba9876543210fedcba9876543210"),
+                )
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .expect("upsert worker does not panic")
+                .expect("concurrent upsert succeeds");
+        }
+        let accounts = store.list_accounts().unwrap();
+        assert_eq!(
+            accounts.len(),
+            1,
+            "并发 upsert 不得产生唯一键失败或重复账号"
+        );
+        assert_eq!(accounts[0].id, "fedcba9876543210fedcba9876543210");
+    }
+
     /// `stamp_incoming_viewed` (contract 1.94, §4.77): the local
     /// markViewed half — first stamp wins, only incoming rows qualify, the
     /// selection is exactly the given ids.
+    #[test]
+    fn backfill_recovers_legacy_group_author_aci_from_sender_hash() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550182", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtYXV0aA==", "Group")
+            .unwrap();
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-author",
+            "client-author",
+            "sent",
+            None,
+            0,
+            None,
+        );
+        let aci = "c3b07a1e-55cc-4a44-9e11-8a2b3c4d5e6f";
+        let hash = stable_hash_id(&[&account.id, "group", aci]);
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET direction='incoming', sender_id=?1, author_aci=NULL
+                 WHERE id='m-author'",
+                params![hash],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO contacts(id, account_id, kind, peer_key, title, extra, synced_at)
+                 VALUES('contact-author', ?1, 'contact', ?2, 'Peer', NULL, 1)",
+                params![account.id, aci],
+            )
+            .unwrap();
+
+        let changed = store.backfill_incoming_author_aci().unwrap();
+        assert_eq!(changed, 1);
+        let row = store
+            .message_by_id(&account.id, &conversation.id, "m-author")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.author_aci.as_deref(), Some(aci));
+    }
+
+    #[test]
+    fn message_mapper_uses_column_names_instead_of_positions() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550180", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550181", "Peer")
+            .unwrap();
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-reordered",
+            "client-reordered",
+            "sent",
+            None,
+            0,
+            None,
+        );
+        let row = store
+            .conn()
+            .query_row(
+                "SELECT delete_failed, is_erased, author_aci, server_timestamp, server_guid,
+                        expire_start_at, expire_seconds, send_outcomes_json, sticker_json,
+                        admin_deleted, viewed_at, read_at, delivered_at, mentions_self,
+                        sender_name, edited_at, rich_json, attachments_json, quote_snapshot,
+                        client_request_id, status, quote_message_id, body_truncated, body_bytes,
+                        body, received_at, sent_at, sender_id, direction, conversation_id,
+                        account_id, id
+                 FROM messages WHERE id='m-reordered'",
+                [],
+                message_record_from_row,
+            )
+            .unwrap();
+        assert_eq!(row.id, "m-reordered");
+        assert_eq!(row.status, "sent");
+    }
+
     #[test]
     fn stamp_incoming_viewed_first_stamp_wins_and_stays_incoming_only() {
         let temp = TempDir::new().unwrap();
@@ -31506,6 +31893,7 @@ mod tests {
                 Some(&MessageSendOutcomes {
                     succeeded: 2,
                     failed: 1,
+                    deleted_for_everyone_send_status: None,
                 }),
             )
             .unwrap()
@@ -31515,6 +31903,7 @@ mod tests {
             Some(MessageSendOutcomes {
                 succeeded: 2,
                 failed: 1,
+                deleted_for_everyone_send_status: None,
             })
         );
         let wire = serde_json::to_value(&settled.0).unwrap();
@@ -31581,6 +31970,7 @@ mod tests {
                 Some(&MessageSendOutcomes {
                     succeeded: 0,
                     failed: 3,
+                    deleted_for_everyone_send_status: None,
                 }),
             )
             .unwrap()
@@ -31591,6 +31981,7 @@ mod tests {
             Some(MessageSendOutcomes {
                 succeeded: 0,
                 failed: 3,
+                deleted_for_everyone_send_status: None,
             })
         );
         // The queue face stays retired: the retry affordance is the manual
@@ -32503,5 +32894,129 @@ mod tests {
             .unwrap();
         assert_eq!(bounded.len(), 1);
         assert_eq!(bounded[0].message_id, "m-newer");
+    }
+    /// Contract 1.272 (section 4.256): the summary exposes the exact
+    /// oldest-unseen anchor, not an index inferred from the unread count.
+    #[test]
+    fn conversation_summary_projects_exact_oldest_unseen_message_id() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let base = |id: &str, sent_at: u64, direction: &str| MessageRecord {
+            is_erased: false,
+            delete_failed: false,
+            required_protocol_version: None,
+            author_aci: None,
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: if direction == "outgoing" {
+                "outgoing"
+            } else {
+                "incoming"
+            },
+            sender_id: if direction == "outgoing" {
+                "self".into()
+            } else {
+                "peer".into()
+            },
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        let insert = |id: &str, sent_at: u64, direction: &str, unread: bool| {
+            store
+                .insert_message(&base(id, sent_at, direction), None, Some("body"), unread)
+                .unwrap();
+        };
+        insert("m1", 100, "incoming", false); // already read
+        insert("m2", 200, "incoming", true); // oldest unseen
+        insert("m3", 300, "outgoing", false); // outgoing interleave does not count
+        insert("m4", 400, "incoming", true); // newer unseen
+        insert("m5", 500, "outgoing", false);
+        // m1 是已读历史；m2/m4 是当前未读。水位先于读取落账。
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET read_watermark_ms=?2 WHERE id=?1",
+                params![conversation.id, 150_i64],
+            )
+            .unwrap();
+
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.unread_count, 2);
+        assert_eq!(summary.oldest_unseen_message_id.as_deref(), Some("m2"));
+
+        // The paged list uses the identical projection (not a second rule).
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        assert_eq!(
+            page.items[0].oldest_unseen_message_id.as_deref(),
+            Some("m2")
+        );
+
+        // Advancing the authoritative watermark moves the exact anchor to m4.
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET read_watermark_ms=?2 WHERE id=?1",
+                params![conversation.id, 250_i64],
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.oldest_unseen_message_id.as_deref(), Some("m4"));
+
+        // A fully-read conversation exposes no anchor (absent, never guessed).
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET read_watermark_ms=?2, unread_count=0 WHERE id=?1",
+                params![conversation.id, 450_i64],
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.oldest_unseen_message_id, None);
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert!(wire.get("oldestUnseenMessageId").is_none());
     }
 }
