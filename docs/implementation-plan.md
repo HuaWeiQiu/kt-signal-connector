@@ -17,7 +17,68 @@
   document for the official anchor and the event mapping.
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.274 (2026-10-27; §4.258 the per-recipient delete
+  settlement and content-erasure completion: remoteDelete results are expanded
+  into `deletedForEveryoneSendStatus` (success=true / failure=false), persisted
+  in the existing `send_outcomes_json` face with `delete_failed`, and
+  `mark_remote_deleted` now erases body/attachments/locators/rich/quote fields
+  and marks reaction events removed. This completes the official
+  `applyDeleteForEveryone` + `eraseMessageContents` structure instead of a
+  status-only tombstone.)
+- Contract revision: 1.273 (2026-10-27; §4.257 the local remote-delete
+  tombstone completion: after a confirmed upstream `remoteDelete`, the
+  connector now marks the target outgoing row `remote-deleted` through the
+  existing author-scoped `store.mark_remote_deleted` helper and emits
+  `ConversationChanged`. The previous prepare-only behavior returned
+  `deleted` while leaving `messages.list` at `read`/`sent`, so a refresh
+  restored the original bubble. The local completion matches the official
+  `applyDeleteForEveryone` persistent tombstone semantics; unknown outcomes
+  still never mark the row or retry automatically.)
+- Contract revision: 1.272 (2026-10-27; §4.256 the authoritative oldest-unseen
+  anchor projection: `ConversationSummary.oldestUnseenMessageId` is an additive,
+  optional field on `conversations.list` and every `conversation_summary`
+  consumer (including `ConversationChanged`). The connector derives it from its
+  own message store using the same authoritative rule as the unread counter and
+  `read_watermark_ms`: only when `unread_count > 0`, the earliest incoming
+  row with `sent_at > COALESCE(read_watermark_ms, 0)`, ordered by
+  `(sent_at ASC, id ASC)`. No row means absent, never a guessed id. This gives
+  the desktop the official `metrics.oldestUnseen.id` fact for the unread divider
+  and replaces its `length - unreadCount` approximation; no engine JSON-RPC or
+  storage schema change is required.)
+- Contract revision: 1.271 (2026-10-25; §4.255 the persisted attachment
+  dimensions face — batch Z32, ledger §29.124: the official data-model shape
+  restored to the connector. The official desktop's Attachment carries optional
+  `width`/`height` (ts/types/Attachment.std.ts:18-19/:77-78/:223-224) filled at
+  receive by the image measurement (ts/types/VisualAttachment.dom.ts:38), so
+  `getImageDimensionsForTimeline` (ts/util/Attachment.std.ts:407) always has a
+  declaration and the timeline box is reserved on the first frame. The connector's
+  `attachments_json` already held those keys, but nothing ever wrote them for
+  rows the engine could not measure — the desktop therefore fell back to an
+  asynchronous probe and the media box grew from the minimum box on every first
+  scroll. Two methods close that gap: `messages.setAttachmentDimensions` (a
+  local store write on the send lane, idempotent, pixel-domain gated, fail-closed
+  on an unreadable descriptor face) and `messages.listAttachmentDimensions`
+  (a bounded store-only read on the read lane, newest first, no unread side
+  effect) carrying the same pairs `messages.list` already projects — zero shape
+  change on the list row. Advertised through the new `attachment-dimensions`
+  feature tag; pre-1.271 hosts read every existing frame byte-identically.)
 - Contract revision: 1.262 (2026-10-24; S13 §4.46 amendment — the v1 line
+- Contract revision: 1.262 (2026-10-25; S21 §4.245 amendment — imported
+  inbound rows land the archive member ACI **as the row sender**:
+  `senderId` on the wire becomes the recipient ACI verbatim (the same
+  lowercase hyphenated form a live envelope's `sourceUuid` speaks) when
+  the archive recipient carries one; recipients without an ACI keep the
+  derived ingest hash honestly. The identity tuple stays total across
+  sender forms (import dedupe carries the legacy hash forms as
+  candidates; the live receive dedupe learns the raw `sourceUuid`
+  candidate), the quote-target ladder learns the ACI form, a completed
+  import keeps the staged recipient registry (the durable mapping
+  source), and the store's schema-v41 one-shot backfill upgrades
+  pre-1.262 rows in place. Official posture: the desktop's member
+  identity is the protocol identity (`getSourceServiceId`,
+  message.preload.ts:257) — the 64-hex local hash is a KT ingest face
+  the protocol never spoke.
+- Contract revision: 1.260 (2026-10-24; S13 §4.46 amendment — the v1 line
   set grows the attachment rows: `chat_item` lines may carry
   `attachments[]` with the §4.38 v2 pointer face verbatim (the
   `project_pointer_common` isomorph: `contentType/fileName/size/width/
@@ -173,6 +234,8 @@
   memo family's (§4.170 untouched).)
 - Contract revision: 1.263 (2026-10-24; §4.247 the incoming-call kind face — batch Z3, ledger §29.80: the official video-call protocol half gets its wire word — the legacy offer frame's proto `Offer.type` the engine already projects as the words `audio`|`video` (offer_type_json, mod.rs offer arm, test :19483-19489) rides the `call.incoming` event additively as `callKind`. The official desktop learns `isVideoCall` from RingRTC's offer parse; on the modern opaque face that bit lives inside the RingRTC-serialized bytes and is unreachable connector-side, so the key stays absent and the desktop's truth-adoption path is the sidecar `call.state` `hasVideo` face (the RingRTC Call.isVideoCall the sidecar already projects) — the wire word covers the legacy face, the truth path covers the modern one, and the banner never invents a kind. Absent-key additive: pre-1.263 hosts read the event byte-identically.)
 - Contract revision: 1.264 (2026-10-24; §4.248 the group-call era receive face — batch Z3, ledger §29.80: the official `handleGroupCallUpdateMessage` posture (background.preload.ts:3534-3563) gets its receive half — the engine's live `DataMessage.groupCallUpdate {eraId}` projection (field 19, mod.rs Q4 arm) routed as a control face (no renderable row, zero persistence — the official consumes the message as `peekNotConnectedGroupCall({conversationId})` and nothing else) and forwarded as the transient `call.groupCallUpdate` event {accountId, conversationId, eraId}. Group context only (the official gate `message.groupV2 && type===GROUP`): an era-less, oversized (the §4.108 send gate's own 256-char cap), or groupless update drops the face — the official warn-and-ignore leg — and the envelope keeps its pre-existing fall-through, so the 1:1 leg stays byte-identical. The send side already rode `calls.sendGroupCallUpdate` (§4.108); this closes the loop: join arm sends the era update, receivers peek and light the header Join face from the peek truth. Transient like `call.incoming`: a missed delivery stays missed, the next era update re-triggers (the official peek-refresh posture).)
+- Contract revision: 1.270 (2026-10-24; §4.254 the avatar backfill face — batch Z14, ledger §29.105, S6 avatar lifecycle ⑦: after a real contacts.sync lands (the 60s throttle early-return never fires this), the supervisor scans direct conversation rows whose conversation_avatars cache entry is absent (bounded 24/round, store avatar_backfill_targets, stable id order, group rows never targeted — group avatars keep the GroupChanged event kick) and enqueues each through the existing avatar-refresh queue. The worker drains them through the exact getAvatar read lane (prepare → read-only engine call → result gate → service commit gate → ConversationChanged push), so a peer photo that never hit any of the four pull moments (profile-change event, group-avatar change, lightbox click, OS-notification avatar) converges on the next sync. Lossy discipline unchanged: a full queue drops, an honest AVATAR_UNAVAILABLE clears idempotently, transient errors retry on the next sync. Zero wire change; pre-1.270 hosts byte-identical.)
+- Contract revision: 1.269 (2026-10-24; §4.253 the direct-peer key-shape gate — batch Z14, ledger §29.105: a prepare-send addressed with direct semantics (kind=direct or contact, text and attachment peer arms) accepts only protocol-shaped peerKeys — a ServiceId (ACI/PNI UUID) or a phone key (+spelled or bare digits); a group master key base64 arriving under direct semantics answers INVALID_REQUEST fail-closed instead of minting a peer_key=<group key> direct conversation row (the audited root of the user-reported greyed Message button: that row's identifiers derive all-absent and the desktop member-card three-key ladder can never resolve it). Group targets must ride kind=group; the contacts.list row set stays untouched — the compose contacts/groups two-section face is deliberate and the group rows' click chain opens group conversations. Zero wire-shape change; pre-1.269 hosts byte-identical apart from the honest refusal.)
 - Contract revision: 1.268 (2026-10-24; §4.252 the hidden write-back
   face — batch Z12, ledger §29.77 S16: the two-repo contract's connector
   half — at the throttled listContacts enrich (the §4.58 stamp
@@ -13306,8 +13369,10 @@ either face keeps the pre-1.148 behavior byte-for-byte).
   - *running* (the connector's NDJSON import pass holds the group slot): the
     cancel flips the run's cooperative abort flag (checked between archive
     lines and between write batches), so the pass exits within one batch, its
-    stage scratch clears on the normal exit path, and the run lands
-    `failed` with the new `cancelled` error class carrying its partial
+    stage scratch clears on the failure exit path (contract 1.262 §4.245:
+    only a COMPLETED run keeps the staged recipient registry — the v41
+    backfill's mapping source — and drops just the chat scratch), and the
+    run lands `failed` with the new `cancelled` error class carrying its partial
     counters — the same honest ledger every other failed run writes. The
     cancel itself additionally flips only a still-`running` row to
     `failed`/`cancelled` through one conditional `UPDATE ... WHERE
@@ -19677,6 +19742,19 @@ TRUSTED_VERIFIED；`state="default"` 信任重置臂 → TRUSTED_UNVERIFIED—�
 default→TRUSTED_UNVERIFIED / unverified→UNTRUSTED；§4.84「无信任位可镜像」
 记档随本面翻案）。NULL = 从未探明，永不回填。
 
+> **§4.244 勘误（Z25 根因批，2026-10-25，台账 §29.118）**：①的全账号面
+> 前提不成立——kt 引擎 `listIdentities` 面是单引用窄读（engine compat
+> §3/§5 行：`number` 必填，账号全量清单形态不提供；`{account}` 缺
+> `number` 按契约恒 -32603）。Z4 批落地的全量往返自 dev.31 起每次
+> internal_error（duration_ms=0），`?` 中断整条 enrich——verified 戳永不
+> 落、触发计数永不自熄，60s 无限循环（活体实证）。①改为对欠戳行逐行
+> 单引用读 `{account, number: peer_key}`：每窗帽 16 行（hidden 回写纯
+> 面帽同款），行序 rowid；词行落词戳（uuid/number 双拼写同前），读成功
+> 而无 identity（官方 SafetyNumberNotReady 态，非错误）落该行
+> `{}`（per-row，语义同原未点名行扫）；引擎错误行保持 NULL 下一窗重试
+> （60s 节流即窗内退避，绝不窗内重试）。wire 位/词表/写穿/收敛三腿零
+> 变化。引擎仓零改动（协议权威，face 原样）。
+
 **wire**：摘要行 additive absent-key `verified` 位（直聊非 self 行；
 true=已验证、false=已探明未验证（含 `{}` DEFAULT 折叠）、缺席=未知
 ——群行/self 行/pre-1.260 连接器/从未探明）；读侧
@@ -19909,3 +19987,219 @@ None（未知绝不折 false，store 读面单测钉形）。
 **wire**：零行变化（引擎 RPC additive，pre-1.268 宿主逐字节同形）。
 **测试**：纯面四臂（初写/翻转/同值不收/缺席与 uuid 缺席不收 + 帽 16）+
 store 三态读面 + 回写臂接线源码锁（enrich 内联）。
+
+## §4.253 direct 对端键词形闸（契约 1.269 · 批 Z14 · 台账 §29.105）
+
+prepare-send 以 direct 语义（kind=direct/contact，文本面 prepare_send_text_to_peer
+与附件面 resolve AttachmentSendTarget::Peer 臂）寻址时，对端键只认协议词形：
+ServiceId（ACI/PNI UUID）或电话键（+前缀/裸数字）。群 master key base64 混入
+direct 语义答 INVALID_REQUEST fail-closed——不再 mint peer_key=群 key 的怪
+direct 行（该行 identifiers 反查全缺席，桌面成员卡三键寻址梯恒 miss：用户
+实测「消息钮置灰」实案的审计根因）。群目标必须走 kind=group 臂。
+contacts.list 行集**不收窄**——桌面 compose「联系人/群组」双分区是有意产品
+面，群行点击链走群会话打开（selectContact 的 group kind 直达群臂）。
+
+**wire**：零行变化（拒收面，schema 不动）。
+**测试**：send_by_peer_rejects_group_key_in_direct_semantics（群键文本面
+INVALID_REQUEST + 直聊行未被 mint + 附件 peer 臂同闸 + ACI/电话键直通）。
+
+## §4.254 头像 backfill 触发编排（契约 1.270 · 批 Z14 · S6 ⑦ · 台账 §29.105）
+
+字节链四环（engine 拉/存指针+getAvatar、connector 读线+commit 闸+wire 投影、
+桌面索引+渲染降级）在位且互相咬合；断点=conversation_avatars 缓存无首次/
+兜底填充源（四时机外冷启动缺口：首轮链接/换机/重启后群成员缓存恒空 →
+wire 无 avatarUrl → 桌面色块）。本批补 connector 侧编排：contacts.sync 真实
+落库后一轮 backfill（store avatar_backfill_targets 读缓存缺席 direct 行，帽
+24/轮、行 id 稳定序、群行恒不入——群头像保持 GroupChanged 事件 kick），逐条
+入队既有 avatar-refresh 队列，worker 端走 getAvatar 读 lane 全链（prepare →
+只读引擎调用 → 结果闸 → commit 闸 → ConversationChanged 推送）。lossy 纪律
+不变：队满即弃（桌面按需拉取兜底）；UNAVAILABLE 幂等清位；瞬态失败随下一
+轮 sync 收敛。
+
+**wire**：零行变化（纯编排，schema 不动）。
+**测试**：store 钉形 avatar_backfill_targets_miss_only_direct_rows（缺席
+direct 入集/已缓存不入/群行不入/帽有界）+ 编排接线源码锁（sync_contacts
+成功臂 kick_avatar_backfill 内联）。
+## §4.245 导入行发送者身份落 ACI + 存量回填（契约 1.262 · 批 Z17/S21 · 台账 §29.105 追记）
+
+官方锚：桌面成员身份 = **协议身份**——消息作者 `getSourceServiceId`
+（`ts/state/selectors/message.preload.ts:257`）返回信封 ACI；成员卡
+（ContactModal）寻址、头像索引、direct 行 JOIN 全部键在 ACI/E.164 词形
+上。本地 64-hex ingest 哈希是协议从未说过的 KT 私有面。
+
+我方根因（S21 结构）：§4.38 导入链把入站行 sender 落成
+`stable_hash_id([account, kind, source])` 派生哈希（与 live 同族的
+ingest privacy hash）——桌面成员卡 member id 显示该哈希、作者协议身份
+`authorAci` 在 1.259（§4.243）前缺席 → 桌面四臂寻址梯（direct 行 /
+头像索引 / 协议词形 / UUID 臂）全 miss：消息钮置灰 + 头像色块，成员
+有直聊会话也跨不过键形差。§4.243 只修了新增捕获（author_aci 列），
+存量行的哈希 id 未回填。
+
+修复（两段）：
+
+1. **导入时（§4.38 入站臂）**：归档 recipient 带 ACI → 行 sender_id
+   = ACI verbatim（小写连字 UUID，与 live 信封 sourceUuid、桌面协议
+   词形同形）；recipient 无 ACI（e164-only）→ 诚实保持派生哈希，绝不
+   发明。去重候选（`alt_sender_ids`，≤2）携带两种旧哈希形（号码键/
+   ACI 键）——pre-1.262 导入行与 live 行无论以哪一形落库都折叠为同一
+   Signal 消息，重导幂等不破。出站行（sender=账号 id）、system 行族、
+   群通知行（§4.38 哈希形、不进成员卡梯）零变化。
+
+2. **存量回填（store schema v41 一次性任务）**：映射源 = 导入完成后
+   **保留**的 staged recipient 表（§4.38 暂存表——本契约起成功导入
+   不再清空 recipient 行，仅清 chat scratch；失败导入仍整表清）。
+   对每个带 ACI 的 contact recipient 重建四种旧哈希候选
+   （direct/group × 号码键/ACI 键），把 `direction='incoming'` 且
+   sender 命中候选的行升格：`sender_id=ACI`、
+   `author_aci=COALESCE(author_aci, ACI)`。诚实边界：无 ACI 的
+   recipient 不进映射；outgoing/system 行不在筛内；行 id（quote 链
+   锚）不动；升格后 sender 为 36 字符 ACI 形与 64 字符哈希候选形状
+   不相交 + 迁移梯每库一次 = 幂等双保险。
+
+配套（identity tuple 总性闭环）：
+
+- live receive 去重第三候选：信封 `sourceUuid`（raw ACI 形）——
+  导入窗竞态（同一条消息既在归档又被 live 重放）不再撞出重复行。
+- quote-target 梯（§4.38 click-to-scroll）：in-batch 与 store 两臂补
+  ACI 形候选，引用环不因 sender 形升格而断。
+
+**wire**：导入入站行 `senderId` 值形变化（哈希 → ACI verbatim，映射
+可用时）；键形仍为 string，schema 零变化；`authorAci`（§4.202）语义
+不变。桌面零改动——id 变 ACI 后四臂梯自然全通（直聊行/头像索引/
+协议词形全命中）。
+**测试**：导入行 sender=ACI + wire senderId/authorAci 双键钉形
+（群/直聊）；e164-only 作者诚实哈希 + authorAci 键缺席钉形；存量回填
+迁移钉形（pre-Z2 哈希行 + Z2 捕获行双臂升格、e164-only 行/outgoing
+行零触碰、行 id 不动、二次重开零命中）；回填后重导全折叠为重复
+（imported=0）；live 重放（source=号码 + sourceUuid=ACI）对 ACI 形
+导入行去重单行钉形；S12 金钉（prepared 帧 author=成员 ACI）随批
+加 sender=ACI 断言。
+
+## §4.255 附件尺寸进消息数据（契约 1.271 · 批 Z32 · 台账 §29.124）
+
+**症状（第 N 次用户实测）**：滑动仍现媒体「从小变大」。已交付三层
+（§29.121 Z29 渲染测量缓存 / §29.123 Z31 磁盘 meta / Z27 aspect-ratio）
+全部绕不过同一层：**渲染时尺寸异步拿不到**——首帧只能落官方缺省盒
+200×50，`@load` 后按实测重算行高 = 虚拟列表位移 = 用户看到「从小变大」。
+
+**真根因（数据模型差，不是渲染算法）**。官方锚（Signal-Desktop 只读）：
+
+| 面 | 官方 | 本端（1.271 前） |
+|---|---|---|
+| 尺寸字段 | `Attachment.width?/height?`（`ts/types/Attachment.std.ts:18-19`、`:77-78`、`:223-224`） | wire 形状**同构**（`NormalizedAttachment.width/height`），但**没有写面**——引擎不投影的行走不到值 |
+| 取值算法 | `getImageDimensionsForTimeline`（`ts/util/Attachment.std.ts:407`）：有声明就用，没有就 `MIN_TIMELINE_IMAGE_*` | 桌面 `signalAttachmentDisplayBox` 已逐值同构（Z27/Z28 对齐） |
+| 尺寸从哪来 | 下载面测量入库：`VisualAttachment.dom.ts:38` `width: image.naturalWidth, height: image.naturalHeight`，随消息持久化 | **缺这一环**：桌面只能用异步探针（Z29 localStorage 缓存 / Z31 盘面 sidecar），两条都是「首帧之后」 |
+
+结论：缺的不是渲染算法，是**数据里没有尺寸**。官方渲染之所以零跳动，
+是因为它读的是消息数据里的字段，永远同步可得。
+
+**契约（两个方法，wire additive）**：
+
+| 方法 | lane | 语义 |
+|---|---|---|
+| `messages.setAttachmentDimensions` | Send + account-scoped mutating | 把一次测量写进该行 `attachments_json` 对应描述符的 `width`/`height`。本地 store 写，**零引擎帧零上游**（`conversations.saveDraft` 同族）；同账号互斥与 delete barrier 同在 |
+| `messages.listAttachmentDimensions` | Read | 一次取该会话已落库的尺寸表（新消息在前，行窗口有界）。纯本地读，**无未读副作用**（§4.76 adjacentMedia 同纪律）；桌面开会话即预载，渲染前同步命中 |
+
+参数面：
+
+- 写：`{accountId, conversationId, messageId, attachmentId, width, height}`。
+- 读：`{accountId, conversationId, limit?}`——`limit` 计扫过的**带附件行**
+  （缺省 200，1..=1000）。
+- 写应答 `{updated: boolean}`：`false` = 同一对值已在库（幂等重放，
+  字节不重写）。读应答 `{entries: [{messageId, attachmentId, width, height}],
+  truncated: boolean}`。
+
+**写纪律（逐条 fail-closed）**：
+
+1. 阶梯：账号 → 会话 → 消息（`ACCOUNT_NOT_FOUND` / `CONVERSATION_NOT_FOUND`
+   / `MESSAGE_NOT_FOUND`），全部在写之前。
+2. `attachmentId` 必须指名该行的一个描述符，否则 `INVALID_REQUEST`
+   （§4.54 附件阶梯同款：给不存在的附件报尺寸是调用方错误，绝不静默空写）。
+3. 像素域：正整数且 ≤ **16384**（官方 `Attachment.width/height` 域），
+   越界 `INVALID_REQUEST`——荒谬的测量永不落库。
+4. 读不懂的 `attachments_json`（非数组/非 JSON）→ `INVALID_REQUEST`，
+   **绝不覆盖读不懂的字节**（§4.11 姿态）；NULL 面 = 该行没有描述符，
+   答 `AttachmentNotFound`（同 2 的语义）。
+5. 幂等：同值重放答 `updated=false` 且不改写；换值只重写被寻址条目的
+   两个键，其余键与其余条目**逐字不变**。
+
+**读纪律**：号/会话阶梯同上；`limit` 域外 `INVALID_REQUEST`；单行形状坏
+（坏 JSON / 非对象描述符）**单行跳过**，绝不让一行坏面拖垮整次预载；只列出
+同时带正 `width` 与 `height` 且落在像素域内的条目——没量过的诚实缺席，
+绝不发明 0。
+
+**wire 面零形状变化**：`messages.list` 的行形状不变（`attachments[]` 的
+`width`/`height` 早就在白名单上，见 §4.88 描述符族）——写面落地后这两键
+自然从「恒缺席」变成「量过就在」，pre-1.271 宿主读同一行逐字节不变。
+
+**能力位**：新 feature tag `attachment-dimensions`（表序广告；旧连接器缺
+tag = 桌面按既有异步臂诚实降级，不报错）。
+
+**测试**：store 三例（描述符面幂等补写 + 其余键/条目逐字不变 / 三路
+fail-closed / 只投影已量条目且新消息在前 + 行窗口有界）；service 三例
+（像素域与号/会话/消息阶梯 + `limit` 域 + 空表诚实零 / 写后
+`messages.list` 自然带出且行键集不变 / 预载读与 list 投影逐值一致）；
+host 一例（两 params 面严格 `deny_unknown_fields`、负值在反序列化层即拒、
+`limit` 可选）；schema-consistency 补三条 bounds 对（`attachmentId`
+maxLength 128、两处 `maximum` 16384、`limit` maximum 1000）。
+
+## §4.256 权威最旧未读锚投影（契约 1.272）
+
+**问题**：官方未读分隔线以 `metrics.oldestUnseen.id` 定位最旧未读消息；
+桌面此前只有 `unreadCount` 与 `read_watermark_ms`，不得不用
+`length - unreadCount` 近似，出站消息穿插时锚会错位。
+
+**实现**：`ConversationSummary` 新增可选 `oldestUnseenMessageId`。
+`conversations.list` 与 `conversation_summary`（含 `ConversationChanged`）
+共用同一 store 查询：仅 `unread_count > 0` 时，取
+`direction='incoming' AND sent_at > COALESCE(read_watermark_ms, 0)`
+的最早一行，按 `(sent_at ASC, id ASC)` 排序；无具体行则键缺席。
+没有改 engine JSON-RPC、消息表结构或既有字段，旧宿主按可选字段忽略即可。
+
+**桌面消费**：优先按该 id 定位；只有 pre-1.272 connector 缺字段时才回退到
+`incoming` 计数推导。显式 id 尚未被当前窗口覆盖时继续回拉，不以近似锚冒充。
+
+**测试**：store 一例同时覆盖：
+- 出站消息穿插不改变最旧未读锚（`m2` 而非按末尾 N 条错算）；
+- `conversations.list` 与 `conversation_summary` 投影一致；
+- 水位前进后锚从 `m2` 精确移动到 `m4`；
+- 全读时字段缺席（JSON 中无 `oldestUnseenMessageId`）。
+桌面 `resolveOldestUnreadAnchorIndex` 测试覆盖精确 id 优先、旧 connector
+回退、显式 id 未覆盖返回 -1。
+
+## §4.257 远端删除确认后的本地墓碑完成半（契约 1.273）
+
+**问题**：此前 `messages.remoteDelete` 是 prepare-only：上行返回
+`deleted` 后既不更新本地消息行，也不发事件。桌面虽会短暂写
+`remoteDeleted`，但下一次 `messages.list` 仍返回 `read/sent`，原气泡恢复。
+用户实测「对所有人删除」后仍显示原文，而官方保留删除墓碑。
+
+**实现**：supervisor 在上行确认后调用
+`service.complete_remote_delete`，复用收件侧 author-scoped
+`store.mark_remote_deleted` 将目标行改为 `remote-deleted`，并发出
+`MessageStatusChanged` 与 `ConversationChanged`。若被删行正占摘要槽，清空
+旧 `last_message_preview`，避免左栏继续残留正文。未知结果仍不落墓碑、
+绝不自动重试；重复完成保持幂等。
+
+**测试**：service 一例验证上行确认后的行状态持久化、摘要预览清空、重复
+完成无二次事件；同时通过 `cargo check`、fmt、clippy 与 release build。
+
+## §4.258 逐收件人删除结算与内容擦除（契约 1.274）
+
+**问题**：官方 `deletedForEveryoneSendStatus` 是逐收件人布尔位图，
+`applyDeleteForEveryone` 还会经 `eraseMessageContents` 清空正文、附件、
+引用/富文本与回应。KT 此前只有 remoteDeleted/deleteFailed 单标志，且
+remoteDelete 只改 status，正文仍留在库里。
+
+**实现**：
+- engine remoteDelete 直聊/群聊返回 `results[]`（success/failure）。
+- connector 将结果展开为 `deletedForEveryoneSendStatus` 并复用
+  `send_outcomes_json` 持久化；桌面归一化到官方顶层字段。
+- `delete_failed` 由消息行投影为官方 `deletedForEveryoneFailed`，不再写死 false。
+- `mark_remote_deleted` 清 body/body_bytes/attachments/locators/rich/quote，
+  并把 reaction events 标记 removed；末条摘要清旧 preview。
+- `delete_failed/delete_failed_at` 补入 schema v42（此前 setter 已用但列缺席）。
+
+**测试**：service completion 覆盖逐人 map、正文/附件/富文本擦除、摘要清空、
+幂等；supervisor 部分成功/失败结果解析；全量 connector 测试通过。
+桌面本地持久化 store 覆盖 pending/success/failure 与重载回填。

@@ -318,6 +318,21 @@ pub const MAX_SEND_MENTIONS: usize = 64;
 /// bound. A larger list answers INVALID_REQUEST; a destructive intent is
 /// never silently truncated (the §4.99 discipline).
 pub const MAX_DELETE_FOR_ME_MESSAGES: usize = 256;
+/// The official Attachment.width/height domain (contract revision 1.271,
+/// §4.255): a measured pixel dimension is a positive integer up to this
+/// ceiling (16 384 = the largest texture edge any Signal client uploads today;
+/// beyond it the value is a caller bug, so the ladder refuses instead of
+/// persisting a number no renderer can use). Mirrored by the schema's
+/// `maximum` and pinned by the schema-consistency bounds test.
+pub const MAX_ATTACHMENT_DIMENSION_PX: u32 = 16_384;
+/// Default row window of `messages.listAttachmentDimensions` (contract
+/// revision 1.271, §4.255): the newest 200 attachment-bearing rows — the same
+/// order of magnitude as one `messages.list` page, so opening a conversation
+/// warms exactly the window the desktop is about to render.
+pub const DEFAULT_ATTACHMENT_DIMENSION_ROWS: u32 = 200;
+/// Ceiling of that window: a caller may not ask the connector to walk more
+/// than this many rows in one warm-up call (bounded work per request).
+pub const MAX_ATTACHMENT_DIMENSION_ROWS: u32 = 1_000;
 /// The multi-attachment send cap (contract revision 1.66, §4.59): the
 /// upstream engine's own per-message attachment ceiling (pinned signal-cli /
 /// kt-engine `ATTACHMENT_MAX_COUNT` = 32) mirrored — a `messages.attachments.
@@ -449,6 +464,21 @@ impl ServiceError {
             // caller mistake, not a missing-resource lookup — the request
             // must fail closed instead of advancing the watermark past what
             // the caller actually read.
+            // Contract revision 1.271, §4.255: a dimension write that names
+            // no descriptor of the addressed row is a caller mistake (the
+            // §4.54 attachment ladder's own refusal), and an unreadable
+            // persisted face fails closed instead of overwriting bytes the
+            // store cannot read.
+            ServiceError::Store(StoreError::AttachmentNotFound) => ApiError::new(
+                "INVALID_REQUEST",
+                "attachmentId does not name an attachment of this message",
+                false,
+            ),
+            ServiceError::Store(StoreError::AttachmentFaceUnreadable) => ApiError::new(
+                "INVALID_REQUEST",
+                "message attachments are not readable",
+                false,
+            ),
             ServiceError::Store(StoreError::ReadWatermarkTargetInvalid) => ApiError::new(
                 "INVALID_REQUEST",
                 "messageId does not name a message of this conversation",
@@ -2222,6 +2252,12 @@ impl ConnectorService {
         media: Option<MediaIngest>,
         preferred_account_id: Option<String>,
     ) -> Self {
+        if let Err(error) = store.backfill_incoming_author_aci() {
+            tracing::warn!(
+                error_class = error.class(),
+                "incoming author ACI backfill failed"
+            );
+        }
         Self {
             store,
             link: None,
@@ -3029,6 +3065,22 @@ impl ConnectorService {
             }
         };
         validate_opaque_id(peer.peer_key, "peerKey")?;
+        // 契约 1.269（§4.253 · 批 Z14）：direct 语义的对端键只认协议词形
+        // （ACI/PNI UUID 或电话键）——群 master key base64 混进来（宿主把
+        // compose 群组行当联系人直发）会 mint 出 peer_key=群 key 的怪
+        // direct 行（成员卡三键寻址梯恒 miss 的实案根因）。fail-closed：
+        // 群目标必须走 kind="group" 臂。
+        if kind == "direct"
+            && !crate::engine::is_uuid_shaped(peer.peer_key)
+            && !peer.peer_key.starts_with('+')
+            && !peer.peer_key.chars().all(|c| c.is_ascii_digit())
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "direct peerKey must be a ServiceId (ACI/PNI) or a phone number — group keys belong to kind=group",
+                false,
+            )));
+        }
         let peer_title = peer
             .peer_title
             .map(str::trim)
@@ -3511,6 +3563,19 @@ impl ConnectorService {
                     }
                 };
                 validate_opaque_id(peer.peer_key, "peerKey")?;
+                // 契约 1.269（§4.253 · 批 Z14）：同文本发送面的 direct 键词
+                // 形闸（群键混入 direct 语义 fail-closed，防怪 direct 行）。
+                if kind == "direct"
+                    && !crate::engine::is_uuid_shaped(peer.peer_key)
+                    && !peer.peer_key.starts_with('+')
+                    && !peer.peer_key.chars().all(|c| c.is_ascii_digit())
+                {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "direct peerKey must be a ServiceId (ACI/PNI) or a phone number — group keys belong to kind=group",
+                        false,
+                    )));
+                }
                 let peer_title = peer
                     .peer_title
                     .map(str::trim)
@@ -8245,8 +8310,49 @@ impl ConnectorService {
             account_id: account_id.to_string(),
             conversation_id: conversation_id.to_string(),
             message_id: message_id.to_string(),
+            target_sent_at: message.sent_at,
             params,
         })
+    }
+
+    /// Confirmed remoteDelete 的本地完成半（契约 1.273 / 官方
+    /// applyDeleteForEveryone 持久墓碑语义）。此前 prepare-only 在上行成功后
+    /// 完全不改本地行，导致 messages.list 继续返回旧正文并覆盖桌面临时墓碑。
+    /// 复用收件侧同一 author-scoped mark_remote_deleted，成功后返回行变化与
+    /// 会话摘要供 supervisor 发 MessageStatusChanged + ConversationChanged。
+    /// 幂等：已 remote-deleted 的行不重复发事件。
+    pub fn complete_remote_delete(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        target_sent_at: u64,
+        send_status: std::collections::BTreeMap<String, bool>,
+        failed: bool,
+    ) -> Result<Option<(MessageRecord, Option<ConversationSummary>)>, ServiceError> {
+        let Some((record, changed)) = self.store.mark_remote_deleted(
+            account_id,
+            conversation_id,
+            target_sent_at,
+            account_id,
+        )?
+        else {
+            return Ok(None);
+        };
+        if !changed {
+            return Ok(None);
+        }
+        self.store.set_deleted_for_everyone_send_status(
+            account_id,
+            message_id,
+            send_status,
+            failed,
+            failed.then_some(now_ms() as i64),
+        )?;
+        let summary = self
+            .store
+            .conversation_summary(account_id, conversation_id)?;
+        Ok(Some((record, summary)))
     }
 
     /// Pure local validation for `messages.sendReaction`
@@ -10427,7 +10533,7 @@ impl ConnectorService {
         // §4.91: the flush key the landed row's sender projects — captured
         // before the record consumes `sender_id` by move.
         let flush_sender_id = sender_id.clone();
-        if let Some(existing) = self.store.message_by_signal_identity(
+        let mut existing = self.store.message_by_signal_identity(
             &account.id,
             &conversation.id,
             direction,
@@ -10438,7 +10544,30 @@ impl ConnectorService {
             } else {
                 &legacy_sender_id
             },
-        )? {
+        )?;
+        // Contract 1.262 (§4.245): an archive-imported row lands the member
+        // ACI verbatim as its sender. A live envelope that replays the same
+        // Signal message (the import-window race the identity tuple exists
+        // for) hashes its source, which can never equal the raw ACI form —
+        // the envelope's sourceUuid rides as the third candidate so the
+        // tuple stays total across both sender forms.
+        if existing.is_none()
+            && direction == "incoming"
+            && let Some(source_uuid) = receive
+                .source_uuid
+                .as_deref()
+                .filter(|value| !value.is_empty())
+        {
+            existing = self.store.message_by_signal_identity(
+                &account.id,
+                &conversation.id,
+                direction,
+                sent_at,
+                source_uuid,
+                source_uuid,
+            )?;
+        }
+        if let Some(existing) = existing {
             // The row identity already landed. This replay must still
             // converge its attachment faces: the row may be a post-relink
             // restore copy with no descriptors, while this envelope carries
@@ -10554,15 +10683,23 @@ impl ConnectorService {
             is_erased: false,
             delete_failed: false,
             required_protocol_version: receive.required_protocol_version,
-            // Contract 1.191 (§4.191): the incoming author's protocol identity
-            // — the envelope's `sourceUuid` member ACI, verbatim. Outgoing
-            // rows name the account itself (its number is the protocol face),
-            // system rows name nobody; both stay NULL. This is the face the
-            // backfill request arm resolves on group rows — the row's
-            // `sender_id` is the ingest privacy hash and never leaves the
-            // store in that seat.
+            // Contract 1.191 (§4.191): the incoming author's protocol identity.
+            // Prefer the envelope's `sourceUuid` member ACI; some engines only
+            // carry the ACI in `source`, so fall back to it when it canonicalizes.
+            // Without this fallback the row keeps only the ingest privacy hash
+            // and every group member renders as「未知联系人」. Outgoing rows name
+            // the account itself; system rows name nobody — both stay NULL.
             author_aci: if direction == "incoming" {
-                receive.source_uuid.clone()
+                receive
+                    .source_uuid
+                    .as_deref()
+                    .and_then(crate::store::canonical_aci)
+                    .or_else(|| {
+                        receive
+                            .source
+                            .as_deref()
+                            .and_then(crate::store::canonical_aci)
+                    })
             } else {
                 None
             },
@@ -15103,6 +15240,110 @@ fn super_supervisor_label_bound(value: Option<&str>, max_bytes: usize) -> Option
         .map(str::to_owned)
 }
 
+/// messages.setAttachmentDimensions (contract revision 1.271, §4.255): the
+/// write ladder for the official data-model shape. The account and the
+/// conversation resolve first (the §4.4 wire order: ACCOUNT_NOT_FOUND then
+/// CONVERSATION_NOT_FOUND), then the store's own row+descriptor ladders answer
+/// MESSAGE_NOT_FOUND / INVALID_REQUEST. `width`/`height` are gated here —
+/// positive integers within [`MAX_ATTACHMENT_DIMENSION_PX`] — before the write,
+/// so an absurd measurement never lands in the persisted face.
+///
+/// Local store only: no engine frame, no upstream traffic. The engine is the
+/// producer of the declared size when it has one; this face is the desktop's
+/// own measurement (the official `VisualAttachment.dom.ts` width/height at
+/// receive) for the faces the engine cannot state.
+pub(crate) fn store_set_attachment_dimensions(
+    store: &Store,
+    params: &MessagesSetAttachmentDimensionsParams,
+) -> Result<AttachmentDimensionsWriteResult, ServiceError> {
+    validate_opaque_id(&params.account_id, "accountId")?;
+    validate_opaque_id(&params.conversation_id, "conversationId")?;
+    validate_opaque_id(&params.message_id, "messageId")?;
+    if params.attachment_id.is_empty() || params.attachment_id.len() > MAX_ATTACHMENT_ID_BYTES {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachmentId must contain between 1 and 128 bytes",
+            false,
+        )));
+    }
+    if params.width < 1 || params.height < 1 {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "width and height must be positive integers",
+            false,
+        )));
+    }
+    if params.width > MAX_ATTACHMENT_DIMENSION_PX || params.height > MAX_ATTACHMENT_DIMENSION_PX {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "width and height must not exceed 16384",
+            false,
+        )));
+    }
+    if store.account_by_id(&params.account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    if store
+        .conversation_by_id(&params.account_id, &params.conversation_id)?
+        .is_none()
+    {
+        return Err(ServiceError::Store(StoreError::ConversationNotFound));
+    }
+    let updated = store.set_attachment_dimensions(
+        &params.account_id,
+        &params.conversation_id,
+        &params.message_id,
+        &params.attachment_id,
+        params.width,
+        params.height,
+    )?;
+    Ok(AttachmentDimensionsWriteResult { updated })
+}
+
+/// messages.listAttachmentDimensions (contract revision 1.271, §4.255): the
+/// read ladder — the same account/conversation resolution as
+/// `store_list_messages`, deliberately without the unread side effect (a
+/// warm-up read is not viewing the thread, the §4.76 adjacentMedia posture).
+/// The row window is bounded (`limit` clamped to
+/// [`MAX_ATTACHMENT_DIMENSION_ROWS`]); an empty table answers an empty list.
+pub(crate) fn store_list_attachment_dimensions(
+    store: &Store,
+    params: &MessagesListAttachmentDimensionsParams,
+) -> Result<AttachmentDimensionsListResult, ServiceError> {
+    validate_opaque_id(&params.account_id, "accountId")?;
+    validate_opaque_id(&params.conversation_id, "conversationId")?;
+    if store.account_by_id(&params.account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    if store
+        .conversation_by_id(&params.account_id, &params.conversation_id)?
+        .is_none()
+    {
+        return Err(ServiceError::Store(StoreError::ConversationNotFound));
+    }
+    let requested = params.limit.unwrap_or(DEFAULT_ATTACHMENT_DIMENSION_ROWS);
+    if !(1..=MAX_ATTACHMENT_DIMENSION_ROWS).contains(&requested) {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "limit must be between 1 and 1000",
+            false,
+        )));
+    }
+    let rows =
+        store.list_attachment_dimensions(&params.account_id, &params.conversation_id, requested)?;
+    let truncated = rows.len() == requested as usize;
+    let entries = rows
+        .into_iter()
+        .map(|row| AttachmentDimensionEntry {
+            message_id: row.message_id,
+            attachment_id: row.attachment_id,
+            width: row.width,
+            height: row.height,
+        })
+        .collect();
+    Ok(AttachmentDimensionsListResult { entries, truncated })
+}
+
 pub(crate) fn store_list_messages(
     store: &Store,
     account_id: &str,
@@ -15379,6 +15620,9 @@ pub struct PreparedRemoteDelete {
     pub account_id: String,
     pub conversation_id: String,
     pub message_id: String,
+    /// Upstream timestamp of the target row, reused by the local tombstone
+    /// completion after a confirmed remoteDelete (contract 1.273).
+    pub target_sent_at: u64,
     pub params: Value,
 }
 
@@ -16428,6 +16672,73 @@ pub struct MessagesListParams {
     pub conversation_id: String,
     pub before: Option<String>,
     pub limit: u32,
+}
+
+/// `messages.setAttachmentDimensions` params (contract revision 1.271,
+/// §4.255): the measured pixel size of one attachment, written into the row's
+/// persisted descriptor face — the official data-model shape. `width`/`height`
+/// are u32 at the deserializer, and the service ladder additionally requires
+/// 1..=[`MAX_ATTACHMENT_DIMENSION_PX`] (the official Attachment.width/height
+/// domain; 0 would be a "measured nothing" lie, so it fails closed).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSetAttachmentDimensionsParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub attachment_id: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// `messages.listAttachmentDimensions` params (contract revision 1.271,
+/// §4.255): one conversation's persisted dimension table, bounded. `limit`
+/// counts attachment-bearing rows scanned newest-first (default
+/// [`DEFAULT_ATTACHMENT_DIMENSION_ROWS`], ceiling
+/// [`MAX_ATTACHMENT_DIMENSION_ROWS`]) — the desktop's open-conversation
+/// warm-up asks for the default and never pages the whole archive.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesListAttachmentDimensionsParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// The §4.255 write answer: `updated` is false only when the addressed
+/// descriptor already carried exactly this pair (the idempotent replay), so a
+/// caller can tell "wrote it now" from "it was already there" without a second
+/// read.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDimensionsWriteResult {
+    pub updated: bool,
+}
+
+/// One §4.255 dimension entry: the attachment identity plus the persisted
+/// pixel size. Keys are the same `messageId`/`attachmentId` pair the desktop's
+/// attachment state key is built from.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDimensionEntry {
+    pub message_id: String,
+    pub attachment_id: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The §4.255 read answer: every measured attachment of the conversation
+/// window, in scan order (newest message first). An empty list is the honest
+/// "nothing measured yet" answer.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDimensionsListResult {
+    pub entries: Vec<AttachmentDimensionEntry>,
+    /// True when the row scan stopped at the row bound — the caller can ask
+    /// again with an older anchor once paging lands (the window is complete
+    /// for the newest rows either way).
+    pub truncated: bool,
 }
 
 /// messages.adjacentMedia direction (contract 1.93, §4.76): `older` probes
@@ -20926,6 +21237,7 @@ mod tests {
             reporting_token: None,
             server_timestamp: None,
         };
+        let mut source_only = receive.clone();
         let events = service
             .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
@@ -20957,6 +21269,26 @@ mod tests {
             })
             .unwrap();
         assert_eq!(prepared["author"], json!(member_aci));
+
+        // Some engines carry the author ACI only in `source` (no sourceUuid).
+        // The fallback must still capture it, otherwise group names resolve to
+        //「未知联系人」even though every contact is present.
+        source_only.timestamp = Some(1726999999005);
+        source_only.source_uuid = None;
+        source_only.source = Some(member_aci.to_string());
+        source_only.text = Some("photo2".into());
+        service
+            .ingest_receive(source_only, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let rows = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        let fallback_row = rows
+            .iter()
+            .find(|row| row.text.as_deref() == Some("photo2"))
+            .expect("the source-only group row lands");
+        assert_eq!(fallback_row.author_aci.as_deref(), Some(member_aci));
         assert_eq!(prepared["groupId"], json!("ZmFrZS1ncm91cA=="));
         assert_eq!(prepared["sentTimestamp"], json!(1726999999004u64));
         assert_ne!(
@@ -24732,6 +25064,115 @@ mod tests {
         );
     }
 
+    /// 契约 1.269（§4.253 · 批 Z14）：direct 语义的对端键词形闸——群
+    /// master key base64 混进 kind=direct/contact 时 fail-closed（不 mint
+    /// 怪 direct 行），UUID/电话键直通。附件 peer 臂同闸同词。
+    #[test]
+    fn send_by_peer_rejects_group_key_in_direct_semantics() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+
+        // 群 key base64 拒收（文本面）。
+        assert!(matches!(
+            service.prepare_send_text_to_peer(
+                &account.id,
+                &PeerTarget {
+                    kind: "contact",
+                    peer_key: "D4DyutMEtvpawXahRoFH/5KPjE/z7ThINwByaAh7Zfw=",
+                    peer_title: Some("Group Mistyped as Contact"),
+                },
+                "hello",
+                "gate-req-1",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            Err(ServiceError::Api(ref api))
+                if api.code == "INVALID_REQUEST"
+        ));
+        // 直聊行未被 mint。
+        assert!(
+            service
+                .list_conversations(&account.id, 10, None)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+
+        // 附件 peer 臂同闸（payload 校验先于上行——INVALID_REQUEST 只能
+        // 出自词形闸；若闸缺席会走 ensure mint 后才在附件描述符校验失败，
+        // 行集断言兜底）。
+        let peer = AttachmentSendTarget::Peer(PeerTarget {
+            kind: "direct",
+            peer_key: "D4DyutMEtvpawXahRoFH/5KPjE/z7ThINwByaAh7Zfw=",
+            peer_title: None,
+        });
+        assert!(matches!(
+            service.prepare_send_attachment(
+                &account.id,
+                &peer,
+                "gate-req-2",
+                "aGVsbG8=",
+                5,
+                Some("fixture.bin"),
+                Some("application/octet-stream"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            ),
+            Err(ServiceError::Api(ref api))
+                if api.code == "INVALID_REQUEST"
+        ));
+        assert!(
+            service
+                .list_conversations(&account.id, 10, None)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+
+        // 协议词形直通：ACI UUID 与 +电话键都放行（不 mint 判定走发送臂
+        // 既有链，这里只断言闸不拒）。
+        for key in ["0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10", "+15555550111"] {
+            let probe = PeerTarget {
+                kind: "contact",
+                peer_key: key,
+                peer_title: None,
+            };
+            // 附件臂文件缺失先于上游——不落到 mint 判定即证明过了词形闸；
+            // 若词形闸误拒会返回 INVALID_REQUEST（同 code），故以文本面
+            // prepare 的 Dispatch 形为准。
+            let prepared = service.prepare_send_text_to_peer(
+                &account.id,
+                &probe,
+                "shape probe",
+                &format!("gate-req-{key}"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                matches!(&prepared, Ok(PreparedSend::Dispatch { .. })),
+                "protocol-shaped key {key} must pass the gate"
+            );
+        }
+    }
+
     #[test]
     fn send_by_peer_creates_conversation_once_and_reuses_it() {
         let (_temp, service) = service();
@@ -25375,6 +25816,106 @@ mod tests {
         assert_eq!(prepared.params["targetTimestamp"], json!(888));
         assert_eq!(prepared.params["groupId"], json!("Z3JvdXAtaWQ="));
         assert!(prepared.params.get("recipient").is_none());
+    }
+
+    /// 契约 1.273：上行确认后的本地完成半必须持久化墓碑，且重复完成
+    /// 不重复发事件；否则 messages.list 会把桌面临时墓碑覆盖回旧正文。
+    #[test]
+    fn complete_remote_delete_persists_tombstone_and_is_idempotent() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let message_id = match service
+            .prepare_send_text(
+                &account.id,
+                &direct.id,
+                "Really",
+                "req-rd-complete",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&message_id, &account.id, &direct.id, 17_000, None)
+            .unwrap();
+        let prepared = service
+            .prepare_remote_delete(&account.id, &direct.id, &message_id)
+            .unwrap();
+
+        let send_status = std::collections::BTreeMap::from([
+            ("peer-a".to_string(), true),
+            ("peer-b".to_string(), false),
+        ]);
+        let (record, summary) = service
+            .complete_remote_delete(
+                &account.id,
+                &direct.id,
+                &message_id,
+                prepared.target_sent_at,
+                send_status.clone(),
+                true,
+            )
+            .unwrap()
+            .expect("confirmed delete must transition the row");
+        assert_eq!(record.status, "remote-deleted");
+        let stored = service
+            .store_ref()
+            .message_by_id(&account.id, &direct.id, &message_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "remote-deleted");
+        assert_eq!(stored.text, None, "正文必须按 eraseMessageContents 擦除");
+        assert!(stored.attachments.is_empty(), "附件必须擦除");
+        assert!(stored.rich.is_none(), "富文本必须擦除");
+        assert_eq!(
+            stored
+                .send_outcomes
+                .as_ref()
+                .and_then(|outcomes| outcomes.deleted_for_everyone_send_status.clone()),
+            Some(send_status),
+        );
+        assert!(stored.delete_failed, "删除失败位必须持久化");
+        assert_eq!(
+            serde_json::to_value(&stored)
+                .unwrap()
+                .get("deletedForEveryoneFailed")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "wire 字段必须是官方 deletedForEveryoneFailed 名称",
+        );
+        assert_eq!(summary.expect("summary").last_message_preview, None);
+
+        // 幂等：同一删除回显/重放不重复产生状态事件。
+        assert!(
+            service
+                .complete_remote_delete(
+                    &account.id,
+                    &direct.id,
+                    &message_id,
+                    prepared.target_sent_at,
+                    std::collections::BTreeMap::new(),
+                    false,
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The eligibility guard is deterministic and local: pending, failed and
@@ -29900,15 +30441,16 @@ mod tests {
         .unwrap();
 
         let conversation_id = stable_hash_id(&[&account.id, "group", GROUP_MASTER]);
-        let sender = stable_hash_id(&[&account.id, "group", "+15550000001"]);
-        let alt_sender = stable_hash_id(&[&account.id, "group", MEMBER_ACI]);
+        // 契约 1.262 §4.245：导入行 sender_id = 成员 ACI verbatim。
+        let sender = MEMBER_ACI;
+        let alt_sender = stable_hash_id(&[&account.id, "group", "+15550000001"]);
         let row = store
             .message_by_signal_identity(
                 &account.id,
                 &conversation_id,
                 "incoming",
                 7000,
-                &sender,
+                sender,
                 &alt_sender,
             )
             .unwrap()
@@ -29918,6 +30460,8 @@ mod tests {
             Some(MEMBER_ACI),
             "the capture is the backfill seat's only answer"
         );
+        // S21 (contract 1.262 §4.245): the row sender IS the member ACI.
+        assert_eq!(row.sender_id, MEMBER_ACI);
 
         let service = ConnectorService::new(store.clone());
         let prepared = service
@@ -29935,6 +30479,101 @@ mod tests {
         assert_eq!(prepared["groupId"], serde_json::json!(GROUP_MASTER));
         assert_eq!(prepared["account"], serde_json::json!("+15555550100"));
         assert_eq!(prepared["sentTimestamp"], serde_json::json!(7000u64));
+    }
+
+    /// Contract 1.262 (§4.245, S21): the identity tuple stays total across
+    /// sender forms. An archive-imported row lands the member ACI verbatim;
+    /// a live envelope that replays the same Signal message (the
+    /// import-window race) hashes its source — the envelope sourceUuid rides
+    /// as the third dedupe candidate, so the replay folds onto the imported
+    /// row instead of landing a duplicate.
+    #[test]
+    fn live_replay_dedupes_against_aci_form_import_rows() {
+        let temp = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(
+            Store::open(
+                &temp.path().join("store"),
+                Some(crate::store::StoreKey::from_bytes([0x6B; 32])),
+            )
+            .unwrap(),
+        );
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        const MEMBER_ACI: &str = "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b";
+        const MEMBER_E164: &str = "+15550000001";
+        const GROUP_MASTER: &str = "ZmFrZS1ncm91cA==";
+        let archive = temp.path().join("history-import.ndjson");
+        std::fs::write(
+            &archive,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                serde_json::json!({"type": "recipient", "id": 1, "kind": "contact",
+                    "name": "Alice", "aci": MEMBER_ACI, "e164": MEMBER_E164}),
+                serde_json::json!({"type": "recipient", "id": 2, "kind": "group",
+                    "name": "Ops", "masterKey": GROUP_MASTER}),
+                serde_json::json!({"type": "chat", "id": 11, "recipientId": 2}),
+                serde_json::json!({"type": "message", "chatId": 11, "authorId": 1,
+                        "dateSent": 7000, "direction": "incoming", "text": "archived"})
+            ),
+        )
+        .unwrap();
+        crate::history_import::run_import(
+            &store,
+            &account.id,
+            "+15555550100",
+            &archive,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let mut service = ConnectorService::new(store.clone());
+        // The live replay: same group conversation, same stamp, source
+        // spelled as the number while the envelope carries the member ACI.
+        let replay = NormalizedReceive {
+            required_protocol_version: None,
+            timestamp: Some(7000),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some(MEMBER_E164.into()),
+            source_uuid: Some(MEMBER_ACI.into()),
+            peer_name: None,
+            group_id: Some(GROUP_MASTER.into()),
+            text: Some("archived".into()),
+            text_bytes: Some(8),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            reporting_token: None,
+            server_timestamp: None,
+        };
+        assert!(
+            service
+                .ingest_receive(replay, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty(),
+            "the replay dedupes - no duplicate row lands"
+        );
+        // Exactly one incoming row remains for the stamp.
+        let conversation_id = stable_hash_id(&[&account.id, "group", GROUP_MASTER]);
+        let page = store
+            .list_messages(&account.id, &conversation_id, 50, None)
+            .unwrap();
+        let incoming: Vec<_> = page
+            .items
+            .iter()
+            .filter(|row| row.direction == "incoming" && row.sent_at == 7000)
+            .collect();
+        assert_eq!(incoming.len(), 1, "one row, not two");
+        assert_eq!(incoming[0].sender_id, MEMBER_ACI);
     }
     #[test]
     fn prepare_delete_for_me_messages_ladders_row_authors() {
@@ -39709,15 +40348,11 @@ mod tests {
             .list_messages(&account.id, &group.id, 10, None)
             .unwrap()
             .items;
-        let status_of = |source: &str| {
-            rows.iter()
-                .find(|row| row.text.as_deref() == Some(&format!("from {source}")))
-                .map(|row| row.status)
-        };
-        assert_eq!(status_of("+15555550101"), Some("remote-deleted"));
+        let status_count = |status: &str| rows.iter().filter(|row| row.status == status).count();
+        assert_eq!(status_count("remote-deleted"), 1);
         assert_eq!(
-            status_of("+15555550102"),
-            Some("delivered"),
+            status_count("delivered"),
+            1,
             "a foreign member's row at the same timestamp is never the target"
         );
 
@@ -40881,13 +41516,9 @@ mod tests {
             .list_messages(&account.id, &group.id, 10, None)
             .unwrap()
             .items;
-        let status_of = |source: &str| {
-            rows.iter()
-                .find(|row| row.text.as_deref() == Some(&format!("from {source}")))
-                .map(|row| row.status)
-        };
-        assert_eq!(status_of("+15555550102"), Some("delivered"));
-        assert_eq!(status_of("+15555550101"), Some("remote-deleted"));
+        let status_count = |status: &str| rows.iter().filter(|row| row.status == status).count();
+        assert_eq!(status_count("delivered"), 1);
+        assert_eq!(status_count("remote-deleted"), 1);
     }
 
     /// Contract 1.110 (§4.91) bounds: the buffer holds at most 512 entries
@@ -46615,5 +47246,220 @@ mod tests {
             .expect("legacy row");
         assert_eq!(legacy_row.id.len(), 32);
         assert_ne!(legacy_row.id, slot_id);
+    }
+
+    /// Contract revision 1.271 (§4.255): the service write ladder refuses the
+    /// pixel domain and the account/conversation resolution before any store
+    /// write, and the read ladder clamps the row window.
+    #[test]
+    fn attachment_dimension_ladders_gate_the_pixel_domain_and_the_scope() {
+        let (_temp, service) = service();
+        let store = Arc::clone(&service.store);
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let params = |width: u32, height: u32| MessagesSetAttachmentDimensionsParams {
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            message_id: "m-1".into(),
+            attachment_id: "att-1".into(),
+            width,
+            height,
+        };
+
+        // 像素域：0 与越界一律 INVALID_REQUEST（写之前，不落库）。
+        for (width, height) in [(0, 10), (10, 0), (MAX_ATTACHMENT_DIMENSION_PX + 1, 10)] {
+            let error =
+                store_set_attachment_dimensions(&store, &params(width, height)).unwrap_err();
+            match error {
+                ServiceError::Api(error) => assert_eq!(error.code, "INVALID_REQUEST"),
+                other => panic!("expected INVALID_REQUEST, got {other:?}"),
+            }
+        }
+        // 账号/会话阶梯：ACCOUNT_NOT_FOUND → CONVERSATION_NOT_FOUND → MESSAGE_NOT_FOUND。
+        let mut wrong_account = params(10, 10);
+        wrong_account.account_id = "nope".into();
+        assert!(matches!(
+            store_set_attachment_dimensions(&store, &wrong_account),
+            Err(ServiceError::Store(StoreError::AccountNotFound))
+        ));
+        let mut wrong_conversation = params(10, 10);
+        wrong_conversation.conversation_id = "nope".into();
+        assert!(matches!(
+            store_set_attachment_dimensions(&store, &wrong_conversation),
+            Err(ServiceError::Store(StoreError::ConversationNotFound))
+        ));
+        assert!(matches!(
+            store_set_attachment_dimensions(&store, &params(10, 10)),
+            Err(ServiceError::Store(StoreError::MessageNotFound))
+        ));
+
+        // 读阶梯：limit 域 + 同一条账号/会话链；空表答空列表（诚实零）。
+        let read = |limit: Option<u32>| MessagesListAttachmentDimensionsParams {
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            limit,
+        };
+        for bad in [Some(0), Some(MAX_ATTACHMENT_DIMENSION_ROWS + 1)] {
+            let error = store_list_attachment_dimensions(&store, &read(bad)).unwrap_err();
+            match error {
+                ServiceError::Api(error) => assert_eq!(error.code, "INVALID_REQUEST"),
+                other => panic!("expected INVALID_REQUEST, got {other:?}"),
+            }
+        }
+        let empty = store_list_attachment_dimensions(&store, &read(None)).unwrap();
+        assert!(empty.entries.is_empty());
+        assert!(!empty.truncated);
+    }
+
+    /// Contract revision 1.271 (§4.255): the write lands in the same
+    /// `attachments_json` the read face projects, so `messages.list` carries
+    /// the measured pair out with **zero shape change** (the keys were already
+    /// on the descriptor whitelist). This is the data-model parity claim the
+    /// desktop batches depend on — no new key, no new envelope.
+    #[test]
+    fn attachment_dimensions_ride_the_messages_list_projection() {
+        let (_temp, service) = service();
+        let store = Arc::clone(&service.store);
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut row = expire_record_fixture(&account.id, &conversation.id, "m-1");
+        row.attachments = vec![crate::engine::NormalizedAttachment {
+            id: "att-1".into(),
+            content_type: Some("image/png".into()),
+            filename: Some("a.png".into()),
+            size: Some(1024),
+            width: None,
+            height: None,
+            is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
+            locator: None,
+            waveform: None,
+            duration: None,
+        }];
+        store.insert_message(&row, None, None, false).unwrap();
+
+        // 写之前的投影：keys 缺席（旧行为逐字）。
+        let before = store_list_messages(&store, &account.id, &conversation.id, 10, None).unwrap();
+        let before_wire = serde_json::to_value(&before.items[0]).unwrap();
+        assert!(before_wire["attachments"][0].get("width").is_none());
+
+        store_set_attachment_dimensions(
+            &store,
+            &MessagesSetAttachmentDimensionsParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                message_id: "m-1".into(),
+                attachment_id: "att-1".into(),
+                width: 1280,
+                height: 720,
+            },
+        )
+        .unwrap();
+
+        // 写之后的同一投影：width/height 自然带出，其余键逐字不变。
+        let after = store_list_messages(&store, &account.id, &conversation.id, 10, None).unwrap();
+        let after_wire = serde_json::to_value(&after.items[0]).unwrap();
+        assert_eq!(
+            after_wire["attachments"][0]["width"],
+            serde_json::json!(1280)
+        );
+        assert_eq!(
+            after_wire["attachments"][0]["height"],
+            serde_json::json!(720)
+        );
+        assert_eq!(
+            after_wire["attachments"][0]["contentType"],
+            serde_json::json!("image/png")
+        );
+        assert_eq!(
+            after_wire["attachments"][0]["size"],
+            serde_json::json!(1024)
+        );
+        // messages.list 的行形状零变化：同一批键仍在（无新增信封键）。
+        assert_eq!(
+            before_wire
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            after_wire
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+    }
+
+    /// Contract revision 1.271 (§4.255): the warm-up read answers exactly the
+    /// pairs the list projection carries — one call, no paging, bounded.
+    #[test]
+    fn attachment_dimension_warmup_read_matches_the_list_projection() {
+        let (_temp, service) = service();
+        let store = Arc::clone(&service.store);
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut row = expire_record_fixture(&account.id, &conversation.id, "m-1");
+        row.attachments = vec![crate::engine::NormalizedAttachment {
+            id: "att-1".into(),
+            content_type: Some("image/png".into()),
+            filename: None,
+            size: Some(1024),
+            width: None,
+            height: None,
+            is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
+            locator: None,
+            waveform: None,
+            duration: None,
+        }];
+        store.insert_message(&row, None, None, false).unwrap();
+        store_set_attachment_dimensions(
+            &store,
+            &MessagesSetAttachmentDimensionsParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                message_id: "m-1".into(),
+                attachment_id: "att-1".into(),
+                width: 800,
+                height: 600,
+            },
+        )
+        .unwrap();
+        let warm = store_list_attachment_dimensions(
+            &store,
+            &MessagesListAttachmentDimensionsParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                limit: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(warm.entries.len(), 1);
+        assert_eq!(warm.entries[0].message_id, "m-1");
+        assert_eq!(warm.entries[0].attachment_id, "att-1");
+        assert_eq!((warm.entries[0].width, warm.entries[0].height), (800, 600));
+        assert!(!warm.truncated);
     }
 }

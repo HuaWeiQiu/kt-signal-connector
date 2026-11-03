@@ -1499,6 +1499,27 @@ impl ProxyGroupRuntime {
         slot.supervisor.story_open_attachment(params).await
     }
 
+    /// messages.setAttachmentDimensions (contract revision 1.271, §4.255):
+    /// the owning group's local write (no engine), routed like every other
+    /// account-scoped store face.
+    pub async fn set_attachment_dimensions(
+        &self,
+        params: crate::service::MessagesSetAttachmentDimensionsParams,
+    ) -> Result<crate::service::AttachmentDimensionsWriteResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.set_attachment_dimensions(params).await
+    }
+
+    /// messages.listAttachmentDimensions (contract revision 1.271, §4.255): the
+    /// owning group's bounded read.
+    pub async fn list_attachment_dimensions(
+        &self,
+        params: crate::service::MessagesListAttachmentDimensionsParams,
+    ) -> Result<crate::service::AttachmentDimensionsListResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.list_attachment_dimensions(params).await
+    }
+
     pub async fn list_messages(
         &self,
         account_id: String,
@@ -3025,6 +3046,7 @@ pub fn open_group_runtime_with_options(
         tracing::info!(
             migrated = report.migrated,
             already_migrated = report.already_migrated,
+            unprovisioned = report.unprovisioned,
             orphans_removed = report.orphans_removed,
             "engine pool migration pass complete"
         );
@@ -3051,12 +3073,20 @@ pub fn open_group_runtime_with_options(
             policy: options.pool_policy.clone(),
             watchdog_interval: options.watchdog_interval,
         });
-        if pool.len() != rows.len() {
+        if pool.len() > rows.len() {
             return Err(StoreError::EnginePoolInvalid(format!(
                 "{} account rows but {} engine slots after migration",
                 rows.len(),
                 pool.len()
             )));
+        }
+        if pool.len() < rows.len() {
+            tracing::warn!(
+                accounts = rows.len(),
+                slots = pool.len(),
+                unprovisioned = rows.len() - pool.len(),
+                "engine pool starts with unprovisioned account rows"
+            );
         }
         let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runtime = ProxyGroupRuntime::full_pool_with_running(

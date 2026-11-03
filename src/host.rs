@@ -55,20 +55,21 @@ use crate::service::{
     MessagesAdjacentMediaParams, MessagesAroundParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams,
     MessagesDeleteForMeMessagesParams, MessagesDeleteForMeParams, MessagesEditParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
-    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
-    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
-    MessagesSendAttachmentParams, MessagesSendContactParams, MessagesSendPinMessageParams,
-    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
-    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendStoryParams,
-    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
-    MessagesSyncReadParams, MessagesSyncViewedParams, NotificationProfilesListParams,
-    NotificationProfilesSetRecordsParams, PhoneLookupParams, PresenceSetTypingMessageParams,
-    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
-    StickerPackSetSyncParams, StorageGetCallLinksParams, StorageIngestParams,
-    StorageSetCallLinkParams, StoriesDeleteForEveryoneParams, StoriesGetDisabledParams,
-    StoriesMarkViewedParams, StoriesSendReactionParams, StoriesSetDisabledParams,
-    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, UsernameLookupParams,
+    MessagesListAttachmentDimensionsParams, MessagesListParams, MessagesMarkReadParams,
+    MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams, MessagesRemoteDeleteParams,
+    MessagesReportSpamParams, MessagesRetryTextParams, MessagesSearchParams,
+    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendContactParams,
+    MessagesSendPinMessageParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
+    MessagesSendPollVoteParams, MessagesSendReactionParams, MessagesSendStickerParams,
+    MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
+    MessagesSendViewOnceOpenParams, MessagesSetAttachmentDimensionsParams, MessagesSyncReadParams,
+    MessagesSyncViewedParams, NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
+    PhoneLookupParams, PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams,
+    StickerPackImageParams, StickerPackManifestParams, StickerPackSetSyncParams,
+    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams,
+    StoriesDeleteForEveryoneParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
+    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListsListParams,
+    StoryDistributionListsSetRecordsParams, UsernameLookupParams,
 };
 use crate::store::{MAX_ADJACENT_MEDIA_LIMIT, MAX_PAGE_LIMIT};
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -2268,6 +2269,54 @@ async fn dispatch(request: HostRequest, runtime: &Arc<ProxyGroupRuntime>) -> Hos
                 reject_probe("messages.list", "params", "invalid messages.list params"),
             ),
         },
+        // Persisted attachment dimensions (contract revision 1.271, §4.255):
+        // the official data-model shape — Attachment.width/height — restored to
+        // the connector's own store, so the desktop's media boxes are laid out
+        // from data on the first frame instead of from an async measurement.
+        // Write half: a local store write (send lane, account-scoped mutating,
+        // zero engine traffic); the params gate is the shape ladder, and the
+        // service ladder validates the pixel domain before the store write.
+        "messages.setAttachmentDimensions" => {
+            match serde_json::from_value::<MessagesSetAttachmentDimensionsParams>(request.params) {
+                Ok(params) => match runtime.set_attachment_dimensions(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "messages.setAttachmentDimensions",
+                        "params",
+                        "invalid messages.setAttachmentDimensions params",
+                    ),
+                ),
+            }
+        }
+        // Read half: the conversation's persisted dimension table, bounded by a
+        // row window — the desktop's open-conversation warm-up. Pure store
+        // read (read lane), no unread side effect, no upstream traffic.
+        "messages.listAttachmentDimensions" => {
+            match serde_json::from_value::<MessagesListAttachmentDimensionsParams>(request.params) {
+                Ok(params) => match runtime.list_attachment_dimensions(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    reject_probe(
+                        "messages.listAttachmentDimensions",
+                        "params",
+                        "invalid messages.listAttachmentDimensions params",
+                    ),
+                ),
+            }
+        }
         // 契约 1.204（M4b）：以锚点为中心取窗——官方
         // getConversationRangeCenteredOnMessage 对位。一次往返拿「锚前 + 锚 + 锚后」，
         // 取代「先拉最新页再补到锚」的两段式（省一次往返、消除中间态空窗）。
@@ -5286,6 +5335,77 @@ mod tests {
             crate::DEFAULT_PROXY_GROUP_ID.to_string(),
             test_supervisor(),
         )])
+    }
+
+    /// Contract revision 1.271 (§4.255): the two attachment-dimension methods
+    /// ride the host frame with their own params faces — a params-shape miss
+    /// answers INVALID_REQUEST through `reject_probe` before any store work,
+    /// and the wire names stay exactly as declared (no key invention, no
+    /// rename). This pins the strict `deny_unknown_fields` posture the rest of
+    /// the family keeps plus the u32/negative refusals.
+    #[test]
+    fn attachment_dimension_params_faces_are_strict() {
+        let write: crate::service::MessagesSetAttachmentDimensionsParams =
+            serde_json::from_value(serde_json::json!({
+                "accountId": "a",
+                "conversationId": "c",
+                "messageId": "m",
+                "attachmentId": "att",
+                "width": 1280,
+                "height": 720
+            }))
+            .expect("the §4.255 write face parses");
+        assert_eq!(write.width, 1280);
+        assert_eq!(write.height, 720);
+
+        // 未知键 = 形状错（与相邻 params 族同一 deny_unknown_fields 纪律）。
+        assert!(
+            serde_json::from_value::<crate::service::MessagesSetAttachmentDimensionsParams>(
+                serde_json::json!({
+                    "accountId": "a",
+                    "conversationId": "c",
+                    "messageId": "m",
+                    "attachmentId": "att",
+                    "width": 1,
+                    "height": 1,
+                    "extra": true
+                }),
+            )
+            .is_err()
+        );
+        // 负值在反序列化层即拒（u32 面）。
+        assert!(
+            serde_json::from_value::<crate::service::MessagesSetAttachmentDimensionsParams>(
+                serde_json::json!({
+                    "accountId": "a",
+                    "conversationId": "c",
+                    "messageId": "m",
+                    "attachmentId": "att",
+                    "width": -1,
+                    "height": 1
+                }),
+            )
+            .is_err()
+        );
+
+        // 读面：limit 缺席合法（缺省窗口），在场必须是整数。
+        let absent: crate::service::MessagesListAttachmentDimensionsParams =
+            serde_json::from_value(serde_json::json!({
+                "accountId": "a",
+                "conversationId": "c"
+            }))
+            .expect("limit is optional on the §4.255 read face");
+        assert_eq!(absent.limit, None);
+        assert!(
+            serde_json::from_value::<crate::service::MessagesListAttachmentDimensionsParams>(
+                serde_json::json!({
+                    "accountId": "a",
+                    "conversationId": "c",
+                    "limit": "many"
+                }),
+            )
+            .is_err()
+        );
     }
 
     #[test]

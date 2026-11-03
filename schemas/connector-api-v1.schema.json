@@ -72,6 +72,8 @@
             "identities.verify",
             "conversations.setExpireTimer",
             "messages.list",
+            "messages.listAttachmentDimensions",
+            "messages.setAttachmentDimensions",
             "messages.adjacentMedia",
             "messages.search",
             "messages.getText",
@@ -682,6 +684,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesListParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.listAttachmentDimensions" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesListAttachmentDimensionsParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.setAttachmentDimensions" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSetAttachmentDimensionsParams" }
             }
           }
         },
@@ -1954,6 +1978,31 @@
         "conversationId": { "$ref": "#/$defs/opaqueId" },
         "before": { "type": "string", "maxLength": 256 },
         "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
+      }
+    },
+    "messagesSetAttachmentDimensionsParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId", "attachmentId", "width", "height"],
+      "description": "Persist one attachment's measured pixel size into the message row's descriptor face (contract revision 1.271, \u00a74.255, capability attachment-dimensions). The official data-model shape restored to the connector: an official Attachment carries optional width/height (ts/types/Attachment.std.ts:18-19/:77-78/:223-224) filled by the receive-side measurement (ts/types/VisualAttachment.dom.ts:38 width: image.naturalWidth, height: image.naturalHeight), so every render reads a declaration and getImageDimensionsForTimeline (ts/util/Attachment.std.ts:407) never falls back to the minimum box. KT's wire already carried these keys on inbound attachment descriptors (messages.list attachments[].width/height) but nothing ever wrote them for rows the engine could not measure; this face lets the desktop persist its own measurement. Write ladder: account then conversation then message resolution (ACCOUNT_NOT_FOUND / CONVERSATION_NOT_FOUND / MESSAGE_NOT_FOUND), then the attachment id must name a descriptor of that row (INVALID_REQUEST - a size for an attachment that is not there is a caller mistake, never a silent no-op), and the pixel pair must be positive integers within 16384 each (INVALID_REQUEST otherwise). Idempotent: rewriting the same pair answers updated=false and leaves the stored bytes untouched; a changed pair rewrites the descriptor array with only the addressed entry's width/height replaced - every other key and every other entry stays byte-identical. A NULL / non-array / unparseable attachments_json cell fails closed (INVALID_REQUEST) instead of inventing a descriptor array. Send lane, account-scoped mutating: a local store write with no engine frame and no upstream traffic (the conversations.saveDraft class, same-account mutex and delete barrier included). Answer: {updated: boolean}.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" },
+        "attachmentId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "width": { "type": "integer", "minimum": 1, "maximum": 16384 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 16384 }
+      }
+    },
+    "messagesListAttachmentDimensionsParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Read one conversation's persisted attachment dimensions (contract revision 1.271, \u00a74.255, capability attachment-dimensions): a bounded store-only projection of the rows' attachments[].width/height faces, newest message first. The desktop calls this once when a conversation opens - the official model always has the sizes in hand, so nothing is measured asynchronously at render time - and seeds its layout table before the first scroll. Only descriptors carrying both a positive width and height are listed; an attachment never measured stays absent rather than shipping a guessed size. limit counts attachment-bearing rows scanned (default 200, 1..=1000) and the answer's truncated flag reports that the scan stopped at the bound. Read lane: no upstream traffic, no mutation, and no unread side effect (the \u00a74.76 adjacentMedia posture - warming a conversation is not viewing it). Answer: {entries: [{messageId, attachmentId, width, height}], truncated: boolean}.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
       }
     },
     "messagesAdjacentMediaParams": {

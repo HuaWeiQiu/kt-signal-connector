@@ -17,7 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 41;
+const SCHEMA_VERSION: i64 = 42;
 /// Multi-pin queue cap (official desktop `getPinnedMessagesLimit` = 3): the
 /// store keeps at most this many pins per conversation; a pin past the cap
 /// replaces the row with the oldest `pinned_at` (the official
@@ -288,6 +288,8 @@ CREATE TABLE IF NOT EXISTS messages (
   first_send_attempted_at INTEGER,
   retry_attempt_count INTEGER NOT NULL DEFAULT 0,
   next_attempt_at INTEGER,
+  delete_failed INTEGER NOT NULL DEFAULT 0,
+  delete_failed_at INTEGER,
   FOREIGN KEY(account_id) REFERENCES accounts(id),
   FOREIGN KEY(conversation_id) REFERENCES conversations(id)
 );
@@ -514,6 +516,18 @@ pub const MAX_PAGE_LIMIT: u32 = 200;
 /// navigation step like the official `limit: 1`; the wider bound exists so a
 /// future strip prefetch never pages unbounded.
 pub const MAX_ADJACENT_MEDIA_LIMIT: u32 = 20;
+/// One persisted attachment dimension pair (contract revision 1.271, §4.255):
+/// the read face behind `messages.listAttachmentDimensions` — the desktop's
+/// one-shot warm-up so every media box renders from data before the first
+/// scroll. Only entries that carry both dimensions are listed (an attachment
+/// never measured simply stays absent — never a guessed 0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAttachmentDimension {
+    pub message_id: String,
+    pub attachment_id: String,
+    pub width: u32,
+    pub height: u32,
+}
 /// One keyset chunk of the adjacent-media scan: rows are inspected in
 /// bounded reads until enough media-bearing rows match (or the range is
 /// exhausted), so a media-sparse conversation never loads its whole history
@@ -565,6 +579,18 @@ pub enum StoreError {
     /// — the caller named a bad target — instead of a NOT_FOUND lookup.
     #[error("read watermark target is not a message of the conversation")]
     ReadWatermarkTargetInvalid,
+    /// messages.setAttachmentDimensions (contract revision 1.271, §4.255):
+    /// the named attachment id is not a descriptor of the addressed row — the
+    /// §4.54 attachment ladder's own refusal (a caller mistake, never a silent
+    /// no-op), answered as INVALID_REQUEST by the service mapping.
+    #[error("attachmentId does not name an attachment of this message")]
+    AttachmentNotFound,
+    /// messages.setAttachmentDimensions (contract revision 1.271, §4.255): the
+    /// row's persisted attachment face is NULL / not an array / not JSON.
+    /// Fail closed — the write never overwrites bytes it cannot read (the
+    /// §4.11 posture), and no descriptor array is invented.
+    #[error("message attachments are not readable")]
+    AttachmentFaceUnreadable,
     /// Fail closed (optimization-plan Phase 3): existing plaintext history is
     /// never opened for serving without a store key to encrypt it with.
     #[error(
@@ -605,6 +631,8 @@ impl StoreError {
             StoreError::OperationConflict => "operation_conflict",
             StoreError::InvalidCursor => "invalid_cursor",
             StoreError::ReadWatermarkTargetInvalid => "read_watermark_target_invalid",
+            StoreError::AttachmentNotFound => "attachment_not_found",
+            StoreError::AttachmentFaceUnreadable => "attachment_face_unreadable",
             StoreError::PlaintextStoreRequiresKey => "plaintext_store_requires_key",
             StoreError::StoreKeyRequired => "store_key_required",
             StoreError::StoreKeyRejected => "store_key_rejected",
@@ -820,6 +848,12 @@ pub struct ConversationSummary {
     /// authoritative read position", never zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_watermark_ms: Option<u64>,
+    /// Contract 1.272 (section 4.256): the authoritative oldest-unseen anchor,
+    /// the local-store counterpart of official metrics.oldestUnseen.id. Present
+    /// only while unread_count > 0 and a concrete incoming row exists after the
+    /// read watermark; absent on fully-read or evidence-less conversations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_unseen_message_id: Option<String>,
     pub muted: bool,
     /// 契约 1.206（M5）：通知细分四开关——官方 `notifyForCallsIfMuted` /
     /// `notifyForMentionsIfMuted` / `notifyForRepliesIfMuted` /
@@ -2156,6 +2190,11 @@ pub struct MessageSendOutcomes {
     pub succeeded: u32,
     #[serde(default)]
     pub failed: u32,
+    /// 契约 1.274：官方 deletedForEveryoneSendStatus 的持久化半面。
+    /// 复用既有 send_outcomes_json 列，避免为新状态再做一次 schema 迁移；
+    /// 桌面把它映射回 MessageRecord 顶层同名字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_for_everyone_send_status: Option<std::collections::BTreeMap<String, bool>>,
 }
 
 /// §4.179 unknown-outcome reconciliation batch entry: one unsettled outgoing
@@ -2191,7 +2230,10 @@ pub struct MessageRecord {
     /// model-types.d.ts:330 deletedForEveryoneFailed 对位）。真值 =
     /// 墓碑已落但删除请求未确认成功，桌面渲染删除失败可重试行。
     /// 内存失败旗标跨重启丢失的持久化半面（台账 §26.17）。
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "deletedForEveryoneFailed",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub delete_failed: bool,
     pub account_id: String,
     pub conversation_id: String,
@@ -3036,6 +3078,82 @@ impl Store {
         Ok(true)
     }
 
+    /// Backfill the protocol author identity for legacy incoming rows whose
+    /// only identity is the ingest privacy hash. The hash is stable over the
+    /// account, conversation kind, and author address, so once contacts (or a
+    /// direct conversation) carries the ACI we can recover it without asking
+    /// the engine for history again. Rows that already have an author ACI are
+    /// untouched; no candidate match means no guess.
+    pub fn backfill_incoming_author_aci(&self) -> Result<usize, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let candidates: Vec<(String, String)> = transaction
+            .prepare(
+                "SELECT account_id, peer_key FROM contacts WHERE kind='contact'
+                 UNION
+                 SELECT account_id, peer_key FROM conversations WHERE kind='direct'",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut by_hash: BTreeMap<(String, String, String), String> = BTreeMap::new();
+        for (account_id, peer_key) in candidates {
+            let Some(aci) = canonical_aci(&peer_key) else {
+                continue;
+            };
+            for kind in ["direct", "group"] {
+                let hash = stable_hash_id(&[&account_id, kind, &aci]);
+                by_hash.insert((account_id.clone(), kind.to_string(), hash), aci.clone());
+            }
+        }
+        if by_hash.is_empty() {
+            return Ok(0);
+        }
+        let rows: Vec<(String, String, String, String)> = transaction
+            .prepare(
+                "SELECT m.id, m.account_id, m.sender_id, c.kind
+                 FROM messages m
+                 JOIN conversations c ON c.id=m.conversation_id AND c.account_id=m.account_id
+                 WHERE m.direction='incoming'
+                   AND (m.author_aci IS NULL OR m.author_aci='')",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut changed = 0usize;
+        for (id, account_id, sender_id, kind) in rows {
+            let Some(aci) = by_hash.get(&(account_id, kind, sender_id)) else {
+                continue;
+            };
+            changed += transaction
+                .execute(
+                    "UPDATE messages SET author_aci=?1
+                     WHERE id=?2 AND (author_aci IS NULL OR author_aci='')",
+                    params![aci, id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed)
+    }
+
     pub fn upsert_account_from_signal(
         &self,
         signal_account: &str,
@@ -3077,10 +3195,16 @@ impl Store {
         }
         let id = preferred_id.map(str::to_string).unwrap_or_else(random_id);
         let masked = mask_address(signal_account);
+        // finishLink 与首条 receive 可能并发 upsert 同一账号。先查再插会让
+        // 第二个 INSERT 撞 UNIQUE(signal_account)，必须把裁决下放到 SQLite。
+        // 冲突时只恢复 ready/linked_at，proxy_group 仍保持链接时不可变。
         self.lock_conn()?
             .execute(
                 "INSERT INTO accounts(id, signal_account, masked_address, display_name, state, linked_at, unread_count, proxy_group)
-                 VALUES(?1, ?2, ?3, NULL, 'ready', ?4, 0, ?5)",
+                 VALUES(?1, ?2, ?3, NULL, 'ready', ?4, 0, ?5)
+                 ON CONFLICT(signal_account) DO UPDATE SET
+                   state='ready',
+                   linked_at=COALESCE(accounts.linked_at, ?4)",
                 params![
                     id,
                     signal_account,
@@ -3090,7 +3214,10 @@ impl Store {
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        self.account_summary(&id)?
+        let existing = self
+            .account_by_signal(signal_account)?
+            .ok_or(StoreError::AccountNotFound)?;
+        self.account_summary(&existing.id)?
             .ok_or(StoreError::AccountNotFound)
     }
 
@@ -4918,6 +5045,64 @@ impl Store {
         .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
+    /// Contract 1.260 (§4.244, Z25 root-cause batch): the owed peer keys —
+    /// the same population the trigger count reads, as a deterministic
+    /// (rowid order) list bounded by the caller's per-window cap. The engine
+    /// listIdentities face is the single-reference narrow read only (compat
+    /// §3/§5: number required, no account-wide list form), so the enrich
+    /// consumes it one owed peer per call and this list is its work queue.
+    pub fn direct_peers_without_identity_verified(
+        &self,
+        account_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT peer_key FROM conversations
+                 WHERE account_id=?1 AND kind='direct'
+                   AND identity_verified_json IS NULL AND peer_key != ''
+                   AND peer_key != (SELECT signal_account FROM accounts WHERE id=?1)
+                   AND peer_key != COALESCE(
+                         (SELECT aci FROM accounts WHERE id=?1), '')
+                 ORDER BY rowid LIMIT ?2",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = statement
+            .query_map(params![account_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut peers = Vec::new();
+        for row in rows {
+            peers.push(row.map_err(|error| StoreError::Unavailable(Some(error)))?);
+        }
+        Ok(peers)
+    }
+
+    /// Contract 1.260 (§4.244, Z25 root-cause batch): the per-row probed-
+    /// absent marker ('{}') — the single-reference probe's honest DEFAULT
+    /// face (the engine answered and named no identity for this peer, the
+    /// official SafetyNumberNotReady state), the same self-extinguishing
+    /// stamp the account-wide arm used to write wholesale. NULL-guarded so
+    /// a stamped word is never clobbered and the write is idempotent.
+    pub fn stamp_identity_verified_absent_peer(
+        &self,
+        account_id: &str,
+        peer_key: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let updated = conn
+            .execute(
+                "UPDATE conversations SET identity_verified_json='{}'
+                 WHERE account_id=?1 AND kind='direct' AND peer_key=?2
+                   AND identity_verified_json IS NULL",
+                params![account_id, peer_key],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(updated > 0)
+    }
+
     /// Contract 1.70 (§4.58 consume batch): merge the authoritative
     /// `messageRequestResponseType` face into one direct conversation's
     /// factor stamp. The stamp is read-modify-written so the sync face never
@@ -5280,6 +5465,13 @@ impl Store {
                         conversation_naming_material(&conn, account_id, kind, &peer_key);
                     // 契约 1.209：群名册（官方 membersV2 投影；缺席 = 未知）。
                     let roster = conversation_roster(&conn, account_id, kind, &peer_key);
+                    let oldest_unseen = oldest_unseen_message_id(
+                        &conn,
+                        account_id,
+                        &row.get::<_, String>(0)?,
+                        row.get(6)?,
+                        row.get(13)?,
+                    )?;
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
@@ -5303,6 +5495,7 @@ impl Store {
                         unread_count: row.get::<_, i64>(6)? as u32,
                         unread_mentions: row.get::<_, i64>(7)? as u32,
                         read_watermark_ms: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
+                        oldest_unseen_message_id: oldest_unseen,
                         muted: row.get::<_, i64>(8)? != 0,
                         // 契约 1.206（M5）：通知细分四开关（裸 bool，恒序列化）。
                         notify_for_calls_if_muted: row.get::<_, i64>(14)? != 0,
@@ -5513,7 +5706,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -5575,7 +5768,8 @@ impl Store {
         let anchor_sent_at: i64 = self
             .lock_conn()?
             .query_row(
-                "SELECT sent_at FROM messages
+                "SELECT sent_at , delete_failed
+                 FROM messages
                   WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![anchor_id, account_id, conversation_id],
                 |row| row.get(0),
@@ -5589,7 +5783,7 @@ impl Store {
         let mut older: Vec<MessageRecord> = {
             let conn = self.read_conn()?;
             let mut stmt = conn
-                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -5615,7 +5809,8 @@ impl Store {
         let anchor: MessageRecord = {
             let conn = self.read_conn()?;
             conn.query_row(
-                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci, is_erased FROM messages WHERE id=?1 AND account_id=?2",
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci, is_erased , delete_failed
+                 FROM messages WHERE id=?1 AND account_id=?2",
                 params![anchor_id, account_id],
                 message_record_from_row,
             )
@@ -5624,7 +5819,7 @@ impl Store {
         let mut newer: Vec<MessageRecord> = {
             let conn = self.read_conn()?;
             let mut stmt = conn
-                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                .prepare("SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at, body, body_bytes, body_truncated, status, quote_message_id, client_request_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
@@ -5696,7 +5891,8 @@ impl Store {
         let anchor_id: Option<String> = self
             .read_conn()?
             .query_row(
-                "SELECT m.id FROM messages m
+                "SELECT m.id , delete_failed
+                 FROM messages m
                    JOIN conversations c
                      ON c.id = m.conversation_id AND c.account_id = m.account_id
                   WHERE m.account_id=?1 AND m.conversation_id=?2
@@ -5764,7 +5960,7 @@ impl Store {
                     AdjacentMediaDirection::Older => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -5774,7 +5970,7 @@ impl Store {
                     AdjacentMediaDirection::Newer => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
@@ -5868,8 +6064,8 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
-                     FROM messages
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
+                 FROM messages
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -5918,7 +6114,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -5938,7 +6134,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -5952,6 +6148,176 @@ impl Store {
             self.attach_quote_snapshot_ids(account_id, std::slice::from_mut(record))?;
         }
         Ok(record)
+    }
+
+    /// messages.setAttachmentDimensions (contract revision 1.271, §4.255):
+    /// persist one attachment descriptor's measured pixel size into the row's
+    /// `attachments_json` face — the official data-model shape
+    /// (Attachment.width/height, ts/types/Attachment.std.ts:18-19, measured at
+    /// receive per ts/types/VisualAttachment.dom.ts, so every render reads the
+    /// declaration instead of probing).
+    ///
+    /// Discipline:
+    /// - The row must exist in the addressed account+conversation, else
+    ///   MESSAGE_NOT_FOUND (the §4.4 ladder — the caller named a row this
+    ///   store does not hold).
+    /// - `attachmentId` must name a descriptor of that row, else
+    ///   InvalidRequest (the §4.54 attachment ladder's own refusal: a size for
+    ///   an attachment that is not there is a caller mistake, never a silent
+    ///   no-op).
+    /// - Idempotent: writing the same pair again changes nothing visible; the
+    ///   full descriptor array is rewritten with only the addressed entry's
+    ///   width/height replaced, every other key and entry byte-identical.
+    /// - Fail-closed on unreadable shapes: a non-array / malformed
+    ///   `attachments_json` cell answers `AttachmentFaceUnreadable` instead of
+    ///   inventing a descriptor array (the §4.11 posture); a NULL face is the
+    ///   honest "no descriptors on this row" and answers `AttachmentNotFound`.
+    ///
+    /// Returns whether anything actually changed (false = the same pair was
+    /// already stored), so the supervisor can keep the answer honest.
+    pub fn set_attachment_dimensions(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.lock_conn()?;
+        let transaction = conn
+            .transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let attachments_json: Option<String> = transaction
+            .query_row(
+                "SELECT attachments_json , delete_failed
+                 FROM messages
+                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                params![message_id, account_id, conversation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .ok_or(StoreError::MessageNotFound)?;
+        // A NULL face means the row carries no descriptor at all — an id that
+        // names one is the same caller mistake as an index miss (§4.54), never
+        // a silent no-op and never a "created" descriptor array.
+        let Some(raw) = attachments_json else {
+            return Err(StoreError::AttachmentNotFound);
+        };
+        let parsed: Value =
+            serde_json::from_str(&raw).map_err(|_| StoreError::AttachmentFaceUnreadable)?;
+        let Some(entries) = parsed.as_array() else {
+            return Err(StoreError::AttachmentFaceUnreadable);
+        };
+        let mut next = entries.clone();
+        let mut found = false;
+        let mut changed = false;
+        for entry in next.iter_mut() {
+            let Some(object) = entry.as_object_mut() else {
+                return Err(StoreError::AttachmentFaceUnreadable);
+            };
+            if object.get("id").and_then(Value::as_str) != Some(attachment_id) {
+                continue;
+            }
+            found = true;
+            let same = object.get("width").and_then(Value::as_u64) == Some(u64::from(width))
+                && object.get("height").and_then(Value::as_u64) == Some(u64::from(height));
+            if same {
+                break;
+            }
+            object.insert("width".to_string(), json!(width));
+            object.insert("height".to_string(), json!(height));
+            changed = true;
+            break;
+        }
+        if !found {
+            return Err(StoreError::AttachmentNotFound);
+        }
+        if !changed {
+            return Ok(false);
+        }
+        let encoded = serde_json::to_string(&Value::Array(next))
+            .map_err(|_| StoreError::Unavailable(None))?;
+        transaction
+            .execute(
+                "UPDATE messages SET attachments_json=?4
+                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                params![message_id, account_id, conversation_id, encoded],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(true)
+    }
+
+    /// messages.listAttachmentDimensions (contract revision 1.271, §4.255):
+    /// scan one conversation's attachment-bearing rows newest-first, bounded
+    /// by `row_limit`, and project every descriptor that carries both a
+    /// positive width and height. Bounded by construction: the scan reads at
+    /// most `row_limit` rows and the caller caps the entry list — a media
+    /// heavy conversation warms the newest window first, never the whole
+    /// archive.
+    pub fn list_attachment_dimensions(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        row_limit: u32,
+    ) -> Result<Vec<StoredAttachmentDimension>, StoreError> {
+        let rows: Vec<(String, String)> = {
+            let conn = self.read_conn()?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, attachments_json FROM messages
+                      WHERE account_id=?1 AND conversation_id=?2
+                        AND attachments_json IS NOT NULL
+                      ORDER BY sent_at DESC, id DESC
+                      LIMIT ?3",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let mapped = stmt
+                .query_map(
+                    params![account_id, conversation_id, row_limit as i64],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+        };
+        let mut entries = Vec::new();
+        for (message_id, raw) in rows {
+            let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+                continue; // 坏面单行跳过：一次投影绝不因一行形状坏而整体失败
+            };
+            let Some(list) = parsed.as_array() else {
+                continue;
+            };
+            for descriptor in list {
+                let Some(object) = descriptor.as_object() else {
+                    continue;
+                };
+                let Some(attachment_id) = object.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let width = object.get("width").and_then(Value::as_u64);
+                let height = object.get("height").and_then(Value::as_u64);
+                let (Some(width), Some(height)) = (width, height) else {
+                    continue;
+                };
+                if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+                    continue;
+                }
+                entries.push(StoredAttachmentDimension {
+                    message_id: message_id.clone(),
+                    attachment_id: attachment_id.to_string(),
+                    width: width as u32,
+                    height: height as u32,
+                });
+            }
+        }
+        Ok(entries)
     }
 
     pub fn message_by_signal_identity(
@@ -5968,7 +6334,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -6299,7 +6665,8 @@ impl Store {
         // everything before the epoch".
         let newest: Option<i64> = conn
             .query_row(
-                "SELECT MAX(sent_at) FROM messages
+                "SELECT MAX(sent_at) , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'",
                 params![account_id, conversation_id],
                 |row| row.get(0),
@@ -6468,7 +6835,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -6516,7 +6883,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -6643,7 +7010,7 @@ impl Store {
                 .query_row(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                      FROM messages WHERE id=?1",
                     params![message_id],
                     message_record_from_row,
@@ -6677,6 +7044,7 @@ impl Store {
             .query_row(
                 "SELECT direction, body, client_request_id, retry_attempt_count,
                         first_send_attempted_at, account_id, attachments_json
+                 , delete_failed
                  FROM messages WHERE id=?1 AND status='failed'",
                 params![message_id],
                 |row| {
@@ -6988,7 +7356,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -7029,7 +7397,8 @@ impl Store {
         // Contract-1.32 snapshot: the body this host-initiated edit replaces.
         let prior: Option<(String, String)> = transaction
             .query_row(
-                "SELECT body, body_bytes FROM messages
+                "SELECT body, body_bytes , delete_failed
+                 FROM messages
                  WHERE id=?1 AND account_id=?2 AND direction='outgoing'",
                 params![message_id, account_id],
                 |row| {
@@ -7064,7 +7433,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -7098,7 +7467,8 @@ impl Store {
         // replaces, read under the same predicate the UPDATE below guards.
         let prior: Option<(String, String)> = transaction
             .query_row(
-                "SELECT id, body FROM messages
+                "SELECT id, body , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
                    AND status NOT IN ('remote-deleted', 'system')
@@ -7137,7 +7507,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -7265,7 +7635,8 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let candidates: Vec<(String, Option<String>)> = transaction
             .prepare(
-                "SELECT id, rich_json FROM messages
+                "SELECT id, rich_json , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
                    AND status NOT IN ('remote-deleted', 'system')
@@ -7321,7 +7692,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE id=?1",
                 params![message_id],
@@ -7362,7 +7733,16 @@ impl Store {
         let changed = transaction
             .execute(
                 "UPDATE messages
-                 SET status='remote-deleted'
+                 SET status='remote-deleted',
+                     body=NULL,
+                     body_bytes=NULL,
+                     body_truncated=0,
+                     attachments_json=NULL,
+                     attachment_locators=NULL,
+                     live_attachment_locators=NULL,
+                     rich_json=NULL,
+                     quote_message_id=NULL,
+                     quote_snapshot=NULL
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id=?4
                    AND status NOT IN ('remote-deleted', 'system')",
@@ -7378,7 +7758,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3 AND sender_id=?4
                  ORDER BY id ASC LIMIT 1",
@@ -7392,6 +7772,36 @@ impl Store {
             )
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // 官方 eraseMessageContents：同时终结该消息上的回应（保留墓碑行，
+        // 但正文/附件/引用/富文本与 reaction 不再可见）。
+        if changed > 0 {
+            transaction
+                .execute(
+                    "UPDATE message_events
+                     SET removed=1
+                     WHERE account_id=?1 AND conversation_id=?2 AND target_timestamp=?3",
+                    params![account_id, conversation_id, target_sent_at as i64],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        // 若被删行正占摘要槽，清掉旧正文预览；conversation_summary 随后
+        // 仍会从该行 status=remote-deleted 计算 last_message_status，桌面据此
+        // 显示官方删除墓碑，而不是摘要继续残留旧正文。
+        if changed > 0
+            && let Some(latest) = record.as_ref()
+        {
+            transaction
+                .execute(
+                    "UPDATE conversations
+                     SET last_message_preview=NULL
+                     WHERE id=?1
+                       AND (SELECT id FROM messages
+                            WHERE conversation_id=?1
+                            ORDER BY sent_at DESC, id DESC LIMIT 1)=?2",
+                    params![conversation_id, latest.id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
         transaction
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -7856,6 +8266,50 @@ impl Store {
         Ok(())
     }
 
+    /// 契约 1.274：持久化 deletedForEveryoneSendStatus + deleteFailed。
+    /// 复用 send_outcomes_json，保留已有计数，不改消息发送结果面。
+    pub fn set_deleted_for_everyone_send_status(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        send_status: std::collections::BTreeMap<String, bool>,
+        failed: bool,
+        failed_at: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        let existing = conn
+            .query_row(
+                "SELECT send_outcomes_json FROM messages WHERE account_id=?1 AND id=?2",
+                params![account_id, message_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .flatten();
+        let mut outcomes = existing
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<MessageSendOutcomes>(json).ok())
+            .unwrap_or(MessageSendOutcomes {
+                succeeded: 0,
+                failed: 0,
+                deleted_for_everyone_send_status: None,
+            });
+        outcomes.deleted_for_everyone_send_status = if send_status.is_empty() {
+            None
+        } else {
+            Some(send_status)
+        };
+        let json = serde_json::to_string(&outcomes).map_err(|_| StoreError::Unavailable(None))?;
+        conn.execute(
+            "UPDATE messages
+             SET send_outcomes_json=?3, delete_failed=?4, delete_failed_at=?5
+             WHERE account_id=?1 AND id=?2",
+            params![account_id, message_id, json, failed as i64, failed_at],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
     pub fn mark_admin_deleted(
         &self,
         account_id: &str,
@@ -7879,7 +8333,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -8103,6 +8557,7 @@ impl Store {
                 "SELECT direction, sender_id, sent_at, received_at, body, body_truncated,
                         status, admin_deleted, quote_message_id, attachments_json,
                         attachment_locators, rich_json, sticker_json
+                 , delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2
                  ORDER BY sent_at ASC, id ASC",
@@ -8818,7 +9273,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY received_at DESC",
@@ -8929,6 +9384,22 @@ impl Store {
         Ok(())
     }
 
+    /// Drop the completed run's pass-2 chat scratch while KEEPING the staged
+    /// recipient rows (contract 1.262 §4.245): the recipient registry is the
+    /// durable recipient→ACI mapping the schema-v41 sender-identity backfill
+    /// rebuilds from — the only honest source once the archive frames are
+    /// gone. The chat edge (chat id → recipient id + timer) is pure pass-2
+    /// scratch and rests empty between runs.
+    pub fn clear_history_chat_stage(&self, account_id: &str) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "DELETE FROM history_import_stage_chats WHERE account_id=?1",
+                params![account_id],
+            )
+            .map(|_| ())
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
     /// One staged conversation identity (pass-2 point lookup): the chat's
     /// recipient row joined through the staging scratch, plus the chat
     /// frame's timer in ms (§4.41) — `None` when the frame stated none.
@@ -9004,16 +9475,19 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         for row in rows {
             let record = &row.record;
-            // Identity dedupe across the number/ACI duality: live receive may
-            // have stored this Signal message under the number-derived sender
-            // hash while the import resolved the ACI form (or the reverse), so
-            // both candidate hashes qualify as "already stored".
-            let sender_clause = match row.alt_sender_id {
-                Some(_) => "IN (?5, ?6)",
-                None => "IN (?5)",
+            // Identity dedupe across the sender forms (contract 1.262
+            // §4.245): live receive may have stored this Signal message under
+            // a hash form (number-keyed or ACI-keyed) while the import landed
+            // the ACI verbatim — and pre-1.262 import rows are hash-form — so
+            // every candidate qualifies as "already stored".
+            let sender_clause = match row.alt_sender_ids.len() {
+                0 => "IN (?5)",
+                1 => "IN (?5, ?6)",
+                _ => "IN (?5, ?6, ?7)",
             };
             let sql = format!(
-                "SELECT id, attachments_json FROM messages
+                "SELECT id, attachments_json , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3
                    AND sent_at=?4 AND sender_id {sender_clause}
                  LIMIT 1"
@@ -9030,7 +9504,7 @@ impl Store {
                     &sent_at,
                     &record.sender_id,
                 ];
-                if let Some(alt) = &row.alt_sender_id {
+                for alt in row.alt_sender_ids.iter().take(2) {
                     all_params.push(alt);
                 }
                 stmt.query_row(all_params.as_slice(), |row| {
@@ -9188,7 +9662,7 @@ impl Store {
                     m.body, m.body_bytes, m.body_truncated, m.status, m.quote_message_id, m.client_request_id,
                     m.quote_snapshot, m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
                     m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
-                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,m.is_erased
+                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,m.is_erased,delete_failed
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id AND c.account_id = m.account_id
              WHERE m.account_id = ?1 AND m.sent_at = ?2 AND m.rich_json IS NOT NULL
@@ -9240,7 +9714,8 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let rich_json: Option<String> = transaction
             .query_row(
-                "SELECT rich_json FROM messages
+                "SELECT rich_json , delete_failed
+                 FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 |row| row.get(0),
@@ -9270,7 +9745,7 @@ impl Store {
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
                         quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self,
-                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
@@ -9345,9 +9820,9 @@ impl Store {
                             m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
                             m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
                             m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid,
-                            m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,m.is_erased,
+                            m.server_timestamp, m.viewed_at, m.send_outcomes_json, m.author_aci,m.is_erased, delete_failed,
                             c.kind, c.peer_key
-                     FROM messages m
+                 FROM messages m
                      JOIN conversations c ON c.id = m.conversation_id
                      WHERE m.account_id=?1 AND m.sent_at=?2 AND m.direction='outgoing'
                      ORDER BY m.id ASC LIMIT 8",
@@ -9362,7 +9837,7 @@ impl Store {
                 let rows: Vec<(MessageRecord, String, String)> = stmt
                     .query_map(params![account_id, timestamp as i64], |row| {
                         let record = message_record_from_row(row)?;
-                        Ok((record, row.get::<_, String>(32)?, row.get::<_, String>(33)?))
+                        Ok((record, row.get::<_, String>(33)?, row.get::<_, String>(34)?))
                     })
                     .map_err(|error| StoreError::Unavailable(Some(error)))?
                     .collect::<Result<_, _>>()
@@ -9820,7 +10295,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming' AND sent_at=?3",
             )
@@ -9873,7 +10348,8 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let mut delete = transaction
             .prepare(
-                "DELETE FROM messages
+                "DELETE , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  RETURNING id",
             )
@@ -10209,7 +10685,7 @@ impl Store {
         let sql = format!(
             "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
                    AND sent_at > ?3
@@ -10248,7 +10724,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3 AND direction='incoming'",
             )
@@ -10705,7 +11181,7 @@ impl Store {
                 let sql = format!(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND id IN ({placeholders})"
                 );
@@ -10870,7 +11346,8 @@ impl Store {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, direction, sender_id FROM messages
+                "SELECT id, direction, sender_id , delete_failed
+                 FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC",
             )
@@ -11085,7 +11562,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at, send_outcomes_json, author_aci,is_erased,delete_failed
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -11115,7 +11592,8 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let previous_status: Option<String> = transaction
             .query_row(
-                "SELECT status FROM messages
+                "SELECT status , delete_failed
+                 FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 |row| row.get(0),
@@ -11260,6 +11738,13 @@ impl Store {
                         conversation_naming_material(&conn, account_id, kind, &peer_key);
                     // 契约 1.209：群名册（官方 membersV2 投影；缺席 = 未知）。
                     let roster = conversation_roster(&conn, account_id, kind, &peer_key);
+                    let oldest_unseen = oldest_unseen_message_id(
+                        &conn,
+                        account_id,
+                        &row.get::<_, String>(0)?,
+                        row.get(6)?,
+                        row.get(13)?,
+                    )?;
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
@@ -11283,6 +11768,7 @@ impl Store {
                         unread_count: row.get::<_, i64>(6)? as u32,
                         unread_mentions: row.get::<_, i64>(7)? as u32,
                         read_watermark_ms: row.get::<_, Option<i64>>(13)?.map(|v| v.max(0) as u64),
+                        oldest_unseen_message_id: oldest_unseen,
                         muted: row.get::<_, i64>(8)? != 0,
                         // 契约 1.206（M5）：通知细分四开关（裸 bool，恒序列化）。
                         notify_for_calls_if_muted: row.get::<_, i64>(14)? != 0,
@@ -12020,6 +12506,10 @@ impl Store {
         let shared_index = shared_group_index(&conn, account_id)?;
         let mut stmt = conn
             .prepare(
+                // 批 Z14 审计记档：本读面同时供桌面「联系人/群组」双分区
+                // （compose 面有意面，群组行点击走群链）——行集收窄会砍
+                // 群分区产品面，不收。怪 direct 行的防复发闸在发送面
+                // （契约 1.269 §4.253：direct 语义拒绝群键 peerKey）。
                 "SELECT id, kind, peer_key, title, extra
                  FROM contacts
                  WHERE account_id=?1
@@ -12165,6 +12655,41 @@ impl Store {
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(())
+    }
+
+    /// 契约 1.270（§4.254 · 批 Z14 · S6 头像生命周期⑦）：direct 会话行的头像
+    /// backfill 目标读——缓存缺席的 direct 行（对端有照片但从未命中任何拉取
+    /// 时机：profile 变更事件/群头像变更事件/灯箱点击/OS 通知头像四源之外的
+    /// 冷启动缺口）。纯 store 读，bounded by the caller's cap；排序用行 id 稳
+    /// 定序（同一轮内确定面，风暴不重排）。群行不入目标集（群头像走既有
+    /// GroupChanged 事件 kick，本面只收敛成员直聊面）。
+    pub fn avatar_backfill_targets(
+        &self,
+        account_id: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id
+                 FROM conversations c
+                 LEFT JOIN conversation_avatars a
+                   ON a.conversation_id = c.id AND a.account_id = c.account_id
+                 WHERE c.account_id = ?1
+                   AND c.kind = 'direct'
+                   AND a.conversation_id IS NULL
+                 ORDER BY c.id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id, limit.clamp(1, 64) as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
     }
 
     /// 契约 1.217（§29.2）：缓存失效面——上游头像被移除（setProfile null
@@ -14130,6 +14655,23 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 42 {
+        // 契约 1.274：delete_failed / delete_failed_at 是删除失败态的持久化
+        // 列。既有 set_delete_failed 已在使用它们，旧库缺列会在删除结算时
+        // 报 no such column；本步补列并保留历史行默认未失败，不回填旧事实。
+        for (column, kind) in [
+            ("delete_failed", "INTEGER NOT NULL DEFAULT 0"),
+            ("delete_failed_at", "INTEGER"),
+        ] {
+            if !table_has_column(conn, "messages", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE messages ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+    }
     if current < 40 {
         // 契约 1.217（§29.2，头像字节面）：conversation_avatars 缓存表——
         // getAvatar 下行字节的第一块持久化家（官方桌面把头像落盘
@@ -14161,6 +14703,24 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             [],
         )
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
+    if current < 41 {
+        // 契约 1.262（§4.245，S21 存量回填）：1.262 之前导入的入站行把发送者
+        // 落成归档派生哈希（§4.38 ingest privacy hash——桌面成员卡 member id
+        // 显示该哈希、作者协议身份 authorAci 在 Z2 前缺席），桌面四臂寻址梯
+        // （直聊行/头像索引/协议词形/UUID 臂）全 miss。归档 recipient 暂存表
+        // （history_import_stage_recipients，导入完成后仍在手）携带官方
+        // Contact.aci，映射可整表重建：对每个带 ACI 的 contact recipient，
+        // 把「该账号入站行中 sender_id 等于两种旧哈希形（号码键/ACI 键）」的
+        // 行升格为 ACI verbatim（wire senderId=ACI，桌面梯自然全通），并补
+        // COALESCE 缺席的 author_aci 捕获。诚实边界：无 ACI 的 recipient 行
+        // 不进映射（保持哈希，绝不发明）；outgoing（sender=账号 id）与
+        // system 行不在 direction='incoming' 筛内；e164-only 的群/联系人
+        // 行零触碰。幂等双保险：迁移梯每库只跑一次，且升格后 sender_id 为
+        // 36 字符 ACI 形、与 64 字符哈希候选形状不相交——重开零命中。
+        // 行 id（含旧哈希的 stable id）保持不动：引用该行的 quote_message_id
+        // /事件链不迁移自愈。
+        backfill_import_sender_aci(conn)?;
     }
     if current < 39 {
         // 契约 1.218（§29.3，到期主动擦除）：messages.is_erased 列——官方
@@ -14290,6 +14850,107 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         params![SCHEMA_VERSION.to_string()],
     )
     .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(())
+}
+
+/// The S21 one-shot backfill (contract 1.262 §4.245): rebuild the archive
+/// recipient → ACI map from the staged recipient table and upgrade legacy
+/// hash-form inbound senders to the ACI verbatim. Bounded three passes —
+/// read the map, scan inbound rows, apply the matched updates — and honest
+/// on every edge: recipients without an ACI never enter the map, outgoing
+/// and system rows sit outside the direction filter, and an already-ACI
+/// sender can never equal a hash candidate (36-char UUID vs 64-char hex),
+/// which makes a rerun a zero-hit no-op even before the ladder gate does.
+fn backfill_import_sender_aci(conn: &Connection) -> Result<(), StoreError> {
+    let mut map: BTreeMap<(String, String), String> = BTreeMap::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT account_id, aci, e164
+                 FROM history_import_stage_recipients
+                 WHERE kind='contact' AND aci IS NOT NULL",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+        {
+            let account_id: String = row
+                .get(0)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let aci: String = row
+                .get(1)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let e164: Option<String> = row
+                .get(2)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            // Both legacy hash forms (the number-keyed one — pre-1.262
+            // imports and live envelopes that spoke the number — and the
+            // ACI-keyed one — pre-1.262 ACI-only imports and live envelopes
+            // that spoke the ACI) across both chat kinds a contact author's
+            // rows can carry: direct and group (the hash input includes the
+            // kind, so each is its own candidate).
+            for kind in ["direct", "group"] {
+                if let Some(e164) = &e164 {
+                    map.insert(
+                        (
+                            account_id.clone(),
+                            stable_hash_id(&[&account_id, kind, e164]),
+                        ),
+                        aci.clone(),
+                    );
+                }
+                map.insert(
+                    (
+                        account_id.clone(),
+                        stable_hash_id(&[&account_id, kind, &aci]),
+                    ),
+                    aci.clone(),
+                );
+            }
+        }
+    }
+    if map.is_empty() {
+        return Ok(());
+    }
+    let mut updates: Vec<(String, String)> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, account_id, sender_id FROM messages WHERE direction='incoming'")
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+        {
+            let id: String = row
+                .get(0)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let account_id: String = row
+                .get(1)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let sender_id: String = row
+                .get(2)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if let Some(aci) = map.get(&(account_id, sender_id)) {
+                updates.push((id, aci.clone()));
+            }
+        }
+    }
+    for (id, aci) in updates {
+        conn.execute(
+            "UPDATE messages
+             SET sender_id=?2, author_aci=COALESCE(author_aci, ?2)
+             WHERE id=?1 AND sender_id != ?2",
+            params![id, aci],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
     Ok(())
 }
 
@@ -14459,6 +15120,31 @@ fn pinned_messages_for_conversation(
         });
     }
     Ok(pins)
+}
+
+// Contract 1.272 (section 4.256): exact oldest-unseen anchor from the store.
+// Reuse the same incoming + watermark rule as the unread counter rather than
+// estimating an index from the unread count and window length.
+fn oldest_unseen_message_id(
+    conn: &Connection,
+    account_id: &str,
+    conversation_id: &str,
+    unread_count: i64,
+    read_watermark_ms: Option<i64>,
+) -> Result<Option<String>, rusqlite::Error> {
+    if unread_count <= 0 {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT id FROM messages
+         WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
+           AND sent_at > COALESCE(?3, 0)
+         ORDER BY sent_at ASC, id ASC
+         LIMIT 1",
+        params![account_id, conversation_id, read_watermark_ms],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
 }
 
 fn conversation_last_message_meta(
@@ -14656,13 +15342,15 @@ pub struct HistoryStageChat {
 
 /// One import batch row: the message record carries the resolved
 /// conversation/direction/sender identity, the preview is the
-/// conversation-summary projection, and `alt_sender_id` covers the
-/// number/ACI duality — a stored row matching either sender hash counts
-/// as the same Signal message.
+/// conversation-summary projection, and `alt_sender_ids` keeps the
+/// identity tuple total across sender forms (contract 1.262 §4.245): a
+/// stored row matching the ACI sender or any of the legacy hash forms
+/// (e164-keyed / ACI-keyed, pre-1.262 import or live receive) counts as
+/// the same Signal message. Bounded at two by construction.
 pub struct HistoryImportInsert {
     pub record: MessageRecord,
     pub preview: Option<String>,
-    pub alt_sender_id: Option<String>,
+    pub alt_sender_ids: Vec<String>,
     /// Contract 1.55 (§4.38 attachv2): the archive attachments' ingest-side
     /// pointer faces, aligned by index with `record.attachments`. Key
     /// material rides this field and the internal `attachment_locators`
@@ -14744,36 +15432,38 @@ fn message_has_visual_media(record: &MessageRecord) -> bool {
 }
 
 fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
-    let text: Option<String> = row.get(7)?;
+    let text: Option<String> = row.get("body")?;
     let text_bytes = row
-        .get::<_, Option<i64>>(8)?
+        .get::<_, Option<i64>>("body_bytes")?
         .map(|value| value.max(0).min(u32::MAX as i64) as u32)
         .or_else(|| {
             text.as_ref()
                 .map(|value| value.len().min(u32::MAX as usize) as u32)
         });
-    let persisted_truncated = row.get::<_, i64>(9)? != 0;
-    let quote_snapshot: Option<String> = row.get(13)?;
-    let attachments_json: Option<String> = row.get(14)?;
-    let rich_json: Option<String> = row.get(15)?;
+    let persisted_truncated = row.get::<_, i64>("body_truncated")? != 0;
+    let quote_snapshot: Option<String> = row.get("quote_snapshot")?;
+    let attachments_json: Option<String> = row.get("attachments_json")?;
+    let rich_json: Option<String> = row.get("rich_json")?;
     Ok(MessageRecord {
-        is_erased: row.get::<_, i64>(31)? != 0,
-        delete_failed: false,
+        is_erased: row.get::<_, i64>("is_erased")? != 0,
+        delete_failed: row.get::<_, i64>("delete_failed")? != 0,
         required_protocol_version: None,
-        id: row.get(0)?,
-        account_id: row.get(1)?,
-        conversation_id: row.get(2)?,
-        direction: static_direction(row.get::<_, String>(3)?),
-        sender_id: row.get(4)?,
-        sent_at: row.get::<_, i64>(5)? as u64,
-        received_at: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+        id: row.get("id")?,
+        account_id: row.get("account_id")?,
+        conversation_id: row.get("conversation_id")?,
+        direction: static_direction(row.get::<_, String>("direction")?),
+        sender_id: row.get("sender_id")?,
+        sent_at: row.get::<_, i64>("sent_at")? as u64,
+        received_at: row
+            .get::<_, Option<i64>>("received_at")?
+            .map(|value| value as u64),
         text_retrievable: text.is_some() && !persisted_truncated,
         text,
         text_bytes,
         text_truncated: persisted_truncated,
-        status: static_status(row.get::<_, String>(10)?),
-        client_request_id: row.get(12)?,
-        quote_message_id: row.get(11)?,
+        status: static_status(row.get::<_, String>("status")?),
+        client_request_id: row.get("client_request_id")?,
+        quote_message_id: row.get("quote_message_id")?,
         quote_snapshot: quote_snapshot
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
@@ -14785,34 +15475,42 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         rich: rich_json
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
-        edited_at: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
-        sender_name: row.get(17)?,
-        mentions_self: row.get::<_, i64>(18)? != 0,
+        edited_at: row
+            .get::<_, Option<i64>>("edited_at")?
+            .map(|value| value as u64),
+        sender_name: row.get("sender_name")?,
+        mentions_self: row.get::<_, i64>("mentions_self")? != 0,
         reactions: Vec::new(),
         edits: Vec::new(),
-        delivered_at: row.get::<_, Option<i64>>(19)?.map(|value| value as u64),
-        read_at: row.get::<_, Option<i64>>(20)?.map(|value| value as u64),
-        viewed_at: row.get::<_, Option<i64>>(28)?.map(|value| value as u64),
-        admin_deleted: row.get::<_, i64>(21)? != 0,
+        delivered_at: row
+            .get::<_, Option<i64>>("delivered_at")?
+            .map(|value| value as u64),
+        read_at: row
+            .get::<_, Option<i64>>("read_at")?
+            .map(|value| value as u64),
+        viewed_at: row
+            .get::<_, Option<i64>>("viewed_at")?
+            .map(|value| value as u64),
+        admin_deleted: row.get::<_, i64>("admin_deleted")? != 0,
         sticker: row
-            .get::<_, Option<String>>(22)?
+            .get::<_, Option<String>>("sticker_json")?
             .and_then(|json| serde_json::from_str(&json).ok()),
         send_outcomes: row
-            .get::<_, Option<String>>(29)?
+            .get::<_, Option<String>>("send_outcomes_json")?
             .and_then(|json| serde_json::from_str(&json).ok()),
         expire_seconds: row
-            .get::<_, Option<i64>>(23)?
+            .get::<_, Option<i64>>("expire_seconds")?
             .map(|value| value.max(0) as u64),
         expire_start_at: row
-            .get::<_, Option<i64>>(24)?
+            .get::<_, Option<i64>>("expire_start_at")?
             .map(|value| value.max(0) as u64),
-        server_guid: row.get(26)?,
+        server_guid: row.get("server_guid")?,
         server_timestamp: row
-            .get::<_, Option<i64>>(27)?
+            .get::<_, Option<i64>>("server_timestamp")?
             .map(|value| value.max(0) as u64),
         is_story: false,
         story_message: None,
-        author_aci: row.get(30)?,
+        author_aci: row.get("author_aci")?,
     })
 }
 
@@ -18712,6 +19410,120 @@ mod tests {
                 assert!(row["verified"].is_boolean(), "row {}", row["id"]);
             }
         }
+    }
+
+    /// Z25 root-cause batch (§4.244 erratum): the owed-peer list and the
+    /// per-row absent stamp — the single-reference probe's store face. The
+    /// list answers the never-probed direct non-self rows in rowid order,
+    /// respects the caller cap, and excludes the self spellings (empty key,
+    /// the signal account, the account ACI); the per-row `{}` stamp is
+    /// NULL-guarded (never clobbers a word stamp, idempotent) and
+    /// extinguishes the trigger count row by row.
+    #[test]
+    fn verified_probe_owed_peer_list_and_absent_stamp() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let absent = store
+            .ensure_conversation(&account.id, "direct", "+15555550103", "A")
+            .unwrap();
+        let worded = store
+            .ensure_conversation(
+                &account.id,
+                "direct",
+                "11111111-1111-4111-8111-111111111111",
+                "B",
+            )
+            .unwrap();
+        let fresh = store
+            .ensure_conversation(&account.id, "direct", "+15555550104", "C")
+            .unwrap();
+        // Self spellings and a group row: never owed.
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "self")
+            .unwrap();
+        store
+            .ensure_conversation(&account.id, "group", "Z3Jw", "Group")
+            .unwrap();
+
+        // Owed list: rowid order, all three non-self direct rows.
+        let owed = store
+            .direct_peers_without_identity_verified(&account.id, 16)
+            .unwrap();
+        assert_eq!(
+            owed,
+            vec![
+                "+15555550103".to_string(),
+                "11111111-1111-4111-8111-111111111111".to_string(),
+                "+15555550104".to_string(),
+            ]
+        );
+
+        // The cap bounds the window (deterministic head of the queue).
+        let owed = store
+            .direct_peers_without_identity_verified(&account.id, 2)
+            .unwrap();
+        assert_eq!(
+            owed,
+            vec![
+                "+15555550103".to_string(),
+                "11111111-1111-4111-8111-111111111111".to_string(),
+            ]
+        );
+
+        // Per-row absent stamp: lands `{}` (the read face folds to the
+        // official DEFAULT false), extinguishes exactly that row, is
+        // idempotent under the NULL guard, and never clobbers a word stamp.
+        assert!(
+            store
+                .stamp_identity_verified_absent_peer(&account.id, "+15555550103")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .stamp_identity_verified_absent_peer(&account.id, "+15555550103")
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &absent.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.verified, Some(false));
+        store
+            .set_conversation_identity_verified_for_peer(
+                &account.id,
+                "11111111-1111-4111-8111-111111111111",
+                "TRUSTED_VERIFIED",
+            )
+            .unwrap();
+        assert!(
+            !store
+                .stamp_identity_verified_absent_peer(
+                    &account.id,
+                    "11111111-1111-4111-8111-111111111111"
+                )
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &worded.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.verified, Some(true));
+
+        // Only the untouched row stays owed; the window extinguishes.
+        let owed = store
+            .direct_peers_without_identity_verified(&account.id, 16)
+            .unwrap();
+        assert_eq!(owed, vec!["+15555550104".to_string()]);
+        assert_eq!(
+            store
+                .count_direct_conversations_without_identity_verified(&account.id)
+                .unwrap(),
+            1
+        );
+        let _ = fresh;
     }
 
     fn test_store_key() -> StoreKey {
@@ -23664,6 +24476,44 @@ mod tests {
         ));
     }
 
+    /// 契约 1.270（§4.254 · 批 Z14 · S6 头像生命周期⑦）：backfill 目标读
+    /// 三臂——缓存缺席 direct 行入集、群行恒不入、已缓存行不再重复。
+    #[test]
+    fn avatar_backfill_targets_miss_only_direct_rows() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let cold = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Cold Direct")
+            .unwrap();
+        let warm = store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Warm Direct")
+            .unwrap();
+        let group = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "Group")
+            .unwrap();
+        store
+            .upsert_conversation_avatar(
+                &account.id,
+                &warm.id,
+                "data:image/png;base64,aGVsbG8=",
+                5,
+                0,
+            )
+            .unwrap();
+
+        let targets = store.avatar_backfill_targets(&account.id, 24).unwrap();
+        assert_eq!(targets, vec![cold.id.clone()]);
+        assert!(!targets.contains(&warm.id));
+        assert!(!targets.contains(&group.id));
+
+        // 有界：帽截断按行 id 稳定序。
+        let capped = store.avatar_backfill_targets(&account.id, 0).unwrap();
+        assert!(capped.is_empty() || capped.len() <= 1);
+    }
+
     #[test]
     fn contacts_synced_at_marker_roundtrips() {
         let temp = TempDir::new().unwrap();
@@ -25527,6 +26377,191 @@ mod tests {
             Store::open(temp.path(), Some(wrong)),
             Err(StoreError::StoreKeyRejected)
         ));
+    }
+
+    /// Contract 1.262 (§4.245, S21): the one-shot sender-identity backfill.
+    /// A store holding pre-1.262 import rows (sender = the derived ingest
+    /// hash, authorAci absent or captured) and the staged archive recipient
+    /// table reopens with every mapped row upgraded to the ACI verbatim;
+    /// honest edges stay untouched (an e164-only recipient's row, the
+    /// outgoing row) and the row id never moves (quote links survive).
+    #[test]
+    fn sender_identity_backfill_maps_legacy_hash_rows_to_the_member_aci() {
+        const ACI: &str = "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b";
+        const E164: &str = "+15550000001";
+        const E164_ONLY: &str = "+15550000009";
+        let temp = TempDir::new().unwrap();
+        let record = |account_id: &str,
+                      conversation: &str,
+                      sender: &str,
+                      author: Option<&str>,
+                      sent_at: u64,
+                      direction: &'static str| MessageRecord {
+            is_erased: false,
+            delete_failed: false,
+            required_protocol_version: None,
+            author_aci: author.map(str::to_string),
+            id: stable_hash_id(&[
+                "signal-message-v2",
+                account_id,
+                conversation,
+                direction,
+                &sent_at.to_string(),
+                sender,
+            ]),
+            account_id: account_id.to_string(),
+            conversation_id: conversation.to_string(),
+            direction,
+            sender_id: sender.to_string(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: Some(1),
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            admin_deleted: false,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        let seeded = {
+            let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+            let account = store
+                .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+                .unwrap();
+            let account_id = account.id.clone();
+            // The mapped recipient's conversation (chat_identity discipline:
+            // contacts key on the number when the archive knows it).
+            let conv = store
+                .ensure_conversation(&account_id, "direct", E164, "alice")
+                .unwrap();
+            let conv_only = store
+                .ensure_conversation(&account_id, "direct", E164_ONLY, "num")
+                .unwrap();
+            // The archive recipient table is still in hand — the mapping
+            // source the backfill rebuilds from.
+            store
+                .stage_history_recipients(
+                    &account_id,
+                    &[HistoryStageRecipient {
+                        id: 1,
+                        kind: "contact".to_string(),
+                        name: "Alice".to_string(),
+                        aci: Some(ACI.to_string()),
+                        e164: Some(E164.to_string()),
+                        master_key: None,
+                    }],
+                )
+                .unwrap();
+            // pre-Z2 row: hash-e164 sender, no capture.
+            let legacy = record(
+                &account_id,
+                &conv.id,
+                &stable_hash_id(&[&account_id, "direct", E164]),
+                None,
+                1000,
+                "incoming",
+            );
+            store.insert_message(&legacy, None, None, true).unwrap();
+            // Z2 row: hash-aci sender, capture present.
+            let z2 = record(
+                &account_id,
+                &conv.id,
+                &stable_hash_id(&[&account_id, "direct", ACI]),
+                Some(ACI),
+                2000,
+                "incoming",
+            );
+            store.insert_message(&z2, None, None, true).unwrap();
+            // e164-only recipient row: its recipient has no ACI — untouched.
+            let honest = record(
+                &account_id,
+                &conv_only.id,
+                &stable_hash_id(&[&account_id, "direct", E164_ONLY]),
+                None,
+                3000,
+                "incoming",
+            );
+            store.insert_message(&honest, None, None, true).unwrap();
+            // outgoing: the account is the sender — untouched.
+            let outgoing = record(&account_id, &conv.id, &account_id, None, 4000, "outgoing");
+            store.insert_message(&outgoing, None, None, true).unwrap();
+            let legacy_id = legacy.id.clone();
+            let z2_id = z2.id.clone();
+            let honest_id = honest.id.clone();
+            let outgoing_id = outgoing.id.clone();
+            let conv_id = conv.id.clone();
+            let conv_only_id = conv_only.id.clone();
+            // Downgrade the marker so the reopen reruns the ladder at 40 and
+            // executes the v41 data backfill exactly as a real old store
+            // would.
+            store
+                .conn()
+                .execute("UPDATE meta SET value='40' WHERE key='schema_version'", [])
+                .unwrap();
+            (
+                account_id,
+                legacy_id,
+                z2_id,
+                honest_id,
+                outgoing_id,
+                conv_id,
+                conv_only_id,
+            )
+        };
+        let (account_id, legacy_id, z2_id, honest_id, outgoing_id, conv_id, conv_only_id) = seeded;
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let row = |conversation: &str, id: &str| {
+            store
+                .message_by_id(&account_id, conversation, id)
+                .unwrap()
+                .expect("row survives the migration")
+        };
+        // Both legacy forms upgrade to the ACI verbatim; the capture fills
+        // where absent and the id (the quote-link anchor) never moves.
+        let upgraded_legacy = row(&conv_id, &legacy_id);
+        assert_eq!(upgraded_legacy.sender_id, ACI);
+        assert_eq!(upgraded_legacy.author_aci.as_deref(), Some(ACI));
+        assert_eq!(upgraded_legacy.id, legacy_id);
+        let upgraded_z2 = row(&conv_id, &z2_id);
+        assert_eq!(upgraded_z2.sender_id, ACI);
+        assert_eq!(upgraded_z2.author_aci.as_deref(), Some(ACI));
+        // Honest edges untouched.
+        assert_eq!(
+            row(&conv_only_id, &honest_id).sender_id,
+            stable_hash_id(&[&account_id, "direct", E164_ONLY])
+        );
+        assert_eq!(row(&conv_only_id, &honest_id).author_aci, None);
+        assert_eq!(row(&conv_id, &outgoing_id).sender_id, account_id);
+        // Idempotent: a second open is a zero-hit no-op.
+        drop(store);
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let again = store
+            .message_by_id(&account_id, &conv_id, &legacy_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.sender_id, ACI);
+        assert_eq!(again.author_aci.as_deref(), Some(ACI));
     }
 
     #[test]
@@ -29140,9 +30175,129 @@ mod tests {
         assert_eq!(other.id.len(), 32);
     }
 
+    #[test]
+    fn upsert_is_atomic_when_finish_link_and_receive_race() {
+        let temp = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(Store::open(temp.path(), Some(test_store_key())).unwrap());
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let store = std::sync::Arc::clone(&store);
+            workers.push(std::thread::spawn(move || {
+                store.upsert_account_from_signal_with_id(
+                    "+15555550179",
+                    Some(9),
+                    DEFAULT_PROXY_GROUP_ID,
+                    Some("fedcba9876543210fedcba9876543210"),
+                )
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .expect("upsert worker does not panic")
+                .expect("concurrent upsert succeeds");
+        }
+        let accounts = store.list_accounts().unwrap();
+        assert_eq!(
+            accounts.len(),
+            1,
+            "并发 upsert 不得产生唯一键失败或重复账号"
+        );
+        assert_eq!(accounts[0].id, "fedcba9876543210fedcba9876543210");
+    }
+
     /// `stamp_incoming_viewed` (contract 1.94, §4.77): the local
     /// markViewed half — first stamp wins, only incoming rows qualify, the
     /// selection is exactly the given ids.
+    #[test]
+    fn backfill_recovers_legacy_group_author_aci_from_sender_hash() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550182", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtYXV0aA==", "Group")
+            .unwrap();
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-author",
+            "client-author",
+            "sent",
+            None,
+            0,
+            None,
+        );
+        let aci = "c3b07a1e-55cc-4a44-9e11-8a2b3c4d5e6f";
+        let hash = stable_hash_id(&[&account.id, "group", aci]);
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET direction='incoming', sender_id=?1, author_aci=NULL
+                 WHERE id='m-author'",
+                params![hash],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO contacts(id, account_id, kind, peer_key, title, extra, synced_at)
+                 VALUES('contact-author', ?1, 'contact', ?2, 'Peer', NULL, 1)",
+                params![account.id, aci],
+            )
+            .unwrap();
+
+        let changed = store.backfill_incoming_author_aci().unwrap();
+        assert_eq!(changed, 1);
+        let row = store
+            .message_by_id(&account.id, &conversation.id, "m-author")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.author_aci.as_deref(), Some(aci));
+    }
+
+    #[test]
+    fn message_mapper_uses_column_names_instead_of_positions() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550180", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550181", "Peer")
+            .unwrap();
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-reordered",
+            "client-reordered",
+            "sent",
+            None,
+            0,
+            None,
+        );
+        let row = store
+            .conn()
+            .query_row(
+                "SELECT delete_failed, is_erased, author_aci, server_timestamp, server_guid,
+                        expire_start_at, expire_seconds, send_outcomes_json, sticker_json,
+                        admin_deleted, viewed_at, read_at, delivered_at, mentions_self,
+                        sender_name, edited_at, rich_json, attachments_json, quote_snapshot,
+                        client_request_id, status, quote_message_id, body_truncated, body_bytes,
+                        body, received_at, sent_at, sender_id, direction, conversation_id,
+                        account_id, id
+                 FROM messages WHERE id='m-reordered'",
+                [],
+                message_record_from_row,
+            )
+            .unwrap();
+        assert_eq!(row.id, "m-reordered");
+        assert_eq!(row.status, "sent");
+    }
+
     #[test]
     fn stamp_incoming_viewed_first_stamp_wins_and_stays_incoming_only() {
         let temp = TempDir::new().unwrap();
@@ -30738,6 +31893,7 @@ mod tests {
                 Some(&MessageSendOutcomes {
                     succeeded: 2,
                     failed: 1,
+                    deleted_for_everyone_send_status: None,
                 }),
             )
             .unwrap()
@@ -30747,6 +31903,7 @@ mod tests {
             Some(MessageSendOutcomes {
                 succeeded: 2,
                 failed: 1,
+                deleted_for_everyone_send_status: None,
             })
         );
         let wire = serde_json::to_value(&settled.0).unwrap();
@@ -30813,6 +31970,7 @@ mod tests {
                 Some(&MessageSendOutcomes {
                     succeeded: 0,
                     failed: 3,
+                    deleted_for_everyone_send_status: None,
                 }),
             )
             .unwrap()
@@ -30823,6 +31981,7 @@ mod tests {
             Some(MessageSendOutcomes {
                 succeeded: 0,
                 failed: 3,
+                deleted_for_everyone_send_status: None,
             })
         );
         // The queue face stays retired: the retry affordance is the manual
@@ -31484,5 +32643,380 @@ mod tests {
             !map.contains_key("+15555550102"),
             "a foreign account's rows never leak across accounts"
         );
+    }
+
+    use crate::engine::NormalizedAttachment;
+
+    /// Contract revision 1.271 (§4.255): the persisted attachment dimension
+    /// write is a descriptor-face patch — the addressed entry gains
+    /// width/height, every other key and every other entry stays byte-level
+    /// untouched, and a replay of the same pair answers unchanged.
+    #[test]
+    fn attachment_dimensions_are_written_into_the_descriptor_face_idempotently() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut row = pin_test_message(&account.id, &conversation.id, "m-1", 1_000);
+        row.attachments = vec![
+            NormalizedAttachment {
+                id: "att-image".into(),
+                content_type: Some("image/png".into()),
+                filename: Some("a.png".into()),
+                size: Some(4096),
+                width: None,
+                height: None,
+                is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
+                locator: None,
+                waveform: None,
+                duration: None,
+            },
+            NormalizedAttachment {
+                id: "att-file".into(),
+                content_type: Some("application/pdf".into()),
+                filename: Some("b.pdf".into()),
+                size: Some(2048),
+                width: None,
+                height: None,
+                is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
+                locator: None,
+                waveform: None,
+                duration: None,
+            },
+        ];
+        store.insert_message(&row, None, None, false).unwrap();
+
+        // 第一次写：真的改了面。
+        assert!(
+            store
+                .set_attachment_dimensions(
+                    &account.id,
+                    &conversation.id,
+                    "m-1",
+                    "att-image",
+                    1280,
+                    720,
+                )
+                .unwrap()
+        );
+        let stored = store
+            .message_by_id(&account.id, &conversation.id, "m-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attachments[0].width, Some(1280));
+        assert_eq!(stored.attachments[0].height, Some(720));
+        assert_eq!(stored.attachments[0].filename.as_deref(), Some("a.png"));
+        assert_eq!(stored.attachments[0].size, Some(4096));
+        // 未寻址的条目逐字不变（宽度仍缺席）。
+        assert_eq!(stored.attachments[1].width, None);
+        assert_eq!(stored.attachments[1].height, None);
+        assert_eq!(stored.attachments[1].filename.as_deref(), Some("b.pdf"));
+
+        // 同值重放：幂等（updated=false，字节不再改写）。
+        assert!(
+            !store
+                .set_attachment_dimensions(
+                    &account.id,
+                    &conversation.id,
+                    "m-1",
+                    "att-image",
+                    1280,
+                    720,
+                )
+                .unwrap()
+        );
+        // 换值重写：只动该条目的两个键。
+        assert!(
+            store
+                .set_attachment_dimensions(
+                    &account.id,
+                    &conversation.id,
+                    "m-1",
+                    "att-image",
+                    800,
+                    600,
+                )
+                .unwrap()
+        );
+        let rewritten = store
+            .message_by_id(&account.id, &conversation.id, "m-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rewritten.attachments[0].width, Some(800));
+        assert_eq!(rewritten.attachments[0].height, Some(600));
+        assert_eq!(rewritten.attachments[1].width, None);
+    }
+
+    /// Contract revision 1.271 (§4.255): the write fails closed on every
+    /// target it cannot honour — a missing row, an attachment id that names no
+    /// descriptor, and a row whose attachment face is not a readable array.
+    #[test]
+    fn attachment_dimension_write_fails_closed_on_bad_targets() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        // 无附件的普通行：id 不指名任何描述符。
+        let plain = pin_test_message(&account.id, &conversation.id, "m-plain", 2_000);
+        store.insert_message(&plain, None, None, false).unwrap();
+        assert!(matches!(
+            store.set_attachment_dimensions(
+                &account.id,
+                &conversation.id,
+                "m-plain",
+                "att-image",
+                10,
+                10
+            ),
+            Err(StoreError::AttachmentNotFound)
+        ));
+        // 行不存在 → MessageNotFound（§4.4 阶梯，不是空写）。
+        assert!(matches!(
+            store.set_attachment_dimensions(
+                &account.id,
+                &conversation.id,
+                "m-gone",
+                "att-image",
+                10,
+                10
+            ),
+            Err(StoreError::MessageNotFound)
+        ));
+        // 坏面（非 JSON 数组）→ 整体拒，绝不覆盖读不懂的字节。
+        let mut broken = pin_test_message(&account.id, &conversation.id, "m-broken", 3_000);
+        broken.attachments = Vec::new();
+        store.insert_message(&broken, None, None, false).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET attachments_json='{\"not\":\"an array\"}' WHERE id='m-broken'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.set_attachment_dimensions(
+                &account.id,
+                &conversation.id,
+                "m-broken",
+                "att-image",
+                10,
+                10
+            ),
+            Err(StoreError::AttachmentFaceUnreadable)
+        ));
+    }
+
+    /// Contract revision 1.271 (§4.255): the read face lists only measured
+    /// descriptors (both dimensions present, in the legal pixel domain),
+    /// newest message first, and the row window bounds the scan.
+    #[test]
+    fn attachment_dimension_list_projects_only_measured_entries_newest_first() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let descriptor = |id: &str, width: Option<u32>, height: Option<u32>| NormalizedAttachment {
+            id: id.into(),
+            content_type: Some("image/png".into()),
+            filename: None,
+            size: Some(1024),
+            width,
+            height,
+            is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
+            locator: None,
+            waveform: None,
+            duration: None,
+        };
+        let mut older = pin_test_message(&account.id, &conversation.id, "m-older", 1_000);
+        older.attachments = vec![descriptor("att-old", Some(640), Some(480))];
+        store.insert_message(&older, None, None, false).unwrap();
+        let mut newer = pin_test_message(&account.id, &conversation.id, "m-newer", 2_000);
+        newer.attachments = vec![
+            descriptor("att-new", None, None),
+            descriptor("att-new-measured", Some(1920), Some(1080)),
+        ];
+        store.insert_message(&newer, None, None, false).unwrap();
+
+        let listed = store
+            .list_attachment_dimensions(&account.id, &conversation.id, 200)
+            .unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                StoredAttachmentDimension {
+                    message_id: "m-newer".into(),
+                    attachment_id: "att-new-measured".into(),
+                    width: 1920,
+                    height: 1080,
+                },
+                StoredAttachmentDimension {
+                    message_id: "m-older".into(),
+                    attachment_id: "att-old".into(),
+                    width: 640,
+                    height: 480,
+                },
+            ],
+            "只有量过的条目入表，新消息在前"
+        );
+        // 行窗口有界：只扫 1 行 = 只有最新消息的条目。
+        let bounded = store
+            .list_attachment_dimensions(&account.id, &conversation.id, 1)
+            .unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].message_id, "m-newer");
+    }
+    /// Contract 1.272 (section 4.256): the summary exposes the exact
+    /// oldest-unseen anchor, not an index inferred from the unread count.
+    #[test]
+    fn conversation_summary_projects_exact_oldest_unseen_message_id() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let base = |id: &str, sent_at: u64, direction: &str| MessageRecord {
+            is_erased: false,
+            delete_failed: false,
+            required_protocol_version: None,
+            author_aci: None,
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: if direction == "outgoing" {
+                "outgoing"
+            } else {
+                "incoming"
+            },
+            sender_id: if direction == "outgoing" {
+                "self".into()
+            } else {
+                "peer".into()
+            },
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            send_outcomes: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        let insert = |id: &str, sent_at: u64, direction: &str, unread: bool| {
+            store
+                .insert_message(&base(id, sent_at, direction), None, Some("body"), unread)
+                .unwrap();
+        };
+        insert("m1", 100, "incoming", false); // already read
+        insert("m2", 200, "incoming", true); // oldest unseen
+        insert("m3", 300, "outgoing", false); // outgoing interleave does not count
+        insert("m4", 400, "incoming", true); // newer unseen
+        insert("m5", 500, "outgoing", false);
+        // m1 是已读历史；m2/m4 是当前未读。水位先于读取落账。
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET read_watermark_ms=?2 WHERE id=?1",
+                params![conversation.id, 150_i64],
+            )
+            .unwrap();
+
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.unread_count, 2);
+        assert_eq!(summary.oldest_unseen_message_id.as_deref(), Some("m2"));
+
+        // The paged list uses the identical projection (not a second rule).
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        assert_eq!(
+            page.items[0].oldest_unseen_message_id.as_deref(),
+            Some("m2")
+        );
+
+        // Advancing the authoritative watermark moves the exact anchor to m4.
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET read_watermark_ms=?2 WHERE id=?1",
+                params![conversation.id, 250_i64],
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.oldest_unseen_message_id.as_deref(), Some("m4"));
+
+        // A fully-read conversation exposes no anchor (absent, never guessed).
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET read_watermark_ms=?2, unread_count=0 WHERE id=?1",
+                params![conversation.id, 450_i64],
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.oldest_unseen_message_id, None);
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert!(wire.get("oldestUnseenMessageId").is_none());
     }
 }

@@ -115,6 +115,10 @@ const EXPIRE_SWEEP_STARTUP_SETTLE: Duration = Duration::from_secs(5);
 /// Capacity of the auto delivery-receipt queue (contract revision 1.34):
 /// bounded, lossy by design — a full queue drops the job, never the receive.
 const DELIVERY_RECEIPT_QUEUE_CAP: usize = 512;
+/// §4.244 verified 探针窗帽（Z25 根因批）：单引用 listIdentities 读每窗
+/// 最多行数——hidden 回写纯面帽 16 同款纪律，余行留下一窗（60s 节流），
+/// 有界自熄。
+const VERIFIED_PROBE_WINDOW_CAP: usize = 16;
 
 /// Batch X · S6①: the stale-avatar refetch queue cap. Profile-change and
 /// group-avatar-change events are rare by protocol construction (the engine's
@@ -123,6 +127,11 @@ const DELIVERY_RECEIPT_QUEUE_CAP: usize = 512;
 /// refetch kick lossily (the desktop's own on-demand pull is the convergence
 /// backstop).
 const AVATAR_REFRESH_QUEUE_CAP: usize = 32;
+/// 契约 1.270（§4.254 · 批 Z14）：单轮头像 backfill 的目标帽——contacts
+/// sync 落库后一轮扫描最多入队的缓存缺席 direct 行数。有界纪律沿用
+/// avatar-refresh 队列（lossy try_send，满即弃；对端无头像的负答由
+/// UNAVAILABLE 幂等清位承载，下一轮 sync 前不重复触发）。
+const AVATAR_BACKFILL_CAP: usize = 24;
 
 /// §4.163 contacts.sync wall-clock budget: the whole face — engine resolve,
 /// the two read-only listings, and the store upsert transaction — must answer
@@ -631,6 +640,10 @@ pub struct RuntimeSupervisor {
     /// queue drops the refetch kick, never the receive (the next profile
     /// change or the desktop's own on-demand pull converges).
     avatar_refresh_rx: StdMutex<Option<mpsc::Receiver<(String, String)>>>,
+    /// 契约 1.270（§4.254 · 批 Z14）：头像 backfill kick 用的队列发送端
+    /// clone（队列本体在 `new` 创建；persistence loop 持原版发送端，本
+    /// 字段供 contacts-sync 落库后的 backfill 臂 try_send，lossy 同纪律）。
+    avatar_backfill_tx: mpsc::Sender<(String, String)>,
     /// The avatar-refresh worker; never held across an await.
     avatar_refresh_worker: StdMutex<Option<JoinHandle<()>>>,
     /// §4.123 outbox drain: the receiver side of the lossy drain-kick channel
@@ -785,6 +798,10 @@ impl RuntimeSupervisor {
         // drains it through the getAvatar read lane. Bounded and lossy.
         let (avatar_refresh_tx, avatar_refresh_rx) =
             mpsc::channel::<(String, String)>(AVATAR_REFRESH_QUEUE_CAP);
+        // 契约 1.270（§4.254 · 批 Z14）：backfill kick 的发送端 clone——原版
+        // 发送端 move 进 persistence loop，本 clone 存 supervisor 字段供
+        // contacts-sync 落库后的 backfill 臂 try_send（lossy 同纪律）。
+        let avatar_backfill_tx = avatar_refresh_tx.clone();
         // §4.123 outbox drain: the cap-1 lossy kick channel the engine-landed
         // hooks send on; the worker (spawned later by the registry) owns the
         // receiver and otherwise paces itself on the due schedules + tick.
@@ -853,6 +870,7 @@ impl RuntimeSupervisor {
             delivery_receipt_rx: StdMutex::new(Some(delivery_receipt_rx)),
             delivery_receipt_worker: StdMutex::new(None),
             avatar_refresh_rx: StdMutex::new(Some(avatar_refresh_rx)),
+            avatar_backfill_tx,
             avatar_refresh_worker: StdMutex::new(None),
             outbox_drain_rx: StdMutex::new(Some(outbox_drain_rx)),
             outbox_drain_tx,
@@ -1265,6 +1283,37 @@ impl RuntimeSupervisor {
                 // cached either way (the clear already ran), the next
                 // profile change or the desktop's own pull retries.
             }
+        }
+    }
+
+    /// 契约 1.270（§4.254 · 批 Z14 · S6 头像生命周期⑦）：contacts sync 落
+    /// 库后的一轮 backfill——扫缓存缺席的 direct 行（有界
+    /// AVATAR_BACKFILL_CAP），逐条经既有 avatar-refresh 队列入队，worker
+    /// 端走 getAvatar 读 lane 全链（prepare → 引擎只读调用 → 结果闸 →
+    /// service commit 闸 → ConversationChanged 推送）。lossy：队满即弃
+    /// （桌面按需拉取是兜底）；UNAVAILABLE 负答由既有幂等清位承载。群行
+    /// 不入目标集（群头像走 GroupChanged 事件 kick）。
+    async fn kick_avatar_backfill(&self, account_id: &str) {
+        let targets = {
+            let store = Arc::clone(&self.store);
+            let account_id = account_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                store.avatar_backfill_targets(&account_id, AVATAR_BACKFILL_CAP as u32)
+            })
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+        };
+        let Some(targets) = targets else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+        for conversation_id in targets {
+            let _ = self
+                .avatar_backfill_tx
+                .try_send((account_id.to_string(), conversation_id));
         }
     }
 
@@ -4110,62 +4159,99 @@ impl RuntimeSupervisor {
         .await
         .map_err(|_| StoreError::Unavailable(None))?;
         // Contract 1.260 (§4.244): the verified storage-consumption leg —
-        // the same one engine window, one full read-only `listIdentities`
-        // round trip (the recipient omitted, the pinned
-        // ListIdentitiesCommand full-account face). Every named peer's direct
-        // row carries the pinned `trustLevel` word verbatim — the
-        // storage-projection landing the official `updateVerified` →
-        // `DataWriter.updateConversation` record write mirrors; the rows
-        // the answer does not name take the probed-absent `{}` marker (the
-        // official DEFAULT face) so the trigger self-extinguishes. Store-only
-        // writes on the blocking pool, warn-silent per row (one bad stamp
-        // never fails the list that triggered the enrich — the title-pass
-        // discipline).
-        let identities = engine
-            .call(
-                "listIdentities",
-                json!({
-                    "account": number,
-                }),
-                CallClass::ReadOnly,
-            )
-            .await
-            .map_err(ServiceError::Engine)?;
-        let identity_entries = identities.as_array().cloned().unwrap_or_default();
-        tokio::task::spawn_blocking({
+        // Z25 根因修复（2026-10-25，台账 §29.118）：引擎 listIdentities 面
+        // 是单引用窄读（engine compat §3/§5 行：number 必填，账号全量清单
+        // 形态不提供）。本臂原发 {account} 缺 number，引擎按契约恒
+        // -32603（duration_ms=0），? 把整条 enrich 中断：verified 戳永不落
+        // → 触发计数永不自熄 → 60s internal_error 无限循环（活体事故实
+        // 证）。改为对欠戳行逐行单引用读 {account, number: peer_key}：
+        // 有界（VERIFIED_PROBE_WINDOW_CAP/窗，hidden 回写纯面帽同款），
+        // 自熄语义逐字保留——读到词行落词戳（uuid/number 双拼写同前），
+        // 读成功而无 identity（官方 SafetyNumberNotReady 态，非错误）落该
+        // 行 probed-absent {}；引擎错误行保持 NULL 下一窗重试（60s 节流即
+        // 窗内退避，绝不窗内重试轰炸引擎）。store 写单趟 blocking 池，逐行
+        // best-effort（一行失败不炸本窗——title-pass 纪律）。
+        let owed_peers = tokio::task::spawn_blocking({
             let store = Arc::clone(&self.store);
             let account_id = account_id.to_string();
             move || {
-                for entry in &identity_entries {
-                    let Some(word) = entry.get("trustLevel").and_then(Value::as_str) else {
+                store.direct_peers_without_identity_verified(&account_id, VERIFIED_PROBE_WINDOW_CAP)
+            }
+        })
+        .await
+        .map_err(|_| StoreError::Unavailable(None))??;
+        // (owed peer key, stamp keys, word) 收集在 await 循环，store 写单趟。
+        let mut probed: Vec<(String, Vec<String>, Option<String>)> = Vec::new();
+        for peer_key in owed_peers {
+            let identities = engine
+                .call(
+                    "listIdentities",
+                    json!({
+                        "account": number,
+                        "number": peer_key,
+                    }),
+                    CallClass::ReadOnly,
+                )
+                .await;
+            let entries = match identities {
+                Ok(value) => value.as_array().cloned().unwrap_or_default(),
+                Err(error) => {
+                    tracing::warn!(
+                        kind = "identity_verified_probe",
+                        class = error.class(),
+                        "engine listIdentities read failed; the row stays owed for the next window",
+                    );
+                    continue;
+                }
+            };
+            let word = entries.iter().find_map(|entry| {
+                let word = entry.get("trustLevel").and_then(Value::as_str)?;
+                IDENTITY_TRUST_WORDS
+                    .contains(&word)
+                    .then(|| word.to_string())
+            });
+            // 词戳双拼写同前（uuid/e164 各落己行形，row key 随创建捕获拼
+            // 写）；无词 = probed-absent，只落欠戳行本身（单引用读答不出
+            // 的拼写无从落）。
+            let mut keys = vec![peer_key.clone()];
+            if word.is_some() {
+                for entry in &entries {
+                    for key in ["uuid", "number"] {
+                        if let Some(spelling) = entry
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|spelling| {
+                                !spelling.is_empty() && !keys.iter().any(|k| k == spelling)
+                            })
+                        {
+                            keys.push(spelling.to_string());
+                        }
+                    }
+                }
+            }
+            probed.push((peer_key, keys, word));
+        }
+        let _ = tokio::task::spawn_blocking({
+            let store = Arc::clone(&self.store);
+            let account_id = account_id.to_string();
+            move || {
+                for (owed_peer, keys, word) in &probed {
+                    let Some(word) = word else {
+                        let _ = store.stamp_identity_verified_absent_peer(&account_id, owed_peer);
                         continue;
                     };
-                    if !IDENTITY_TRUST_WORDS.contains(&word) {
-                        continue;
-                    }
-                    // Both spellings stamp their own row form (the uuid and
-                    // the e164 name the same peer identity; the conversations
-                    // row key follows the creating capture's spelling).
-                    for key in ["uuid", "number"] {
-                        let Some(peer_key) = entry.get(key).and_then(Value::as_str).map(str::trim)
-                        else {
-                            continue;
-                        };
-                        if peer_key.is_empty() {
-                            continue;
-                        }
+                    for key in keys {
                         let _ = store.set_conversation_identity_verified_for_peer(
                             &account_id,
-                            peer_key,
+                            key,
                             word,
                         );
                     }
                 }
-                let _ = store.stamp_identity_verified_absent_rows(&account_id);
             }
         })
-        .await
-        .map_err(|_| StoreError::Unavailable(None))?;
+        .await;
         // 引擎存储回写（两仓契约的 connector 半）：有界/轮（纯面帽 16），
         // best-effort warn-only——丢失的回写让引擎读臂暂退批 W 反演近似，
         // 下一次 hidden 变化自然再火，绝不阻断 enrich。uuid = 引擎
@@ -4188,6 +4274,32 @@ impl RuntimeSupervisor {
             }
         }
         Ok(())
+    }
+
+    /// messages.setAttachmentDimensions (contract revision 1.271, §4.255): a
+    /// local store write on the send lane — the conversations.saveDraft class
+    /// (mutating, account-scoped mutex and delete barrier, no engine frame, no
+    /// upstream traffic). The lane/mutex classification lives in the method
+    /// table; this wrapper only hands the work to the blocking pool.
+    pub async fn set_attachment_dimensions(
+        &self,
+        params: crate::service::MessagesSetAttachmentDimensionsParams,
+    ) -> Result<crate::service::AttachmentDimensionsWriteResult, ServiceError> {
+        let store = Arc::clone(&self.store);
+        blocking_service(move || crate::service::store_set_attachment_dimensions(&store, &params))
+            .await
+    }
+
+    /// messages.listAttachmentDimensions (contract revision 1.271, §4.255): a
+    /// bounded store-only read on the read lane — no upstream traffic, no
+    /// mutation, and no unread side effect (the §4.76 adjacentMedia posture).
+    pub async fn list_attachment_dimensions(
+        &self,
+        params: crate::service::MessagesListAttachmentDimensionsParams,
+    ) -> Result<crate::service::AttachmentDimensionsListResult, ServiceError> {
+        let store = Arc::clone(&self.store);
+        blocking_service(move || crate::service::store_list_attachment_dimensions(&store, &params))
+            .await
     }
 
     pub async fn list_messages(
@@ -4415,6 +4527,7 @@ impl RuntimeSupervisor {
         let mut counted = crate::store::MessageSendOutcomes {
             succeeded: 0,
             failed: 0,
+            deleted_for_everyone_send_status: None,
         };
         for entry in entries {
             if entry.get("success").is_some() {
@@ -4451,7 +4564,7 @@ impl RuntimeSupervisor {
                     recipient: recipient.to_string(),
                     succeeded: true,
                 });
-            } else if entry.get("failure").is_some() {
+            } else if entry.get("failure").is_some() || entry.get("error").is_some() {
                 seeds.push(crate::store::SendReceiptSeed {
                     recipient: recipient.to_string(),
                     succeeded: false,
@@ -4459,6 +4572,18 @@ impl RuntimeSupervisor {
             }
         }
         (!seeds.is_empty()).then_some(seeds)
+    }
+
+    /// 契约 1.274：把 remoteDelete 的逐收件人 results 展开为
+    /// deletedForEveryoneSendStatus（success=true / failure=false）。
+    fn deleted_for_everyone_send_status_from_reply(
+        result: &Value,
+    ) -> std::collections::BTreeMap<String, bool> {
+        let mut status = std::collections::BTreeMap::new();
+        for seed in Self::send_receipt_seeds_from_reply(result).unwrap_or_default() {
+            status.insert(seed.recipient, seed.succeeded);
+        }
+        status
     }
 
     async fn dispatch_prepared(
@@ -7624,12 +7749,10 @@ impl RuntimeSupervisor {
             .map_err(ServiceError::from)
     }
 
-    /// Best-effort "Delete for everyone" for one own sent message
-    /// (docs/remote-delete-l2-plan.md): local prepare under the service lock,
-    /// upstream `remoteDelete` call without it — the same shape as
-    /// `send_text`. No local row is created or changed and no event is
-    /// emitted; an indeterminate mutating outcome maps to the explicit
-    /// `{"status":"unknown"}` response, never to an automatic retry.
+    /// "Delete for everyone" for one own sent message: local prepare under
+    /// the service lock, upstream `remoteDelete` without it, then the
+    /// contract-1.273 local tombstone completion on confirmation. Indeterminate
+    /// outcomes still answer `{"status":"unknown"}` and never auto-retry.
     pub async fn remote_delete(
         &self,
         account_id: String,
@@ -7653,7 +7776,39 @@ impl RuntimeSupervisor {
             let _ = service.set_message_delete_failed(&account_id, &message_id, failed);
         }
         match outcome {
-            Ok(_) => Ok("deleted"),
+            Ok(result) => {
+                // 契约 1.273 + 1.274：上行确认后落本地墓碑，并持久化逐收件人
+                // 删除状态。部分失败保留 success=true 的条目，同时置 failed。
+                let send_status = Self::deleted_for_everyone_send_status_from_reply(&result);
+                let failed = send_status.values().any(|succeeded| !succeeded);
+                let completed = {
+                    let service = self.service.lock().await;
+                    service.complete_remote_delete(
+                        &prepared.account_id,
+                        &prepared.conversation_id,
+                        &prepared.message_id,
+                        prepared.target_sent_at,
+                        send_status,
+                        failed,
+                    )?
+                };
+                if let Some((record, summary)) = completed {
+                    let _ = self.host_events.send(HostSideEvent::MessageStatusChanged {
+                        account_id: record.account_id,
+                        message_id: record.id,
+                        status: record.status,
+                        delivered_at: None,
+                        read_at: None,
+                        viewed_at: None,
+                    });
+                    if let Some(summary) = summary {
+                        let _ = self
+                            .host_events
+                            .send(HostSideEvent::ConversationChanged(summary));
+                    }
+                }
+                Ok("deleted")
+            }
             Err(EngineError::UnknownOutcome) => Ok("unknown"),
             Err(error) => Err(error.into()),
         }
@@ -9762,7 +9917,7 @@ impl RuntimeSupervisor {
                 });
             }
         }
-        tokio::time::timeout(CONTACTS_SYNC_BUDGET, async {
+        let outcome = tokio::time::timeout(CONTACTS_SYNC_BUDGET, async {
             let engine = self.running_engine().await?;
             sync_contacts_with(&self.service, &engine, account_id, &self.host_events).await
         })
@@ -9775,7 +9930,13 @@ impl RuntimeSupervisor {
                 "contacts sync exceeded its budget; retry later",
                 true,
             )))
-        })
+        });
+        if outcome.is_ok() {
+            // 契约 1.270（§4.254 · 批 Z14）：真实落库（非 60s 节流早退）后
+            // 一轮头像 backfill——首轮链接/换机/重启后的冷缓存收敛点。
+            self.kick_avatar_backfill(account_id).await;
+        }
+        outcome
     }
 }
 
@@ -11572,6 +11733,7 @@ async fn receive_persistence_loop(
                         tracing::warn!(
                             state = "unavailable",
                             error_class = error.class(),
+                            error = ?error,
                             "receive persistence failed; retrying"
                         );
                         let _ = host_events.send(HostSideEvent::StorageChanged {
@@ -12044,6 +12206,18 @@ mod tests {
     /// totals; direct sends (no array), empty arrays, and shape-hostile
     /// entries degrade to `None` (the pre-1.173 shape — no outcomes face).
     #[test]
+    fn remote_delete_send_status_tracks_partial_recipient_results() {
+        let map = RuntimeSupervisor::deleted_for_everyone_send_status_from_reply(&json!({
+            "results": [
+                { "recipientNumber": "+1", "success": { "timestamp": 7 } },
+                { "recipientNumber": "+2", "failure": { "type": "NetworkFailure" } },
+            ]
+        }));
+        assert_eq!(map.get("+1"), Some(&true));
+        assert_eq!(map.get("+2"), Some(&false));
+    }
+
+    #[test]
     fn send_outcomes_from_reply_counts_group_results_entries() {
         assert_eq!(
             RuntimeSupervisor::send_outcomes_from_reply(&json!({
@@ -12057,6 +12231,7 @@ mod tests {
             Some(crate::store::MessageSendOutcomes {
                 succeeded: 2,
                 failed: 1,
+                deleted_for_everyone_send_status: None,
             })
         );
         // No recognizable entry counts as no face (never an all-zero Some).
